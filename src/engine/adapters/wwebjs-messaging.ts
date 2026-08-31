@@ -813,9 +813,17 @@ export class WwebjsMessaging {
 
   async votePoll(chatId: string, pollMessageId: string, options: string[]): Promise<void> {
     this.host.ensureReady();
+    // Timed in two halves because they fail differently and are fixed differently: the lookup is
+    // ours (a 100-message fetch we could narrow), the vote is WhatsApp's send and is not. Measured
+    // here, the lookup is ~100ms in every group while a vote has ranged from 0.4s to past 30s in
+    // the same one — so without the split, a slow vote is unattributable and invites optimising
+    // the half that was never the cost.
+    const startedAt = Date.now();
     // Same 100-message window as pin/react/delete, so a poll older than that is unreachable and
     // reported as not-found rather than as a failed vote.
     const message = await this.findInFetchWindow(chatId, pollMessageId);
+    const lookupMs = Date.now() - startedAt;
+    const voteStartedAt = Date.now();
     try {
       await (message as unknown as { vote(selected: string[]): Promise<void> }).vote(options);
     } catch (error) {
@@ -825,13 +833,25 @@ export class WwebjsMessaging {
       if (typeof error === 'string') {
         throw new BadRequestException(`Message ${pollMessageId} is not a poll: ${error}`);
       }
+      // A failed vote is timed too: "it threw after 30s" and "it threw at once" are different
+      // faults, and only the log can tell them apart after the fact.
+      this.host.logger.warn(`Vote on poll ${pollMessageId} failed`, {
+        chatId,
+        lookupMs,
+        voteMs: Date.now() - voteStartedAt,
+        error: error instanceof Error ? error.message : String(error),
+      });
       throw error;
     }
-    this.host.logger.log(`Voted on poll ${pollMessageId} in chat ${chatId} (${options.length} option(s))`);
+    this.host.logger.log(`Voted on poll ${pollMessageId} in chat ${chatId} (${options.length} option(s))`, {
+      lookupMs,
+      voteMs: Date.now() - voteStartedAt,
+    });
   }
 
   async getPollVotes(chatId: string, pollMessageId: string): Promise<PollVote[]> {
     this.host.ensureReady();
+    const startedAt = Date.now();
     // Same 100-message window as votePoll, and for the same reason: the two act on the same polls,
     // so a poll one of them cannot reach must not appear reachable through the other.
     const message = await this.findInFetchWindow(chatId, pollMessageId);
@@ -850,6 +870,12 @@ export class WwebjsMessaging {
       }
       throw error;
     }
+    // Timed alongside the vote path, so "reading a poll is slow" and "voting on it is slow" are
+    // separable — they share the lookup and nothing else.
+    this.host.logger.debug(`Read ${raw.length} vote(s) on poll ${pollMessageId}`, {
+      chatId,
+      elapsedMs: Date.now() - startedAt,
+    });
     // A vote with no readable voter is dropped by the mapper — see mapWwebjsPollVote for why one
     // cannot be counted. Logged in aggregate so a shape change shows up as a number rather than as
     // a silently short list.
