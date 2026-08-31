@@ -42,7 +42,7 @@ describe('MessageService', () => {
   let engines: EngineRegistry;
   let messageProjector: { recordOutboundMessageEdit: jest.Mock };
   let hookManager: jest.Mocked<Partial<HookManager>>;
-  let lidMappingStore: { lidsForPhone: jest.Mock; getCached: jest.Mock };
+  let lidMappingStore: { lidsForPhone: jest.Mock; getCached: jest.Mock; resolveLid: jest.Mock };
   let mockEngine: ReturnType<typeof createMockEngine>;
 
   beforeEach(async () => {
@@ -70,7 +70,11 @@ describe('MessageService', () => {
         .mockImplementation((_event: string, data: unknown) => Promise.resolve({ continue: true, data })),
     };
 
-    lidMappingStore = { lidsForPhone: jest.fn().mockReturnValue([]), getCached: jest.fn().mockReturnValue(undefined) };
+    lidMappingStore = {
+      lidsForPhone: jest.fn().mockReturnValue([]),
+      getCached: jest.fn().mockReturnValue(undefined),
+      resolveLid: jest.fn().mockReturnValue(null),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -737,6 +741,36 @@ describe('MessageService', () => {
       mockEngine.getContactById.mockResolvedValueOnce({ id: '99@lid', number: '' });
       const [resolved] = await service.getPollVotes('sess-1', '621@c.us', 'P1', true);
       expect(resolved.voterPhone).toBeUndefined();
+    });
+
+    it('never reports a @lid voter’s own digits as their phone number', async () => {
+      // Measured live: WhatsApp Web answers `number` with the LID restated, which looks exactly
+      // like a phone number. Passing it through hands the caller something they might dial.
+      mockEngine.getPollVotes.mockResolvedValueOnce([{ ...vote, voterId: '234475837493478@lid' }]);
+      mockEngine.getContactById.mockResolvedValueOnce({
+        id: '234475837493478@lid',
+        name: 'Purnam Support',
+        number: '234475837493478',
+      });
+      const [resolved] = await service.getPollVotes('sess-1', '621@c.us', 'P1', true);
+      expect(resolved.voterPhone).toBeUndefined();
+      // The name still comes back — losing the number must not cost the identity.
+      expect(resolved.voterName).toBe('Purnam Support');
+    });
+
+    it('uses the lid->phone mirror when it knows the voter', async () => {
+      mockEngine.getPollVotes.mockResolvedValueOnce([{ ...vote, voterId: '234475837493478@lid' }]);
+      mockEngine.getContactById.mockResolvedValueOnce({ id: '234475837493478@lid', number: '234475837493478' });
+      lidMappingStore.resolveLid.mockReturnValueOnce('628123456789');
+      const [resolved] = await service.getPollVotes('sess-1', '621@c.us', 'P1', true);
+      expect(resolved.voterPhone).toBe('628123456789');
+    });
+
+    it('keeps a phone-dialect voter’s number, which the id carries itself', async () => {
+      mockEngine.getPollVotes.mockResolvedValueOnce([{ ...vote, voterId: '628123456789@c.us' }]);
+      mockEngine.getContactById.mockResolvedValueOnce({ id: '628123456789@c.us', number: '628123456789' });
+      const [resolved] = await service.getPollVotes('sess-1', '621@c.us', 'P1', true);
+      expect(resolved.voterPhone).toBe('628123456789');
     });
   });
 

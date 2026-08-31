@@ -1296,6 +1296,11 @@ Read the votes cast on a poll: one entry per voter who has voted at least once.
 | --------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------- |
 | resolveContacts | boolean | no       | Also return each voter's `voterName`, `voterPushName` and `voterPhone`. One contact lookup per voter, so opt-in |
 
+> **`voterPhone` is absent for a `@lid` voter the gateway cannot map.** WhatsApp Web reports such
+> a contact's `number` as the LID's own digits — they look like a phone number and are not one — so
+> the lid is resolved through the gateway's lid→phone mirror instead, and nothing is returned when
+> that mirror has no mapping. `voterName` / `voterPushName` are unaffected.
+
 **Response** `200`
 
 Returns a bare array of `PollVote`:

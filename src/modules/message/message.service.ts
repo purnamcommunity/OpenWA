@@ -519,13 +519,11 @@ export class MessageService implements PluginMessagePort {
   ): Promise<{ voterName?: string; voterPushName?: string; voterPhone?: string }> {
     try {
       const contact = await engine.getContactById(voterId);
-      if (!contact) return {};
+      if (!contact) return { voterPhone: this.voterPhone(voterId, undefined) };
       return {
         voterName: contact.name,
         voterPushName: contact.pushName,
-        // A `@lid` voter resolves to a contact whose `number` is the real phone; an empty string
-        // means the engine has no number for them, which is absent rather than blank.
-        voterPhone: contact.number || undefined,
+        voterPhone: this.voterPhone(voterId, contact.number),
       };
     } catch (error) {
       this.logger.debug(`Could not resolve poll voter ${voterId}`, {
@@ -534,6 +532,31 @@ export class MessageService implements PluginMessagePort {
       });
       return {};
     }
+  }
+
+  /**
+   * A voter's phone number, or nothing at all.
+   *
+   * The contact's own `number` cannot be trusted for a `@lid` voter: WhatsApp Web answers with the
+   * LID's own digits, which look exactly like a phone number and are not one — measured live, a
+   * voter at `234475837493478@lid` came back as `number: "234475837493478"`. Passed through, that
+   * reaches a caller as a number they might dial or match a contact against.
+   *
+   * So a lid resolves through the lid->phone mirror (the same one the message from-filter and the
+   * webhook filters use, so all of them agree on who a lid is), and reports NOTHING when the mirror
+   * has no mapping. An absent number is a fact the caller can handle; a wrong one is not.
+   */
+  private voterPhone(voterId: string, reported: string | undefined): string | undefined {
+    const parsed = parseWaId(voterId);
+    if (parsed.kind !== 'lid') {
+      // A phone-dialect id carries its number in the id itself, so the two agree by construction.
+      return reported || parsed.userPart || undefined;
+    }
+    const mapped = this.lidMappingStore.resolveLid(voterId);
+    if (mapped) return mapped;
+    // Keep a reported number that is NOT merely the lid restated — a build that starts answering
+    // with the real phone here should not be discarded.
+    return reported && reported !== parsed.userPart ? reported : undefined;
   }
 
   async deleteMessage(

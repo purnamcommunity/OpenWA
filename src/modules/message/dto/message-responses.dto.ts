@@ -350,7 +350,9 @@ export class PollVoteDto {
   @ApiPropertyOptional({
     description:
       'Phone digits, when the engine can map the voter to a number. Only present when ' +
-      '`resolveContacts=true`; absent for a `@lid` voter WhatsApp does not map.',
+      '`resolveContacts=true`; absent for a `@lid` voter the gateway cannot map to a phone — never ' +
+      'the lid’s own digits, which WhatsApp Web reports as the contact “number” and which are not a ' +
+      'phone number.',
     example: '628123456789',
   })
   voterPhone?: string;
