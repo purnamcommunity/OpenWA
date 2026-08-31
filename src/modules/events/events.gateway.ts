@@ -647,6 +647,15 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   /**
+   * Emit a poll vote. Payload mirrors the `message.poll_vote` webhook:
+   * `{ messageId, chatId, voterId, selectedOptions, timestamp }`, where `selectedOptions` is the
+   * voter's whole current selection — an empty array means they cleared their vote.
+   */
+  emitPollVote(sessionId: string, data: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'message.poll_vote', data);
+  }
+
+  /**
    * Emit a group membership join (a user was added or joined via invite). Payload mirrors the
    * `group.join` webhook: `{ groupId, participantIds, timestamp, actorId? }`.
    */

@@ -218,6 +218,18 @@ export class ChatHistoryCallDto {
   missed!: boolean;
 }
 
+/** OpenAPI mirror of the engine `PollDetails` carried by a poll-creation message. */
+export class ChatHistoryPollDto {
+  @ApiProperty({ description: 'The poll question (also carried in `body`).', example: 'Where should we meet?' })
+  name!: string;
+
+  @ApiProperty({ type: [String], description: 'Option texts, in display order.', example: ['Park', 'Beach'] })
+  options!: string[];
+
+  @ApiProperty({ description: 'Whether a voter may select more than one option.', example: false })
+  allowMultipleAnswers!: boolean;
+}
+
 /** OpenAPI mirror of the engine `IncomingMessage` served by the live chat-history route. */
 export class ChatHistoryMessageDto {
   @ApiProperty({ example: 'true_628123456789@c.us_3EB0123456789' })
@@ -296,6 +308,52 @@ export class ChatHistoryMessageDto {
 
   @ApiPropertyOptional({ type: ChatHistoryLocationDto })
   location?: ChatHistoryLocationDto;
+
+  @ApiPropertyOptional({ type: ChatHistoryPollDto, description: 'Set for `poll` messages.' })
+  poll?: ChatHistoryPollDto;
+}
+
+/**
+ * OpenAPI mirror of the engine `PollVote` served by the poll-votes route: one entry per voter,
+ * carrying that voter's CURRENT selection rather than a running count.
+ */
+export class PollVoteDto {
+  @ApiProperty({
+    description: 'Who voted. A `@lid` when WhatsApp reports only a privacy id.',
+    example: '628123456789@c.us',
+  })
+  voterId!: string;
+
+  @ApiProperty({
+    type: [String],
+    description: 'Option texts this voter currently has selected; empty when they cleared their vote.',
+    example: ['Park'],
+  })
+  selectedOptions!: string[];
+
+  @ApiProperty({ description: 'Unix seconds the selection was made.', example: 1700000010 })
+  timestamp!: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Saved address-book name. Only present when `resolveContacts=true` and the account has the voter saved.',
+    example: 'Alice',
+  })
+  voterName?: string;
+
+  @ApiPropertyOptional({
+    description: 'The name the voter set on their own profile. Only present when `resolveContacts=true`.',
+    example: 'Alice',
+  })
+  voterPushName?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Phone digits, when the engine can map the voter to a number. Only present when ' +
+      '`resolveContacts=true`; absent for a `@lid` voter WhatsApp does not map.',
+    example: '628123456789',
+  })
+  voterPhone?: string;
 }
 
 export class MessageReactionSenderDto {

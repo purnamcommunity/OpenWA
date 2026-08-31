@@ -17,6 +17,7 @@ const (
 	EventMessageFailed        WebhookEvent = "message.failed"
 	EventMessageRevoked       WebhookEvent = "message.revoked"
 	EventMessageReaction      WebhookEvent = "message.reaction"
+	EventMessagePollVote      WebhookEvent = "message.poll_vote"
 	EventMessageEdited        WebhookEvent = "message.edited"
 	EventSessionStatus        WebhookEvent = "session.status"
 	EventSessionQR            WebhookEvent = "session.qr"

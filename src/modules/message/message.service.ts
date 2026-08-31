@@ -2,6 +2,7 @@ import { Injectable, BadRequestException, NotFoundException, Optional } from '@n
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { EngineRegistry } from '../../engine/engine-registry.service';
+import type { IWhatsAppEngine, PollVote } from '../../engine/interfaces/whatsapp-engine.interface';
 import { MessageProjector } from '../session/message-projector.service';
 import { SendTextMessageDto, SendMediaMessageDto, SendAudioMessageDto, MessageResponseDto } from './dto';
 import { SendTemplateMessageDto } from './dto/send-template.dto';
@@ -21,6 +22,20 @@ import type { PluginMessagePort } from '../../core/plugins/plugin-host-ports';
 
 // Re-exported for existing importers (bulk send shares the rendered-template cap with the send path).
 export { DEFAULT_TEMPLATE_RENDER_MAX_CHARS } from './message-send.service';
+
+/**
+ * A {@link PollVote} with the voter's identity attached, as served when the poll-votes route is
+ * asked to resolve contacts. Every added field is optional and independently absent: WhatsApp may
+ * know a push name but no saved name, and a `@lid` voter it cannot map has no phone at all.
+ */
+export interface ResolvedPollVote extends PollVote {
+  /** Saved address-book name, when the account has this voter saved. */
+  voterName?: string;
+  /** The name the voter set on their own profile. */
+  voterPushName?: string;
+  /** Phone digits, when the engine can map the voter to a number. */
+  voterPhone?: string;
+}
 
 export interface GetMessagesOptions {
   chatId?: string;
@@ -462,6 +477,63 @@ export class MessageService implements PluginMessagePort {
     const engine = this.getEngine(sessionId);
     await engine.votePoll(dto.chatId, dto.pollMessageId, dto.options);
     return { success: true };
+  }
+
+  /**
+   * Read the votes cast on a poll — one entry per voter, each carrying that voter's current
+   * selection. Served straight from the engine: votes are not persisted here (see
+   * `dispatchPollVote` for why a vote must not be stored like a message), so this is the only way
+   * to obtain a tally for a poll whose votes were cast before a consumer started listening.
+   *
+   * `resolveContacts` adds each voter's name and phone number. Opt-in rather than always-on: it
+   * costs one contact lookup per voter, and a community poll can have hundreds — a caller that
+   * only needs a tally should not pay for that. It matters because WhatsApp increasingly reports
+   * voters as `@lid` privacy ids, which carry no phone number at all, so a display that must name
+   * a voter has nowhere else to get one.
+   */
+  async getPollVotes(
+    sessionId: string,
+    chatId: string,
+    pollMessageId: string,
+    resolveContacts = false,
+  ): Promise<ResolvedPollVote[]> {
+    const engine = this.getEngine(sessionId);
+    const votes = await engine.getPollVotes(chatId, pollMessageId);
+    if (!resolveContacts) return votes;
+    const resolved: ResolvedPollVote[] = [];
+    for (const vote of votes) {
+      resolved.push({ ...vote, ...(await this.resolveVoter(sessionId, engine, vote.voterId)) });
+    }
+    return resolved;
+  }
+
+  /**
+   * Best-effort identity for one voter. A failed or empty lookup leaves the vote nameless rather
+   * than failing the read: the selection is the answer the caller came for, and a poll is still
+   * usable with an unnamed voter in it.
+   */
+  private async resolveVoter(
+    sessionId: string,
+    engine: IWhatsAppEngine,
+    voterId: string,
+  ): Promise<{ voterName?: string; voterPushName?: string; voterPhone?: string }> {
+    try {
+      const contact = await engine.getContactById(voterId);
+      if (!contact) return {};
+      return {
+        voterName: contact.name,
+        voterPushName: contact.pushName,
+        // A `@lid` voter resolves to a contact whose `number` is the real phone; an empty string
+        // means the engine has no number for them, which is absent rather than blank.
+        voterPhone: contact.number || undefined,
+      };
+    } catch (error) {
+      this.logger.debug(`Could not resolve poll voter ${voterId}`, {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {};
+    }
   }
 
   async deleteMessage(

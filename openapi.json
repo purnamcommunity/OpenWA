@@ -3130,6 +3130,80 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/messages/{chatId}/{messageId}/poll-votes": {
+      "get": {
+        "operationId": "MessageController_getPollVotes",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "chatId",
+            "required": true,
+            "in": "path",
+            "description": "Chat ID containing the poll",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "messageId",
+            "required": true,
+            "in": "path",
+            "description": "The poll creation message",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "resolveContacts",
+            "required": false,
+            "in": "query",
+            "description": "Also return each voter’s name and phone number. Costs one contact lookup per voter, so it is opt-in; without it a voter is identified only by `voterId`, which is often a `@lid` privacy id carrying no number.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One entry per voter, carrying that voter’s CURRENT selection rather than a running count. Empty when nobody has voted, or when every vote predates this session being linked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PollVoteDto"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The target message is not a poll"
+          },
+          "404": {
+            "description": "No such message — the id is outside the engine's lookup window (roughly the last hundred messages of the chat, or absent from the Baileys store) or the message was revoked."
+          },
+          "409": {
+            "description": "The session is not connected — an engine exists for it but is not `ready`: disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it — for those few seconds the answer is a `409` naming the reload; retry shortly."
+          },
+          "501": {
+            "description": "The active engine cannot serve this operation. It is part of the engine contract, but the engine currently running has no implementation for it."
+          }
+        },
+        "summary": "Get the votes cast on a poll",
+        "tags": [
+          "messages"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/messages/{chatId}/{messageId}/media": {
       "get": {
         "operationId": "MessageController_getChatMedia",
@@ -10657,6 +10731,7 @@
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
+                "message.poll_vote",
                 "message.edited",
                 "status.received",
                 "session.status",
@@ -10751,6 +10826,7 @@
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
+                "message.poll_vote",
                 "message.edited",
                 "status.received",
                 "session.status",
@@ -10849,6 +10925,7 @@
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
+                "message.poll_vote",
                 "message.edited",
                 "status.received",
                 "session.status",
@@ -11846,6 +11923,37 @@
           "longitude"
         ]
       },
+      "ChatHistoryPollDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The poll question (also carried in `body`).",
+            "example": "Where should we meet?"
+          },
+          "options": {
+            "description": "Option texts, in display order.",
+            "example": [
+              "Park",
+              "Beach"
+            ],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowMultipleAnswers": {
+            "type": "boolean",
+            "description": "Whether a voter may select more than one option.",
+            "example": false
+          }
+        },
+        "required": [
+          "name",
+          "options",
+          "allowMultipleAnswers"
+        ]
+      },
       "ChatHistoryMessageDto": {
         "type": "object",
         "properties": {
@@ -11982,6 +12090,14 @@
           },
           "location": {
             "$ref": "#/components/schemas/ChatHistoryLocationDto"
+          },
+          "poll": {
+            "description": "Set for `poll` messages.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatHistoryPollDto"
+              }
+            ]
           }
         },
         "required": [
@@ -12039,6 +12155,51 @@
         "required": [
           "emoji",
           "senders"
+        ]
+      },
+      "PollVoteDto": {
+        "type": "object",
+        "properties": {
+          "voterId": {
+            "type": "string",
+            "description": "Who voted. A `@lid` when WhatsApp reports only a privacy id.",
+            "example": "628123456789@c.us"
+          },
+          "selectedOptions": {
+            "description": "Option texts this voter currently has selected; empty when they cleared their vote.",
+            "example": [
+              "Park"
+            ],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "timestamp": {
+            "type": "number",
+            "description": "Unix seconds the selection was made.",
+            "example": 1700000010
+          },
+          "voterName": {
+            "type": "string",
+            "description": "Saved address-book name. Only present when `resolveContacts=true` and the account has the voter saved.",
+            "example": "Alice"
+          },
+          "voterPushName": {
+            "type": "string",
+            "description": "The name the voter set on their own profile. Only present when `resolveContacts=true`.",
+            "example": "Alice"
+          },
+          "voterPhone": {
+            "type": "string",
+            "description": "Phone digits, when the engine can map the voter to a number. Only present when `resolveContacts=true`; absent for a `@lid` voter WhatsApp does not map.",
+            "example": "628123456789"
+          }
+        },
+        "required": [
+          "voterId",
+          "selectedOptions",
+          "timestamp"
         ]
       },
       "DeleteMessageDto": {

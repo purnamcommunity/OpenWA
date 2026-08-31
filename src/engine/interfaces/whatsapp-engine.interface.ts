@@ -148,6 +148,23 @@ export interface IncomingMessage {
     address?: string;
     url?: string;
   };
+  /**
+   * Set on a poll-creation message (`type: 'poll'`). The question is also carried in `body` — the
+   * engines put it there — but the choices exist nowhere else, so a consumer that only reads the
+   * message row renders a poll as a bare question with no way to show what could be voted for.
+   * Vote COUNTS are deliberately absent: they are not a property of the creation message and move
+   * independently of it (see `onPollVote` / `getPollVotes`).
+   */
+  poll?: PollDetails;
+}
+
+/** The choices a poll-creation message offers, and whether a voter may pick more than one. */
+export interface PollDetails {
+  /** The poll question. Mirrors `IncomingMessage.body`. */
+  name: string;
+  /** Option texts, in the order WhatsApp displays them. */
+  options: string[];
+  allowMultipleAnswers: boolean;
 }
 
 /**
@@ -568,6 +585,33 @@ export interface ReactionEvent {
 }
 
 /**
+ * One voter's CURRENT selection on a poll — not a tally, and not an increment.
+ *
+ * WhatsApp reports a vote as the voter's whole selection at that instant, so a consumer keeps one
+ * row per voter and REPLACES it: a voter who switches from A to B sends `['B']`, and a voter who
+ * clears their vote sends `[]`. Counting arrivals instead would double-count every mind changed.
+ *
+ * Options are named by TEXT for the same reason `votePoll` takes texts: no engine surfaces a stable
+ * per-option id through this interface. A poll with duplicate option texts is therefore ambiguous
+ * here — WhatsApp permits it, and the name is the only handle available.
+ */
+export interface PollVote {
+  /** Neutral id of the voter (`@c.us`, or `@lid` when WhatsApp only reports a privacy id). */
+  voterId: string;
+  /** Option texts currently selected; empty means the voter cleared their vote. */
+  selectedOptions: string[];
+  /** Unix seconds the selection was made. */
+  timestamp: number;
+}
+
+/** A {@link PollVote} plus the poll it belongs to, as delivered live through `onPollVote`. */
+export interface PollVoteEvent extends PollVote {
+  /** The poll-creation message this vote is cast on. */
+  messageId: string;
+  chatId: string;
+}
+
+/**
  * A group membership or metadata change, mapped at the adapter boundary to this neutral
  * shape so consumers never see engine-specific payloads:
  *  - whatsapp-web.js: `group_join` / `group_leave` / `group_update` /
@@ -720,6 +764,12 @@ export interface EngineEventCallbacks {
   onMessageAck?: (messageId: string, status: DeliveryStatus) => void;
   onMessageRevoked?: (message: RevokedMessage) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
+  /**
+   * Fired when someone selects or deselects options on a poll. Each event carries that voter's
+   * whole current selection (see {@link PollVote}), so consumers replace what they hold for the
+   * voter rather than adding to it.
+   */
+  onPollVote?: (event: PollVoteEvent) => void;
   onMessageEdited?: (message: EditedMessage) => void;
   /**
    * Fired on group membership changes (join/leave), group metadata updates
@@ -960,6 +1010,18 @@ export interface MessageOperationsCapability {
    * duplicates, and the name is the only handle available.
    */
   votePoll(chatId: string, pollMessageId: string, options: string[]): Promise<void>;
+
+  /**
+   * Read the votes cast on a poll: one entry per voter who has voted at least once, each carrying
+   * that voter's current selection. Reads what the engine already holds — no WhatsApp round trip —
+   * so a voter whose vote arrived before this session was linked is simply absent, and a poll
+   * nobody has voted on returns an empty list rather than an error.
+   *
+   * The live `onPollVote` stream and this read are the same data from two directions: the stream is
+   * what keeps a tally current, this is how a consumer gets one without having watched from the
+   * start.
+   */
+  getPollVotes(chatId: string, pollMessageId: string): Promise<PollVote[]>;
 
   /**
    * Pin a message in its chat for a bounded window. WhatsApp only recognises three durations —

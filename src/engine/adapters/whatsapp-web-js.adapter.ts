@@ -18,6 +18,7 @@ import {
   PollInput,
   ContactCard,
   MessageReaction,
+  PollVote,
   Label,
   Channel,
   ChannelMessage,
@@ -729,6 +730,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   votePoll(chatId: string, pollMessageId: string, options: string[]): Promise<void> {
     return this.messaging.votePoll(chatId, pollMessageId, options);
+  }
+
+  getPollVotes(chatId: string, pollMessageId: string): Promise<PollVote[]> {
+    return this.messaging.getPollVotes(chatId, pollMessageId);
   }
 
   unpinMessage(chatId: string, messageId: string): Promise<void> {

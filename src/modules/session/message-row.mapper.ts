@@ -29,7 +29,7 @@ export const OMITTED_MEDIA = { mimetype: '', omitted: true } as const;
  *   and an empty object would be noise).
  */
 export function buildMessageMetadata(
-  message: Pick<IncomingMessage, 'media' | 'quotedMessage' | 'call' | 'type'>,
+  message: Pick<IncomingMessage, 'media' | 'quotedMessage' | 'call' | 'poll' | 'type'>,
   synthesizeOmittedMedia = false,
 ): Record<string, unknown> | undefined {
   const metadata: Record<string, unknown> = {};
@@ -43,6 +43,12 @@ export function buildMessageMetadata(
   }
   if (message.call) {
     metadata.call = message.call;
+  }
+  // A poll's choices exist only on the creation message, and `body` carries just the question — so
+  // a row stored without them renders as a question with nothing to vote on, and no later read can
+  // recover them (the engine's own history is the only other copy, and it ages out).
+  if (message.poll) {
+    metadata.poll = message.poll;
   }
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }

@@ -48,7 +48,7 @@ BatchLifecycleStatus = Literal["pending", "processing", "completed", "failed", "
 ChatKind = Literal["individual", "group", "channel", "status", "broadcast", "unknown"]
 WebhookEvent = Literal[
     "message.received", "message.sent", "message.ack", "message.failed", "message.revoked",
-    "message.reaction", "message.edited", "session.status", "session.qr", "session.authenticated",
+    "message.reaction", "message.poll_vote", "message.edited", "session.status", "session.qr", "session.authenticated",
     "session.disconnected", "session.reconnect_loop", "session.restriction", "presence.update",
     "group.join", "group.leave", "group.update", "group.join_request",
     "call.received", "status.received",
@@ -578,6 +578,23 @@ class ReactionRecord(TypedDict, total=False):
 
     emoji: str
     senders: list[ReactionSender]
+
+
+class PollVoteRecord(TypedDict, total=False):
+    """One voter's CURRENT selection on a poll — not a running count.
+
+    A voter who changes their mind sends their whole new selection, and an empty
+    ``selectedOptions`` means they cleared their vote, so a tally keeps one entry per voter and
+    replaces it. The ``voter*`` identity fields are present only when the read asked for
+    ``resolveContacts``.
+    """
+
+    voterId: str
+    selectedOptions: list[str]
+    timestamp: int
+    voterName: str
+    voterPushName: str
+    voterPhone: str
 
 
 # ── Bulk ──────────────────────────────────────────────────────────

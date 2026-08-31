@@ -25,6 +25,7 @@ from ..types import (
     MessageHistoryQuery,
     MessageListResponse,
     MessageResponse,
+    PollVoteRecord,
     ReactionRecord,
     ReactMessageRequest,
     ReplyMessageRequest,
@@ -110,6 +111,20 @@ class MessagesResource:
     def reactions(self, session_id: str, chat_id: str, message_id: str) -> List[ReactionRecord]:
         return self._http.request(
             "GET", f"/api/sessions/{quote_segment(session_id)}/messages/{quote_segment(chat_id)}/{quote_segment(message_id)}/reactions"
+        )
+
+    def poll_votes(
+        self, session_id: str, chat_id: str, message_id: str, resolve_contacts: bool = False
+    ) -> List[PollVoteRecord]:
+        """Read the votes cast on a poll. Not supported on the Baileys engine (501).
+
+        ``resolve_contacts`` also returns each voter's name and phone number, at one contact
+        lookup per voter — which is why it is opt-in.
+        """
+        return self._http.request(
+            "GET",
+            f"/api/sessions/{quote_segment(session_id)}/messages/{quote_segment(chat_id)}/{quote_segment(message_id)}/poll-votes",
+            query={"resolveContacts": "true"} if resolve_contacts else None,
         )
 
     def pin(self, session_id: str, body: PinMessageRequest) -> SuccessResult:

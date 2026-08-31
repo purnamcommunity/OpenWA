@@ -29,6 +29,45 @@ describe('buildIncomingMessageBase', () => {
     expect(r.isLidSender).toBeUndefined(); // a normal @c.us sender is not flagged
   });
 
+  it('carries a poll message’s choices, which the body does not hold', () => {
+    // wwebjs puts the QUESTION in `body` and the options nowhere else, so a row stored without
+    // this renders as a question with nothing to vote on.
+    const r = buildIncomingMessageBase({
+      ...base,
+      type: 'poll_creation',
+      body: 'Where should we meet?',
+      pollName: 'Where should we meet?',
+      pollOptions: [
+        { name: 'Park', localId: 0 },
+        { name: 'Beach', localId: 1 },
+      ],
+      allowMultipleAnswers: true,
+    });
+    expect(r.type).toBe('poll');
+    expect(r.poll).toEqual({ name: 'Where should we meet?', options: ['Park', 'Beach'], allowMultipleAnswers: true });
+  });
+
+  it('accepts the plain-string options the wwebjs typings promise', () => {
+    // index.d.ts:1277 declares `pollOptions: string[]` while the runtime assigns `{name, localId}`
+    // records; both are read so a future upstream fix does not silently blank every option.
+    const r = buildIncomingMessageBase({ ...base, type: 'poll_creation', pollName: 'Q', pollOptions: ['A', 'B'] });
+    expect(r.poll).toEqual({ name: 'Q', options: ['A', 'B'], allowMultipleAnswers: false });
+  });
+
+  it('drops an option with no readable name rather than rendering a blank choice', () => {
+    const r = buildIncomingMessageBase({
+      ...base,
+      type: 'poll_creation',
+      pollName: 'Q',
+      pollOptions: [{ name: 'A', localId: 0 }, { localId: 1 }],
+    });
+    expect(r.poll?.options).toEqual(['A']);
+  });
+
+  it('leaves `poll` unset on a message that is not a poll', () => {
+    expect(buildIncomingMessageBase(base).poll).toBeUndefined();
+  });
+
   it('stamps kind from the chat JID', () => {
     expect(buildIncomingMessageBase({ ...base, from: '12036@g.us' }).kind).toBe('group');
   });

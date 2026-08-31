@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Poll results are readable and live. `GET /sessions/{id}/messages/{chatId}/{messageId}/poll-votes`
+  returns one entry per voter with that voter's current selection, and the new `message.poll_vote`
+  webhook/WebSocket event fires as votes arrive. `?resolveContacts=true` also returns each voter's
+  name and phone number — one contact lookup per voter, which is why it is opt-in, and the only way
+  to name a `@lid` voter. whatsapp-web.js only: Baileys receives poll updates encrypted and keeps no
+  decrypted vote table (`501`).
+- A poll message now carries its `poll: { name, options, allowMultipleAnswers }` on
+  `message.received`, in chat history, and on the stored row. Only the question was surfaced before
+  (in `body`), so a poll rendered as a question with nothing to vote on.
+
 - `PUPPETEER_PROTOCOL_TIMEOUT_MS` raises the per-browser-command budget on the whatsapp-web.js
   engine, for large accounts whose reads fail with `Runtime.callFunctionOn timed out`. Unset keeps
   Puppeteer's own budget, so nothing changes for a deployment that does not set it. The gateway

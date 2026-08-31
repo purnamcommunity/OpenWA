@@ -7,6 +7,7 @@ import {
 } from '../interfaces/whatsapp-engine.interface';
 import { type SerializedWid } from '../types/whatsapp-web-js.types';
 import { buildEditedMessage, buildIncomingMessageBase, mapContactFields } from './message-mapper';
+import { mapWwebjsPollVoteEvent, type RawWwebjsPollVote } from './wwebjs-poll-votes';
 import { extractWwebjsCall, wwebjsAckToDeliveryStatus } from './wwebjs-messaging';
 import { type WwebjsEngineHost } from './wwebjs-host';
 
@@ -195,6 +196,27 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       host.getCallbacks().onMessageReaction?.(event);
     } catch (error) {
       host.logger.error('Error processing message_reaction', String(error));
+    }
+  });
+
+  client.on('vote_update', vote => {
+    try {
+      // wwebjs builds this structure from the WA Web vote table — the same table its own
+      // `getPollVotes` read is served from, so a live vote and a later read agree by construction.
+      // The mapping is shared with that read (./wwebjs-poll-votes) rather than repeated here.
+      const event = mapWwebjsPollVoteEvent(vote);
+      if (!event) {
+        // Dropped rather than forwarded with a blank id: a vote naming neither a voter nor a poll
+        // cannot replace anything, and applying it to whatever an empty id matches is worse than
+        // losing it. The warning is the signal that the payload shape moved.
+        host.logger.warn('Dropping a poll vote with no readable voter or poll', {
+          messageId: (vote as unknown as RawWwebjsPollVote).parentMsgKey?._serialized,
+        });
+        return;
+      }
+      host.getCallbacks().onPollVote?.(event);
+    } catch (error) {
+      host.logger.error('Error processing vote_update', String(error));
     }
   });
 
