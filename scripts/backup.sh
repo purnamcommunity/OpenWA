@@ -199,7 +199,14 @@ ARCHIVE_LIST="$(tar -tzf "$ARCHIVE")"
 # install (new API keys, new master key) reported as success.
 MISSING_MEMBERS=""
 for member in "${REQUIRED_MEMBERS[@]}"; do
-  if ! printf '%s\n' "$ARCHIVE_LIST" | grep -qxF "$member"; then
+  # A here-string, NOT `printf ... | grep -q`. Under `set -o pipefail` that pipeline reports the
+  # member MISSING whenever it is present but early: `grep -q` exits at the first match, `printf`
+  # is still writing the rest of the listing, and the SIGPIPE it takes becomes the pipeline's exit
+  # status (141). A real install trips this every time — the whatsapp-web.js session directory is a
+  # Chromium profile of ~10k files, so the listing dwarfs the 64KB pipe buffer and the two database
+  # members sit near its start. The archive was correct, the check called it defective, and the
+  # script then DELETED it: every backup on such a host failed, leaving no backups at all.
+  if ! grep -qxF "$member" <<<"$ARCHIVE_LIST"; then
     MISSING_MEMBERS="$MISSING_MEMBERS $member"
   fi
 done

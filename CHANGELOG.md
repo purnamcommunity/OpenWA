@@ -47,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the library still calls it positionally, so `widToGroupJid` threw inside the page. A new
   install-time patch (🔧⁹, docs/29) sends the options object; an empty description still clears.
   `setGroupSubject` was never affected and Baileys is unchanged.
+
+- `scripts/backup.sh` no longer reports a correct archive as defective — and then deletes it. Its
+  min-content check piped the member listing into `grep -q`, which exits at the first match while
+  `printf` is still writing; under `set -o pipefail` that SIGPIPE (141) became the check's verdict.
+  Any host whose archive listing exceeds the pipe buffer hit it on every run — a whatsapp-web.js
+  session directory is a Chromium profile of ~10k files — so those hosts have been left with no
+  backups at all, reported only as "archive failed the min-content check".
 - Inbound media whose download fails now keeps the `media` envelope with `omitted: true` and the declared
   size, on both engines, instead of dropping the field and looking like a message that never had media.
 - Webhook filters and automation rules gated on `hasMedia` now match those messages.

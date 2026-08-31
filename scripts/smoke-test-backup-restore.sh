@@ -78,10 +78,10 @@ make_fixture "$A/custom/store.sqlite" "alpha-data"
     "$BACKUP" >/dev/null
 )
 ARCHIVE_A="$(ls "$A"/out/openwa-backup-*.tar.gz)"
-if ! tar -tzf "$ARCHIVE_A" | grep -qx './main.sqlite'; then
+if ! tar -tzf "$ARCHIVE_A" | grep -xF './main.sqlite' >/dev/null; then
   fail "(a) archive missing ./main.sqlite"
 fi
-if ! tar -tzf "$ARCHIVE_A" | grep -qx './openwa.sqlite'; then
+if ! tar -tzf "$ARCHIVE_A" | grep -xF './openwa.sqlite' >/dev/null; then
   fail "(a) archive missing ./openwa.sqlite"
 fi
 (
