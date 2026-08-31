@@ -726,7 +726,7 @@ describe('MessageService', () => {
         number: '628123456789',
       });
       await expect(service.getPollVotes('sess-1', '621@c.us', 'P1', true)).resolves.toEqual([
-        { ...vote, voterName: 'Alice', voterPushName: 'Ali', voterPhone: '628123456789' },
+        { ...vote, voterName: 'Alice', voterPushName: 'Ali', voterPhone: '628123456789', isMe: false },
       ]);
     });
 
@@ -757,6 +757,23 @@ describe('MessageService', () => {
       expect(resolved.voterPhone).toBeUndefined();
       // The name still comes back — losing the number must not cost the identity.
       expect(resolved.voterName).toBe('Purnam Support');
+    });
+
+    it('marks the account’s own vote, which nothing downstream can work out', async () => {
+      // The account is a `@lid` in a group and a phone JID everywhere else, and the two share no
+      // digits — so a caller holding its own number cannot recognise its own vote. Only the engine
+      // knows, and it says so on the contact.
+      mockEngine.getPollVotes.mockResolvedValueOnce([{ ...vote, voterId: 'own-lid@lid' }]);
+      mockEngine.getContactById.mockResolvedValueOnce({ id: 'own-lid@lid', name: 'Me', isMe: true });
+      const [resolved] = await service.getPollVotes('sess-1', '621@c.us', 'P1', true);
+      expect(resolved.isMe).toBe(true);
+    });
+
+    it('marks everyone else’s vote as not the account’s own', async () => {
+      mockEngine.getPollVotes.mockResolvedValueOnce([vote]);
+      mockEngine.getContactById.mockResolvedValueOnce({ id: '99@lid', name: 'Someone' });
+      const [resolved] = await service.getPollVotes('sess-1', '621@c.us', 'P1', true);
+      expect(resolved.isMe).toBe(false);
     });
 
     it('asks the engine when the mirror cannot place the lid', async () => {

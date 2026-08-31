@@ -12190,6 +12190,11 @@
             "description": "The name the voter set on their own profile. Only present when `resolveContacts=true`.",
             "example": "Alice"
           },
+          "isMe": {
+            "type": "boolean",
+            "description": "This vote is the linked account’s own. Only present when `resolveContacts=true`, and the only reliable way to know: the voter is usually a `@lid`, which shares no digits with the account’s phone number.",
+            "example": false
+          },
           "voterPhone": {
             "type": "string",
             "description": "Phone digits, when the engine can map the voter to a number. Only present when `resolveContacts=true`; absent for a `@lid` voter the gateway cannot map to a phone — never the lid’s own digits, which WhatsApp Web reports as the contact “number” and which are not a phone number.",

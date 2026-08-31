@@ -610,6 +610,9 @@ export interface PollVoteRecord {
   voterId: string;
   selectedOptions: string[];
   timestamp: number;
+  /** This vote is the linked account's own — the only reliable way to know, since a voter is
+   *  usually a `@lid` sharing no digits with the account's phone number. */
+  isMe?: boolean;
   voterName?: string;
   voterPushName?: string;
   voterPhone?: string;

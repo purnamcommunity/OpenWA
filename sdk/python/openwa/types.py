@@ -592,6 +592,7 @@ class PollVoteRecord(TypedDict, total=False):
     voterId: str
     selectedOptions: list[str]
     timestamp: int
+    isMe: bool
     voterName: str
     voterPushName: str
     voterPhone: str
