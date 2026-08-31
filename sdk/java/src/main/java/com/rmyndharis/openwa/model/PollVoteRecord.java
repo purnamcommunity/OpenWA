@@ -13,6 +13,8 @@ public record PollVoteRecord(
     String voterId,
     List<String> selectedOptions,
     Long timestamp,
+    /** This vote is the linked account's own; null unless the read resolved contacts. */
+    Boolean isMe,
     String voterName,
     String voterPushName,
     String voterPhone) {}

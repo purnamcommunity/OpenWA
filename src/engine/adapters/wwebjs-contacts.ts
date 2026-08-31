@@ -48,6 +48,7 @@ export class WwebjsContacts {
         number: contact.number,
         isMyContact: contact.isMyContact,
         isBlocked: contact.isBlocked,
+        isMe: contact.isMe === true,
       };
     } catch (error) {
       // Unlike the avatar lookup, a throw here can legitimately mean the contact is absent:

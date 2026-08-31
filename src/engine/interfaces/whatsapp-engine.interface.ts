@@ -206,6 +206,13 @@ export interface Contact {
   isMyContact: boolean;
   isBlocked: boolean;
   profilePicUrl?: string;
+  /**
+   * True when this contact IS the linked account. Only the engine can answer it: WhatsApp addresses
+   * the account by a `@lid` in one place and a phone JID in another, and the two share no digits —
+   * so a consumer holding only its own phone number cannot recognise its own `@lid` at all.
+   * Optional because not every engine reports it.
+   */
+  isMe?: boolean;
 }
 
 export interface Group {

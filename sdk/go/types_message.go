@@ -343,6 +343,9 @@ type PollVoteRecord struct {
 	VoterID         string   `json:"voterId"`
 	SelectedOptions []string `json:"selectedOptions"`
 	Timestamp       int64    `json:"timestamp"`
+	// IsMe reports that this vote is the linked account's own — the only reliable way to know,
+	// since a voter is usually a @lid sharing no digits with the account's phone number.
+	IsMe bool `json:"isMe,omitempty"`
 	VoterName       string   `json:"voterName,omitempty"`
 	VoterPushName   string   `json:"voterPushName,omitempty"`
 	VoterPhone      string   `json:"voterPhone,omitempty"`

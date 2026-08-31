@@ -29,6 +29,12 @@ export { DEFAULT_TEMPLATE_RENDER_MAX_CHARS } from './message-send.service';
  * know a push name but no saved name, and a `@lid` voter it cannot map has no phone at all.
  */
 export interface ResolvedPollVote extends PollVote {
+  /**
+   * This vote is the linked account's own. Answered here rather than by the caller because the
+   * voter is usually a `@lid`, which shares no digits with the phone number the caller knows the
+   * account by — so nothing downstream can work it out.
+   */
+  isMe?: boolean;
   /** Saved address-book name, when the account has this voter saved. */
   voterName?: string;
   /** The name the voter set on their own profile. */
@@ -516,13 +522,14 @@ export class MessageService implements PluginMessagePort {
     sessionId: string,
     engine: IWhatsAppEngine,
     voterId: string,
-  ): Promise<{ voterName?: string; voterPushName?: string; voterPhone?: string }> {
+  ): Promise<{ voterName?: string; voterPushName?: string; voterPhone?: string; isMe?: boolean }> {
     try {
       const contact = await engine.getContactById(voterId);
       return {
         voterName: contact?.name,
         voterPushName: contact?.pushName,
         voterPhone: await this.voterPhone(engine, voterId, contact?.number),
+        isMe: contact?.isMe === true,
       };
     } catch (error) {
       this.logger.debug(`Could not resolve poll voter ${voterId}`, {

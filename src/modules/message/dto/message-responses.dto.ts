@@ -349,6 +349,15 @@ export class PollVoteDto {
 
   @ApiPropertyOptional({
     description:
+      'This vote is the linked account’s own. Only present when `resolveContacts=true`, and the ' +
+      'only reliable way to know: the voter is usually a `@lid`, which shares no digits with the ' +
+      'account’s phone number.',
+    example: false,
+  })
+  isMe?: boolean;
+
+  @ApiPropertyOptional({
+    description:
       'Phone digits, when the engine can map the voter to a number. Only present when ' +
       '`resolveContacts=true`; absent for a `@lid` voter the gateway cannot map to a phone — never ' +
       'the lid’s own digits, which WhatsApp Web reports as the contact “number” and which are not a ' +
