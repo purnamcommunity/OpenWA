@@ -5,7 +5,7 @@ import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { DEFAULT_MEDIA_MAX_BYTES, STATUS_TTL_MS, StatusStoreService } from '../status-store/status-store.service';
 import { buildIncomingStatus } from '../status-store/incoming-status';
-import { GroupEvent, IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
+import { GroupEvent, IWhatsAppEngine, PollVoteEvent } from '../../engine/interfaces/whatsapp-engine.interface';
 import { type createLogger } from '../../common/services/logger.service';
 
 // How many recent status-broadcast messages the connect-time seed pulls (each with its media).
@@ -165,6 +165,27 @@ export class SessionEngineLeafEvents {
         void this.webhookService.dispatch(id, 'group.join_request', payload);
         break;
     }
+  }
+
+  /**
+   * Fan a poll vote out to the WebSocket room and the webhook stream as `message.poll_vote`.
+   *
+   * Nothing is persisted, deliberately. A vote is not a message: it carries the voter's WHOLE
+   * current selection and replaces their previous one, so storing arrivals in the message table
+   * would build a log that reads as a tally and counts every changed mind twice. Consumers that
+   * want a tally keep one voter-keyed row each and can rebuild it at any time from
+   * `GET /messages/:chatId/:messageId/poll-votes`, which serves the engine's own table.
+   */
+  dispatchPollVote(id: string, event: PollVoteEvent): void {
+    const payload: Record<string, unknown> = {
+      messageId: event.messageId,
+      chatId: event.chatId,
+      voterId: event.voterId,
+      selectedOptions: event.selectedOptions,
+      timestamp: event.timestamp,
+    };
+    this.eventsGateway.emitPollVote(id, payload);
+    void this.webhookService.dispatch(id, 'message.poll_vote', payload);
   }
 
   /**

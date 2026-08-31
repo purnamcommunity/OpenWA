@@ -34,7 +34,9 @@ public record ChatHistoryMessage(
     Integer font,
     Media media,
     QuotedMessage quotedMessage,
-    Location location) {
+    Location location,
+    /** Set on poll messages only: the choices, which {@code body} (the question) does not carry. */
+    Poll poll) {
 
     /** Attached media; {@code data} is absent when the payload was omitted (too large). */
     public record Media(String mimetype, String filename, String data, Boolean omitted, Long sizeBytes) {}
@@ -42,6 +44,8 @@ public record ChatHistoryMessage(
     public record QuotedMessage(String id, String body) {}
 
     public record Location(double latitude, double longitude, String description, String address, String url) {}
+
+    public record Poll(String name, List<String> options, boolean allowMultipleAnswers) {}
 
     /** Present on {@code call} messages only. */
     public record Call(Boolean video, Boolean missed) {}

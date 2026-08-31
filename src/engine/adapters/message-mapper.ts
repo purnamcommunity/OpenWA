@@ -1,4 +1,10 @@
-import { EditedMessage, IncomingMessage, MessageContact, MessageType } from '../interfaces/whatsapp-engine.interface';
+import {
+  EditedMessage,
+  IncomingMessage,
+  MessageContact,
+  MessageType,
+  PollDetails,
+} from '../interfaces/whatsapp-engine.interface';
 import type { SerializedWid } from '../types/whatsapp-web-js.types';
 import { chatKind } from '../identity/wa-id';
 
@@ -65,6 +71,36 @@ export interface RawMessageFields {
   mentionedIds?: string[];
   /** Raw wwebjs payload; `notifyName` carries the sender's push name without an extra lookup. */
   _data?: { notifyName?: string; ephemeralDuration?: number };
+  /** Poll question, on a `poll_creation` message (whatsapp-web.js Message.js:332). */
+  pollName?: string;
+  /**
+   * Poll choices. Typed as the raw `{ name, localId }` records WA Web stores, NOT the `string[]`
+   * whatsapp-web.js's own typings claim (index.d.ts:1277): `Message._patch` assigns the WA Web
+   * value straight through, and `Message.vote` reads `.name`/`.localId` off each entry — so the
+   * declared type is wrong and a consumer that trusted it would render `[object Object]`.
+   * Plain strings are still accepted here because that is what the typings promise and a future
+   * upstream fix may deliver.
+   */
+  pollOptions?: (string | { name?: string; localId?: number })[];
+  allowMultipleAnswers?: boolean;
+}
+
+/**
+ * Read a poll-creation message's choices, tolerating both shapes `pollOptions` can arrive in.
+ * An entry with no readable name is dropped rather than rendered as an empty choice: WhatsApp
+ * has no unnamed option, so one here means the payload shape moved again, and a blank row in a
+ * poll is worse than a short list.
+ */
+export function readPollDetails(msg: RawMessageFields): PollDetails | undefined {
+  if (msg.pollName === undefined && msg.pollOptions === undefined) return undefined;
+  const options = (msg.pollOptions ?? [])
+    .map(option => (typeof option === 'string' ? option : option?.name))
+    .filter((name): name is string => typeof name === 'string' && name.length > 0);
+  return {
+    name: msg.pollName ?? '',
+    options,
+    allowMultipleAnswers: msg.allowMultipleAnswers === true,
+  };
 }
 
 /**
@@ -123,6 +159,14 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   // Ephemeral/disappearing-messages timer, when the chat has one set.
   if (msg._data?.ephemeralDuration && msg._data.ephemeralDuration > 0) {
     incoming.ephemeralDuration = msg._data.ephemeralDuration;
+  }
+
+  // Poll choices, which live nowhere else: `body` carries only the question. Read off the type this
+  // mapper already derived rather than off the raw token, so the one place that knows
+  // `poll_creation` -> `poll` stays the only place that knows it.
+  if (incoming.type === 'poll') {
+    const poll = readPollDetails(msg);
+    if (poll) incoming.poll = poll;
   }
 
   return incoming;

@@ -192,6 +192,16 @@ export class SessionEngineEventWiring {
 
         host.messages.applyReactionQueued(id, event);
       },
+      onPollVote: (event): void => {
+        if (!host.isLiveEngine(id, engine)) return;
+        this.logger.debug(`Poll vote received: ${event.voterId} -> ${event.messageId}`, {
+          sessionId: id,
+          messageId: event.messageId,
+          action: 'poll_vote_received',
+        });
+
+        host.leafEvents.dispatchPollVote(id, event);
+      },
       onMessageEdited: (message): void => {
         if (!host.isLiveEngine(id, engine)) return;
         if (!message.messageId) {

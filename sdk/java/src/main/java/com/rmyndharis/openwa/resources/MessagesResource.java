@@ -16,6 +16,8 @@ import com.rmyndharis.openwa.model.MessageHistoryQuery;
 import com.rmyndharis.openwa.model.MessageListResponse;
 import com.rmyndharis.openwa.model.MessageResponse;
 import com.rmyndharis.openwa.model.PinMessageRequest;
+import com.rmyndharis.openwa.model.PollVoteRecord;
+import com.rmyndharis.openwa.model.PollVotesQuery;
 import com.rmyndharis.openwa.model.ReactMessageRequest;
 import com.rmyndharis.openwa.model.ReactionRecord;
 import com.rmyndharis.openwa.model.ReplyMessageRequest;
@@ -267,6 +269,26 @@ public final class MessagesResource {
             null,
             null,
             ReactionRecord.class);
+    }
+
+    /**
+     * Get the votes cast on a poll, one entry per voter. Not supported on the Baileys engine (501).
+     * Pass a query with {@code resolveContacts} to also get each voter's name and phone number —
+     * one contact lookup per voter, which is why it is opt-in.
+     */
+    public List<PollVoteRecord> pollVotes(String sessionId, String chatId, String messageId, PollVotesQuery query) {
+        return client.requestList(
+            HttpMethod.GET,
+            "/api/sessions/"
+                + encodeSegment(sessionId)
+                + "/messages/"
+                + encodeSegment(chatId)
+                + "/"
+                + encodeSegment(messageId)
+                + "/poll-votes",
+            query,
+            null,
+            PollVoteRecord.class);
     }
 
     /**

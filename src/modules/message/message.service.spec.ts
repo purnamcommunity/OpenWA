@@ -28,6 +28,8 @@ function createMockEngine() {
     pinMessage: jest.fn().mockResolvedValue(undefined),
     starMessage: jest.fn().mockResolvedValue(undefined),
     votePoll: jest.fn().mockResolvedValue(undefined),
+    getPollVotes: jest.fn().mockResolvedValue([]),
+    getContactById: jest.fn().mockResolvedValue(null),
     unpinMessage: jest.fn().mockResolvedValue(undefined),
     editMessage: jest.fn().mockResolvedValue({ id: 'wa-msg-1', timestamp: 1706868000 }),
     getChatHistory: jest.fn().mockResolvedValue([]),
@@ -697,6 +699,44 @@ describe('MessageService', () => {
     it('forwards an empty selection, which clears the vote rather than being a no-op', async () => {
       await service.votePoll('sess-1', { chatId: '621@c.us', pollMessageId: 'P1', options: [] });
       expect(mockEngine.votePoll).toHaveBeenCalledWith('621@c.us', 'P1', []);
+    });
+  });
+
+  describe('getPollVotes', () => {
+    const vote = { voterId: '99@lid', selectedOptions: ['A'], timestamp: 1_700_000_000 };
+
+    it('returns the engine’s votes untouched when contacts were not asked for', async () => {
+      mockEngine.getPollVotes.mockResolvedValueOnce([vote]);
+      await expect(service.getPollVotes('sess-1', '621@c.us', 'P1')).resolves.toEqual([vote]);
+      expect(mockEngine.getContactById).not.toHaveBeenCalled();
+    });
+
+    it('attaches each voter’s name and number when asked', async () => {
+      // The case this exists for: a `@lid` voter is unnameable and unreachable without the lookup.
+      mockEngine.getPollVotes.mockResolvedValueOnce([vote]);
+      mockEngine.getContactById.mockResolvedValueOnce({
+        id: '99@lid',
+        name: 'Alice',
+        pushName: 'Ali',
+        number: '628123456789',
+      });
+      await expect(service.getPollVotes('sess-1', '621@c.us', 'P1', true)).resolves.toEqual([
+        { ...vote, voterName: 'Alice', voterPushName: 'Ali', voterPhone: '628123456789' },
+      ]);
+    });
+
+    it('keeps the vote when the voter cannot be resolved', async () => {
+      // The selection is the answer the caller came for; a failed name lookup must not lose it.
+      mockEngine.getPollVotes.mockResolvedValueOnce([vote]);
+      mockEngine.getContactById.mockRejectedValueOnce(new Error('no such contact'));
+      await expect(service.getPollVotes('sess-1', '621@c.us', 'P1', true)).resolves.toEqual([vote]);
+    });
+
+    it('treats an empty number as absent rather than blank', async () => {
+      mockEngine.getPollVotes.mockResolvedValueOnce([vote]);
+      mockEngine.getContactById.mockResolvedValueOnce({ id: '99@lid', number: '' });
+      const [resolved] = await service.getPollVotes('sess-1', '621@c.us', 'P1', true);
+      expect(resolved.voterPhone).toBeUndefined();
     });
   });
 

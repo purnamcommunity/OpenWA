@@ -9,6 +9,7 @@ import {
   MessageReaction,
   MessageResult,
   PollInput,
+  PollVote,
   Quotable,
 } from '../interfaces/whatsapp-engine.interface';
 import { MessageWithReactions, SerializedWid } from '../types/whatsapp-web-js.types';
@@ -19,6 +20,7 @@ import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import { chatKind, userPart } from '../identity/wa-id';
 import { chatHistoryMediaBudgetBytes, coerceDeclaredSize, ingestMediaBudgetBytes } from './inbound-media-cap';
 import { buildIncomingMessageBase } from './message-mapper';
+import { mapWwebjsPollVote, type RawWwebjsPollVote } from './wwebjs-poll-votes';
 import { buildVCard } from './vcard';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
@@ -826,6 +828,40 @@ export class WwebjsMessaging {
       throw error;
     }
     this.host.logger.log(`Voted on poll ${pollMessageId} in chat ${chatId} (${options.length} option(s))`);
+  }
+
+  async getPollVotes(chatId: string, pollMessageId: string): Promise<PollVote[]> {
+    this.host.ensureReady();
+    // Same 100-message window as votePoll, and for the same reason: the two act on the same polls,
+    // so a poll one of them cannot reach must not appear reachable through the other.
+    const message = await this.findInFetchWindow(chatId, pollMessageId);
+    // Pre-check the type rather than letting the library reject it: wwebjs throws a bare STRING for
+    // a non-poll target here too (Client.js:3424), and without this the client-side mistake would
+    // surface as an opaque 500 — the same mapping votePoll makes.
+    if (message.type !== MessageTypes.POLL_CREATION) {
+      throw new BadRequestException(`Message ${pollMessageId} is not a poll`);
+    }
+    let raw: RawWwebjsPollVote[];
+    try {
+      raw = (await (message as unknown as { getPollVotes(): Promise<RawWwebjsPollVote[]> }).getPollVotes()) ?? [];
+    } catch (error) {
+      if (typeof error === 'string') {
+        throw new BadRequestException(`Message ${pollMessageId} is not a poll: ${error}`);
+      }
+      throw error;
+    }
+    // A vote with no readable voter is dropped by the mapper — see mapWwebjsPollVote for why one
+    // cannot be counted. Logged in aggregate so a shape change shows up as a number rather than as
+    // a silently short list.
+    const votes = raw.map(mapWwebjsPollVote).filter((vote): vote is PollVote => vote !== null);
+    if (votes.length !== raw.length) {
+      this.host.logger.warn('Dropped poll votes with an unreadable voter', {
+        pollMessageId,
+        chatId,
+        dropped: raw.length - votes.length,
+      });
+    }
+    return votes;
   }
 
   async pinMessage(chatId: string, messageId: string, durationSeconds: number): Promise<void> {

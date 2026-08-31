@@ -36,6 +36,7 @@ import {
   LocationInput,
   MediaInput,
   MessageReaction,
+  PollVote,
   MessageResult,
   PaginatedProducts,
   ParticipantOperationResult,
@@ -558,6 +559,13 @@ export class BaileysAdapter implements IWhatsAppEngine {
   // creation's messageSecret.
   votePoll(_chatId: string, _pollMessageId: string, _options: string[]): Promise<void> {
     return this.unsupported('votePoll');
+  }
+
+  // Reading votes is unsupported for the same reason: Baileys hands over an ENCRYPTED poll update
+  // and decryptPollVote needs the poll creation's messageSecret, so there is no stored, decrypted
+  // vote table to read the way WhatsApp Web keeps one.
+  getPollVotes(_chatId: string, _pollMessageId: string): Promise<PollVote[]> {
+    return this.unsupported('getPollVotes');
   }
   getChatHistory(
     _chatId: string,

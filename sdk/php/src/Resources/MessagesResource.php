@@ -169,6 +169,20 @@ class MessagesResource
     }
 
     /**
+     * Read the votes cast on a poll — one entry per voter, carrying that voter's CURRENT
+     * selection rather than a running count. Not supported on the Baileys engine (501).
+     *
+     * @param bool $resolveContacts Also return each voter's name and phone number, at one contact
+     *                              lookup per voter — which is why it is opt-in.
+     * @return array<int,array<string,mixed>>
+     */
+    public function pollVotes(string $sessionId, string $chatId, string $messageId, bool $resolveContacts = false): array
+    {
+        $query = $resolveContacts ? ['resolveContacts' => 'true'] : [];
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($messageId)}/poll-votes", $query) ?? [];
+    }
+
+    /**
      * Pin a message in its chat.
      *
      * @param array<string,mixed> $body chatId, messageId and an optional durationSeconds of

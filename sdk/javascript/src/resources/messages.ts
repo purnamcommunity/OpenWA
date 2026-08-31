@@ -21,6 +21,7 @@ import type {
   MessageListResponse,
   MessageResponse,
   PinMessageRequest,
+  PollVoteRecord,
   ReactionRecord,
   ReactMessageRequest,
   ReplyMessageRequest,
@@ -179,6 +180,24 @@ export class MessagesResource {
     return this.client.request<ReactionRecord[]>({
       method: 'GET',
       path: `/api/sessions/${encodeSegment(sessionId)}/messages/${encodeSegment(chatId)}/${encodeSegment(messageId)}/reactions`,
+    });
+  }
+
+  /**
+   * Get the votes cast on a poll. Not supported on the Baileys engine (501). Pass
+   * `resolveContacts` to also get each voter's name and phone number — one contact lookup per
+   * voter, which is why it is opt-in.
+   */
+  pollVotes(
+    sessionId: string,
+    chatId: string,
+    messageId: string,
+    query?: { resolveContacts?: boolean },
+  ): Promise<PollVoteRecord[]> {
+    return this.client.request<PollVoteRecord[]>({
+      method: 'GET',
+      path: `/api/sessions/${encodeSegment(sessionId)}/messages/${encodeSegment(chatId)}/${encodeSegment(messageId)}/poll-votes`,
+      query,
     });
   }
 

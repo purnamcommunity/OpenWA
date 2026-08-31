@@ -412,6 +412,12 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     evidence:
       "wwjs Client.saveOrEditAddressbookContact(phoneNumber, firstName, lastName, syncToAddressbook=false) → void (index.d.ts:293-299; Client.js:3275) — lastName is positional and required, so an absent one is passed as ''; baileys addOrEditContact(jid, IContactAction{firstName,fullName,saveOnPrimaryAddressbook}) (Socket/chats.d.ts:66; WAProto IContactAction:11812)",
   },
+  getPollVotes: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'not-available', rootCause: 'library-limitation' },
+    evidence:
+      "wwjs Message.getPollVotes() → PollVote[] (index.d.ts:1356) delegates to Client.getPollVotes (Client.js:3421), which reads the page's own WAWebPollsVotesSchema table — so it returns votes WA Web has already decrypted and stored, with no WhatsApp round trip; baileys hands over an encrypted poll update and decryptPollVote (Utils/process-message.d.ts) needs the poll creation's messageSecret, keeping no decrypted vote table to read back",
+  },
   votePoll: {
     wwjs: { status: 'supported' },
     baileys: { status: 'not-available', rootCause: 'library-limitation' },

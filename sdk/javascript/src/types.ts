@@ -576,6 +576,8 @@ export interface ChatHistoryMessage {
   };
   quotedMessage?: { id: string; body: string };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
+  /** Present on `poll` messages only: the choices, which `body` (the question) does not carry. */
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
 }
 
 /** Paginated payload returned by `GET /sessions/:id/messages`. */
@@ -595,6 +597,22 @@ export interface ReactionSender {
 export interface ReactionRecord {
   emoji: string;
   senders: ReactionSender[];
+}
+
+/**
+ * One voter's CURRENT selection on a poll — not a running count. A voter who changes their mind
+ * sends their whole new selection, and an empty `selectedOptions` means they cleared their vote,
+ * so a tally keeps one entry per voter and replaces it.
+ *
+ * The `voter*` identity fields are present only when the read asked for `resolveContacts`.
+ */
+export interface PollVoteRecord {
+  voterId: string;
+  selectedOptions: string[];
+  timestamp: number;
+  voterName?: string;
+  voterPushName?: string;
+  voterPhone?: string;
 }
 
 // ── Bulk ──────────────────────────────────────────────────────────
@@ -861,6 +879,7 @@ export type WebhookEvent =
   | 'message.failed'
   | 'message.revoked'
   | 'message.reaction'
+  | 'message.poll_vote'
   | 'message.edited'
   | 'session.status'
   | 'session.qr'

@@ -1276,6 +1276,58 @@ Returns a bare array of `MessageReaction`:
 
 **Errors:** `400` session not active · `401` missing/invalid API key · `500` engine error · `409` conflict or engine not ready (retryable) · `501` not supported on the active engine
 
+#### GET /api/sessions/:sessionId/messages/:chatId/:messageId/poll-votes
+
+Read the votes cast on a poll: one entry per voter who has voted at least once.
+
+**Auth:** API key · **Engines:** whatsapp-web.js only — Baileys returns `501`
+
+**Path parameters**
+
+| Name      | Type   | Description                 |
+| --------- | ------ | --------------------------- |
+| sessionId | string | Session ID                  |
+| chatId    | string | Chat ID containing the poll |
+| messageId | string | The poll creation message   |
+
+**Query parameters**
+
+| Name            | Type    | Required | Description                                                                                                     |
+| --------------- | ------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+| resolveContacts | boolean | no       | Also return each voter's `voterName`, `voterPushName` and `voterPhone`. One contact lookup per voter, so opt-in |
+
+**Response** `200`
+
+Returns a bare array of `PollVote`:
+
+```json
+[
+  {
+    "voterId": "628123456789@c.us",
+    "selectedOptions": ["Park"],
+    "timestamp": 1719312050,
+    "voterName": "Alice",
+    "voterPushName": "Alice",
+    "voterPhone": "628123456789"
+  }
+]
+```
+
+> **Each entry is a voter's whole current selection, not a running count.** A voter who changes
+> their mind sends their entire new selection, and `selectedOptions: []` means they cleared their
+> vote — so build a tally by keeping one entry per voter and replacing it, never by incrementing.
+> Options are named by text, for the same reason `vote-poll` takes texts.
+
+> **Only what this session has seen.** The votes come from WhatsApp Web's own stored table, so a
+> vote cast before this session was linked is simply absent, and an empty array can mean either
+> "nobody voted" or "nobody voted while we were watching". Live votes arrive as the
+> `message.poll_vote` event.
+
+> **Only recent polls can be read.** The poll must be within the same 100-message window
+> `vote-poll` uses; an older one comes back `404`.
+
+**Errors:** `400` session not active, or the target message is not a poll · `401` missing/invalid API key · `404` poll not found in recent history · `500` engine error · `409` conflict or engine not ready (retryable) · `501` not supported on the active engine
+
 #### POST /api/sessions/:sessionId/messages/vote-poll
 
 Cast a vote on a poll.
@@ -4295,7 +4347,7 @@ Webhooks are configured per session and managed under `/api/sessions/:sessionId/
 
 Two fields — `secret` and `headers` — are **write-only**: they are accepted on create/update but are never returned by any webhook route (the response DTO has no `@Expose` for them, so `fromEntity` drops them). `GET /api/infra/export-data` also omits both from its `webhooks` rows, so a backup no longer carries webhook credentials — a restored webhook comes back unsigned (`secret` null, `headers` `{}`) until you set them again. The `secret` is used to compute the `X-OpenWA-Signature: sha256=<hex>` HMAC-SHA256 header on deliveries.
 
-The `events` array accepts these members plus the `*` wildcard: `message.received`, `message.sent`, `message.ack`, `message.failed`, `message.revoked`, `message.reaction`, `message.edited`, `session.status`, `session.qr`, `session.authenticated`, `session.disconnected`, `session.reconnect_loop`, `session.restriction`, `presence.update`, `call.accepted`, `call.rejected`, `call.missed`, `group.join`, `group.leave`, `group.update`, `group.join_request`, `call.received`, `status.received`. All of them are actively dispatched by at least one engine — none is a reserved placeholder. Four are **Baileys only**, because whatsapp-web.js produces no callback behind them: `presence.update` (its prerequisite `POST .../presence/subscribe` answers `501` there, so this one announces itself) and `call.accepted` / `call.rejected` / `call.missed` (whatsapp-web.js sees a call ring but never its outcome, so these three are accepted on subscribe and then simply never fire). See the per-event catalog below for engine scope.
+The `events` array accepts these members plus the `*` wildcard: `message.received`, `message.sent`, `message.ack`, `message.failed`, `message.revoked`, `message.reaction`, `message.poll_vote`, `message.edited`, `session.status`, `session.qr`, `session.authenticated`, `session.disconnected`, `session.reconnect_loop`, `session.restriction`, `presence.update`, `call.accepted`, `call.rejected`, `call.missed`, `group.join`, `group.leave`, `group.update`, `group.join_request`, `call.received`, `status.received`. All of them are actively dispatched by at least one engine — none is a reserved placeholder. Four are **Baileys only**, because whatsapp-web.js produces no callback behind them: `presence.update` (its prerequisite `POST .../presence/subscribe` answers `501` there, so this one announces itself) and `call.accepted` / `call.rejected` / `call.missed` (whatsapp-web.js sees a call ring but never its outcome, so these three are accepted on subscribe and then simply never fire). See the per-event catalog below for engine scope.
 
 #### GET /api/sessions/:sessionId/webhooks
 
@@ -6674,6 +6726,7 @@ message.sent
 message.ack
 message.revoked
 message.reaction
+message.poll_vote
 message.edited
 session.status
 session.qr
@@ -6758,6 +6811,7 @@ These are the events OpenWA actually emits. A webhook is registered with an `eve
 | `message.failed`                                  | A receipt resolves to `failed` (dispatched in addition to `message.ack`)                                                                                                                                                              | `{ id, messageId, status: "failed", ack: -1 }`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `message.revoked`                                 | A message is deleted/recalled                                                                                                                                                                                                         | `{ id, revokedId?, chatId, from, to, type: "revoked", body: "", timestamp }` — **reconcile on `revokedId`** (the original deleted message's id), falling back to `id`. On whatsapp-web.js `id` is the _revocation notification_ (a distinct message that won't match a stored id) and `revokedId` may be absent when the original isn't cached locally; on Baileys the two coincide                                                                                                                                                                                                      |
 | `message.reaction`                                | A reaction is added, changed, or removed                                                                                                                                                                                              | `{ messageId, chatId, reaction, senderId, reactions? }` — `reactions` is the post-apply `{ senderId: emoji }` snapshot, omitted when the gateway holds no stored copy of the message to compute it from (an ephemeral message, or one predating the session going live); treat it as unknown rather than empty and keep the map you already hold. `reaction` is empty when removed                                                                                                                                                                                                       |
+| `message.poll_vote`                               | Someone selects or deselects options on a poll                                                                                                                                                                                        | `{ messageId, chatId, voterId, selectedOptions, timestamp }` — `messageId` is the poll creation message and `selectedOptions` is the voter's WHOLE current selection by option text, empty when they cleared their vote. Replace what you hold for that voter rather than incrementing a count, or a changed mind is counted twice. `voterId` is often a `@lid` privacy id; `GET .../poll-votes?resolveContacts=true` resolves names and numbers. **whatsapp-web.js only** — Baileys receives poll updates encrypted and surfaces no vote callback                                       |
 | `message.edited`                                  | A message body or media caption is edited                                                                                                                                                                                             | `{ messageId, chatId, body, senderId, from, to, fromMe, isGroup, type, hasMedia, author?, mentionedIds?, timestamp }` — `messageId` is the original message id, `body` is the latest text/caption, and `timestamp` is the edit occurrence time in epoch **seconds** (not the original creation time)                                                                                                                                                                                                                                                                                     |
 | `session.qr`                                      | A new pairing QR is generated                                                                                                                                                                                                         | `{ sessionId, qr }` — `qr` is a **PNG data URL** (`data:image/png;base64,…`), the same rendered value `GET /api/sessions/{sessionId}/qr` returns as `qrCode`, not the raw `2@…` linking ref. Render it directly in an `<img src>`; the raw ref never leaves the engine adapter                                                                                                                                                                                                                                                                                                           |
 | `session.authenticated`                           | The session pairs and becomes ready                                                                                                                                                                                                   | `{ sessionId, phone, pushName }`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -6840,6 +6894,7 @@ Every delivery includes:
 - `message.revoked`: `rev_{sessionId}_{messageId}`
 - `message.edited`: `edit_{sessionId}_{messageId}_{occurredAt}`
 - `message.reaction`: `react_{sessionId}_{messageId}_{senderId}_{occurredAt}`
+- `message.poll_vote`: `poll_{sessionId}_{messageId}_{voterId}_{occurredAt}`
 - `session.qr`: `qr_{sessionId}_{hash(qr)}`
 - `session.status`: `sess_{sessionId}_{status}_{occurredAt}`
 - `session.authenticated`: `auth_{sessionId}_{hash(data)}_{occurredAt}`

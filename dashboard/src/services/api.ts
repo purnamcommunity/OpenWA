@@ -335,6 +335,8 @@ export interface EngineHistoryMessage {
   };
   quotedMessage?: { id: string; body: string };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
+  /** Present on `poll` messages only: the choices, which `body` (the question) does not carry. */
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
 }
 
 // Mirrors the backend engine Channel / ChannelMessage (GET /sessions/:id/channels[/:id/messages]).

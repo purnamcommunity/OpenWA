@@ -30,6 +30,7 @@ import {
   MessageListResponseDto,
   ChatHistoryMessageDto,
   MessageReactionDto,
+  PollVoteDto,
 } from './dto/message-responses.dto';
 import {
   SendLocationDto,
@@ -432,6 +433,44 @@ export class MessageController {
     @Param('messageId') messageId: string,
   ) {
     return this.messageService.getMessageReactions(sessionId, chatId, messageId);
+  }
+
+  @Get(':chatId/:messageId/poll-votes')
+  @ApiOperation({ summary: 'Get the votes cast on a poll' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'chatId', description: 'Chat ID containing the poll' })
+  @ApiParam({ name: 'messageId', description: 'The poll creation message' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'One entry per voter, carrying that voter’s CURRENT selection rather than a running count. ' +
+      'Empty when nobody has voted, or when every vote predates this session being linked.',
+    type: [PollVoteDto],
+  })
+  @ApiQuery({
+    name: 'resolveContacts',
+    required: false,
+    description:
+      'Also return each voter’s name and phone number. Costs one contact lookup per voter, so it ' +
+      'is opt-in; without it a voter is identified only by `voterId`, which is often a `@lid` ' +
+      'privacy id carrying no number.',
+  })
+  @ApiResponse({ status: 400, description: 'The target message is not a poll' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 404, description: MESSAGE_NOT_FOUND_404 })
+  @ApiResponse({ status: 501, description: ENGINE_NOT_SUPPORTED_501 })
+  async getPollVotes(
+    @Param('sessionId') sessionId: string,
+    @Param('chatId') chatId: string,
+    @Param('messageId') messageId: string,
+    @Query('resolveContacts') resolveContacts?: string,
+  ) {
+    return this.messageService.getPollVotes(
+      sessionId,
+      chatId,
+      messageId,
+      resolveContacts === 'true' || resolveContacts === '1',
+    );
   }
 
   // Three path segments, so it never collides with `:chatId/history` (two) regardless of

@@ -1,6 +1,9 @@
 package openwa
 
-import "context"
+import (
+	"context"
+	"net/url"
+)
 
 // MessagesService sends and queries messages.
 // Backed by src/modules/message/message.controller.ts. NOTE: send paths use the
@@ -134,6 +137,20 @@ func (s *MessagesService) Reactions(ctx context.Context, sessionID, chatID, mess
 	var out []ReactionRecord
 	path := s.base(sessionID) + "/" + pathEscape(chatID) + "/" + pathEscape(messageID) + "/reactions"
 	err := s.client.do(ctx, "GET", path, nil, nil, &out)
+	return out, err
+}
+
+// PollVotes returns the votes cast on a poll, one entry per voter. Not supported on the Baileys
+// engine (501). resolveContacts also returns each voter's name and phone number, at one contact
+// lookup per voter — which is why it is opt-in.
+func (s *MessagesService) PollVotes(ctx context.Context, sessionID, chatID, messageID string, resolveContacts bool) ([]PollVoteRecord, error) {
+	var out []PollVoteRecord
+	path := s.base(sessionID) + "/" + pathEscape(chatID) + "/" + pathEscape(messageID) + "/poll-votes"
+	var query url.Values
+	if resolveContacts {
+		query = url.Values{"resolveContacts": []string{"true"}}
+	}
+	err := s.client.do(ctx, "GET", path, query, nil, &out)
 	return out, err
 }
 

@@ -170,6 +170,32 @@ describe('Idempotency Utils', () => {
       );
     });
 
+    it('salts message.poll_vote keys so a voter who returns to an earlier choice is still delivered', () => {
+      // A → B → A is three real occurrences. Keying on the selection would dedupe the third onto
+      // the first and leave a tally showing B.
+      const data = { sessionId: 'A', messageId: 'POLL1', voterId: '628111@c.us', selectedOptions: ['A'] };
+      expect(generateIdempotencyKey('message.poll_vote', data, '2026-06-20T00:00:00.000Z')).not.toBe(
+        generateIdempotencyKey('message.poll_vote', data, '2026-06-20T00:05:00.000Z'),
+      );
+    });
+
+    it('is retry-stable for message.poll_vote: the same occurrence regenerates the same key', () => {
+      const at = '2026-06-20T00:00:00.000Z';
+      const data = { sessionId: 'A', messageId: 'POLL1', voterId: '628111@c.us', selectedOptions: ['A'] };
+      expect(generateIdempotencyKey('message.poll_vote', data, at)).toBe(
+        generateIdempotencyKey('message.poll_vote', data, at),
+      );
+    });
+
+    it('gives two voters on the same poll DISTINCT keys', () => {
+      const at = '2026-06-20T00:00:00.000Z';
+      expect(
+        generateIdempotencyKey('message.poll_vote', { sessionId: 'A', messageId: 'POLL1', voterId: 'x@c.us' }, at),
+      ).not.toBe(
+        generateIdempotencyKey('message.poll_vote', { sessionId: 'A', messageId: 'POLL1', voterId: 'y@c.us' }, at),
+      );
+    });
+
     it('gives two senders reacting to the same message DISTINCT message.reaction keys', () => {
       const at = '2026-06-20T00:00:00.000Z';
       const a = generateIdempotencyKey('message.reaction', { sessionId: 'A', messageId: 'M', senderId: 'S1' }, at);

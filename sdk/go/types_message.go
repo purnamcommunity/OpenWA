@@ -285,6 +285,15 @@ type ChatHistoryMessage struct {
 	Media         *ChatHistoryMedia `json:"media,omitempty"`
 	QuotedMessage *QuotedMessage    `json:"quotedMessage,omitempty"`
 	Location      *MessageLocation  `json:"location,omitempty"`
+	// Poll is set on poll messages only: the choices, which Body (the question) does not carry.
+	Poll *MessagePoll `json:"poll,omitempty"`
+}
+
+// MessagePoll is the poll block on a poll-creation message.
+type MessagePoll struct {
+	Name                 string   `json:"name"`
+	Options              []string `json:"options"`
+	AllowMultipleAnswers bool     `json:"allowMultipleAnswers"`
 }
 
 // MessageCall is the call block on a live history message, present on call messages only.
@@ -324,6 +333,19 @@ type ReactionSender struct {
 type ReactionRecord struct {
 	Emoji   string           `json:"emoji"`
 	Senders []ReactionSender `json:"senders"`
+}
+
+// PollVoteRecord is one voter's CURRENT selection on a poll — not a running count. A voter who
+// changes their mind sends their whole new selection, and an empty SelectedOptions means they
+// cleared their vote, so a tally keeps one entry per voter and replaces it. The Voter* identity
+// fields are populated only when the read asked for resolveContacts.
+type PollVoteRecord struct {
+	VoterID         string   `json:"voterId"`
+	SelectedOptions []string `json:"selectedOptions"`
+	Timestamp       int64    `json:"timestamp"`
+	VoterName       string   `json:"voterName,omitempty"`
+	VoterPushName   string   `json:"voterPushName,omitempty"`
+	VoterPhone      string   `json:"voterPhone,omitempty"`
 }
 
 // BulkMediaContent is a per-item media block for a bulk send. It mirrors the
