@@ -519,11 +519,10 @@ export class MessageService implements PluginMessagePort {
   ): Promise<{ voterName?: string; voterPushName?: string; voterPhone?: string }> {
     try {
       const contact = await engine.getContactById(voterId);
-      if (!contact) return { voterPhone: this.voterPhone(voterId, undefined) };
       return {
-        voterName: contact.name,
-        voterPushName: contact.pushName,
-        voterPhone: this.voterPhone(voterId, contact.number),
+        voterName: contact?.name,
+        voterPushName: contact?.pushName,
+        voterPhone: await this.voterPhone(engine, voterId, contact?.number),
       };
     } catch (error) {
       this.logger.debug(`Could not resolve poll voter ${voterId}`, {
@@ -546,17 +545,30 @@ export class MessageService implements PluginMessagePort {
    * webhook filters use, so all of them agree on who a lid is), and reports NOTHING when the mirror
    * has no mapping. An absent number is a fact the caller can handle; a wrong one is not.
    */
-  private voterPhone(voterId: string, reported: string | undefined): string | undefined {
+  private async voterPhone(
+    engine: IWhatsAppEngine,
+    voterId: string,
+    reported: string | undefined,
+  ): Promise<string | undefined> {
     const parsed = parseWaId(voterId);
     if (parsed.kind !== 'lid') {
       // A phone-dialect id carries its number in the id itself, so the two agree by construction.
       return reported || parsed.userPart || undefined;
     }
-    const mapped = this.lidMappingStore.resolveLid(voterId);
-    if (mapped) return mapped;
     // Keep a reported number that is NOT merely the lid restated — a build that starts answering
     // with the real phone here should not be discarded.
-    return reported && reported !== parsed.userPart ? reported : undefined;
+    if (reported && reported !== parsed.userPart) return reported;
+    // The mirror is the cheap answer (in-memory) but only knows lids it has already seen.
+    const mapped = this.lidMappingStore.resolveLid(voterId);
+    if (mapped) return mapped;
+    // Then ask the engine, which is what `GET /contacts/:id/phone` does and what actually resolves
+    // most of them: measured on a live poll, three voters the mirror could not place all came back
+    // with real numbers here. Best-effort — a lid WhatsApp will not map has no number to report.
+    try {
+      return (await engine.resolveContactPhone(voterId)) ?? undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   async deleteMessage(

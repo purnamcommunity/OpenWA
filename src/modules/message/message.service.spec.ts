@@ -30,6 +30,7 @@ function createMockEngine() {
     votePoll: jest.fn().mockResolvedValue(undefined),
     getPollVotes: jest.fn().mockResolvedValue([]),
     getContactById: jest.fn().mockResolvedValue(null),
+    resolveContactPhone: jest.fn().mockResolvedValue(null),
     unpinMessage: jest.fn().mockResolvedValue(undefined),
     editMessage: jest.fn().mockResolvedValue({ id: 'wa-msg-1', timestamp: 1706868000 }),
     getChatHistory: jest.fn().mockResolvedValue([]),
@@ -756,6 +757,25 @@ describe('MessageService', () => {
       expect(resolved.voterPhone).toBeUndefined();
       // The name still comes back — losing the number must not cost the identity.
       expect(resolved.voterName).toBe('Purnam Support');
+    });
+
+    it('asks the engine when the mirror cannot place the lid', async () => {
+      // What actually resolves most of them: measured on a live poll, voters the mirror had never
+      // seen came back with real numbers from this lookup — the same one GET /contacts/:id/phone
+      // serves.
+      mockEngine.getPollVotes.mockResolvedValueOnce([{ ...vote, voterId: '110213306818601@lid' }]);
+      mockEngine.getContactById.mockResolvedValueOnce({ id: '110213306818601@lid', number: '110213306818601' });
+      mockEngine.resolveContactPhone.mockResolvedValueOnce('917845499660');
+      const [resolved] = await service.getPollVotes('sess-1', '621@c.us', 'P1', true);
+      expect(resolved.voterPhone).toBe('917845499660');
+    });
+
+    it('reports no number when neither the mirror nor the engine can place the lid', async () => {
+      mockEngine.getPollVotes.mockResolvedValueOnce([{ ...vote, voterId: '9@lid' }]);
+      mockEngine.getContactById.mockResolvedValueOnce({ id: '9@lid', number: '9' });
+      mockEngine.resolveContactPhone.mockRejectedValueOnce(new Error('unmapped'));
+      const [resolved] = await service.getPollVotes('sess-1', '621@c.us', 'P1', true);
+      expect(resolved.voterPhone).toBeUndefined();
     });
 
     it('uses the lid->phone mirror when it knows the voter', async () => {
