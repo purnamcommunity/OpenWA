@@ -87,17 +87,27 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
     return Promise.resolve({ refused: `not a callable id: ${String(error)}` });
   }
 
+  // Narrowed inline rather than through a shared helper: this function is serialized into the
+  // page, so it cannot close over anything in this module.
+  const readId = (value: unknown): string | null =>
+    typeof value === 'object' && value !== null && typeof (value as { id?: unknown }).id === 'string'
+      ? (value as { id: string }).id
+      : null;
+
   // 0 = "not from the UI" in the call-origin enum the outgoing QPL logs.
   return start(wid, arg.isVideo, 0).then(
-    () => {
-      // Narrowed inline rather than through a shared helper: this function is serialized into the
-      // page, so it cannot close over anything in this module.
-      const active: unknown = calls?.lastActiveCall;
-      const id =
-        typeof active === 'object' && active !== null && typeof (active as { id?: unknown }).id === 'string'
-          ? (active as { id: string }).id
-          : null;
-      return { ok: true, callId: id };
+    async () => {
+      // startWAWebVoipCall resolves when the offer is away, which is BEFORE the collection has
+      // published the call. Reading the id immediately therefore returned null almost every time,
+      // and a caller with no id cannot later hang the call up. Poll briefly instead — the id
+      // appears within a few hundred milliseconds, and a call that never publishes one is still
+      // reported as placed rather than failed.
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const id = readId(calls?.activeCall) ?? readId(calls?.lastActiveCall);
+        if (id !== null) return { ok: true, callId: id };
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      return { ok: true, callId: null };
     },
     (error: unknown) => ({ refused: `WhatsApp refused the call: ${String(error)}` }),
   );
