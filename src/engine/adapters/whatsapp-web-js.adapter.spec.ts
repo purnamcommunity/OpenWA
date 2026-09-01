@@ -3023,7 +3023,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
     const sent = onMessageCreate.mock.calls[0][0] as { call?: { video: boolean; missed: boolean } };
     // An outgoing call is never "missed", whatever its duration.
-    expect(sent.call).toEqual({ video: true, missed: false });
+    expect(sent.call).toEqual({ video: true, missed: false, duration: 12 });
   });
 
   it('enriches an own-send (message_create) echo with the media payload', async () => {
@@ -4677,6 +4677,28 @@ describe('LID mapping persistence to LidMappingStore (#583 R3)', () => {
 });
 
 describe('extractWwebjsCall (call_log → { video, missed }, salvaged from #494)', () => {
+  it('reports how long a connected call lasted', () => {
+    expect(extractWwebjsCall(m({ type: 'call_log', fromMe: true, _data: { callDuration: 42 } }))).toEqual({
+      video: false,
+      missed: false,
+      duration: 42,
+    });
+  });
+
+  it('omits a duration for a call that never connected', () => {
+    // Absent, not zero: "connected for 0 seconds" is a different claim from "never connected".
+    expect(extractWwebjsCall(m({ type: 'call_log', fromMe: false, _data: {} }))).toEqual({
+      video: false,
+      missed: true,
+    });
+  });
+
+  it('omits a zero duration rather than reporting 0s', () => {
+    expect(extractWwebjsCall(m({ type: 'call_log', fromMe: true, _data: { callDuration: 0 } }))).not.toHaveProperty(
+      'duration',
+    );
+  });
+
   const m = (over: Record<string, unknown>) => over as unknown as Parameters<typeof extractWwebjsCall>[0];
 
   it('returns undefined for a non-call message', () => {
@@ -4689,6 +4711,7 @@ describe('extractWwebjsCall (call_log → { video, missed }, salvaged from #494)
     ).toEqual({
       video: true,
       missed: false,
+      duration: 30,
     });
   });
 

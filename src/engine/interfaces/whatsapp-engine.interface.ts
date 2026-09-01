@@ -109,7 +109,12 @@ export interface IncomingMessage {
   /** WIDs @mentioned in the message (empty/absent when none). Surfaced for command targeting. */
   mentionedIds?: string[];
   /** Set for `call` (call_log) messages: video vs voice, and whether an incoming call went unanswered. */
-  call?: { video: boolean; missed: boolean };
+  call?: {
+    video: boolean;
+    missed: boolean;
+    /** Seconds the call was connected. Absent when it never connected. */
+    duration?: number;
+  };
   /**
    * Set by the adapter when the sender is identified by a privacy id (e.g. a WhatsApp `@lid`) rather
    * than a phone number, so engine-neutral code can decide whether to attempt phone resolution without
