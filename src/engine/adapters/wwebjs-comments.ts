@@ -162,11 +162,16 @@ export async function submitMessageComment(input: {
   // reply for one the thread already carries.
   const settled = await Promise.race([
     action.sendCommentMessage(parent, input.text).then(() => true),
-    // 8s, written here rather than as a module constant: this body is stringified into the page and
-    // closes over nothing from this file. A reference to one throws INSIDE the page — after
+    // 1.2s, written here rather than as a module constant: this body is stringified into the page
+    // and closes over nothing from this file. A reference to one throws INSIDE the page — after
     // sendCommentMessage has already been called, because the array above evaluates left to right,
     // so the reply goes out and the caller is told it failed.
-    new Promise<boolean>(resolve => setTimeout(() => resolve(false), 8000)),
+    //
+    // Short because the wait buys almost nothing: WhatsApp posts the reply in the first moment and
+    // then, measured against a live announcement, does not settle the promise at all. A longer
+    // window only holds the request open over a send that has already happened. Confirmation is not
+    // what makes the reply real here — the thread re-read is.
+    new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1200)),
   ]);
   return { sent: true, confirmed: settled };
 }
