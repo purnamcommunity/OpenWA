@@ -87,6 +87,14 @@ ARG TARGETARCH
 # cost with --no-install-recommends: ~210 MB, and no new fixable CRITICAL/HIGH findings under the
 # release image scan. It is the Debian package rather than a bundled static build precisely so that
 # codec CVEs arrive through the same security stream as everything else here.
+# pulseaudio/pulseaudio-utils back the VOIP capture device. Chromium is linked against libpulse and
+# will open a PulseAudio source, but a container has no sound hardware, so getUserMedia fails
+# NotFoundError and a call carries no audio. Chromium's --use-fake-device-for-media-capture is NOT a
+# way out here: Debian's chromium is built without it (the flag string is absent from the binary),
+# and there is no upstream Chrome for linux-arm64 to swap in. A null sink plus a source remapped
+# from its monitor gives Chromium a real capture device to open. docker-entrypoint.sh starts the
+# daemon and loads the modules when VOIP_AUDIO_ENABLED=true; without that flag nothing runs and the
+# packages sit unused. Measured cost ~14 MB.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     $([ "$TARGETARCH" = arm64 ] && echo "chromium chromium-sandbox") \
     fonts-liberation \
@@ -113,6 +121,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     sqlite3 \
     ffmpeg \
+    pulseaudio \
+    pulseaudio-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # The PostgreSQL client for the DATABASE_TYPE=postgres half of backup.sh/restore.sh, which the
@@ -252,6 +262,17 @@ RUN mkdir -p ./data/sessions ./data/media ./data/plugins && \
 ENV HOME=/app/data
 ENV XDG_CONFIG_HOME=/tmp/.config
 ENV XDG_CACHE_HOME=/tmp/.cache
+
+# PulseAudio runs per-user (never --system) with its runtime dir on the tmpfs /tmp, so it works
+# unchanged on a read_only rootfs where /var/run is not writable. Both the daemon and Chromium
+# resolve the same socket from this one variable. Harmless when VOIP_AUDIO_ENABLED is unset: no
+# daemon is started and nothing reads it.
+#
+# PULSE_SERVER is deliberately NOT set. It names a socket to connect to, which pins clients to a
+# path before the daemon has created it — `pulseaudio --start` then fails "Connection refused"
+# instead of starting, and the capture device is never created. PULSE_RUNTIME_PATH is the correct
+# knob: the daemon binds $PULSE_RUNTIME_PATH/native and clients look there.
+ENV PULSE_RUNTIME_PATH=/tmp/pulse
 
 # Operator backup/restore scripts. docs/11-operational-runbooks.md drives them in-container
 # (`docker exec` against the named-volume mount at /app/data), and the sqlite3 CLI installed above
