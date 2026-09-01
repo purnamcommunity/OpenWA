@@ -618,6 +618,20 @@ export interface PollVoteRecord {
   voterPhone?: string;
 }
 
+/** One reply in a community announcement's reply thread. */
+export interface CommentRecord {
+  id: string;
+  parentMessageId: string;
+  /** May be an `@lid` privacy id, which carries no phone number. */
+  authorId: string;
+  timestamp: number;
+  /** Null for a deleted reply and for one carrying no text. */
+  body: string | null;
+  /** True once the author deletes it; the reply stays in the thread. */
+  revoked: boolean;
+  fromMe: boolean;
+}
+
 // ── Bulk ──────────────────────────────────────────────────────────
 
 export type BulkMessageType = 'text' | 'image' | 'video' | 'audio' | 'document';

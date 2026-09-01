@@ -19,6 +19,7 @@ import com.rmyndharis.openwa.model.PinMessageRequest;
 import com.rmyndharis.openwa.model.PollVoteRecord;
 import com.rmyndharis.openwa.model.PollVotesQuery;
 import com.rmyndharis.openwa.model.ReactMessageRequest;
+import com.rmyndharis.openwa.model.CommentRecord;
 import com.rmyndharis.openwa.model.ReactionRecord;
 import com.rmyndharis.openwa.model.ReplyMessageRequest;
 import com.rmyndharis.openwa.model.SendBulkRequest;
@@ -289,6 +290,28 @@ public final class MessagesResource {
             query,
             null,
             PollVoteRecord.class);
+    }
+
+    /**
+     * Replies posted on a community announcement, oldest first.
+     *
+     * <p>These are add-ons on the announcement rather than chat messages, so they appear in no
+     * history read. Answered from what the account stored locally, so a reply received while it was
+     * unlinked may be missing even though the message's replyCount includes it.
+     */
+    public List<CommentRecord> comments(String sessionId, String chatId, String messageId) {
+        return client.requestList(
+            HttpMethod.GET,
+            "/api/sessions/"
+                + encodeSegment(sessionId)
+                + "/messages/"
+                + encodeSegment(chatId)
+                + "/"
+                + encodeSegment(messageId)
+                + "/comments",
+            null,
+            null,
+            CommentRecord.class);
     }
 
     /**

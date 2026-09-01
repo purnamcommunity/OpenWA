@@ -226,6 +226,19 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     evidence:
       'baileys no getLabel/fetchLabel in lib/**/*.d.ts; chats.d.ts:69-73 + business.d.ts:162-166 expose ONLY writes; derivable only from an app-state-sync event cache; wwjs Client.getLabels (Client.js:2760)',
   },
+  getMessageComments: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'not-available', rootCause: 'library-limitation' },
+    evidence:
+      'Community announcement replies are message ADD-ONS, not messages: WhatsApp Web stores them ' +
+      'in the add-on table beside reactions and poll votes (WAWebAddonCommentTableMode, sibling of ' +
+      'WAWebAddonReactionTableMode/WAWebAddonPollVoteTableMode), keyed by parent message. They ' +
+      'therefore reach no fetchMessages read and raise no message event on either engine — a ' +
+      'reply moves only the chat’s sort timestamp. wwjs exposes nothing for them, so the adapter ' +
+      'reads commentTableMode.bulkGetByParentMsgKey from the page and feature-detects the module ' +
+      '(see wwebjs-comments.ts), refusing with 422 rather than 501 when a build has moved it — the ' +
+      'engine supports the read, a given page build may not. baileys keeps no add-on store to read.',
+  },
   getMessageReactions: {
     wwjs: { status: 'supported' },
     baileys: { status: 'not-available', rootCause: 'library-limitation' },

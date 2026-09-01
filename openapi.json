@@ -3204,6 +3204,71 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/messages/{chatId}/{messageId}/comments": {
+      "get": {
+        "operationId": "MessageController_getComments",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "chatId",
+            "required": true,
+            "in": "path",
+            "description": "Chat ID containing the announcement",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "messageId",
+            "required": true,
+            "in": "path",
+            "description": "The announcement message ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Replies on the announcement, oldest first. Answered from what this account has stored locally, so a reply received while it was unlinked may be missing even though the message’s replyCount includes it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MessageCommentDto"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such message — the id is outside the engine's lookup window (roughly the last hundred messages of the chat, or absent from the Baileys store) or the message was revoked."
+          },
+          "409": {
+            "description": "The session is not connected — an engine exists for it but is not `ready`: disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it — for those few seconds the answer is a `409` naming the reload; retry shortly."
+          },
+          "422": {
+            "description": "This WhatsApp Web build no longer exposes the reply thread. The thread is an undocumented internal that moves between releases; the response names the module that moved."
+          },
+          "501": {
+            "description": "The active engine cannot serve this operation. It is part of the engine contract, but the engine currently running has no implementation for it."
+          }
+        },
+        "summary": "Get replies posted on a community announcement",
+        "tags": [
+          "messages"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/messages/{chatId}/{messageId}/media": {
       "get": {
         "operationId": "MessageController_getChatMedia",
@@ -12223,6 +12288,50 @@
           "voterId",
           "selectedOptions",
           "timestamp"
+        ]
+      },
+      "MessageCommentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Id of the reply itself."
+          },
+          "parentMessageId": {
+            "type": "string",
+            "description": "The announcement this reply hangs off."
+          },
+          "authorId": {
+            "type": "string",
+            "description": "Who replied. May be an @lid privacy id, which carries no phone number.",
+            "example": "919611933126@c.us"
+          },
+          "timestamp": {
+            "type": "number",
+            "description": "Unix seconds the reply was posted.",
+            "example": 1788239820
+          },
+          "body": {
+            "type": "string",
+            "description": "Reply text; null for a deleted reply and for one carrying no text.",
+            "nullable": true
+          },
+          "revoked": {
+            "type": "boolean",
+            "description": "True once the author deletes the reply; it stays in the thread."
+          },
+          "fromMe": {
+            "type": "boolean",
+            "description": "True when this account posted the reply."
+          }
+        },
+        "required": [
+          "id",
+          "parentMessageId",
+          "authorId",
+          "timestamp",
+          "revoked",
+          "fromMe"
         ]
       },
       "DeleteMessageDto": {

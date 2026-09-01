@@ -183,6 +183,20 @@ class MessagesResource
     }
 
     /**
+     * Replies posted on a community announcement, oldest first.
+     *
+     * These are add-ons on the announcement rather than chat messages, so they appear in no
+     * history read. Answered from what the account stored locally, so a reply received while it
+     * was unlinked may be missing even though the message's replyCount includes it.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public function comments(string $sessionId, string $chatId, string $messageId): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($messageId)}/comments") ?? [];
+    }
+
+    /**
      * Pin a message in its chat.
      *
      * @param array<string,mixed> $body chatId, messageId and an optional durationSeconds of

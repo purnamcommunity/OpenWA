@@ -386,3 +386,38 @@ export class MessageReactionDto {
   @ApiProperty({ type: [MessageReactionSenderDto], description: 'Who placed this emoji.' })
   senders!: MessageReactionSenderDto[];
 }
+
+/**
+ * One reply in a community announcement's reply thread. Not a chat message: WhatsApp keeps these as
+ * add-ons on the announcement, so they appear in no history read.
+ */
+export class MessageCommentDto {
+  @ApiProperty({ description: 'Id of the reply itself.' })
+  id!: string;
+
+  @ApiProperty({ description: 'The announcement this reply hangs off.' })
+  parentMessageId!: string;
+
+  @ApiProperty({
+    description: 'Who replied. May be an @lid privacy id, which carries no phone number.',
+    example: '919611933126@c.us',
+  })
+  authorId!: string;
+
+  @ApiProperty({ description: 'Unix seconds the reply was posted.', example: 1788239820 })
+  timestamp!: number;
+
+  @ApiProperty({
+    description: 'Reply text; null for a deleted reply and for one carrying no text.',
+    nullable: true,
+    required: false,
+    type: String,
+  })
+  body!: string | null;
+
+  @ApiProperty({ description: 'True once the author deletes the reply; it stays in the thread.' })
+  revoked!: boolean;
+
+  @ApiProperty({ description: 'True when this account posted the reply.' })
+  fromMe!: boolean;
+}

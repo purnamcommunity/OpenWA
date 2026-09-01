@@ -70,7 +70,7 @@ export interface RawMessageFields {
   /** WIDs @mentioned in the message; whatsapp-web.js attaches this to every Message. */
   mentionedIds?: string[];
   /** Raw wwebjs payload; `notifyName` carries the sender's push name without an extra lookup. */
-  _data?: { notifyName?: string; ephemeralDuration?: number };
+  _data?: { notifyName?: string; ephemeralDuration?: number; replyCount?: number };
   /** Poll question, on a `poll_creation` message (whatsapp-web.js Message.js:332). */
   pollName?: string;
   /**
@@ -167,6 +167,14 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   if (incoming.type === 'poll') {
     const poll = readPollDetails(msg);
     if (poll) incoming.poll = poll;
+  }
+
+  // Replies drawn by a community announcement. Carried on the message because WhatsApp keeps the
+  // count there, while the replies themselves are add-ons reached only through getMessageComments.
+  // Zero is preserved rather than dropped: "an announcement nobody replied to" and "a message that
+  // cannot take replies" are different, and only the latter should be absent.
+  if (typeof msg._data?.replyCount === 'number') {
+    incoming.replyCount = msg._data.replyCount;
   }
 
   return incoming;

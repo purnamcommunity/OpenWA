@@ -601,6 +601,21 @@ class PollVoteRecord(TypedDict, total=False):
 # ── Bulk ──────────────────────────────────────────────────────────
 
 
+class CommentRecord(TypedDict, total=False):
+    """One reply in a community announcement's reply thread (server returns MessageComment[])."""
+
+    id: str
+    parentMessageId: str
+    authorId: str
+    timestamp: int
+    body: str | None
+    revoked: bool
+    fromMe: bool
+
+
+# ── Bulk ──────────────────────────────────────────────────────────
+
+
 class BulkMessageContent(TypedDict, total=False):
     text: str
     image: BulkMediaRequest

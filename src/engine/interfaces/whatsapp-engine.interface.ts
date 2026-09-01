@@ -137,6 +137,12 @@ export interface IncomingMessage {
     /** Decoded byte size of the media; always set when `omitted` is true. */
     sizeBytes?: number;
   };
+  /**
+   * How many replies an announcement message has drawn, when the engine reports it. The replies
+   * themselves are not messages and are read separately (see `getMessageComments`); this is the
+   * count WhatsApp itself shows on the message, and it moves without the message changing.
+   */
+  replyCount?: number;
   quotedMessage?: {
     id: string;
     body: string;
@@ -371,6 +377,30 @@ export interface ReactionSender {
 export interface MessageReaction {
   emoji: string;
   senders: ReactionSender[];
+}
+
+/**
+ * One reply in a community announcement's reply thread — WhatsApp's "N replies" behind an
+ * announcement message.
+ *
+ * These are not messages in the chat. WhatsApp keeps them as add-ons attached to the parent
+ * message, so they reach no message read and raise no message event; `getMessageComments` is the
+ * only way to see them. Only engines whose store models add-ons can answer at all.
+ */
+export interface MessageComment {
+  /** Neutral id of the reply itself. */
+  id: string;
+  /** The announcement this reply hangs off. */
+  parentMessageId: string;
+  /** Who replied (`@c.us`, or `@lid` when WhatsApp only reports a privacy id). */
+  authorId: string;
+  /** Unix seconds the reply was posted. */
+  timestamp: number;
+  /** Reply text; null for a deleted reply and for one carrying no text. */
+  body: string | null;
+  /** True once the author deletes the reply. It stays in the thread, as WhatsApp shows it. */
+  revoked: boolean;
+  fromMe: boolean;
 }
 
 // Phase 3: Labels (WhatsApp Business)
@@ -1002,6 +1032,18 @@ export interface MessageOperationsCapability {
   reactToMessage(chatId: string, messageId: string, emoji: string): Promise<void>;
 
   getMessageReactions(chatId: string, messageId: string): Promise<MessageReaction[]>;
+
+  /**
+   * Replies posted on a community announcement, oldest first.
+   *
+   * Answers from what the account has stored locally, so a reply that arrived while this account
+   * was not linked may be missing even though the parent's `replyCount` includes it.
+   *
+   * An empty array means "asked, nobody replied". An engine that cannot model add-ons at all
+   * reports unsupported; an engine whose page build no longer exposes the thread refuses with 422,
+   * because that is a property of the build rather than of the engine.
+   */
+  getMessageComments(chatId: string, messageId: string): Promise<MessageComment[]>;
 
   deleteMessage(chatId: string, messageId: string, forEveryone?: boolean): Promise<void>;
 

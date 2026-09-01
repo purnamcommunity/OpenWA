@@ -350,6 +350,15 @@ export class MessageService implements PluginMessagePort {
   }
 
   /**
+   * Replies posted on a community announcement. The thread is not part of the chat's messages, so
+   * this is the only read that surfaces it — see `MessageComment`.
+   */
+  async getMessageComments(sessionId: string, chatId: string, messageId: string) {
+    const engine = this.getEngine(sessionId);
+    return engine.getMessageComments(chatId, messageId);
+  }
+
+  /**
    * Read a message's media: the archived file when one exists, else the inline copy persisted on
    * the message row. The fallback is what makes media sent BY the account retrievable here — the
    * archive is written only on the inbound path, but outbound rows carry the payload inline: the

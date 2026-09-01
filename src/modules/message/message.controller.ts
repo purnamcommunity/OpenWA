@@ -29,6 +29,7 @@ import {
   MessageActionResponseDto,
   MessageListResponseDto,
   ChatHistoryMessageDto,
+  MessageCommentDto,
   MessageReactionDto,
   PollVoteDto,
 } from './dto/message-responses.dto';
@@ -471,6 +472,36 @@ export class MessageController {
       messageId,
       resolveContacts === 'true' || resolveContacts === '1',
     );
+  }
+
+  @Get(':chatId/:messageId/comments')
+  @ApiOperation({ summary: 'Get replies posted on a community announcement' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'chatId', description: 'Chat ID containing the announcement' })
+  @ApiParam({ name: 'messageId', description: 'The announcement message ID' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Replies on the announcement, oldest first. Answered from what this account has stored ' +
+      'locally, so a reply received while it was unlinked may be missing even though the ' +
+      'message’s replyCount includes it.',
+    type: [MessageCommentDto],
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 404, description: MESSAGE_NOT_FOUND_404 })
+  @ApiResponse({
+    status: 422,
+    description:
+      'This WhatsApp Web build no longer exposes the reply thread. The thread is an undocumented ' +
+      'internal that moves between releases; the response names the module that moved.',
+  })
+  @ApiResponse({ status: 501, description: ENGINE_NOT_SUPPORTED_501 })
+  async getComments(
+    @Param('sessionId') sessionId: string,
+    @Param('chatId') chatId: string,
+    @Param('messageId') messageId: string,
+  ) {
+    return this.messageService.getMessageComments(sessionId, chatId, messageId);
   }
 
   // Three path segments, so it never collides with `:chatId/history` (two) regardless of

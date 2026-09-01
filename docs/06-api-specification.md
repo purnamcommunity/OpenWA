@@ -1333,6 +1333,52 @@ Returns a bare array of `PollVote`:
 
 **Errors:** `400` session not active, or the target message is not a poll · `401` missing/invalid API key · `404` poll not found in recent history · `500` engine error · `409` conflict or engine not ready (retryable) · `501` not supported on the active engine
 
+#### GET /api/sessions/:sessionId/messages/:chatId/:messageId/comments
+
+Get the replies posted on a community announcement — what WhatsApp shows behind a message's
+"N replies", and the only way to read them.
+
+These are not chat messages. WhatsApp stores announcement replies as add-ons attached to the
+announcement, so they appear in no history read and raise no message event; a reply moves only the
+chat's sort timestamp. The message itself carries `replyCount`, so a caller can show "2 replies"
+without fetching the thread.
+
+Answered from what the account has stored locally: a reply received while this account was not
+linked may be missing even though `replyCount` counts it. An empty array means the announcement drew
+no replies.
+
+**Auth:** API key · **Engines:** whatsapp-web.js only — Baileys returns `501`
+
+**Path parameters**
+
+| Name      | Type   | Description                         |
+| --------- | ------ | ----------------------------------- |
+| sessionId | string | Session ID                          |
+| chatId    | string | Chat ID containing the announcement |
+| messageId | string | The announcement message ID         |
+
+**Response** `200`
+
+Returns a bare array of `MessageComment`, oldest first. `body` is `null` for a deleted reply, which
+stays in the thread as WhatsApp shows it; `authorId` may be an `@lid` privacy id, which carries no
+phone number.
+
+```json
+[
+  {
+    "id": "true_120363405383317199@g.us_3EB0662156A04B7910180A_234475837493478@lid",
+    "parentMessageId": "false_120363405383317199@g.us_3EB001DAD9B56824D5C2A8_53331011588251@lid",
+    "authorId": "234475837493478@lid",
+    "timestamp": 1788239820,
+    "body": "🙏🪷",
+    "revoked": false,
+    "fromMe": true
+  }
+]
+```
+
+**Errors:** `400` session not active · `401` missing/invalid API key · `404` message not found in that chat · `422` this WhatsApp Web build no longer exposes the reply thread · `500` engine error · `409` conflict or engine not ready (retryable) · `501` not supported on the active engine
+
 #### POST /api/sessions/:sessionId/messages/vote-poll
 
 Cast a vote on a poll.

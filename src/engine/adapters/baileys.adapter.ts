@@ -35,6 +35,7 @@ import {
   LabelInput,
   LocationInput,
   MediaInput,
+  MessageComment,
   MessageReaction,
   PollVote,
   MessageResult,
@@ -544,6 +545,10 @@ export class BaileysAdapter implements IWhatsAppEngine {
 
   getMessageReactions(_chatId: string, _messageId: string): Promise<MessageReaction[]> {
     return this.unsupported('getMessageReactions');
+  }
+
+  getMessageComments(_chatId: string, _messageId: string): Promise<MessageComment[]> {
+    return this.unsupported('getMessageComments');
   }
 
   // Baileys exposes label WRITES only — chats.d.ts:69-73 has addLabel/addChatLabel/removeChatLabel
