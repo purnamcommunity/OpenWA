@@ -141,6 +141,13 @@ services:
       - SESSION_DATA_PATH=${SESSION_DATA_PATH:-}
       - PUPPETEER_HEADLESS=${PUPPETEER_HEADLESS:-}
       - PUPPETEER_ARGS=${PUPPETEER_ARGS:-}
+      # VoIP call audio. Off by default: it starts a PulseAudio daemon and creates the virtual
+      # capture device a call's microphone needs. WhatsApp aborts an outgoing call BEFORE signalling
+      # when no capture device exists, so calls do not work without this — see docker-entrypoint.sh.
+      - VOIP_AUDIO_ENABLED=${VOIP_AUDIO_ENABLED:-false}
+      - VOIP_AUDIO_MIC_SINK=${VOIP_AUDIO_MIC_SINK:-}
+      - VOIP_AUDIO_OUT_SINK=${VOIP_AUDIO_OUT_SINK:-}
+      - VOIP_AUDIO_SOURCE=${VOIP_AUDIO_SOURCE:-}
       - PUPPETEER_PROTOCOL_TIMEOUT_MS=${PUPPETEER_PROTOCOL_TIMEOUT_MS:-}
       # Optional WhatsApp Web version override. DEFAULT (empty, "latest", or "auto"): OpenWA auto-resolves a
       # settled build from the third-party wppconnect-team/wa-version registry and pins its remote HTML

@@ -178,6 +178,7 @@ describe('validateApiKey entrypoint coverage', () => {
     ['modules/auth/guards/api-key.guard.ts', 'REST route guard'],
     ['modules/events/events.gateway.ts', 'websocket connect and per-subscribe re-validation'],
     ['modules/health/health.controller.ts', 'version disclosure on the public health check'],
+    ['modules/voip-audio/voip-audio.gateway.ts', 'call-audio websocket connect'],
   ]);
 
   /** Where validateApiKey is declared, which is not a caller. */

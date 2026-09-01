@@ -23,6 +23,11 @@
  */
 export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'ENGINE_TYPE',
+  // VoIP audio device names. Not dashboard-managed; the entrypoint has its own defaults, but the
+  // blank forward still has to be cleared or it shadows .env / data/.env.generated.
+  'VOIP_AUDIO_MIC_SINK',
+  'VOIP_AUDIO_OUT_SINK',
+  'VOIP_AUDIO_SOURCE',
   // Inbound-media knobs. Not dashboard-managed, but every blank compose forward must be cleared or
   // the empty value shadows .env / data/.env.generated — which is why the gate above requires an
   // entry for each one.

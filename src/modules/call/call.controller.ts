@@ -4,6 +4,7 @@ import { CallAckResponseDto } from './dto/call-response.dto';
 import { CreateCallLinkDto } from './dto/create-call-link.dto';
 import { PlaceCallDto } from './dto/place-call.dto';
 import { PlaceCallResponseDto } from './dto/place-call-response.dto';
+import { AnswerCallDto } from './dto/answer-call.dto';
 import { CallLinkResponseDto } from './dto/call-link-response.dto';
 import { CallService } from './call.service';
 import { RequireRole } from '../auth/decorators/auth.decorators';
@@ -94,8 +95,12 @@ export class CallController {
   @ApiResponse({ status: 404, description: 'Call not found or no longer ringing' })
   @ApiResponse({ status: 501, description: 'The active engine cannot answer calls (Baileys has no media stack)' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
-  async answer(@Param('sessionId') sessionId: string, @Param('callId') callId: string) {
-    await this.callService.answerCall(sessionId, callId);
+  async answer(
+    @Param('sessionId') sessionId: string,
+    @Param('callId') callId: string,
+    @Body() dto: AnswerCallDto = {},
+  ) {
+    await this.callService.answerCall(sessionId, callId, dto?.withVideo === true);
     return { success: true };
   }
 

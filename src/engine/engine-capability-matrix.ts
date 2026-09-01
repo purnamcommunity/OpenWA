@@ -345,13 +345,13 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'not-available', rootCause: 'library-limitation' },
     evidence:
-      "wwjs page module WAWebVoipStackInterface.getVoipStackInterface().acceptCall(callId) on the 'web' stack — the same object the call UI's accept button drives (useWAWebVoipCallHandlers); baileys can signal accept but has no media stack to carry the audio, so an answered call would be silent",
+      "wwjs page module WAWebVoipStackInterface.getVoipStackInterface().acceptCall(withAudio, withVideo) on the 'web' stack — takes flags, NOT an id, because the stack holds one call, so the requested id is checked against WAWebCallCollection.activeCall first; same object the call UI's accept button drives (useWAWebVoipCallHandlers calls acceptCall(!muted, !videoMuted)); baileys can signal accept but has no media stack, so an answered call would be silent",
   },
   endCall: {
     wwjs: { status: 'supported' },
     baileys: { status: 'not-available', rootCause: 'library-limitation' },
     evidence:
-      'wwjs page module WAWebVoipStackInterface.getVoipStackInterface().endCall ?? .rejectCall() — takes no id because the stack holds one call; baileys rejectCall only ends a RINGING call, never a connected one',
+      'wwjs page module WAWebVoipStackInterface.getVoipStackInterface().endCall(EndCallReason.Self, true) — takes no id because the stack holds one call, and the trailing true notifies the peer or the far end keeps ringing (WAWebVoipNackHandlers uses the same form); baileys rejectCall only ends a RINGING call, never a connected one',
   },
   sendCatalog: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },

@@ -24,37 +24,46 @@ if ! mkdir -p "${XDG_CONFIG_HOME:-/tmp/.config}" "${XDG_CACHE_HOME:-/tmp/.cache}
 fi
 chown openwa:openwa "${XDG_CONFIG_HOME:-/tmp/.config}" "${XDG_CACHE_HOME:-/tmp/.cache}"
 
-# VOIP capture device. Chromium opens a PulseAudio source for a call's microphone; a container has
-# no sound hardware, so without this getUserMedia fails NotFoundError and any call carries silence.
-# A null sink plus a source remapped from its monitor is a capture device Chromium can open, and it
-# is what the audio bridge later writes the operator's microphone into.
+# VOIP audio devices. Chromium opens a PulseAudio source for a call's microphone and plays the far
+# end to a sink; a container has no sound hardware, so without this getUserMedia fails
+# NotFoundError and any call carries silence.
 #
-# The daemon runs as openwa, not root and never --system: its runtime dir is the tmpfs /tmp, so a
-# read_only rootfs needs no extra mount, and Chromium (also openwa) resolves the same socket from
-# PULSE_RUNTIME_PATH. Failure here is NOT fatal — a session that never places a call is unaffected,
-# so a broken audio device must not cost the operator their messaging. It warns and carries on.
+# TWO null sinks, deliberately. The operator's microphone is played into `micsink`, whose monitor is
+# remapped to the source `vmic` that Chromium records. Chromium's own playback goes to a SEPARATE
+# `outsink`, whose monitor the bridge records and streams back to the operator. Collapsing these
+# into one sink loops Chromium's output straight back into its own microphone — the far end hears
+# itself, which is the whole reason for the split.
+#
+# The daemon runs as openwa, never --system: its runtime dir is the tmpfs /tmp, so a read_only
+# rootfs needs no extra mount. Failure here is NOT fatal — a session that never places a call is
+# unaffected, so a broken audio device must not cost the operator their messaging.
 if [ "${VOIP_AUDIO_ENABLED:-false}" = "true" ]; then
   PULSE_DIR="${PULSE_RUNTIME_PATH:-/tmp/pulse}"
-  SINK="${VOIP_AUDIO_SINK:-vsink}"
+  MIC_SINK="${VOIP_AUDIO_MIC_SINK:-micsink}"
+  OUT_SINK="${VOIP_AUDIO_OUT_SINK:-outsink}"
   SOURCE="${VOIP_AUDIO_SOURCE:-vmic}"
   # gosu does not synthesize an environment for the target user, and PulseAudio resolves both its
   # runtime dir and its cookie from one — so HOME and PULSE_RUNTIME_PATH are passed explicitly.
-  # Without them the daemon binds a different path than Chromium later looks in, and the device is
-  # created but never seen.
+  # Without them the daemon binds a different path than Chromium later looks in.
   PA="gosu openwa env HOME=${HOME:-/app/data} PULSE_RUNTIME_PATH=$PULSE_DIR"
   if mkdir -p "$PULSE_DIR" && chown openwa:openwa "$PULSE_DIR"; then
     # --exit-idle-time=-1 keeps the daemon up while no client holds a stream; without it PulseAudio
-    # exits between calls and the device disappears from Chromium's enumeration.
+    # exits between calls and the devices disappear from Chromium's enumeration.
     if $PA pulseaudio --start --exit-idle-time=-1 --disallow-exit --realtime=no 2>/dev/null &&
-       $PA pactl load-module module-null-sink sink_name="$SINK" >/dev/null 2>&1 &&
-       $PA pactl load-module module-remap-source source_name="$SOURCE" master="$SINK.monitor" >/dev/null 2>&1; then
-      echo "VOIP audio: PulseAudio ready (capture source '$SOURCE')."
+       $PA pactl load-module module-null-sink sink_name="$MIC_SINK" >/dev/null 2>&1 &&
+       $PA pactl load-module module-null-sink sink_name="$OUT_SINK" >/dev/null 2>&1 &&
+       $PA pactl load-module module-remap-source source_name="$SOURCE" master="$MIC_SINK.monitor" >/dev/null 2>&1; then
+      # Chromium picks the DEFAULTS; pinning them is what makes it record the operator rather than
+      # an arbitrary monitor, and play to the sink the bridge is recording.
+      $PA pactl set-default-source "$SOURCE" >/dev/null 2>&1 || true
+      $PA pactl set-default-sink "$OUT_SINK" >/dev/null 2>&1 || true
+      echo "VOIP audio: PulseAudio ready (mic '$SOURCE' <- '$MIC_SINK', playback -> '$OUT_SINK')."
     else
-      echo "WARNING: VOIP_AUDIO_ENABLED=true but the PulseAudio capture device could not be created." >&2
-      echo "         Calls will have no microphone; messaging is unaffected." >&2
+      echo "WARNING: VOIP_AUDIO_ENABLED=true but the PulseAudio devices could not be created." >&2
+      echo "         Calls will have no audio; messaging is unaffected." >&2
     fi
   else
-    echo "WARNING: cannot create PulseAudio runtime dir $PULSE_DIR; calls will have no microphone." >&2
+    echo "WARNING: cannot create PulseAudio runtime dir $PULSE_DIR; calls will have no audio." >&2
   fi
 fi
 

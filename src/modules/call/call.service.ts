@@ -47,8 +47,8 @@ export class CallService {
    * Answer a ringing call. Like rejectCall, an unknown or no-longer-ringing callId surfaces as 404
    * via the adapter's CallNotFoundError.
    */
-  answerCall(sessionId: string, callId: string): Promise<void> {
-    return this.getEngine(sessionId).answerCall(callId);
+  answerCall(sessionId: string, callId: string, withVideo = false): Promise<void> {
+    return this.getEngine(sessionId).answerCall(callId, withVideo);
   }
 
   /** Hang up the call this session is on. */
