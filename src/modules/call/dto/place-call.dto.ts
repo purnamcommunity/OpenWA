@@ -1,5 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { IsBoolean, IsOptional, IsString, Matches } from 'class-validator';
+import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
 
 export class PlaceCallDto {
   @ApiProperty({
@@ -21,6 +22,7 @@ export class PlaceCallDto {
     default: false,
   })
   @IsOptional()
+  @ToStrictBoolean()
   @IsBoolean()
   isVideo?: boolean;
 }
