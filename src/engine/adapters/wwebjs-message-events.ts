@@ -99,6 +99,12 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
 
     void (async () => {
       const incomingMessage = buildIncomingMessageBase(msg);
+      // Call-log detail, exactly as the incoming path attaches it. Every OUTGOING call log arrives
+      // here rather than through `message`, so leaving it off meant a placed call reached a
+      // consumer as a bodiless `call` message with nothing to say whether it was video, or
+      // answered — and a consumer keying call history off that record logged nothing at all.
+      const call = extractWwebjsCall(msg);
+      if (call) incomingMessage.call = call;
       // Enrich with the media payload through the same capped path the incoming handler uses —
       // the base builder is sync and carries none, so a phone-sent image would otherwise persist
       // and render as a bare 📎 marker even though the media is downloadable right here.

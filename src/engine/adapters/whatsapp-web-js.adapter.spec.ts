@@ -2984,6 +2984,48 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     expect(msg.call).toEqual({ video: true, missed: true });
   });
 
+  it('carries call detail on an own-send (message_create) call log', async () => {
+    // EVERY outgoing call log arrives through message_create, not `message`. Without the detail it
+    // reaches a consumer as a bodiless `call` message that says neither video nor answered — and a
+    // consumer keying call history off that record logs nothing at all.
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-echo-call',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    const onMessageCreate = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageCreate };
+    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+
+    client.emit('message_create', {
+      id: { _serialized: 'true_628111@c.us_CALL9' },
+      from: '628123@c.us',
+      to: '628111@c.us',
+      body: '',
+      type: 'call_log',
+      timestamp: 1700000090,
+      fromMe: true,
+      hasMedia: false,
+      _data: { isVideoCall: true, callDuration: 12 },
+      getContact: jest.fn().mockResolvedValue(null),
+      hasQuotedMsg: false,
+    });
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    expect(onMessageCreate).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const sent = onMessageCreate.mock.calls[0][0] as { call?: { video: boolean; missed: boolean } };
+    // An outgoing call is never "missed", whatever its duration.
+    expect(sent.call).toEqual({ video: true, missed: false });
+  });
+
   it('enriches an own-send (message_create) echo with the media payload', async () => {
     // buildIncomingMessageBase is sync and carries no media; without enrichment a phone-composed
     // image persists/renders as a bare 📎 marker. The echo must reuse the same capped download path
