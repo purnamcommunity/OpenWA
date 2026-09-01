@@ -107,7 +107,7 @@ describe('WwebjsVoip.placeCall', () => {
     const { host } = hostWith(pageWith(mods));
 
     await expect(new WwebjsVoip(host).placeCall('919876543210@c.us', false)).rejects.toThrow(
-      /has not enabled web calling for this account/,
+      /has not switched on calling from the web/,
     );
     expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).not.toHaveBeenCalled();
   });

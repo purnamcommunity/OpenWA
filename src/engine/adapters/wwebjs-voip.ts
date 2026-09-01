@@ -81,8 +81,8 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
   if (typeof callingEnabled === 'function' && !callingEnabled()) {
     return Promise.resolve({
       refused:
-        'WhatsApp has not enabled web calling for this account (server-side enable_web_calling flag) — ' +
-        'calls from its phone still work, and the flag may be granted over time',
+        'WhatsApp has not switched on calling from the web for this account yet. ' +
+        'You can still call from the phone itself — WhatsApp usually enables web calling on its own over time.',
     });
   }
 
