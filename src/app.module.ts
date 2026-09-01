@@ -22,6 +22,7 @@ import { LoggerModule } from './common/services/logger.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { InfraModule } from './modules/infra/infra.module';
 import { EventsModule } from './modules/events/events.module';
+import { VoipAudioModule } from './modules/voip-audio/voip-audio.module';
 import { ContactModule } from './modules/contact/contact.module';
 import { GroupModule } from './modules/group/group.module';
 import { ProfileModule } from './modules/profile/profile.module';
@@ -288,6 +289,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
     StorageModule,
     AuditModule,
     EventsModule, // WebSocket real-time events
+    VoipAudioModule, // Operator <-> gateway call audio (see modules/voip-audio)
     ...queueModules,
     AuthModule,
     EngineModule,
