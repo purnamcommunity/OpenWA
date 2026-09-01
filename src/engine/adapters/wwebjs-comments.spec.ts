@@ -47,7 +47,12 @@ const pageWith = (rows: unknown[]): PageRequire => {
  * it had failed. These rebuild each function from its own source, exactly as the page does.
  */
 describe('the page functions close over nothing from this module', () => {
+  // The Function constructor is the point, not an oversight: it is how puppeteer's evaluate gets a
+  // function into the page — from source text, with no surrounding scope. Anything safer would run
+  // the body in this module's scope and reproduce nothing.
+  /* eslint-disable @typescript-eslint/no-implied-eval, @typescript-eslint/no-unsafe-call */
   const rebuild = (fn: unknown) => new Function(`return (${String(fn)})`)() as typeof fn;
+  /* eslint-enable @typescript-eslint/no-implied-eval, @typescript-eslint/no-unsafe-call */
 
   const sendable: PageRequire = (name: string) => {
     if (name === 'WAWebSendCommentMessageAction') {
