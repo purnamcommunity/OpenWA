@@ -6398,6 +6398,216 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/calls": {
+      "post": {
+        "description": "Sends a call offer and returns once it is away — NOT when the other party answers; the outcome arrives as a `call.*` event. The session must have a capture device (VOIP_AUDIO_ENABLED), or the call connects carrying silence. One call per session at a time.",
+        "operationId": "CallController_place",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlaceCallDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Offer sent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlaceCallResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started, or an invalid chatId"
+          },
+          "403": {
+            "description": "WhatsApp refused the call, the id is not callable, or this session is already on a call"
+          },
+          "409": {
+            "description": "The session is not connected — an engine exists for it but is not `ready`: disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it — for those few seconds the answer is a `409` naming the reload; retry shortly."
+          },
+          "501": {
+            "description": "The active engine cannot place calls (Baileys has no media stack)"
+          }
+        },
+        "summary": "Place a voice or video call",
+        "tags": [
+          "calls"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/calls/voip/warmup": {
+      "post": {
+        "description": "WhatsApp Web keeps VoIP in lazily-fetched chunks a headless session never loads on its own, so the first call of a session otherwise waits on that fetch. Idempotent.",
+        "operationId": "CallController_warmup",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The VoIP stack is running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallAckResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started"
+          },
+          "403": {
+            "description": "VoIP initialization failed, or needs a session restart"
+          },
+          "409": {
+            "description": "The session is not connected — an engine exists for it but is not `ready`: disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it — for those few seconds the answer is a `409` naming the reload; retry shortly."
+          },
+          "501": {
+            "description": "The active engine has no VoIP stack (Baileys)"
+          }
+        },
+        "summary": "Boot the VoIP stack ahead of a call",
+        "tags": [
+          "calls"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/calls/{callId}/answer": {
+      "post": {
+        "operationId": "CallController_answer",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "callId",
+            "required": true,
+            "in": "path",
+            "description": "Call ID from the call.received event",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Call answered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallAckResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started"
+          },
+          "403": {
+            "description": "The VoIP stack refused the answer"
+          },
+          "404": {
+            "description": "Call not found or no longer ringing"
+          },
+          "409": {
+            "description": "The session is not connected — an engine exists for it but is not `ready`: disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it — for those few seconds the answer is a `409` naming the reload; retry shortly."
+          },
+          "501": {
+            "description": "The active engine cannot answer calls (Baileys has no media stack)"
+          }
+        },
+        "summary": "Answer a ringing incoming call",
+        "tags": [
+          "calls"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/calls/{callId}/end": {
+      "post": {
+        "description": "Ends a connected call. Use reject for one that is still ringing.",
+        "operationId": "CallController_end",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "callId",
+            "required": true,
+            "in": "path",
+            "description": "Call ID from the call.received event or a placed call",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Call ended",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallAckResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started"
+          },
+          "403": {
+            "description": "The VoIP stack refused the hang-up, or no call is running"
+          },
+          "409": {
+            "description": "The session is not connected — an engine exists for it but is not `ready`: disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it — for those few seconds the answer is a `409` naming the reload; retry shortly."
+          },
+          "501": {
+            "description": "The active engine cannot end calls (Baileys has no media stack)"
+          }
+        },
+        "summary": "Hang up the call this session is on",
+        "tags": [
+          "calls"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/calls/{callId}/reject": {
       "post": {
         "operationId": "CallController_reject",
@@ -15292,6 +15502,45 @@
         },
         "required": [
           "link"
+        ]
+      },
+      "PlaceCallDto": {
+        "type": "object",
+        "properties": {
+          "chatId": {
+            "type": "string",
+            "description": "Chat to call, as a 1:1 user id (`<number>@c.us`). Group calls are not offered here: the page module places them through a different entry point that takes a participant list.",
+            "example": "919876543210@c.us"
+          },
+          "isVideo": {
+            "type": "boolean",
+            "description": "Place a video call rather than a voice call. A video call additionally needs a camera device in the container; without one WhatsApp still places the call and sends no video.",
+            "example": false,
+            "default": false
+          }
+        },
+        "required": [
+          "chatId"
+        ]
+      },
+      "PlaceCallResponseDto": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "description": "Always true — the offer was sent.",
+            "example": true
+          },
+          "callId": {
+            "type": "object",
+            "description": "The engine's call id, usable with the answer/end/reject routes. Null when the offer went out but WhatsApp had not yet published an id for it — the id then arrives on the next `call.*` event instead.",
+            "example": "A1B2C3D4E5F6",
+            "nullable": true
+          }
+        },
+        "required": [
+          "success",
+          "callId"
         ]
       },
       "CallAckResponseDto": {
