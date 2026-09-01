@@ -563,6 +563,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.voip.answerCall(callId, id => this.calls.liveCalls.has(id), withVideo);
   }
 
+  async callState(): Promise<{ callId: string | null; connected: boolean; outgoing: boolean; peer: string | null }> {
+    return this.voip.callState();
+  }
+
   /** See ./wwebjs-voip. */
   async endCall(callId: string): Promise<void> {
     return this.voip.endCall(callId);

@@ -353,6 +353,12 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     evidence:
       'wwjs page module WAWebVoipStackInterface.getVoipStackInterface().endCall(EndCallReason.Self, true) — takes no id because the stack holds one call, and the trailing true notifies the peer or the far end keeps ringing (WAWebVoipNackHandlers uses the same form); baileys rejectCall only ends a RINGING call, never a connected one',
   },
+  callState: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'not-available', rootCause: 'library-limitation' },
+    evidence:
+      "wwjs reads WAWebCallCollection.activeCall plus isInConnectedCall in the page — the collection's own answer to 'is media flowing', which is what separates a ringing outgoing call from an answered one; baileys reports call events as outcomes only (Types/Call.d.ts WACallUpdateType) and holds no live call object to read",
+  },
   sendCatalog: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
     baileys: { status: 'not-available', rootCause: 'library-limitation' },

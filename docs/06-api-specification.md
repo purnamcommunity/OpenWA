@@ -6470,6 +6470,25 @@ placed, and the id arrives on the next `call.*` event.
 
 **Errors:** `400` session is not started, or an invalid `chatId` · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, WhatsApp refused the call, the id is not callable, or this session is already on a call · `409` conflict or engine not ready (retryable) · `501` the active engine cannot place calls (Baileys has no media stack) · `503` session not ready or dependency unavailable (retryable)
 
+#### GET /api/sessions/:sessionId/calls/state
+
+What this session'"'"'s current call is doing. Polled rather than pushed: an outgoing call raises no
+event when the far end answers — the `call.*` events report OUTCOMES, which arrive once a call is
+over — so a client that wants to show "ringing" and then a duration has to ask.
+
+**Auth:** API key (OPERATOR)
+
+**Path parameters**
+
+| Name      | Type   | Description |
+| --------- | ------ | ----------- |
+| sessionId | string | Session ID  |
+
+**Response** `200` — `{ "callId": "A1B2C3", "connected": true, "outgoing": true, "peer": "919876543210@c.us" }`.
+`callId` is `null` when no call is up. `connected` is false while an outgoing call is still ringing.
+
+**Errors:** `400` session is not started · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role · `409` conflict or engine not ready (retryable) · `501` the active engine cannot report call state (Baileys holds no live call object) · `503` session not ready or dependency unavailable (retryable)
+
 #### POST /api/sessions/:sessionId/calls/voip/warmup
 
 Boot the VoIP stack ahead of a call. WhatsApp Web keeps VoIP in lazily-fetched chunks a headless

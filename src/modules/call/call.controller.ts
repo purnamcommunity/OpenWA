@@ -1,10 +1,11 @@
-import { Controller, Post, Param, Body, HttpCode, HttpStatus } from '@nestjs/common';
+import { Controller, Post, Get, Param, Body, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
 import { CallAckResponseDto } from './dto/call-response.dto';
 import { CreateCallLinkDto } from './dto/create-call-link.dto';
 import { PlaceCallDto } from './dto/place-call.dto';
 import { PlaceCallResponseDto } from './dto/place-call-response.dto';
 import { AnswerCallDto } from './dto/answer-call.dto';
+import { CallStateResponseDto } from './dto/call-state-response.dto';
 import { CallLinkResponseDto } from './dto/call-link-response.dto';
 import { CallService } from './call.service';
 import { RequireRole } from '../auth/decorators/auth.decorators';
@@ -121,6 +122,24 @@ export class CallController {
   async end(@Param('sessionId') sessionId: string, @Param('callId') callId: string) {
     await this.callService.endCall(sessionId, callId);
     return { success: true };
+  }
+
+  @Get('state')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({
+    summary: "What this session's current call is doing",
+    description:
+      'Polled rather than pushed: an outgoing call raises no event when the far end answers — the ' +
+      'call events report outcomes, which arrive once a call is over — so a client showing ' +
+      '"ringing" and then a duration has to ask.',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'The current call, or a null callId', type: CallStateResponseDto })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 501, description: 'The active engine cannot report call state' })
+  async state(@Param('sessionId') sessionId: string): Promise<CallStateResponseDto> {
+    return this.callService.callState(sessionId);
   }
 
   @Post(':callId/reject')

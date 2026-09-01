@@ -291,6 +291,64 @@ describe('WwebjsVoip microphone grant', () => {
   });
 });
 
+describe('WwebjsVoip.callState', () => {
+  it('reports a ringing outgoing call as NOT connected', async () => {
+    const mods = readyModules({
+      WAWebCallCollection: {
+        pendingOutgoingCall: null,
+        isInConnectedCall: false,
+        activeCall: { id: 'C1', outgoing: true, peerJid: '91@c.us' },
+      },
+    });
+
+    // The distinction the UI could not make: its own microphone being open is not the far end
+    // having answered.
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).callState()).resolves.toEqual({
+      callId: 'C1',
+      connected: false,
+      outgoing: true,
+      peer: '91@c.us',
+    });
+  });
+
+  it('reports a connected call once media is flowing', async () => {
+    const mods = readyModules({
+      WAWebCallCollection: {
+        pendingOutgoingCall: null,
+        isInConnectedCall: true,
+        activeCall: { id: 'C1', outgoing: true, peerJid: '91@c.us' },
+      },
+    });
+
+    expect((await new WwebjsVoip(hostWith(pageWith(mods)).host).callState()).connected).toBe(true);
+  });
+
+  it('reports a null callId when no call is up', async () => {
+    const mods = readyModules({
+      WAWebCallCollection: { pendingOutgoingCall: null, isInConnectedCall: false, activeCall: null },
+    });
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).callState()).resolves.toEqual({
+      callId: null,
+      connected: false,
+      outgoing: false,
+      peer: null,
+    });
+  });
+
+  it('marks an inbound call as not outgoing', async () => {
+    const mods = readyModules({
+      WAWebCallCollection: {
+        pendingOutgoingCall: null,
+        isInConnectedCall: true,
+        activeCall: { id: 'C2', outgoing: false, peerJid: '92@c.us' },
+      },
+    });
+
+    expect((await new WwebjsVoip(hostWith(pageWith(mods)).host).callState()).outgoing).toBe(false);
+  });
+});
+
 describe('WwebjsVoip without a page', () => {
   it('reports a session with no page instead of dereferencing null', async () => {
     const { host } = hostWith(undefined);
