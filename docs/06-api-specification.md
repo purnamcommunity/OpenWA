@@ -6460,7 +6460,7 @@ time** — WhatsApp Web's VoIP stack is a per-page singleton.
 
 | Field   | Type    | Required | Description                                                     |
 | ------- | ------- | -------- | --------------------------------------------------------------- |
-| chatId  | string  | yes      | 1:1 user id ending in `@c.us`. Group calls are not offered here |
+| chatId  | string  | yes      | 1:1 user id — `@c.us` or `@lid`. Group calls are not offered here |
 | isVideo | boolean | no       | Place a video call rather than voice (default `false`)          |
 
 **Response** `200` — `{ "success": true, "callId": "A1B2C3" }`. The offer completes before WhatsApp
