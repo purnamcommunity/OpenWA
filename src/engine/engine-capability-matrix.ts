@@ -126,10 +126,10 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
       'wwjs Chat.clearMessages() → boolean (index.d.ts:1896); the injected sendClearChat returns false for an unknown chat (Injected/Utils.js:1220); baileys chatModify({clear:true,lastMessages}, jid) (Types/Chat.d.ts:75-78) — same last-message requirement as archiveChat, so a chat with no known history resolves false',
   },
   createGroup: {
-    wwjs: { status: 'not-available', rootCause: 'library-limitation' },
+    wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'baileys groupCreate(subject, participants) → GroupMetadata (Socket/groups.d.ts). wwjs Client.createGroup exists and is typed Promise<CreateGroupResult | string> (index.d.ts) but its injected evaluate reaches a WhatsApp Web internal that no longer exposes findImpl (Client.js:2325) — measured live on TWO builds, 2.3000.1044858477-alpha auto-resolved and 2.3000.1044770897-alpha pinned, both TypeError "this.findImpl is not a function" reaching the caller as a bare 500. Bare and @c.us-qualified participant ids fail identically, so the id shape is not the variable, and varying the build is what separates this from registry pin drift. findImpl appears in neither the installed Client.js nor any OpenWA patcher, so it is the page\'s, not the library\'s, and cannot be patched around. Baileys creates groups normally on the same account',
+      "baileys groupCreate(subject, participants) → GroupMetadata (Socket/groups.d.ts). wwjs Client.createGroup(title, participants) → Promise<CreateGroupResult | string> (index.d.ts:906) — depends on the adapter loading the New Group bundle first: WAWebGroupCreateJob ships in a chunk WhatsApp Web fetches only when a human opens the New Group flow, so on a headless session the name is absent from require('__debug').modulesMap entirely and window.require answers undefined, which wwjs then reads .createGroup off inside a catch that discards the error (Client.js:2366-2388). WAWebNewGroupFlowLoadable.requireBundle() pulls in ~1,150 modules including WAWebGroupCreateJob, WASmaxOutGroupsCreateRequest and WAWebCreateGroupAction, after which the stock path works: measured live on wwjs 1.34.7 — group created, server-assigned JID returned, participants resolved through WAWebApiContact.getPhoneNumber. An unloaded page module and a deleted one are indistinguishable by name lookup, which is what made this read as a library limitation",
   },
   deleteContact: {
     wwjs: { status: 'supported' },
