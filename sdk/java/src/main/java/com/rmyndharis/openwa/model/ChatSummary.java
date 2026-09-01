@@ -13,6 +13,7 @@ public record ChatSummary(
     Integer unreadCount,
     /** Preview text of the last message (the server returns a plain string, not an object). */
     String lastMessage,
+    ChatActivityPreview lastActivity,
     Long timestamp,
     ChatKind kind,
     Boolean archived,

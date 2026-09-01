@@ -973,6 +973,21 @@ export interface WebhookTestResult {
 
 // ── Chat (session-scoped chat operations) ─────────────────────────
 
+/**
+ * The newest thing in a chat when that thing is not a message — a reply on a community
+ * announcement, a reaction, a vote. These move a chat to the top of the list while changing nothing
+ * a message read can see, so without this the chat rises showing its previous message.
+ */
+export interface ChatActivityPreview {
+  /** `comment` | `reaction` | `poll_vote`, and whatever WhatsApp adds next. */
+  kind: string;
+  /** May be an `@lid` privacy id, which carries no phone number. */
+  senderId: string;
+  /** Unix seconds. */
+  timestamp: number;
+  parentMessageId?: string;
+}
+
 export interface ChatSummary {
   id: Jid;
   name: string;
@@ -980,6 +995,8 @@ export interface ChatSummary {
   unreadCount: number;
   /** Preview text of the last message (the server returns a plain string, not an object). */
   lastMessage?: string;
+  /** Set when the chat's newest activity is an add-on rather than a message. */
+  lastActivity?: ChatActivityPreview;
   /** Unix seconds of the last activity. */
   timestamp: number;
   kind: ChatKind;

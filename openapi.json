@@ -10637,6 +10637,35 @@
           "name"
         ]
       },
+      "ChatActivityPreviewDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "What moved the chat: `comment` is a reply on a community announcement, `reaction` an emoji on a message, `poll_vote` a vote. Not a closed set — WhatsApp adds add-on types, and an unrecognised one is still a real event.",
+            "example": "comment"
+          },
+          "senderId": {
+            "type": "string",
+            "description": "Who caused it. May be an `@lid` privacy id, which carries no phone number.",
+            "example": "628111@c.us"
+          },
+          "timestamp": {
+            "type": "number",
+            "description": "Unix seconds.",
+            "example": 1700000010
+          },
+          "parentMessageId": {
+            "type": "string",
+            "description": "The message the add-on hangs off, when the engine reports one."
+          }
+        },
+        "required": [
+          "kind",
+          "senderId",
+          "timestamp"
+        ]
+      },
       "ChatSummaryDto": {
         "type": "object",
         "properties": {
@@ -10693,6 +10722,14 @@
             "type": "boolean",
             "description": "Whether the chat is muted right now, as set via POST /sessions/{sessionId}/chats/mute. The verdict rather than the expiry: whatsapp-web.js derives it itself from Chat.isMuted, and Baileys carries a muteEndTime that this gateway compares against now. The expiry instant itself is tracked separately in #1473.",
             "example": false
+          },
+          "lastActivity": {
+            "description": "Set when the chat’s newest activity is an add-on rather than a message — a reply on an announcement, a reaction, a vote. These move a chat to the top of the list while changing nothing a message read can see, so without this the chat rises showing its previous message and the reason is invisible. Absent on engines that do not model add-ons.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatActivityPreviewDto"
+              }
+            ]
           }
         },
         "required": [

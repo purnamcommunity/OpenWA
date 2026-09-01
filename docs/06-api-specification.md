@@ -432,6 +432,26 @@ against now. The expiry instant itself is tracked separately in #1473.
 
 Sorted by `timestamp` DESC (most recent first) then paginated. `timestamp` is an epoch number (seconds). `kind` is the user-facing chat discriminator — one of `individual|group|channel|status|broadcast|unknown`; `isGroup` is retained for back-compat (true only for `kind: "group"`).
 
+`lastActivity` is present when the chat's newest activity is a message ADD-ON rather than a message
+— a reply on a community announcement (`kind: "comment"`), a reaction, a poll vote. These move a
+chat to the top of the list while changing nothing a message read can see, so without it a chat
+rises still showing its previous `lastMessage` and the reason it rose is invisible. It is omitted
+when the newest activity is an ordinary message, and on engines that do not model add-ons.
+
+```json
+{
+  "lastActivity": {
+    "kind": "comment",
+    "senderId": "234475837493478@lid",
+    "timestamp": 1788256182,
+    "parentMessageId": "false_120363@g.us_3EB0ABC_53331@lid"
+  }
+}
+```
+
+`kind` is not a closed set: WhatsApp adds add-on types, and an unrecognised one is still a real
+event that moved the chat. `senderId` is often an `@lid` privacy id, which carries no phone number.
+
 **Errors:** `400` session not started · `401` · `403` · `404` session not found · `409` session not connected (also answered for a few seconds while WhatsApp Web reloads its page and the engine re-injects) · `503` page connection died mid-read
 
 #### GET /api/sessions/stats/overview
@@ -6431,10 +6451,10 @@ time** — WhatsApp Web's VoIP stack is a per-page singleton.
 
 **Request body**
 
-| Field   | Type    | Required | Description                                                          |
-| ------- | ------- | -------- | -------------------------------------------------------------------- |
-| chatId  | string  | yes      | 1:1 user id ending in `@c.us`. Group calls are not offered here       |
-| isVideo | boolean | no       | Place a video call rather than voice (default `false`)                |
+| Field   | Type    | Required | Description                                                     |
+| ------- | ------- | -------- | --------------------------------------------------------------- |
+| chatId  | string  | yes      | 1:1 user id ending in `@c.us`. Group calls are not offered here |
+| isVideo | boolean | no       | Place a video call rather than voice (default `false`)          |
 
 **Response** `200` — `{ "success": true, "callId": "A1B2C3" }`. The offer completes before WhatsApp
 publishes the call, so the gateway waits up to two seconds for the id rather than answering `null`
@@ -6480,9 +6500,9 @@ ringing call and a stale id is refused rather than silently answering a differen
 
 **Request body**
 
-| Field     | Type    | Required | Description                                             |
-| --------- | ------- | -------- | ------------------------------------------------------- |
-| withVideo | boolean | no       | Answer with video as well as audio (default `false`)     |
+| Field     | Type    | Required | Description                                          |
+| --------- | ------- | -------- | ---------------------------------------------------- |
+| withVideo | boolean | no       | Answer with video as well as audio (default `false`) |
 
 **Response** `200` — `{ "success": true }`
 
@@ -6497,17 +6517,16 @@ connected one and notifies the peer, so the far end stops rather than continuing
 
 **Path parameters**
 
-| Name      | Type   | Description                                              |
-| --------- | ------ | -------------------------------------------------------- |
-| sessionId | string | Session ID                                               |
-| callId    | string | Call ID from the `call.received` event or a placed call  |
+| Name      | Type   | Description                                             |
+| --------- | ------ | ------------------------------------------------------- |
+| sessionId | string | Session ID                                              |
+| callId    | string | Call ID from the `call.received` event or a placed call |
 
 **Request body** — none.
 
 **Response** `200` — `{ "success": true }`
 
 **Errors:** `400` session is not started · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, the VoIP stack refused the hang-up, or no call is running · `409` conflict or engine not ready (retryable) · `501` the active engine cannot end calls (Baileys has no media stack) · `503` session not ready or dependency unavailable (retryable)
-
 
 ### 6.4.15 Media conversion (opt-in)
 

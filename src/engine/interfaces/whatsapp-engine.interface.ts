@@ -536,6 +536,32 @@ export interface PaginatedProducts {
  * Only library-agnostic primitives are leaked here; raw whatsapp-web.js objects are
  * mapped to this shape inside the adapter.
  */
+/**
+ * The newest thing in a chat when that thing is not a message.
+ *
+ * A reply on a community announcement, a reaction, a poll vote: all are message ADD-ONS, so they
+ * move a chat to the top of the list while changing nothing a message read can see. Without this a
+ * chat rises showing its previous message and the reason it rose is invisible — which is exactly
+ * how a reply to an announcement appears.
+ *
+ * Compare `timestamp` with the chat's own to decide whether this is newer than `lastMessage`; both
+ * are unix seconds.
+ */
+export interface ChatActivityPreview {
+  /**
+   * `comment` is a reply on an announcement, `reaction` an emoji on a message, `poll_vote` a vote.
+   * Deliberately not a closed union: WhatsApp adds add-on types, and an unrecognised one is still a
+   * real event that moved the chat.
+   */
+  kind: 'comment' | 'reaction' | 'poll_vote' | (string & {});
+  /** Who caused it (`@c.us`, or `@lid` when WhatsApp only reports a privacy id). */
+  senderId: string;
+  /** Unix seconds. */
+  timestamp: number;
+  /** The message the add-on hangs off, when the engine reports one. */
+  parentMessageId?: string;
+}
+
 export interface ChatSummary {
   id: string;
   name: string;
@@ -559,6 +585,12 @@ export interface ChatSummary {
    * expiry instant itself is tracked separately in #1473.
    */
   muted: boolean;
+  /**
+   * Set when the chat's newest activity is an add-on rather than a message — see
+   * {@link ChatActivityPreview}. Absent on engines that do not model add-ons, and on a chat whose
+   * newest activity is an ordinary message.
+   */
+  lastActivity?: ChatActivityPreview;
 }
 
 /**
