@@ -133,7 +133,7 @@ describe('submitMessageComment', () => {
     const result = await withPageRequire(require, () =>
       submitMessageComment({ parentMessageId: PARENT, text: 'hello' }),
     );
-    expect(result).toEqual({ sent: true });
+    expect(result).toEqual({ sent: true, confirmed: true });
     // The model, not the id: `sendCommentMessage` takes the message the way `sendReactionToMsg` does.
     expect(require.sent).toEqual([{ parent: { id: PARENT }, text: 'hello' }]);
   });
@@ -161,6 +161,17 @@ describe('submitMessageComment', () => {
     expect(result).toEqual({ notFound: true });
     expect(require.sent).toEqual([]);
   });
+
+  it('reports a send WhatsApp never settles as sent but unconfirmed', async () => {
+    // Measured against a live announcement: the reply reaches the thread while the promise
+    // `sendCommentMessage` returns never settles. Waiting on it forever is what wedged the request,
+    // and reporting failure would invite a second reply for one already posted.
+    const require = sendPage({
+      WAWebSendCommentMessageAction: { sendCommentMessage: () => new Promise(() => {}) },
+    });
+    const result = await withPageRequire(require, () => submitMessageComment({ parentMessageId: PARENT, text: 'x' }));
+    expect(result).toEqual({ sent: true, confirmed: false });
+  }, 15_000);
 
   it('reports a renamed send module as unsupported, and sends nothing', async () => {
     // A send is not retryable-by-guessing: reporting unsupported is what stops a caller believing

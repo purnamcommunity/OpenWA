@@ -94,8 +94,22 @@ export async function probeMessageComments(parentMessageId: string): Promise<Pag
   return { comments };
 }
 
-/** Either sent, or the reason it could not be — never a throw, for the reasons above. */
-export type PageCommentSendResult = { sent: true } | { unsupported: string } | { notFound: true };
+/**
+ * Either sent, or the reason it could not be — never a throw, for the reasons above.
+ *
+ * `confirmed` says whether WhatsApp settled the send. It reaches the thread either way: the promise
+ * `sendCommentMessage` returns does not reliably resolve — measured against a live announcement, the
+ * reply appeared while the promise never settled — so waiting on it forever is what wedged the
+ * request rather than what proved delivery. The thread re-read is the confirmation.
+ */
+export type PageCommentSendResult = { sent: true; confirmed: boolean } | { unsupported: string } | { notFound: true };
+
+/**
+ * How long the page waits for `sendCommentMessage` to settle before reporting the reply as sent but
+ * unconfirmed. Generous enough that a normally-settling send is reported as confirmed, short enough
+ * that a caller is not left holding an open request.
+ */
+const SEND_SETTLE_TIMEOUT_MS = 8000;
 
 /**
  * Runs INSIDE the page: posts a reply into an announcement's thread.
@@ -147,8 +161,14 @@ export async function submitMessageComment(input: {
   // not a failed send, and certainly not a comment posted somewhere else.
   if (!parent) return { notFound: true };
 
-  await action.sendCommentMessage(parent, input.text);
-  return { sent: true };
+  // Raced, not awaited: see PageCommentSendResult. A send that never settles has still gone out,
+  // and reporting it as unconfirmed is the honest answer — claiming failure would invite a second
+  // reply for one the thread already carries.
+  const settled = await Promise.race([
+    action.sendCommentMessage(parent, input.text).then(() => true),
+    new Promise<boolean>(resolve => setTimeout(() => resolve(false), SEND_SETTLE_TIMEOUT_MS)),
+  ]);
+  return { sent: true, confirmed: settled };
 }
 
 /** Drops rows the page could not identify: a comment with no id or author cannot be shown or acted on. */
