@@ -5,7 +5,7 @@ Three-way comparison of every capability: the **Baileys library** (`@whiskeysock
 its adapter layer and REST API — including which "supported" cells only work because OpenWA patches
 the installed library. Coverage is total: all 120 `IWhatsAppEngine` methods (29.4), **all 152
 Baileys + 81 whatsapp-web.js library methods** (29.5), all 34 + 31 library events (29.5.4), and all
-10 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
+11 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
 
 ## 29.1 How to read this matrix
 
@@ -49,7 +49,7 @@ flowchart LR
         IF --> BA["BaileysAdapter"]
         SVC --> STORE["OpenWA-side stores"]
     end
-    WA --> WLIB["whatsapp-web.js 1.34.7<br/>+ 8 OpenWA patches"]
+    WA --> WLIB["whatsapp-web.js 1.34.7<br/>+ 9 OpenWA patches"]
     BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc13<br/>+ 2 OpenWA patches"]
     WLIB --> WEB["WhatsApp Web<br/>headless Chromium"]
     BLIB --> WAS["WhatsApp servers<br/>browser-free socket"]
@@ -125,13 +125,13 @@ wrong interface method. Those three remain reader-verified.
 
 ## 29.3 Install-time patches OpenWA applies to the libraries
 
-OpenWA ships ten exact, self-disabling source transforms over the installed engines. Each runs at
+OpenWA ships eleven exact, self-disabling source transforms over the installed engines. Each runs at
 `npm install` (`scripts/postinstall.js`, `--best-effort`) and again in the Docker production stage
 (**without** best-effort — dependency drift fails the image build). "Self-disabling" means the
 patcher no-ops once the fix is present upstream, and an unrecognized source shape fails loudly
 rather than shipping a silently partial patch.
 
-### 29.3.1 The ten patches
+### 29.3.1 The eleven patches
 
 | #   | Patcher                                                    | Library target                       | What it repairs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Stand-down predicate                                                                                                                                                                                                                                                                                                                                                  |
 | --- | ---------------------------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -145,10 +145,11 @@ rather than shipping a silently partial patch.
 | 🔧⁸ | `scripts/patch-wwebjs-block.js`                            | whatsapp-web.js `Contact.js`         | `Contact.block()`/`unblock()` resolved their target through `getContactToBlockOnlyUseIfNoAssociatedChat`, which WhatsApp Web removed, so both answered an opaque `500` for every id shape. The replacement helpers `handleBlock`/`handleUnblock` are modal-driven UI wrappers that block nothing when called headless, and the server now refuses a phone-keyed block outright (`trying to block a pn contact without a chat`) because individual chats are keyed by LID while wwjs folds every id back to a phone number. Resolves through `WAWebLidMigrationUtils.toUserLid` to the chat-owning identity and calls `blockContact`/`unblockContact` directly, falling back to the original contact when no LID or chat exists.                                                                                                                                          | exact-shape match on both bodies; unknown shape fails the build.                                                                                                                                                                                                                                                                                                      |
 | 🔧⁹ | `scripts/patch-wwebjs-group-description.js`                | whatsapp-web.js `GroupChat.js`       | `GroupChat.setDescription()` calls the page's `WAWebGroupModifyInfoJob.setGroupDescription(chatWid, description, newId, descId)` positionally, but that job now takes a single options object `{desc, groupWid, newDescId, prevDescId}`. The first positional argument lands where the object is read, every field comes back undefined, and `widToGroupJid(undefined)` throws inside the page — reaching the caller as a bare `500` while the library still types the method `Promise<boolean>`. `setGroupSubject` in the same module is still positional, which is why subjects kept working and made the Wid look innocent. The patch sends the options object, takes `newDescId` from `WARandomHex.randomHex(8)` as the product does, and maps an empty description to `desc: null` so it selects the job's delete branch rather than sending an empty body element. | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
 | 🔧¹⁰ | `scripts/patch-wwebjs-call-state.js`                       | whatsapp-web.js `Client.js`          | wwjs raises its `call` event from an injected override of the call collection's internal Map. That override runs on EVERY write — including each state transition of a call already ringing — but forwards a fixed field whitelist (`id`, `peerJid`, `isVideo`, `isGroup`, `canHandleLocally`, `outgoing`, `webClientShouldHandle`, `participants`) that omits the call's state. The transition saying "answered" or "rejected" therefore arrives stripped of the one value distinguishing it from the ring, and a call can only ever be reported as RINGING. The patch forwards every own enumerable primitive field of the call model alongside the existing ones; it names no field, because WhatsApp Web's own name for the state is not knowable without a live call and a guessed name would break silently. Strictly additive — the explicit fields are spread last so they still win. | exact-shape match; unknown shape fails the build. |
+| 🔧¹¹ | `scripts/patch-wwebjs-call-log-event.js`                   | whatsapp-web.js `Client.js`          | WhatsApp writes a `call_log` message for every call — placed, answered or missed — and that record is the reliable history, written whichever linked device was rung. whatsapp-web.js never delivers it: its page hook reads `Msg.on('add', msg => { if (!msg.isNewMsg) return; ... })` and a call log carries NO `isNewMsg`, so the guard drops it. Measured by instrumenting both ends of that hook across a real call: the collection recorded `{type:'call_log', isNewMsg:null}` while the very next step recorded nothing. Downstream the loss is total — no `message_create`, so no `message.sent`, so nothing to store, so calls are invisible in the chat and in call history. The guard is kept for every other type (it is what stops history replays being re-announced) and widened only for `call_log`, which is written once at the end of a call and so cannot replay itself. | exact-shape match; unknown shape fails the build. |
 
 ### 29.3.2 Which matrix rows depend on which patch
 
-This is the patch visibility the matrix cells refer to. Every patch is engine-specific (8 on wwjs,
+This is the patch visibility the matrix cells refer to. Every patch is engine-specific (9 on wwjs,
 2 on Baileys), and **no row carries a row-level patch mark on both engines**. The two column-wide
 patches are a separate matter: 🔧¹ underwrites every wwjs cell and 🔧⁵ every baileys cell, so in
 that sense every row does depend on a patch on each side. "Patch-dependent" below means the
@@ -165,6 +166,7 @@ row-level marks.
 | 🔧⁷ participant arity       | `removeParticipants`, `promoteParticipants`, `demoteParticipants` on **wwjs**. Without it a request naming only non-members throws an arity assertion on removal, and promote/demote answer `200` for people WhatsApp never touched; the patch returns one boolean per REQUESTED id so the adapter reports a real per-participant outcome. Row-marked. |
 | 🔧⁹ group description       | `setGroupDescription` on **wwjs**. Without it every call throws in the page and answers a bare `500`, so the capability is dead rather than degraded; `setGroupSubject` beside it is unaffected. Row-marked.                                                                                                                                           |
 | 🔧¹⁰ call state             | The `call.*` OUTCOME events on **wwjs**. Without it every call is reported RINGING and never resolves, so call history cannot distinguish answered from missed; the ring itself still arrives, which makes the gap look like a UI problem. |
+| 🔧¹¹ call-log event         | Every `call_log` message on **wwjs**. Without it a call raises no message event at all, so the chat shows no call and the Calls page stays empty while the engine plainly holds the record. |
 | 🔧⁸ block/unblock           | `blockContact`, `unblockContact` on **wwjs**. Without it both answer an opaque `500` on every id, so the capability is dead rather than degraded; the blocklist read still works, which makes the failure look one-sided.                                                                                                                              |
 
 Rows that are ✅ on **both** engines where one side is patch-dependent: `initialize` (🔧⁴ wwjs),
@@ -989,7 +991,7 @@ adapter sources — re-derive the same way when anything changes:
   provides, and `transferChannelOwnership`, whose page function rejects locally against a
   subscriber list it cannot repopulate (both in 29.6.2). Both answer 501 on wwjs. `.d.ts` presence
   is not capability, and only a live call distinguishes the two.
-- **10** install-time patches (8 whatsapp-web.js + 2 Baileys), all exact and self-disabling.
+- **11** install-time patches (9 whatsapp-web.js + 2 Baileys), all exact and self-disabling.
 - **0 phantom-support rows** — every `not-available` cell throws at the adapter boundary.
 - Remaining adapter-gaps (fixable in this repo, ranked): **#1** `getChannelMessages` (Baileys —
   fetch is one line, `BinaryNode`→`ChannelMessage` parser is the work); **#2** `subscribeToChannel`
