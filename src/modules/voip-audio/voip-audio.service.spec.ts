@@ -125,6 +125,23 @@ describe('VoipAudioService backlog cap', () => {
     expect(mic().proc.written.length).toBe(accepted);
   });
 
+  it('reports the peak backlog and the audio it refused in the close summary', () => {
+    const { service } = serviceWith();
+    const logged: string[] = [];
+    jest.spyOn((service as unknown as { logger: { log: (m: string) => void } }).logger, 'log')
+      .mockImplementation(m => logged.push(m));
+    service.open('s1', () => {});
+
+    while (service.writeMic('s1', frame())) {
+      /* fill to the cap; the final refused write is the dropped frame */
+    }
+    service.close('s1');
+
+    const summary = logged.find(m => m.includes('bridge closed'));
+    expect(summary).toContain(`peak mic backlog ${MAX_MIC_BACKLOG_BYTES / 96}ms`);
+    expect(summary).toContain(`dropped ${FRAME_BYTES / 96}ms`);
+  });
+
   it('accepts audio again once the pipe drains', () => {
     const { service, mic } = serviceWith();
     service.open('s1', () => {});
