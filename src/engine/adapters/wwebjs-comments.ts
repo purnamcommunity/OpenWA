@@ -24,6 +24,8 @@ export interface PageComment {
   revoked: boolean;
   fromMe: boolean;
   ack: number | null;
+  /** On a revoke row, the id of the comment it deletes. Null on an ordinary comment. */
+  revokes: string | null;
 }
 
 /** Either the rows, or the name of the page module that has moved — never a throw. See below. */
@@ -89,6 +91,7 @@ export async function probeMessageComments(parentMessageId: string): Promise<Pag
       revoked: Boolean(r.revokeAddonType) || typeof r.revokeTimestamp === 'number',
       fromMe: Boolean(id?.fromMe),
       ack: typeof r.ack === 'number' ? r.ack : null,
+      revokes: serialize(r.protocolMessageKey),
     };
   });
   return { comments };
@@ -171,18 +174,36 @@ export async function submitMessageComment(input: {
   return { sent: true, confirmed: settled };
 }
 
-/** Drops rows the page could not identify: a comment with no id or author cannot be shown or acted on. */
+/**
+ * Drops rows the page could not identify: a comment with no id or author cannot be shown or acted on.
+ *
+ * Deleting a comment does not edit it. WhatsApp writes a SEPARATE revoke row naming the deleted
+ * comment in `protocolMessageKey` and removes the original — but not at the same instant, so for a
+ * window the table holds both. Rendered as they come, one deleted reply appears twice: once still
+ * carrying its text, once as the deletion. The revoke is therefore folded onto its target while the
+ * target is still present, and stands alone as the deleted entry once the original is gone, which is
+ * the steady state and how WhatsApp itself shows it.
+ */
 export function mapPageComments(parentMessageId: string, rows: PageComment[]): MessageComment[] {
+  const revokedIds = new Set(rows.map(row => row.revokes).filter((id): id is string => Boolean(id)));
+  const supersededRevokes = new Set(
+    rows.filter(row => row.revokes && rows.some(other => other.id === row.revokes)).map(row => row.id),
+  );
+
   return rows
     .filter((row): row is PageComment & { id: string; author: string } => Boolean(row.id && row.author))
-    .map(row => ({
-      id: row.id,
-      parentMessageId: row.parentId ?? parentMessageId,
-      authorId: row.author,
-      timestamp: row.timestamp ?? 0,
-      body: row.revoked ? null : row.body,
-      revoked: row.revoked,
-      fromMe: row.fromMe,
-    }))
+    .filter(row => !supersededRevokes.has(row.id))
+    .map(row => {
+      const revoked = row.revoked || revokedIds.has(row.id);
+      return {
+        id: row.id,
+        parentMessageId: row.parentId ?? parentMessageId,
+        authorId: row.author,
+        timestamp: row.timestamp ?? 0,
+        body: revoked ? null : row.body,
+        revoked,
+        fromMe: row.fromMe,
+      };
+    })
     .sort((a, b) => a.timestamp - b.timestamp);
 }
