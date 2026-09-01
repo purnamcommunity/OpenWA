@@ -32,6 +32,12 @@ import {
 import { buildVCard } from './vcard';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { MessageCommentsUnavailableError } from '../../common/errors/message-comments-unavailable.error';
+
+/**
+ * Ceiling on the whole page call for a thread reply. Comfortably above the page's own settle race,
+ * so a send that reports itself unconfirmed still returns through the normal path rather than here.
+ */
+const COMMENT_SEND_EVALUATE_TIMEOUT_MS = 20_000;
 import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
 import { type WwebjsEngineHost } from './wwebjs-host';
 
@@ -746,11 +752,26 @@ export class WwebjsMessaging {
     }
 
     let result: PageCommentSendResult;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      result = await page.evaluate(submitMessageComment, { parentMessageId: messageId, text });
+      // A backstop around the page's own settle race: that race bounds WhatsApp not answering, this
+      // bounds the evaluate itself never returning — a wedged page would otherwise hold the request
+      // open until the client gives up, which is what a hung reply box looks like from the outside.
+      result = await Promise.race([
+        page.evaluate(submitMessageComment, { parentMessageId: messageId, text }),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error('sendMessageComment: the page did not answer')),
+            COMMENT_SEND_EVALUATE_TIMEOUT_MS,
+          );
+          timeout.unref?.();
+        }),
+      ]);
     } catch (error) {
       this.host.reportIfPageTransportError(error, 'sendMessageComment');
       throw error;
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
 
     if ('unsupported' in result) {
@@ -762,7 +783,13 @@ export class WwebjsMessaging {
     if ('notFound' in result) {
       throw new MessageNotFoundError(messageId, chatId);
     }
-    this.host.logger.log(`Replied in the thread on ${messageId}`);
+    // Logged apart: a reply WhatsApp never acknowledged has still gone out, and the difference is
+    // worth seeing in the logs when someone asks why a thread shows a reply nothing confirmed.
+    this.host.logger.log(
+      result.confirmed
+        ? `Replied in the thread on ${messageId}`
+        : `Replied in the thread on ${messageId} (WhatsApp did not confirm; the reply is sent)`,
+    );
   }
 
   async getChatHistory(
