@@ -5479,6 +5479,37 @@ describe('WhatsAppWebJsAdapter orphaned Chromium sweep (pre-launch)', () => {
     }
   });
 
+  it('stops muting Chromium when calling is enabled, or the operator hears nothing', async () => {
+    const prev = process.env.VOIP_AUDIO_ENABLED;
+    process.env.VOIP_AUDIO_ENABLED = 'true';
+    try {
+      const adapter = newAdapter();
+      await adapter.initialize({});
+      const client = (adapter as unknown as { client: { options: { puppeteer?: { ignoreDefaultArgs?: string[] } } } })
+        .client;
+      // Puppeteer adds --mute-audio by default, which silences the far end's voice before it ever
+      // reaches the sink the audio bridge records.
+      expect(client.options.puppeteer?.ignoreDefaultArgs).toContain('--mute-audio');
+    } finally {
+      if (prev === undefined) delete process.env.VOIP_AUDIO_ENABLED;
+      else process.env.VOIP_AUDIO_ENABLED = prev;
+    }
+  });
+
+  it('keeps the quieter default when calling is off', async () => {
+    const prev = process.env.VOIP_AUDIO_ENABLED;
+    delete process.env.VOIP_AUDIO_ENABLED;
+    try {
+      const adapter = newAdapter();
+      await adapter.initialize({});
+      const client = (adapter as unknown as { client: { options: { puppeteer?: { ignoreDefaultArgs?: string[] } } } })
+        .client;
+      expect(client.options.puppeteer?.ignoreDefaultArgs).toBeUndefined();
+    } finally {
+      if (prev !== undefined) process.env.VOIP_AUDIO_ENABLED = prev;
+    }
+  });
+
   it('appends the --openwa-session marker to the puppeteer args handed to the Client', async () => {
     const adapter = newAdapter();
 
