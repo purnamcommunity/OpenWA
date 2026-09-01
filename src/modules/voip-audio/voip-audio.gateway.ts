@@ -12,6 +12,7 @@ import { AuthService } from '../auth/auth.service';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 import { resolveCorsPolicy } from '../../config/bootstrap-security';
 import { VoipAudioService } from './voip-audio.service';
+import { VoipAudioTokenService } from './voip-audio-token.service';
 import { FRAME_BYTES, PCM_CHANNELS, PCM_FORMAT, PCM_SAMPLE_RATE } from './voip-audio.constants';
 
 function corsOrigin(): boolean | string[] {
@@ -39,33 +40,51 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
   private readonly logger = new Logger(VoipAudioGateway.name);
   /** Which session each socket is carrying, so a disconnect closes the right bridge. */
   private readonly sessionOf = new Map<string, string>();
+  /** Sockets authenticated by a minted token are BOUND to that token's session — a token buys
+   *  audio for one line, never a pick of lines the way an API key does. */
+  private readonly boundTo = new Map<string, string>();
 
   constructor(
     private readonly audio: VoipAudioService,
     private readonly authService: AuthService,
+    private readonly tokens: VoipAudioTokenService,
   ) {}
 
   async handleConnection(client: Socket): Promise<void> {
     // Never the query string: it leaks the credential into proxy and access logs.
-    const auth = client.handshake.auth as { apiKey?: string } | undefined;
-    const apiKey = auth?.apiKey || (client.handshake.headers['x-api-key'] as string | undefined);
-    if (!apiKey) {
-      client.emit('audio:error', { code: 'UNAUTHORIZED', message: 'API key required' });
-      client.disconnect();
-      return;
-    }
-    try {
-      const key = await this.authService.validateApiKey(apiKey);
-      // Placing and answering calls is an OPERATOR action, and so is speaking into one.
-      if (key.role !== ApiKeyRole.OPERATOR && key.role !== ApiKeyRole.ADMIN) {
-        client.emit('audio:error', { code: 'FORBIDDEN', message: 'operator role required' });
+    const auth = client.handshake.auth as { apiKey?: string; token?: string } | undefined;
+
+    // A browser presents a minted single-use token (see VoipAudioTokenService); a trusted backend
+    // presents the API key. The token is checked first so a client sending both is treated as the
+    // less-privileged thing it claims to be.
+    if (auth?.token) {
+      const sessionId = this.tokens.consume(auth.token);
+      if (!sessionId) {
+        client.emit('audio:error', { code: 'UNAUTHORIZED', message: 'invalid or expired audio token' });
         client.disconnect();
         return;
       }
-    } catch {
-      client.emit('audio:error', { code: 'UNAUTHORIZED', message: 'invalid API key' });
-      client.disconnect();
-      return;
+      this.boundTo.set(client.id, sessionId);
+    } else {
+      const apiKey = auth?.apiKey || (client.handshake.headers['x-api-key'] as string | undefined);
+      if (!apiKey) {
+        client.emit('audio:error', { code: 'UNAUTHORIZED', message: 'API key required' });
+        client.disconnect();
+        return;
+      }
+      try {
+        const key = await this.authService.validateApiKey(apiKey);
+        // Placing and answering calls is an OPERATOR action, and so is speaking into one.
+        if (key.role !== ApiKeyRole.OPERATOR && key.role !== ApiKeyRole.ADMIN) {
+          client.emit('audio:error', { code: 'FORBIDDEN', message: 'operator role required' });
+          client.disconnect();
+          return;
+        }
+      } catch {
+        client.emit('audio:error', { code: 'UNAUTHORIZED', message: 'invalid API key' });
+        client.disconnect();
+        return;
+      }
     }
 
     if (!VoipAudioService.isEnabled()) {
@@ -89,9 +108,14 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
   /** Attach this socket to a session and start pumping the call's audio both ways. */
   @SubscribeMessage('audio:start')
   start(@ConnectedSocket() client: Socket, @MessageBody() body: { sessionId?: string }): void {
-    const sessionId = body?.sessionId;
+    const bound = this.boundTo.get(client.id);
+    const sessionId = body?.sessionId ?? bound;
     if (!sessionId) {
       client.emit('audio:error', { code: 'BAD_REQUEST', message: 'sessionId required' });
+      return;
+    }
+    if (bound && sessionId !== bound) {
+      client.emit('audio:error', { code: 'FORBIDDEN', message: 'this token is for another session' });
       return;
     }
     this.sessionOf.set(client.id, sessionId);
@@ -123,6 +147,7 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
   private release(client: Socket): void {
     const sessionId = this.sessionOf.get(client.id);
     this.sessionOf.delete(client.id);
+    this.boundTo.delete(client.id);
     if (sessionId) this.audio.close(sessionId);
   }
 }
