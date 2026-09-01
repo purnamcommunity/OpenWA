@@ -879,6 +879,19 @@ class WebhookTestResult(TypedDict, total=False):
 # ── Chat ──────────────────────────────────────────────────────────
 
 
+class ChatActivityPreview(TypedDict, total=False):
+    """The newest thing in a chat when that thing is not a message.
+
+    A reply on a community announcement, a reaction, a vote. These move a chat to the top of the
+    list while changing nothing a message read can see.
+    """
+
+    kind: str
+    senderId: str
+    timestamp: int
+    parentMessageId: str
+
+
 class ChatSummary(TypedDict):
     id: Jid
     name: str
@@ -886,6 +899,7 @@ class ChatSummary(TypedDict):
     unreadCount: int
     # Server returns a plain preview string, not a message object.
     lastMessage: NotRequired[str]
+    lastActivity: NotRequired["ChatActivityPreview"]
     timestamp: str | int
     kind: ChatKind
 

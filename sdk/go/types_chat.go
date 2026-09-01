@@ -9,6 +9,9 @@ type ChatSummary struct {
 	IsGroup     bool     `json:"isGroup"`
 	UnreadCount int      `json:"unreadCount"`
 	LastMessage string   `json:"lastMessage,omitempty"`
+	// LastActivity is set when the chat's newest activity is an add-on rather than a
+	// message — a reply on an announcement, a reaction, a vote.
+	LastActivity *ChatActivityPreview `json:"lastActivity,omitempty"`
 	Timestamp   int64    `json:"timestamp"`
 	Kind        ChatKind `json:"kind"`
 }
@@ -101,4 +104,15 @@ func (q *ListChatsQuery) values() url.Values {
 	setInt(v, "limit", q.Limit)
 	setInt(v, "offset", q.Offset)
 	return v
+}
+
+// ChatActivityPreview is the newest thing in a chat when that thing is not a message.
+// These move a chat to the top of the list while changing nothing a message read can see.
+type ChatActivityPreview struct {
+	// Kind is "comment", "reaction", "poll_vote", and whatever WhatsApp adds next.
+	Kind string `json:"kind"`
+	// SenderID may be an @lid privacy id, which carries no phone number.
+	SenderID        string `json:"senderId"`
+	Timestamp       int64  `json:"timestamp"`
+	ParentMessageID string `json:"parentMessageId,omitempty"`
 }

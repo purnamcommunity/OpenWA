@@ -1,8 +1,9 @@
 import { BadRequestException } from '@nestjs/common';
 import { MessageTypes, type Client } from 'whatsapp-web.js';
-import { ChatSummary, ChatState } from '../interfaces/whatsapp-engine.interface';
+import { ChatActivityPreview, ChatSummary, ChatState } from '../interfaces/whatsapp-engine.interface';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { chatKind, isChannelJid } from '../identity/wa-id';
+import { indexChatActivity, probeChatActivity } from './wwebjs-chat-activity';
 import { WwebjsMessaging } from './wwebjs-messaging';
 import { type WwebjsEngineHost } from './wwebjs-host';
 
@@ -12,6 +13,19 @@ import { type WwebjsEngineHost } from './wwebjs-host';
  * never touches lifecycle state directly. Presence (sendChatState) resolves the recipient through
  * the messaging delegate's send-id cache, exactly like a send.
  */
+/**
+ * Is the add-on the chat's newest news?
+ *
+ * The chat's own timestamp tracks the newest activity of EITHER kind, so an add-on that is the
+ * latest thing matches it. A second of tolerance because the two are written by different paths —
+ * the preview in milliseconds, the chat stamp in seconds — and a rounding edge should not silently
+ * drop the line.
+ */
+function activityIsNewest(activity: ChatActivityPreview | undefined, chatTimestamp: number | undefined): boolean {
+  if (!activity || !chatTimestamp) return false;
+  return activity.timestamp >= chatTimestamp - 1;
+}
+
 export class WwebjsChats {
   constructor(
     private readonly host: WwebjsEngineHost,
@@ -37,6 +51,10 @@ export class WwebjsChats {
       }
       throw error;
     }
+    // One page call for the whole list: the add-on preview lives on the chat models already in
+    // memory, so asking per chat would pay a round trip each to read something already loaded.
+    const activity = await this.readChatActivity();
+
     const summaries: ChatSummary[] = [];
     let skipped = 0;
 
@@ -60,6 +78,11 @@ export class WwebjsChats {
         timestamp: chat.timestamp || 0,
         // A location message's body is the base64 map thumbnail; don't surface it as the chat preview.
         lastMessage: chat.lastMessage?.type === MessageTypes.LOCATION ? '📍' : chat.lastMessage?.body || undefined,
+        // Only when it is NEWER than the chat's last message: WhatsApp shows this line in place of
+        // the message preview, and showing it for an add-on the chat has since moved past would
+        // describe the chat by something that is no longer its latest news. The chat's own
+        // timestamp already tracks the newest activity of either kind, so equality is the test.
+        ...(activityIsNewest(activity.get(id), chat.timestamp) ? { lastActivity: activity.get(id) } : {}),
       });
     }
 
@@ -68,6 +91,36 @@ export class WwebjsChats {
     }
 
     return summaries;
+  }
+
+  /**
+   * The add-on preview for every chat, indexed by id.
+   *
+   * Failure here is not failure of the chat list: a build that has renamed the field, or a page too
+   * busy to answer, costs the activity lines and nothing else. The list is the feature; the lines
+   * are a detail on it.
+   */
+  private async readChatActivity(): Promise<Map<string, ChatActivityPreview>> {
+    const page = (
+      this.client() as unknown as {
+        pupPage?: { evaluate: <T>(fn: () => T) => Promise<T> };
+      }
+    ).pupPage;
+    if (!page) return new Map();
+
+    try {
+      const result = await page.evaluate(probeChatActivity);
+      if ('unsupported' in result) {
+        this.host.logger.warn(
+          `Chat activity lines are unavailable on this WhatsApp Web build: ${result.unsupported} is missing.`,
+        );
+        return new Map();
+      }
+      return indexChatActivity(result.activity);
+    } catch (error) {
+      this.host.logger.warn(`Could not read chat activity previews: ${(error as Error).message}`);
+      return new Map();
+    }
   }
 
   async sendSeen(chatId: string): Promise<boolean> {

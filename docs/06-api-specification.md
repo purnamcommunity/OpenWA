@@ -424,6 +424,26 @@ Get active chats for a session, most-recent first (paginated).
 
 Sorted by `timestamp` DESC (most recent first) then paginated. `timestamp` is an epoch number (seconds). `kind` is the user-facing chat discriminator — one of `individual|group|channel|status|broadcast|unknown`; `isGroup` is retained for back-compat (true only for `kind: "group"`).
 
+`lastActivity` is present when the chat's newest activity is a message ADD-ON rather than a message
+— a reply on a community announcement (`kind: "comment"`), a reaction, a poll vote. These move a
+chat to the top of the list while changing nothing a message read can see, so without it a chat
+rises still showing its previous `lastMessage` and the reason it rose is invisible. It is omitted
+when the newest activity is an ordinary message, and on engines that do not model add-ons.
+
+```json
+{
+  "lastActivity": {
+    "kind": "comment",
+    "senderId": "234475837493478@lid",
+    "timestamp": 1788256182,
+    "parentMessageId": "false_120363@g.us_3EB0ABC_53331@lid"
+  }
+}
+```
+
+`kind` is not a closed set: WhatsApp adds add-on types, and an unrecognised one is still a real
+event that moved the chat. `senderId` is often an `@lid` privacy id, which carries no phone number.
+
 **Errors:** `400` session not started · `401` · `403` · `404` session not found · `409` session not connected (also answered for a few seconds while WhatsApp Web reloads its page and the engine re-injects) · `503` page connection died mid-read
 
 #### GET /api/sessions/stats/overview
