@@ -340,6 +340,12 @@ export class WwebjsLifecycle {
       puppeteer: {
         headless: this.host.config.puppeteer?.headless ?? true,
         args: puppeteerArgs,
+        // Puppeteer adds --mute-audio to every launch by default, which silences Chromium's audio
+        // OUTPUT. For a scraper that is right; for a call it means the far end's voice is never
+        // played to the sink the bridge records, so the operator hears nothing while the other
+        // side hears them perfectly. Dropped only when calling is switched on, so a deployment
+        // that never places calls keeps the quieter default.
+        ...(process.env.VOIP_AUDIO_ENABLED === 'true' ? { ignoreDefaultArgs: ['--mute-audio'] } : {}),
         // Do NOT let Puppeteer install its own process signal handlers. By default it handles
         // SIGINT (→ synchronous process.exit(130), which would skip the graceful drain entirely)
         // and SIGTERM/SIGHUP (→ kills Chromium at signal time, defeating the drain window). We own
