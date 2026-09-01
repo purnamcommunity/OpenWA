@@ -66,7 +66,11 @@ services:
       - ENGINE_TYPE=${ENGINE_TYPE:-}
       - SESSION_DATA_PATH=${SESSION_DATA_PATH:-/app/data/sessions}
       - PUPPETEER_HEADLESS=${PUPPETEER_HEADLESS:-true}
-      - PUPPETEER_ARGS=${PUPPETEER_ARGS:---no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu}
+      # --enable-features=SharedArrayBuffer is what makes CALLS work: WhatsApp Web's VoIP stack is
+      # WebAssembly with a worker thread pool and needs SharedArrayBuffer, which a headless session
+      # does not reliably get from cross-origin isolation. Without it every call is refused with
+      # "VoIP initialization did not complete".
+      - PUPPETEER_ARGS=${PUPPETEER_ARGS:---no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu,--enable-features=SharedArrayBuffer}
       # VoIP call audio. Off by default: it starts a PulseAudio daemon and creates the virtual
       # capture device a call's microphone needs. WhatsApp aborts an outgoing call BEFORE signalling
       # when no capture device exists, so calls do not work without this — see docker-entrypoint.sh.
