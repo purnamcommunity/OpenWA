@@ -27,6 +27,7 @@ from ..types import (
     MessageResponse,
     PollVoteRecord,
     CommentRecord,
+    SendCommentRequest,
     ReactionRecord,
     ReactMessageRequest,
     ReplyMessageRequest,
@@ -137,6 +138,18 @@ class MessagesResource:
         """
         return self._http.request(
             "GET", f"/api/sessions/{quote_segment(session_id)}/messages/{quote_segment(chat_id)}/{quote_segment(message_id)}/comments"
+        )
+
+    def send_comment(self, session_id: str, chat_id: str, message_id: str, body: SendCommentRequest) -> SuccessResult:
+        """Reply in a community announcement's thread.
+
+        Not a quoted reply: that sends an ordinary message to the whole group, while this goes into
+        the thread behind the announcement's "N replies".
+        """
+        return self._http.request(
+            "POST",
+            f"/api/sessions/{quote_segment(session_id)}/messages/{quote_segment(chat_id)}/{quote_segment(message_id)}/comments",
+            body=body,
         )
 
     def pin(self, session_id: str, body: PinMessageRequest) -> SuccessResult:

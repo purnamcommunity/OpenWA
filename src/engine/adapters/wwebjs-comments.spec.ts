@@ -1,4 +1,4 @@
-import { mapPageComments, probeMessageComments, type PageComment } from './wwebjs-comments';
+import { mapPageComments, probeMessageComments, submitMessageComment, type PageComment } from './wwebjs-comments';
 
 /**
  * The reply thread is read out of WhatsApp Web internals that carry no compatibility promise, so
@@ -104,6 +104,71 @@ describe('probeMessageComments', () => {
       name === 'WAWebMsgKey' ? { fromString: (id: string) => ({ id }) } : { commentTableMode: {} };
     const result = await withPageRequire(require, () => probeMessageComments(PARENT));
     expect(result).toEqual({ unsupported: 'commentTableMode.bulkGetByParentMsgKey' });
+  });
+});
+
+describe('submitMessageComment', () => {
+  const sendPage = (over: Record<string, unknown> = {}): PageRequire => {
+    const sent: unknown[] = [];
+    const modules: Record<string, unknown> = {
+      WAWebSendCommentMessageAction: {
+        sendCommentMessage: (parent: unknown, text: string) => {
+          sent.push({ parent, text });
+          return Promise.resolve();
+        },
+      },
+      WAWebCollections: { Msg: { get: (id: string) => ({ id }) } },
+      ...over,
+    };
+    const require = ((name: string) => {
+      if (!(name in modules)) throw new Error(`module not found: ${name}`);
+      return modules[name];
+    }) as PageRequire & { sent: unknown[] };
+    require.sent = sent;
+    return require;
+  };
+
+  it('posts the reply against the parent message model, as WhatsApp own reply box does', async () => {
+    const require = sendPage() as PageRequire & { sent: { parent: { id: string }; text: string }[] };
+    const result = await withPageRequire(require, () =>
+      submitMessageComment({ parentMessageId: PARENT, text: 'hello' }),
+    );
+    expect(result).toEqual({ sent: true });
+    // The model, not the id: `sendCommentMessage` takes the message the way `sendReactionToMsg` does.
+    expect(require.sent).toEqual([{ parent: { id: PARENT }, text: 'hello' }]);
+  });
+
+  it('falls back to the store for a message not held in memory', async () => {
+    // An announcement worth replying to is usually older than what is loaded, so the in-memory
+    // collection missing it is the NORMAL case, not an error.
+    const require = sendPage({
+      WAWebCollections: {
+        Msg: {
+          get: () => undefined,
+          getMessagesById: () => Promise.resolve({ messages: [{ id: 'from-store' }] }),
+        },
+      },
+    }) as PageRequire & { sent: { parent: { id: string } }[] };
+    await withPageRequire(require, () => submitMessageComment({ parentMessageId: PARENT, text: 'x' }));
+    expect(require.sent[0].parent).toEqual({ id: 'from-store' });
+  });
+
+  it('reports a message it cannot find rather than sending somewhere else', async () => {
+    const require = sendPage({
+      WAWebCollections: { Msg: { get: () => undefined, getMessagesById: () => Promise.resolve({ messages: [] }) } },
+    }) as PageRequire & { sent: unknown[] };
+    const result = await withPageRequire(require, () => submitMessageComment({ parentMessageId: PARENT, text: 'x' }));
+    expect(result).toEqual({ notFound: true });
+    expect(require.sent).toEqual([]);
+  });
+
+  it('reports a renamed send module as unsupported, and sends nothing', async () => {
+    // A send is not retryable-by-guessing: reporting unsupported is what stops a caller believing
+    // the reply landed.
+    const require = sendPage({ WAWebSendCommentMessageAction: {} }) as PageRequire & { sent: unknown[] };
+    const result = await withPageRequire(require, () => submitMessageComment({ parentMessageId: PARENT, text: 'x' }));
+    expect(result).toEqual({ unsupported: 'sendCommentMessage' });
+    expect(require.sent).toEqual([]);
   });
 });
 

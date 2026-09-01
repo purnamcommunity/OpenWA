@@ -618,6 +618,11 @@ export interface PollVoteRecord {
   voterPhone?: string;
 }
 
+/** A reply to post into a community announcement's thread. */
+export interface SendCommentRequest {
+  text: string;
+}
+
 /** One reply in a community announcement's reply thread. */
 export interface CommentRecord {
   id: string;

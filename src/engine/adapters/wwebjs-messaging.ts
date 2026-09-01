@@ -22,7 +22,13 @@ import { chatKind, userPart } from '../identity/wa-id';
 import { chatHistoryMediaBudgetBytes, coerceDeclaredSize, ingestMediaBudgetBytes } from './inbound-media-cap';
 import { buildIncomingMessageBase } from './message-mapper';
 import { mapWwebjsPollVote, type RawWwebjsPollVote } from './wwebjs-poll-votes';
-import { mapPageComments, probeMessageComments, type PageCommentResult } from './wwebjs-comments';
+import {
+  mapPageComments,
+  probeMessageComments,
+  submitMessageComment,
+  type PageCommentResult,
+  type PageCommentSendResult,
+} from './wwebjs-comments';
 import { buildVCard } from './vcard';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { MessageCommentsUnavailableError } from '../../common/errors/message-comments-unavailable.error';
@@ -711,6 +717,52 @@ export class WwebjsMessaging {
       throw new MessageCommentsUnavailableError(result.unsupported);
     }
     return mapPageComments(messageId, result.comments);
+  }
+
+  /**
+   * Post a reply into an announcement's thread — what WhatsApp's own "Add a reply" box does.
+   *
+   * Deliberately separate from `replyToMessage`, which quotes a message in the chat: that is an
+   * ordinary message to the whole group, this is an add-on only the thread shows. Confusing the two
+   * in an announcement group would broadcast to every member something meant for a thread.
+   */
+  async sendMessageComment(chatId: string, messageId: string, text: string): Promise<void> {
+    this.host.ensureReady();
+
+    const remote = messageId.split('_')[1];
+    if (remote && remote !== chatId) {
+      throw new MessageNotFoundError(messageId, chatId);
+    }
+
+    const page = (
+      this.client() as unknown as {
+        pupPage?: {
+          evaluate: <T, A>(fn: (arg: A) => T | Promise<T>, arg?: A) => Promise<T>;
+        };
+      }
+    ).pupPage;
+    if (!page) {
+      throw new MessageCommentsUnavailableError('the session has no page to send through');
+    }
+
+    let result: PageCommentSendResult;
+    try {
+      result = await page.evaluate(submitMessageComment, { parentMessageId: messageId, text });
+    } catch (error) {
+      this.host.reportIfPageTransportError(error, 'sendMessageComment');
+      throw error;
+    }
+
+    if ('unsupported' in result) {
+      this.host.logger.warn(
+        `Replying to an announcement is unavailable on this WhatsApp Web build: ${result.unsupported} is missing.`,
+      );
+      throw new MessageCommentsUnavailableError(result.unsupported);
+    }
+    if ('notFound' in result) {
+      throw new MessageNotFoundError(messageId, chatId);
+    }
+    this.host.logger.log(`Replied in the thread on ${messageId}`);
   }
 
   async getChatHistory(

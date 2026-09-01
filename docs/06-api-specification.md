@@ -1379,6 +1379,42 @@ phone number.
 
 **Errors:** `400` session not active · `401` missing/invalid API key · `404` message not found in that chat · `422` this WhatsApp Web build no longer exposes the reply thread · `500` engine error · `409` conflict or engine not ready (retryable) · `501` not supported on the active engine
 
+#### POST /api/sessions/:sessionId/messages/:chatId/:messageId/comments
+
+Reply in a community announcement's thread — what WhatsApp's own "Add a reply" box does.
+
+**This is not a quoted reply.** Replying with a quote (`replyToMessage` / `quotedMessageId`) sends an
+ordinary message to the whole group; this goes into the thread behind the announcement's
+"N replies" and is seen only by whoever opens it. In an announcement group, where ordinary members
+cannot post at all, the two differ in audience as well as in placement.
+
+The reply raises no message event and appears in no history read, so re-read
+`GET .../comments` to see it.
+
+**Auth:** API key (OPERATOR) · **Engines:** whatsapp-web.js only — Baileys returns `501`
+
+**Path parameters**
+
+| Name      | Type   | Description                         |
+| --------- | ------ | ----------------------------------- |
+| sessionId | string | Session ID                          |
+| chatId    | string | Chat ID containing the announcement |
+| messageId | string | The announcement being replied to   |
+
+**Body**
+
+| Field | Type   | Required | Description                                              |
+| ----- | ------ | -------- | -------------------------------------------------------- |
+| text  | string | yes      | The reply text. Goes into the thread, not into the chat. |
+
+**Response** `200`
+
+```json
+{ "success": true }
+```
+
+**Errors:** `400` session not active / validation · `401` missing/invalid API key · `403` key lacks OPERATOR role · `404` the announcement is not one this account can see · `422` this WhatsApp Web build no longer exposes the reply thread · `409` conflict or engine not ready (retryable) · `501` not supported on the active engine
+
 #### POST /api/sessions/:sessionId/messages/vote-poll
 
 Cast a vote on a poll.

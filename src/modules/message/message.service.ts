@@ -359,6 +359,16 @@ export class MessageService implements PluginMessagePort {
   }
 
   /**
+   * Post a reply into an announcement's thread. Not a quoted reply: that is an ordinary message to
+   * the whole group, this reaches only the thread — see `sendMessageComment` on the engine.
+   */
+  async sendMessageComment(sessionId: string, chatId: string, messageId: string, text: string) {
+    const engine = this.getEngine(sessionId);
+    await engine.sendMessageComment(chatId, messageId, text);
+    return { success: true };
+  }
+
+  /**
    * Read a message's media: the archived file when one exists, else the inline copy persisted on
    * the message row. The fallback is what makes media sent BY the account retrievable here — the
    * archive is written only on the inbound path, but outbound rows carry the payload inline: the

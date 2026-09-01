@@ -94,6 +94,63 @@ export async function probeMessageComments(parentMessageId: string): Promise<Pag
   return { comments };
 }
 
+/** Either sent, or the reason it could not be — never a throw, for the reasons above. */
+export type PageCommentSendResult = { sent: true } | { unsupported: string } | { notFound: true };
+
+/**
+ * Runs INSIDE the page: posts a reply into an announcement's thread.
+ *
+ * `sendCommentMessage(parentMessage, text)` is what WhatsApp Web's own "Add a reply" box calls, and
+ * it takes the parent MESSAGE MODEL rather than an id — the same shape as `sendReactionToMsg`. The
+ * model is resolved the way whatsapp-web.js resolves one for a reaction (`Client.js`): from the
+ * in-memory collection first, then by asking the store, because an announcement worth replying to is
+ * usually older than what is loaded.
+ *
+ * Feature-detected like the read: a build that has moved the module reports `unsupported` rather
+ * than throwing, so a WhatsApp Web release degrades to "replying is unavailable" instead of a 500
+ * on a send the caller cannot tell succeeded or failed.
+ */
+export async function submitMessageComment(input: {
+  parentMessageId: string;
+  text: string;
+}): Promise<PageCommentSendResult> {
+  const req = (globalThis as unknown as { require?: (name: string) => unknown }).require;
+  if (typeof req !== 'function') return { unsupported: 'window.require' };
+
+  let action: { sendCommentMessage?: (parent: unknown, text: string) => Promise<unknown> } | undefined;
+  let collections:
+    | {
+        Msg?: {
+          get?: (id: string) => unknown;
+          getMessagesById?: (ids: string[]) => Promise<{ messages?: unknown[] } | undefined>;
+        };
+      }
+    | undefined;
+  try {
+    action = req('WAWebSendCommentMessageAction') as typeof action;
+  } catch {
+    return { unsupported: 'WAWebSendCommentMessageAction' };
+  }
+  try {
+    collections = req('WAWebCollections') as typeof collections;
+  } catch {
+    return { unsupported: 'WAWebCollections' };
+  }
+  if (typeof action?.sendCommentMessage !== 'function') {
+    return { unsupported: 'sendCommentMessage' };
+  }
+
+  const Msg = collections?.Msg;
+  const parent =
+    Msg?.get?.(input.parentMessageId) ?? (await Msg?.getMessagesById?.([input.parentMessageId]))?.messages?.[0];
+  // Not found is its own answer: replying to a message this account can no longer see is a 404,
+  // not a failed send, and certainly not a comment posted somewhere else.
+  if (!parent) return { notFound: true };
+
+  await action.sendCommentMessage(parent, input.text);
+  return { sent: true };
+}
+
 /** Drops rows the page could not identify: a comment with no id or author cannot be shown or acted on. */
 export function mapPageComments(parentMessageId: string, rows: PageComment[]): MessageComment[] {
   return rows

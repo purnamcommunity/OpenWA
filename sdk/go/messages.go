@@ -161,9 +161,21 @@ func (s *MessagesService) PollVotes(ctx context.Context, sessionID, chatID, mess
 // may be missing even though the message's ReplyCount includes it.
 func (s *MessagesService) Comments(ctx context.Context, sessionID, chatID, messageID string) ([]CommentRecord, error) {
 	var out []CommentRecord
-	path := s.base(sessionID) + "/" + pathEscape(chatID) + "/" + pathEscape(messageID) + "/comments"
-	err := s.client.do(ctx, "GET", path, nil, nil, &out)
+	// Path inlined rather than held in a variable: the SDK coverage guard reads the verb and the
+	// path from the do() call itself, and a path this route shares with its POST is only checked
+	// per-verb when both are visible there.
+	err := s.client.do(ctx, "GET", s.base(sessionID)+"/"+pathEscape(chatID)+"/"+pathEscape(messageID)+"/comments", nil, nil, &out)
 	return out, err
+}
+
+// SendComment replies in a community announcement's thread.
+//
+// Not a quoted reply: that sends an ordinary message to the whole group, while this goes into the
+// thread behind the announcement's "N replies" and is seen only by whoever opens it.
+func (s *MessagesService) SendComment(ctx context.Context, sessionID, chatID, messageID string, body SendCommentRequest) (*SuccessResult, error) {
+	var out SuccessResult
+	err := s.client.do(ctx, "POST", s.base(sessionID)+"/"+pathEscape(chatID)+"/"+pathEscape(messageID)+"/comments", nil, body, &out)
+	return &out, err
 }
 
 // Pin pins a message in its chat for a bounded window.

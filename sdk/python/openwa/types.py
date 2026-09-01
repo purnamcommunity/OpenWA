@@ -598,7 +598,10 @@ class PollVoteRecord(TypedDict, total=False):
     voterPhone: str
 
 
-# ── Bulk ──────────────────────────────────────────────────────────
+class SendCommentRequest(TypedDict, total=False):
+    """A reply to post into a community announcement's thread."""
+
+    text: str
 
 
 class CommentRecord(TypedDict, total=False):
