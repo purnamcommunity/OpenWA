@@ -6440,9 +6440,12 @@ Reject a currently ringing incoming call. Only a live call can be rejected — t
 Place a voice or video call to a 1:1 chat. Returns once the offer is away — **not** when the other
 party answers; the outcome arrives as a `call.*` event.
 
-Calling needs a real capture device. A container has none by default, and WhatsApp aborts an
-outgoing call **before signalling** when no microphone exists, so this answers `403` on a gateway
-started without `VOIP_AUDIO_ENABLED=true` (see `.env.example`). A session carries **one call at a
+Calling needs two things the default container lacks. A **capture device** — WhatsApp aborts an
+outgoing call before signalling when no microphone exists — enabled with `VOIP_AUDIO_ENABLED=true`.
+And **SharedArrayBuffer**, because the VoIP stack is WebAssembly with a worker thread pool; a
+headless session is not reliably cross-origin isolated, so `--enable-features=SharedArrayBuffer`
+must be in `PUPPETEER_ARGS` or every call is refused with "VoIP initialization did not complete".
+Both are in `.env.example`; without either this answers `403`. A session carries **one call at a
 time** — WhatsApp Web's VoIP stack is a per-page singleton.
 
 **Auth:** API key (OPERATOR)
