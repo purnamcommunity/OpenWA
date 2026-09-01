@@ -20,6 +20,14 @@ export class ChatActivityPreviewDto {
   })
   senderId!: string;
 
+  @ApiProperty({
+    description:
+      'True when this account caused it. Answered by the engine because nothing else can: in a ' +
+      'group the account is an `@lid` sharing no digits with its own phone number.',
+    example: false,
+  })
+  isMe!: boolean;
+
   @ApiProperty({ description: 'Unix seconds.', example: 1700000010 })
   timestamp!: number;
 

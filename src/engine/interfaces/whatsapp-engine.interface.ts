@@ -556,6 +556,12 @@ export interface ChatActivityPreview {
   kind: 'comment' | 'reaction' | 'poll_vote' | (string & {});
   /** Who caused it (`@c.us`, or `@lid` when WhatsApp only reports a privacy id). */
   senderId: string;
+  /**
+   * True when this account caused it. Answered by the engine because nothing else can: in a group
+   * the account is an `@lid` sharing no digits with its own phone number, so a caller comparing ids
+   * could never render "You replied" correctly.
+   */
+  isMe: boolean;
   /** Unix seconds. */
   timestamp: number;
   /** The message the add-on hangs off, when the engine reports one. */

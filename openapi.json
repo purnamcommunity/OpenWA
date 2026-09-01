@@ -10650,6 +10650,11 @@
             "description": "Who caused it. May be an `@lid` privacy id, which carries no phone number.",
             "example": "628111@c.us"
           },
+          "isMe": {
+            "type": "boolean",
+            "description": "True when this account caused it. Answered by the engine because nothing else can: in a group the account is an `@lid` sharing no digits with its own phone number.",
+            "example": false
+          },
           "timestamp": {
             "type": "number",
             "description": "Unix seconds.",
@@ -10663,6 +10668,7 @@
         "required": [
           "kind",
           "senderId",
+          "isMe",
           "timestamp"
         ]
       },

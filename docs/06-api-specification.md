@@ -443,6 +443,7 @@ when the newest activity is an ordinary message, and on engines that do not mode
   "lastActivity": {
     "kind": "comment",
     "senderId": "234475837493478@lid",
+    "isMe": true,
     "timestamp": 1788256182,
     "parentMessageId": "false_120363@g.us_3EB0ABC_53331@lid"
   }
@@ -450,7 +451,10 @@ when the newest activity is an ordinary message, and on engines that do not mode
 ```
 
 `kind` is not a closed set: WhatsApp adds add-on types, and an unrecognised one is still a real
-event that moved the chat. `senderId` is often an `@lid` privacy id, which carries no phone number.
+event that moved the chat. `senderId` is often an `@lid` privacy id, which carries no phone number,
+which is why `isMe` is answered by the engine rather than left to a caller: in a group this account
+is a lid sharing no digits with its own number, so nothing outside the engine can match the two —
+and that is the difference between rendering "You replied" and someone else's name.
 
 **Errors:** `400` session not started · `401` · `403` · `404` session not found · `409` session not connected (also answered for a few seconds while WhatsApp Web reloads its page and the engine re-injects) · `503` page connection died mid-read
 
