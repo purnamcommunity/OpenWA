@@ -137,6 +137,18 @@ func (s *MessagesService) Reactions(ctx context.Context, sessionID, chatID, mess
 	return out, err
 }
 
+// Comments returns the replies posted on a community announcement, oldest first.
+//
+// These are add-ons on the announcement rather than chat messages, so they appear in no history
+// read. Answered from what the account stored locally, so a reply received while it was unlinked
+// may be missing even though the message's ReplyCount includes it.
+func (s *MessagesService) Comments(ctx context.Context, sessionID, chatID, messageID string) ([]CommentRecord, error) {
+	var out []CommentRecord
+	path := s.base(sessionID) + "/" + pathEscape(chatID) + "/" + pathEscape(messageID) + "/comments"
+	err := s.client.do(ctx, "GET", path, nil, nil, &out)
+	return out, err
+}
+
 // Pin pins a message in its chat for a bounded window.
 func (s *MessagesService) Pin(ctx context.Context, sessionID string, body PinMessageRequest) (*SuccessResult, error) {
 	var out SuccessResult

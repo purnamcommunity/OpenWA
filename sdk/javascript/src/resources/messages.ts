@@ -21,6 +21,7 @@ import type {
   MessageListResponse,
   MessageResponse,
   PinMessageRequest,
+  CommentRecord,
   ReactionRecord,
   ReactMessageRequest,
   ReplyMessageRequest,
@@ -179,6 +180,20 @@ export class MessagesResource {
     return this.client.request<ReactionRecord[]>({
       method: 'GET',
       path: `/api/sessions/${encodeSegment(sessionId)}/messages/${encodeSegment(chatId)}/${encodeSegment(messageId)}/reactions`,
+    });
+  }
+
+  /**
+   * Replies posted on a community announcement, oldest first.
+   *
+   * These are add-ons on the announcement, not chat messages, so they appear in no history read.
+   * Answered from what the account stored locally: a reply received while it was unlinked may be
+   * missing even though the message's `replyCount` includes it.
+   */
+  comments(sessionId: string, chatId: string, messageId: string): Promise<CommentRecord[]> {
+    return this.client.request<CommentRecord[]>({
+      method: 'GET',
+      path: `/api/sessions/${encodeSegment(sessionId)}/messages/${encodeSegment(chatId)}/${encodeSegment(messageId)}/comments`,
     });
   }
 

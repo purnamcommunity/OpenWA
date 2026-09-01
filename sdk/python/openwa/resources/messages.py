@@ -25,6 +25,7 @@ from ..types import (
     MessageHistoryQuery,
     MessageListResponse,
     MessageResponse,
+    CommentRecord,
     ReactionRecord,
     ReactMessageRequest,
     ReplyMessageRequest,
@@ -110,6 +111,17 @@ class MessagesResource:
     def reactions(self, session_id: str, chat_id: str, message_id: str) -> List[ReactionRecord]:
         return self._http.request(
             "GET", f"/api/sessions/{quote_segment(session_id)}/messages/{quote_segment(chat_id)}/{quote_segment(message_id)}/reactions"
+        )
+
+    def comments(self, session_id: str, chat_id: str, message_id: str) -> List[CommentRecord]:
+        """Replies on a community announcement, oldest first.
+
+        These are add-ons on the announcement rather than chat messages, so they appear in no
+        history read. Answered from what the account stored locally, so a reply received while it
+        was unlinked may be missing even though the message's ``replyCount`` includes it.
+        """
+        return self._http.request(
+            "GET", f"/api/sessions/{quote_segment(session_id)}/messages/{quote_segment(chat_id)}/{quote_segment(message_id)}/comments"
         )
 
     def pin(self, session_id: str, body: PinMessageRequest) -> SuccessResult:

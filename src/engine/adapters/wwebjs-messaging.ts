@@ -6,6 +6,7 @@ import {
   ContactCard,
   DeliveryStatus,
   MediaInput,
+  MessageComment,
   MessageReaction,
   MessageResult,
   PollInput,
@@ -19,8 +20,10 @@ import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import { chatKind, userPart } from '../identity/wa-id';
 import { chatHistoryMediaBudgetBytes, coerceDeclaredSize, ingestMediaBudgetBytes } from './inbound-media-cap';
 import { buildIncomingMessageBase } from './message-mapper';
+import { mapPageComments, probeMessageComments, type PageCommentResult } from './wwebjs-comments';
 import { buildVCard } from './vcard';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
+import { MessageCommentsUnavailableError } from '../../common/errors/message-comments-unavailable.error';
 import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
 import { type WwebjsEngineHost } from './wwebjs-host';
 
@@ -656,6 +659,56 @@ export class WwebjsMessaging {
       });
     }
     return result;
+  }
+
+  /**
+   * Replies on a community announcement.
+   *
+   * Read straight out of the page's add-on table, because whatsapp-web.js models none of this:
+   * WhatsApp stores announcement replies as add-ons on the parent message, so they are absent from
+   * `fetchMessages` and raise no message event (see `wwebjs-comments.ts`). The message itself is
+   * never fetched — the id already names its chat, and the announcement is usually far outside any
+   * affordable fetch window.
+   *
+   * A page whose add-on modules have been renamed reports unsupported rather than throwing, so a
+   * WhatsApp Web release that moves them degrades to "no reply thread here" instead of a 500.
+   */
+  async getMessageComments(chatId: string, messageId: string): Promise<MessageComment[]> {
+    this.host.ensureReady();
+
+    // The id carries its own chat (`fromMe_chat_id_participant`); a mismatch means the caller is
+    // asking the wrong conversation for this message, which is a not-found, not an empty thread.
+    const remote = messageId.split('_')[1];
+    if (remote && remote !== chatId) {
+      throw new MessageNotFoundError(messageId, chatId);
+    }
+
+    const page = (
+      this.client() as unknown as {
+        pupPage?: {
+          evaluate: <T, A>(fn: (arg: A) => T | Promise<T>, arg?: A) => Promise<T>;
+        };
+      }
+    ).pupPage;
+    if (!page) {
+      throw new MessageCommentsUnavailableError('the session has no page to read');
+    }
+
+    let result: PageCommentResult;
+    try {
+      result = await page.evaluate(probeMessageComments, messageId);
+    } catch (error) {
+      this.host.reportIfPageTransportError(error, 'getMessageComments');
+      throw error;
+    }
+
+    if ('unsupported' in result) {
+      this.host.logger.warn(
+        `Announcement replies are unavailable on this WhatsApp Web build: ${result.unsupported} is missing.`,
+      );
+      throw new MessageCommentsUnavailableError(result.unsupported);
+    }
+    return mapPageComments(messageId, result.comments);
   }
 
   async getChatHistory(

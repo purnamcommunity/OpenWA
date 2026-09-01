@@ -580,6 +580,18 @@ class ReactionRecord(TypedDict, total=False):
     senders: list[ReactionSender]
 
 
+class CommentRecord(TypedDict, total=False):
+    """One reply in a community announcement's reply thread (server returns MessageComment[])."""
+
+    id: str
+    parentMessageId: str
+    authorId: str
+    timestamp: int
+    body: str | None
+    revoked: bool
+    fromMe: bool
+
+
 # ── Bulk ──────────────────────────────────────────────────────────
 
 
