@@ -2,6 +2,8 @@ import { Controller, Post, Param, Body, HttpCode, HttpStatus } from '@nestjs/com
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
 import { CallAckResponseDto } from './dto/call-response.dto';
 import { CreateCallLinkDto } from './dto/create-call-link.dto';
+import { PlaceCallDto } from './dto/place-call.dto';
+import { PlaceCallResponseDto } from './dto/place-call-response.dto';
 import { CallLinkResponseDto } from './dto/call-link-response.dto';
 import { CallService } from './call.service';
 import { RequireRole } from '../auth/decorators/auth.decorators';
@@ -34,6 +36,86 @@ export class CallController {
   ): Promise<CallLinkResponseDto> {
     const link = await this.callService.createCallLink(sessionId, dto.type, dto.startTime);
     return { link };
+  }
+
+  @Post()
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Place a voice or video call',
+    description:
+      'Sends a call offer and returns once it is away — NOT when the other party answers; the ' +
+      'outcome arrives as a `call.*` event. The session must have a capture device ' +
+      '(VOIP_AUDIO_ENABLED), or the call connects carrying silence. One call per session at a time.',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Offer sent', type: PlaceCallResponseDto })
+  @ApiResponse({ status: 400, description: 'Session is not started, or an invalid chatId' })
+  @ApiResponse({
+    status: 403,
+    description: 'WhatsApp refused the call, the id is not callable, or this session is already on a call',
+  })
+  @ApiResponse({ status: 501, description: 'The active engine cannot place calls (Baileys has no media stack)' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async place(@Param('sessionId') sessionId: string, @Body() dto: PlaceCallDto): Promise<PlaceCallResponseDto> {
+    const callId = await this.callService.placeCall(sessionId, dto.chatId, dto.isVideo === true);
+    return { success: true, callId };
+  }
+
+  @Post('voip/warmup')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Boot the VoIP stack ahead of a call',
+    description:
+      "WhatsApp Web keeps VoIP in lazily-fetched chunks a headless session never loads on its own, " +
+      'so the first call of a session otherwise waits on that fetch. Idempotent.',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'The VoIP stack is running', type: CallAckResponseDto })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
+  @ApiResponse({ status: 403, description: 'VoIP initialization failed, or needs a session restart' })
+  @ApiResponse({ status: 501, description: 'The active engine has no VoIP stack (Baileys)' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async warmup(@Param('sessionId') sessionId: string) {
+    await this.callService.ensureVoipReady(sessionId);
+    return { success: true };
+  }
+
+  @Post(':callId/answer')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Answer a ringing incoming call' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'callId', description: 'Call ID from the call.received event' })
+  @ApiResponse({ status: 200, description: 'Call answered', type: CallAckResponseDto })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
+  @ApiResponse({ status: 403, description: 'The VoIP stack refused the answer' })
+  @ApiResponse({ status: 404, description: 'Call not found or no longer ringing' })
+  @ApiResponse({ status: 501, description: 'The active engine cannot answer calls (Baileys has no media stack)' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async answer(@Param('sessionId') sessionId: string, @Param('callId') callId: string) {
+    await this.callService.answerCall(sessionId, callId);
+    return { success: true };
+  }
+
+  @Post(':callId/end')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Hang up the call this session is on',
+    description: 'Ends a connected call. Use reject for one that is still ringing.',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'callId', description: 'Call ID from the call.received event or a placed call' })
+  @ApiResponse({ status: 200, description: 'Call ended', type: CallAckResponseDto })
+  @ApiResponse({ status: 400, description: 'Session is not started' })
+  @ApiResponse({ status: 403, description: 'The VoIP stack refused the hang-up, or no call is running' })
+  @ApiResponse({ status: 501, description: 'The active engine cannot end calls (Baileys has no media stack)' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async end(@Param('sessionId') sessionId: string, @Param('callId') callId: string) {
+    await this.callService.endCall(sessionId, callId);
+    return { success: true };
   }
 
   @Post(':callId/reject')

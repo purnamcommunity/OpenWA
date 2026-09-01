@@ -317,6 +317,30 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     evidence:
       "wwjs Call.reject() (index.d.ts:2417) on the live Call cached from the client 'call' event (index.d.ts:643); baileys rejectCall(callId, callFrom) (Socket/messages-recv.d.ts:10) with the raw `from` JID cached from the 'offer' call event (Types/Call.d.ts)",
   },
+  ensureVoipReady: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'not-available', rootCause: 'library-limitation' },
+    evidence:
+      "wwjs page module WAWebEnsureVoipInited.ensureVoipInitialized('call') pulls WAWebVoipBackendLoadable.requireVoipJsBackend() and calls WAWebVoipInit.initWAWebVoip; baileys has no browser page and no media stack (Socket/* exposes only rejectCall)",
+  },
+  placeCall: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'not-available', rootCause: 'library-limitation' },
+    evidence:
+      'wwjs page module WAWebVoipStartCall.startWAWebVoipCall(wid, isVideo, callFromUi) with the wid from WAWebWidFactory.createWid, guarded on WAWebCallCollection.pendingOutgoingCall/isInConnectedCall; baileys AnyMessageContent has no call offer and the socket carries no media',
+  },
+  answerCall: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'not-available', rootCause: 'library-limitation' },
+    evidence:
+      "wwjs page module WAWebVoipStackInterface.getVoipStackInterface().acceptCall(callId) on the 'web' stack — the same object the call UI's accept button drives (useWAWebVoipCallHandlers); baileys can signal accept but has no media stack to carry the audio, so an answered call would be silent",
+  },
+  endCall: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'not-available', rootCause: 'library-limitation' },
+    evidence:
+      'wwjs page module WAWebVoipStackInterface.getVoipStackInterface().endCall ?? .rejectCall() — takes no id because the stack holds one call; baileys rejectCall only ends a RINGING call, never a connected one',
+  },
   sendCatalog: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
     baileys: { status: 'not-available', rootCause: 'library-limitation' },

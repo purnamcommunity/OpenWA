@@ -1263,10 +1263,43 @@ export interface GroupCapability {
 }
 
 /**
- * Calls: rejecting a ringing call and generating call links. Call EVENTS arrive through
- * EngineEventCallbacks (onCall / onCallOutcome), not through this slice.
+ * Calls: placing, answering, ending and rejecting them, and generating call links. Call EVENTS
+ * arrive through EngineEventCallbacks (onCall / onCallOutcome), not through this slice.
+ *
+ * Placing and answering carry live audio, so they are supported only on an engine that drives a
+ * real browser AND on a deployment that gave that browser a capture device (VOIP_AUDIO_ENABLED).
+ * Baileys has no media stack at all and reports them not-available; a call it "answered" would
+ * connect to silence. A session carries ONE call at a time — WhatsApp Web's VOIP stack is a
+ * per-page singleton.
  */
 export interface CallCapability {
+  /**
+   * Boot the VoIP stack so a later placeCall/answerCall does not pay the first-boot cost. WhatsApp
+   * Web keeps VoIP in lazily-fetched chunks a headless session never loads on its own, so the first
+   * call on a session otherwise waits on that fetch. Idempotent: an already-running stack returns
+   * immediately.
+   */
+  ensureVoipReady(): Promise<void>;
+
+  /**
+   * Place a voice or video call to a 1:1 chat. Resolves when the offer is away — NOT when the other
+   * party answers; the outcome arrives later as a call event. Returns the engine's call id when the
+   * page exposes one, or null when the offer was sent but no id was readable yet.
+   *
+   * Rejected (403) when the session is already on a call, when the id is not callable, or when
+   * WhatsApp itself refuses. Fails 501 when the WhatsApp Web build exposes no VoIP module.
+   */
+  placeCall(chatId: string, isVideo: boolean): Promise<string | null>;
+
+  /**
+   * Answer a ringing incoming call. Like rejectCall, only a call still inside the ringing window is
+   * answerable — an unknown or expired callId fails with a not-found error (HTTP 404).
+   */
+  answerCall(callId: string): Promise<void>;
+
+  /** Hang up the call this session is on. */
+  endCall(callId: string): Promise<void>;
+
   /**
    * Reject an incoming call. Only a currently-ringing call can be rejected: the adapter keeps the
    * engine's live call handle (keyed by the `callId` from {@link IncomingCallEvent}) for the

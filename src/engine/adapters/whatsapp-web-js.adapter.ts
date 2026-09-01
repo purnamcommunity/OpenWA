@@ -60,6 +60,7 @@ import { WwebjsLifecycle } from './wwebjs-lifecycle';
 import { WwebjsReadyReconcile } from './wwebjs-reconcile';
 import { WwebjsStuckAuth } from './wwebjs-stuck-auth';
 import { WwebjsCalls } from './wwebjs-calls';
+import { WwebjsVoip } from './wwebjs-voip';
 import {
   capInboundMedia,
   coerceDeclaredSize,
@@ -154,6 +155,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private readonly reconcile: WwebjsReadyReconcile;
   private readonly stuckAuth: WwebjsStuckAuth;
   private readonly calls: WwebjsCalls;
+  private readonly voip: WwebjsVoip;
   private readonly onboardingWatcher: WwebjsOnboardingWatcher;
 
   // Connection-lifecycle state is owned by the lifecycle delegate (./wwebjs-lifecycle); these
@@ -224,6 +226,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.messaging = new WwebjsMessaging(this.host);
     this.contacts = new WwebjsContacts(this.host);
     this.profile = new WwebjsProfile(this.host);
+    this.voip = new WwebjsVoip(this.host);
     this.labels = new WwebjsLabels(this.host);
     this.channels = new WwebjsChannels(this.host);
     this.statuses = new WwebjsStatus(this.host);
@@ -542,6 +545,27 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    *  CallNotFoundError (HTTP 404). */
   async rejectCall(callId: string): Promise<void> {
     return this.calls.rejectCall(callId);
+  }
+
+  /** See ./wwebjs-voip — boots WhatsApp Web's lazily-chunked VoIP stack; idempotent. */
+  async ensureVoipReady(): Promise<void> {
+    return this.voip.ensureVoipReady();
+  }
+
+  /** See ./wwebjs-voip — resolves when the offer is away, not when it is answered. */
+  async placeCall(chatId: string, isVideo: boolean): Promise<string | null> {
+    return this.voip.placeCall(chatId, isVideo);
+  }
+
+  /** See ./wwebjs-voip — answerable only while still ringing, so the live-call cache decides
+   *  whether this is a 404, exactly as rejectCall does. */
+  async answerCall(callId: string): Promise<void> {
+    return this.voip.answerCall(callId, id => this.calls.liveCalls.has(id));
+  }
+
+  /** See ./wwebjs-voip. */
+  async endCall(callId: string): Promise<void> {
+    return this.voip.endCall(callId);
   }
 
   sendTextMessage(

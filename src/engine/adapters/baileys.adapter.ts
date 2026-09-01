@@ -772,6 +772,28 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return phone ? `${phone}@s.whatsapp.net` : '';
   }
 
+  /**
+   * Placing, answering and ending a call all need a media stack to carry the audio. Baileys is a
+   * socket client with none: it can signal a call (it already rejects one) but can never carry a
+   * voice stream, so a call it "answered" would connect to silence. Declining is the honest answer
+   * — see engine-capability-matrix.ts.
+   */
+  ensureVoipReady(): Promise<void> {
+    return this.unsupported('ensureVoipReady');
+  }
+
+  placeCall(): Promise<string | null> {
+    return this.unsupported('placeCall');
+  }
+
+  answerCall(): Promise<void> {
+    return this.unsupported('answerCall');
+  }
+
+  endCall(): Promise<void> {
+    return this.unsupported('endCall');
+  }
+
   private unsupported(method: string): Promise<any> {
     return Promise.reject(new EngineNotSupportedError(method));
   }
