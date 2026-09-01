@@ -99,6 +99,71 @@ describe('WwebjsVoip.ensureVoipReady', () => {
   });
 });
 
+describe('raw audio capture', () => {
+  /**
+   * Runs the real override against a fake navigator, then calls getUserMedia the way WhatsApp Web
+   * does and inspects what actually reached the browser. The point of the override is the
+   * constraints it rewrites, so anything less than that asserts nothing.
+   */
+  const withOverride = async (): Promise<{ seen: MediaStreamConstraints[]; media: { getUserMedia: (c?: MediaStreamConstraints) => Promise<MediaStream> } }> => {
+    const seen: MediaStreamConstraints[] = [];
+    const media = {
+      getUserMedia: (c?: MediaStreamConstraints) => {
+        seen.push(c as MediaStreamConstraints);
+        return Promise.resolve({} as MediaStream);
+      },
+    };
+    const page = {
+      browserContext: () => ({ overridePermissions: jest.fn() }),
+      evaluate: jest.fn(async (fn: (arg: unknown) => unknown, arg: unknown) => {
+        const prevNav = (globalThis as { navigator?: unknown }).navigator;
+        const prevWin = (globalThis as { window?: unknown }).window;
+        (globalThis as { navigator?: unknown }).navigator = { mediaDevices: media };
+        (globalThis as { window?: unknown }).window = {
+          require: () => ({ ensureVoipInitialized: () => Promise.resolve(undefined) }),
+        };
+        try {
+          return await fn(arg);
+        } finally {
+          (globalThis as { navigator?: unknown }).navigator = prevNav;
+          (globalThis as { window?: unknown }).window = prevWin;
+        }
+      }),
+    };
+    const { host } = hostWith(page);
+    await new WwebjsVoip(host).ensureVoipReady();
+    return { seen, media };
+  };
+
+  it('turns off the processing Chromium would apply to an already-processed signal', async () => {
+    const { media, seen } = await withOverride();
+    await media.getUserMedia({ audio: true });
+
+    // vmic is a digital loopback of audio the operator's browser already cleaned up; a second
+    // pass only gates out what survived the first, which is heard as a thin, hollow voice.
+    expect(seen[0].audio).toMatchObject({
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    });
+  });
+
+  it('keeps the constraints WhatsApp asked for that are not about processing', async () => {
+    const { media, seen } = await withOverride();
+    await media.getUserMedia({ audio: { deviceId: 'vmic', sampleRate: 48000 }, video: false });
+
+    expect(seen[0].audio).toMatchObject({ deviceId: 'vmic', sampleRate: 48000 });
+    expect(seen[0].video).toBe(false);
+  });
+
+  it('leaves a video-only request alone', async () => {
+    const { media, seen } = await withOverride();
+    await media.getUserMedia({ video: true });
+
+    expect(seen[0]).toEqual({ video: true });
+  });
+});
+
 describe('WwebjsVoip.placeCall', () => {
   it('refuses loudly when WhatsApp has web calling disabled for the account', async () => {
     // With enable_web_calling off, startWAWebVoipCall itself resolves while publishing NO call —

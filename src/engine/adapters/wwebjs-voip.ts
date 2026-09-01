@@ -52,6 +52,38 @@ function pageEnsureVoipReady(): Promise<PageResult> {
   );
 }
 
+/**
+ * Page function: capture the virtual microphone RAW.
+ *
+ * Chromium applies echo cancellation, noise suppression and automatic gain control to whatever
+ * `getUserMedia` returns. Every one of those is designed for a real room — an acoustic echo path,
+ * background noise, a microphone at an unknown distance. This container has none of that: `vmic`
+ * is a digital loopback of audio the operator's own browser has ALREADY echo-cancelled and
+ * noise-suppressed. Processing it a second time only takes away what survived the first pass,
+ * which is what a listener hears as a thin, hollow voice with quiet syllables gated out.
+ *
+ * There is no echo path to cancel either: Chromium's playback goes to a separate sink from the
+ * one `vmic` mirrors (see "Two sinks, not one"), so the far end cannot hear itself regardless.
+ *
+ * Applied by overriding the constraints WhatsApp Web asks for, because the request is made by
+ * WhatsApp's own code. Video constraints are passed through untouched. Idempotent: the override
+ * marks the function it installs, so re-running it does not wrap a wrapper.
+ */
+function pageRawAudioCapture(): { ok: true } {
+  const media = navigator.mediaDevices as MediaDevices & { __rawAudioPatched?: boolean };
+  if (media.__rawAudioPatched) return { ok: true };
+  const original = media.getUserMedia.bind(media);
+  media.getUserMedia = (constraints?: MediaStreamConstraints): Promise<MediaStream> => {
+    if (!constraints?.audio) return original(constraints);
+    const raw = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+    const audio =
+      typeof constraints.audio === 'object' ? { ...constraints.audio, ...raw } : raw;
+    return original({ ...constraints, audio });
+  };
+  media.__rawAudioPatched = true;
+  return { ok: true };
+}
+
 /** Page function: place a 1:1 call. `startWAWebVoipCall(wid, isVideo, callFromUi)` resolves once
  *  signalling is away; the id is read back from the collection because it returns none. */
 function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageResult<{ callId: string | null }>> {
@@ -298,6 +330,7 @@ export class WwebjsVoip {
   async ensureVoipReady(): Promise<void> {
     this.host.ensureReady();
     await this.grantMicrophone();
+    await this.useRawAudioCapture();
     await this.run('ensureVoipReady', pageEnsureVoipReady);
     this.host.logger.log('VoIP stack ready');
   }
@@ -320,6 +353,20 @@ export class WwebjsVoip {
       await context?.overridePermissions?.(WA_ORIGIN, ['microphone']);
     } catch (error) {
       this.host.logger.warn(`Could not grant the microphone to ${WA_ORIGIN}: ${String(error)}`);
+    }
+  }
+
+  /**
+   * Stop Chromium from processing the virtual microphone — see `pageRawAudioCapture`.
+   *
+   * Best-effort, like the permission grant: a page that refuses the override still carries the
+   * call, just with WhatsApp's default processing on an already-processed signal.
+   */
+  private async useRawAudioCapture(): Promise<void> {
+    try {
+      await this.page().evaluate(pageRawAudioCapture);
+    } catch (error) {
+      this.host.logger.warn(`Could not disable Chromium audio processing: ${String(error)}`);
     }
   }
 
