@@ -60,10 +60,14 @@ export function wwebjsAckToDeliveryStatus(ack: number): DeliveryStatus {
  * incoming call (`!fromMe`) with no recorded `callDuration` was never answered → missed; an outgoing
  * call is never "missed". Used by getChatHistory, where `call_log` entries actually appear.
  */
-export function extractWwebjsCall(msg: Message): { video: boolean; missed: boolean } | undefined {
+export function extractWwebjsCall(msg: Message): { video: boolean; missed: boolean; duration?: number } | undefined {
   if ((msg.type as string) !== 'call_log') return undefined;
   const d = (msg as unknown as { _data?: { isVideoCall?: boolean; callDuration?: number } })._data ?? {};
-  return { video: Boolean(d.isVideoCall), missed: !msg.fromMe && !d.callDuration };
+  // Seconds the call was connected for. Absent on a call that never connected, which is the same
+  // fact `missed` reports for an inbound one — an OUTGOING call nobody answered is not "missed"
+  // but has no duration either, so the two are not interchangeable.
+  const duration = typeof d.callDuration === 'number' && d.callDuration > 0 ? d.callDuration : undefined;
+  return { video: Boolean(d.isVideoCall), missed: !msg.fromMe && !d.callDuration, ...(duration ? { duration } : {}) };
 }
 
 /**
