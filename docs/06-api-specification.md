@@ -6411,6 +6411,102 @@ Reject a currently ringing incoming call. Only a live call can be rejected — t
 
 > **Auto-reject per session.** Set `"config": { "autoRejectCalls": true }` when creating a session to have the server reject every incoming call automatically — the `call.received` event is still dispatched first, so automations keep full visibility.
 
+#### POST /api/sessions/:sessionId/calls
+
+Place a voice or video call to a 1:1 chat. Returns once the offer is away — **not** when the other
+party answers; the outcome arrives as a `call.*` event.
+
+Calling needs a real capture device. A container has none by default, and WhatsApp aborts an
+outgoing call **before signalling** when no microphone exists, so this answers `403` on a gateway
+started without `VOIP_AUDIO_ENABLED=true` (see `.env.example`). A session carries **one call at a
+time** — WhatsApp Web's VoIP stack is a per-page singleton.
+
+**Auth:** API key (OPERATOR)
+
+**Path parameters**
+
+| Name      | Type   | Description |
+| --------- | ------ | ----------- |
+| sessionId | string | Session ID  |
+
+**Request body**
+
+| Field   | Type    | Required | Description                                                          |
+| ------- | ------- | -------- | -------------------------------------------------------------------- |
+| chatId  | string  | yes      | 1:1 user id ending in `@c.us`. Group calls are not offered here       |
+| isVideo | boolean | no       | Place a video call rather than voice (default `false`)                |
+
+**Response** `200` — `{ "success": true, "callId": "A1B2C3" }`. `callId` is `null` when the offer
+went out but WhatsApp had not yet published an id — it then arrives on the next `call.*` event.
+
+**Errors:** `400` session is not started, or an invalid `chatId` · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, WhatsApp refused the call, the id is not callable, or this session is already on a call · `409` conflict or engine not ready (retryable) · `501` the active engine cannot place calls (Baileys has no media stack) · `503` session not ready or dependency unavailable (retryable)
+
+#### POST /api/sessions/:sessionId/calls/voip/warmup
+
+Boot the VoIP stack ahead of a call. WhatsApp Web keeps VoIP in lazily-fetched chunks a headless
+session never loads on its own, so the first call of a session otherwise waits on that fetch.
+Idempotent — an already-running stack returns immediately.
+
+**Auth:** API key (OPERATOR)
+
+**Path parameters**
+
+| Name      | Type   | Description |
+| --------- | ------ | ----------- |
+| sessionId | string | Session ID  |
+
+**Request body** — none.
+
+**Response** `200` — `{ "success": true }`
+
+**Errors:** `400` session is not started · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, VoIP initialization failed, or it needs a session restart · `409` conflict or engine not ready (retryable) · `501` the active engine has no VoIP stack (Baileys) · `503` session not ready or dependency unavailable (retryable)
+
+#### POST /api/sessions/:sessionId/calls/:callId/answer
+
+Answer a ringing incoming call. Like reject, only a call still inside the ringing window can be
+answered. The VoIP stack answers the one call it holds, so the id is checked against the currently
+ringing call and a stale id is refused rather than silently answering a different call.
+
+**Auth:** API key (OPERATOR)
+
+**Path parameters**
+
+| Name      | Type   | Description                            |
+| --------- | ------ | -------------------------------------- |
+| sessionId | string | Session ID                             |
+| callId    | string | Call ID from the `call.received` event |
+
+**Request body**
+
+| Field     | Type    | Required | Description                                             |
+| --------- | ------- | -------- | ------------------------------------------------------- |
+| withVideo | boolean | no       | Answer with video as well as audio (default `false`)     |
+
+**Response** `200` — `{ "success": true }`
+
+**Errors:** `400` session is not started · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, or the VoIP stack refused the answer · `404` call not found or no longer ringing · `409` conflict or engine not ready (retryable) · `501` the active engine cannot answer calls (Baileys has no media stack) · `503` session not ready or dependency unavailable (retryable)
+
+#### POST /api/sessions/:sessionId/calls/:callId/end
+
+Hang up the call this session is on. Use reject for a call that is still ringing; this ends a
+connected one and notifies the peer, so the far end stops rather than continuing to ring.
+
+**Auth:** API key (OPERATOR)
+
+**Path parameters**
+
+| Name      | Type   | Description                                              |
+| --------- | ------ | -------------------------------------------------------- |
+| sessionId | string | Session ID                                               |
+| callId    | string | Call ID from the `call.received` event or a placed call  |
+
+**Request body** — none.
+
+**Response** `200` — `{ "success": true }`
+
+**Errors:** `400` session is not started · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, the VoIP stack refused the hang-up, or no call is running · `409` conflict or engine not ready (retryable) · `501` the active engine cannot end calls (Baileys has no media stack) · `503` session not ready or dependency unavailable (retryable)
+
+
 ### 6.4.15 Media conversion (opt-in)
 
 Server-side transcoding into the shapes WhatsApp clients actually play. Disabled by default; set

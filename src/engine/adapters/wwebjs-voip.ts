@@ -46,8 +46,8 @@ function pageEnsureVoipReady(): Promise<PageResult> {
       // decision that belongs to the operator, not to a retry loop here.
       const name = (error as { name?: string })?.name ?? '';
       return name === 'VoipInitUnavailableError'
-        ? ({ refused: 'VoIP initialization requires a page reload' } as PageResult)
-        : ({ refused: `VoIP initialization failed: ${String(error)}` } as PageResult);
+        ? { refused: 'VoIP initialization requires a page reload' }
+        : { refused: `VoIP initialization failed: ${String(error)}` };
     },
   );
 }
@@ -64,8 +64,7 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
   };
   const startMod = req('WAWebVoipStartCall');
   const start = startMod?.startWAWebVoipCall as
-    | ((wid: unknown, isVideo: boolean, callFromUi: number) => Promise<void>)
-    | undefined;
+    ((wid: unknown, isVideo: boolean, callFromUi: number) => Promise<void>) | undefined;
   const widFactory = req('WAWebWidFactory');
   const createWid = widFactory?.createWid as ((jid: string) => unknown) | undefined;
   const calls = req('WAWebCallCollection');
@@ -91,10 +90,16 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
   // 0 = "not from the UI" in the call-origin enum the outgoing QPL logs.
   return start(wid, arg.isVideo, 0).then(
     () => {
-      const active = (calls?.lastActiveCall ?? null) as { id?: string } | null;
-      return { ok: true, callId: active?.id ?? null } as PageResult<{ callId: string | null }>;
+      // Narrowed inline rather than through a shared helper: this function is serialized into the
+      // page, so it cannot close over anything in this module.
+      const active: unknown = calls?.lastActiveCall;
+      const id =
+        typeof active === 'object' && active !== null && typeof (active as { id?: unknown }).id === 'string'
+          ? (active as { id: string }).id
+          : null;
+      return { ok: true, callId: id };
     },
-    (error: unknown) => ({ refused: `WhatsApp refused the call: ${String(error)}` }) as PageResult<{ callId: string | null }>,
+    (error: unknown) => ({ refused: `WhatsApp refused the call: ${String(error)}` }),
   );
 }
 
@@ -107,11 +112,7 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
  * for is therefore checked against the collection's active call first — without that, answering a
  * stale id would silently answer a different call.
  */
-function pageCallAction(arg: {
-  action: 'accept' | 'end';
-  callId: string;
-  withVideo: boolean;
-}): Promise<PageResult> {
+function pageCallAction(arg: { action: 'accept' | 'end'; callId: string; withVideo: boolean }): Promise<PageResult> {
   const req = (name: string): Record<string, unknown> | undefined => {
     try {
       return (window as unknown as { require: (n: string) => Record<string, unknown> }).require(name);
@@ -125,37 +126,41 @@ function pageCallAction(arg: {
     return Promise.resolve({ unsupported: 'WAWebVoipStackInterface.getVoipStackInterface' });
   }
   return get().then(
-    (iface) => {
-      if (iface == null) return { refused: 'the VoIP stack is not running' } as PageResult;
-      if (iface.type !== 'web') return { unsupported: `voip stack type ${String(iface.type)}` } as PageResult;
+    iface => {
+      if (iface == null) return { refused: 'the VoIP stack is not running' };
+      if (iface.type !== 'web') return { unsupported: `voip stack type ${String(iface.type)}` };
 
       if (arg.action === 'accept') {
         // The stack answers the call it holds, so make sure that is the one asked for.
-        const active = (req('WAWebCallCollection')?.activeCall ?? null) as { id?: string } | null;
-        if (active?.id != null && active.id !== arg.callId) {
-          return { refused: `call ${arg.callId} is no longer the ringing call` } as PageResult;
+        const active: unknown = req('WAWebCallCollection')?.activeCall;
+        const activeId =
+          typeof active === 'object' && active !== null && typeof (active as { id?: unknown }).id === 'string'
+            ? (active as { id: string }).id
+            : null;
+        if (activeId !== null && activeId !== arg.callId) {
+          return { refused: `call ${arg.callId} is no longer the ringing call` };
         }
         const accept = iface.acceptCall as ((withAudio: boolean, withVideo: boolean) => Promise<unknown>) | undefined;
-        if (typeof accept !== 'function') return { unsupported: 'voipStackInterface.acceptCall' } as PageResult;
+        if (typeof accept !== 'function') return { unsupported: 'voipStackInterface.acceptCall' };
         // Answer unmuted; video only when the caller asked for it.
         return accept(true, arg.withVideo).then(
           () => ({ ok: true }) as PageResult,
-          (e: unknown) => ({ refused: `accept failed: ${String(e)}` }) as PageResult,
+          (e: unknown) => ({ refused: `accept failed: ${String(e)}` }),
         );
       }
 
       const end = iface.endCall as ((reason: number, notifyPeer: boolean) => Promise<unknown>) | undefined;
-      if (typeof end !== 'function') return { unsupported: 'voipStackInterface.endCall' } as PageResult;
+      if (typeof end !== 'function') return { unsupported: 'voipStackInterface.endCall' };
       // EndCallReason.Self — this side hung up. The trailing true tells the peer, which is what the
       // UI's own hang-up passes; without it the other end keeps ringing.
       const reasons = req('WAWebVoipSignalingEnums')?.EndCallReason as Record<string, number> | undefined;
       const self = typeof reasons?.Self === 'number' ? reasons.Self : 2;
       return end(self, true).then(
         () => ({ ok: true }) as PageResult,
-        (e: unknown) => ({ refused: `end failed: ${String(e)}` }) as PageResult,
+        (e: unknown) => ({ refused: `end failed: ${String(e)}` }),
       );
     },
-    (e: unknown) => ({ refused: `the VoIP stack could not be reached: ${String(e)}` }) as PageResult,
+    (e: unknown) => ({ refused: `the VoIP stack could not be reached: ${String(e)}` }),
   );
 }
 
@@ -169,7 +174,9 @@ export class WwebjsVoip {
   private page(): EvaluatablePage {
     const page = (this.host.getClient() as unknown as { pupPage?: EvaluatablePage }).pupPage;
     if (!page) {
-      throw new EngineNotSupportedError('the session has no page to place a call from');
+      // A literal condition rather than an interpolated message: the parity fence keys throw sites
+      // on their literal, and the detail belongs in logs anyway.
+      throw new EngineNotSupportedError('voipCall(no page)');
     }
     return page;
   }
@@ -177,8 +184,12 @@ export class WwebjsVoip {
   /** Unwrap a page result, mapping the two failure shapes onto the errors the HTTP layer maps. */
   private unwrap<T>(result: PageResult<T>, context: string): PageOk<T> {
     if ('unsupported' in result) {
-      this.host.logger.warn(`Calling is unavailable on this WhatsApp Web build: ${result.unsupported} is missing.`);
-      throw new EngineNotSupportedError(`${context}: this WhatsApp Web build exposes no ${result.unsupported}`);
+      // The missing symbol is logged rather than interpolated into the error: the parity fence
+      // requires a literal, and a per-build symbol name would register as a pseudo-method anyway.
+      this.host.logger.warn(
+        `Calling is unavailable on this WhatsApp Web build: ${result.unsupported} is missing (during ${context}).`,
+      );
+      throw new EngineNotSupportedError('voipCall(module missing)');
     }
     if ('refused' in result) {
       throw new EngineRefusedError(result.refused);
@@ -186,14 +197,10 @@ export class WwebjsVoip {
     return result;
   }
 
-  private async run<T>(
-    context: string,
-    fn: (arg: never) => Promise<PageResult<T>>,
-    arg?: unknown,
-  ): Promise<PageOk<T>> {
+  private async run<T>(context: string, fn: (arg: never) => Promise<PageResult<T>>, arg?: unknown): Promise<PageOk<T>> {
     let result: PageResult<T>;
     try {
-      result = await this.page().evaluate(fn as never, arg as never);
+      result = await this.page().evaluate(fn, arg as never);
     } catch (error) {
       this.host.reportIfPageTransportError(error, context);
       throw error;

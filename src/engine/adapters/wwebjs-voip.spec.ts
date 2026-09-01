@@ -66,6 +66,12 @@ const readyModules = (over: Partial<Modules> = {}): Modules => ({
   ...over,
 });
 
+/** The acceptCall spy on the stack interface the modules hand back. */
+const acceptCallOf = async (mods: Modules): Promise<jest.Mock> => {
+  const get = mods.WAWebVoipStackInterface!.getVoipStackInterface as () => Promise<Record<string, unknown>>;
+  return (await get()).acceptCall as jest.Mock;
+};
+
 describe('WwebjsVoip.ensureVoipReady', () => {
   it('boots the stack through the same entry point the call button uses', async () => {
     const mods = readyModules();
@@ -174,17 +180,14 @@ describe('WwebjsVoip.answerCall', () => {
     const { host } = hostWith(pageWith(mods));
 
     await expect(new WwebjsVoip(host).answerCall('CALL1', () => true)).resolves.toBeUndefined();
-    const iface = await (mods.WAWebVoipStackInterface!.getVoipStackInterface as jest.Mock)();
     // The stack answers the one call it holds, so acceptCall takes flags, never an id.
-    expect(iface.acceptCall).toHaveBeenCalledWith(true, false);
+    expect(await acceptCallOf(mods)).toHaveBeenCalledWith(true, false);
   });
 
   it('answers with video when asked', async () => {
     const mods = readyModules();
     await new WwebjsVoip(hostWith(pageWith(mods)).host).answerCall('CALL1', () => true, true);
-    const iface = await (mods.WAWebVoipStackInterface!.getVoipStackInterface as jest.Mock)();
-
-    expect(iface.acceptCall).toHaveBeenCalledWith(true, true);
+    expect(await acceptCallOf(mods)).toHaveBeenCalledWith(true, true);
   });
 
   it('refuses when the ringing call is no longer the one asked for', async () => {

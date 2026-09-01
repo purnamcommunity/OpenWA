@@ -1,13 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { spawn, type ChildProcessByStdio } from 'child_process';
 import type { Readable, Writable } from 'stream';
-import {
-  FRAME_BYTES,
-  MAX_MIC_BACKLOG_BYTES,
-  PCM_CHANNELS,
-  PCM_FORMAT,
-  PCM_SAMPLE_RATE,
-} from './voip-audio.constants';
+import { FRAME_BYTES, MAX_MIC_BACKLOG_BYTES, PCM_CHANNELS, PCM_FORMAT, PCM_SAMPLE_RATE } from './voip-audio.constants';
 
 /**
  * Carries a call's audio between the operator's browser and the gateway's headless Chromium.

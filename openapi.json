@@ -6521,6 +6521,16 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnswerCallDto"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Call answered",
@@ -15555,6 +15565,17 @@
         "required": [
           "success"
         ]
+      },
+      "AnswerCallDto": {
+        "type": "object",
+        "properties": {
+          "withVideo": {
+            "type": "boolean",
+            "description": "Answer with video as well as audio. Defaults to audio only — a video answer additionally needs a camera device in the container, and without one the call is answered sending no video.",
+            "example": false,
+            "default": false
+          }
+        }
       },
       "LabelDto": {
         "type": "object",

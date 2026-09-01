@@ -83,6 +83,10 @@ const ANY_THROW_SITE_RE = /(?:new EngineNotSupportedError|this\.unsupported)\(/;
 const CONDITIONAL_THROW_SITES: Readonly<Record<string, string>> = {
   'sendTextMessage(customPreview)':
     'wwjs sendTextMessage is supported; it refuses only when customPreview is passed, because whatsapp-web.js takes a boolean linkPreview and cannot represent a custom card',
+  'voipCall(no page)':
+    'wwjs placeCall/answerCall/endCall are supported; they refuse only when the session has no puppeteer page to reach the VoIP stack through, which is a lifecycle state rather than a missing capability',
+  'voipCall(module missing)':
+    'wwjs placeCall/answerCall/endCall are supported; they refuse only when the running WhatsApp Web build exposes no VoIP module, which is a per-build condition — the missing symbol is logged, not thrown, so the literal stays stable',
 };
 
 function readDelegateThrows(): Record<string, Set<string>> {

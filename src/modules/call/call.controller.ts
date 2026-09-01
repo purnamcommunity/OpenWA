@@ -69,7 +69,7 @@ export class CallController {
   @ApiOperation({
     summary: 'Boot the VoIP stack ahead of a call',
     description:
-      "WhatsApp Web keeps VoIP in lazily-fetched chunks a headless session never loads on its own, " +
+      'WhatsApp Web keeps VoIP in lazily-fetched chunks a headless session never loads on its own, ' +
       'so the first call of a session otherwise waits on that fetch. Idempotent.',
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })

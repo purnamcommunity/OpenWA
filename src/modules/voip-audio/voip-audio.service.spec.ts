@@ -62,9 +62,7 @@ describe('VoipAudioService topology', () => {
     expect(out().command).toBe('parec');
     expect(out().args).toContain('--device=outsink.monitor');
     // One shared sink would loop Chromium's own playback back into its microphone.
-    expect(mic().args.find(a => a.startsWith('--device='))).not.toBe(
-      out().args.find(a => a.startsWith('--device=')),
-    );
+    expect(mic().args.find(a => a.startsWith('--device='))).not.toBe(out().args.find(a => a.startsWith('--device=')));
   });
 
   it('pins the same PCM format on both pipes', () => {
