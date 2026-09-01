@@ -2084,6 +2084,7 @@ describe('SessionService', () => {
       delete process.env.AUTO_START_SESSIONS;
     });
     afterEach(() => {
+      delete process.env.SESSION_AUTOSTART_THROTTLE_MS;
       if (originalFlag === undefined) delete process.env.AUTO_START_SESSIONS;
       else process.env.AUTO_START_SESSIONS = originalFlag;
     });
@@ -5921,6 +5922,12 @@ describe('SessionService', () => {
 
     const originalFlag = process.env.AUTO_START_SESSIONS;
 
+    // The inter-launch throttle is a real sleep between sessions. These tests assert WHAT gets
+    // started, not how it is paced, so it is off here — the pacing has its own tests below.
+    beforeEach(() => {
+      process.env.SESSION_AUTOSTART_THROTTLE_MS = '0';
+    });
+
     afterEach(async () => {
       if (originalFlag === undefined) delete process.env.AUTO_START_SESSIONS;
       else process.env.AUTO_START_SESSIONS = originalFlag;
@@ -5949,6 +5956,43 @@ describe('SessionService', () => {
       await autoStartRun();
 
       expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it('paces the launches apart, so two browsers never cold-start on top of each other', async () => {
+      // Concurrent cold starts starve each other on a small host; the readiness watchdog then
+      // reloads a still-attaching page and WhatsApp unlinks the device over it. A small value
+      // here keeps the test quick — what matters is that the second launch waits for the first.
+      process.env.SESSION_AUTOSTART_THROTTLE_MS = '80';
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([
+        { id: 'a', name: 'A' },
+        { id: 'b', name: 'B' },
+      ]);
+      const startedAt: number[] = [];
+      jest.spyOn(service, 'start').mockImplementation(async () => {
+        startedAt.push(Date.now());
+        return undefined as never;
+      });
+
+      service.onApplicationBootstrap();
+      await autoStartRun();
+
+      expect(startedAt).toHaveLength(2);
+      expect(startedAt[1] - startedAt[0]).toBeGreaterThanOrEqual(70);
+    });
+
+    it('does not pace the very first launch — nothing is competing with it yet', async () => {
+      process.env.SESSION_AUTOSTART_THROTTLE_MS = '5000';
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([{ id: 'only', name: 'Only' }]);
+      const startSpy = jest.spyOn(service, 'start').mockResolvedValue(undefined as never);
+
+      const began = Date.now();
+      service.onApplicationBootstrap();
+      await autoStartRun();
+
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(Date.now() - began).toBeLessThan(1000);
     });
 
     it('auto-starts every previously-authenticated session', async () => {

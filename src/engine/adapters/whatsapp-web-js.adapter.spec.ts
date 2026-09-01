@@ -1872,7 +1872,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     (adapter as unknown as { clearLocalAuth: unknown }).clearLocalAuth = clearLocalAuth;
 
     client.emit('authenticated');
-    await jest.advanceTimersByTimeAsync(91_000);
+    await jest.advanceTimersByTimeAsync(READY_RECONCILE_TIMEOUT_MS + 1_000);
 
     // The link itself is healthy — wiping the only copy of the credentials would trade a
     // restart-fixable fault for a forced re-pair. FAILED with the reason, auth left alone.
@@ -2036,14 +2036,14 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     const { client } = attachFakeClient(adapter, { pupPage: { evaluate: jest.fn().mockResolvedValue(false) } });
 
     client.emit('authenticated');
-    await jest.advanceTimersByTimeAsync(80_000);
+    await jest.advanceTimersByTimeAsync(READY_RECONCILE_TIMEOUT_MS - 10_000);
     expect(adapter.getStatus()).toBe(EngineStatus.AUTHENTICATING);
 
-    client.emit('authenticated'); // re-fire 80s in — must not restart the window
-    await jest.advanceTimersByTimeAsync(11_000); // 91s total since the FIRST authenticated
+    client.emit('authenticated'); // re-fire near the end — must not restart the window
+    await jest.advanceTimersByTimeAsync(11_000); // now past the deadline since the FIRST authenticated
 
     expect(adapter.getStatus()).toBe(EngineStatus.AUTHENTICATING);
-    expect(jest.getTimerCount()).toBe(0); // gave up at 90s; not reset by the re-fire
+    expect(jest.getTimerCount()).toBe(0); // gave up at the deadline; not reset by the re-fire
   });
 
   // beginClientTeardown sets DISCONNECTED before the awaited destroy/logout; an 'authenticated' event
@@ -2333,12 +2333,12 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     (adapter as unknown as { callbacks: { onDisconnected?: jest.Mock } }).callbacks.onDisconnected = onDisconnected;
 
     client.emit('authenticated');
-    await jest.advanceTimersByTimeAsync(50_000);
+    await jest.advanceTimersByTimeAsync(READY_RECONCILE_TIMEOUT_MS - 10_000);
     expect(jest.getTimerCount()).toBe(1); // chain still alive despite the hung probe
 
-    await jest.advanceTimersByTimeAsync(45_000); // ~95s total
+    await jest.advanceTimersByTimeAsync(15_000); // now past the deadline
     expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED); // never falsely promoted; self-healed
-    expect(jest.getTimerCount()).toBe(0); // gave up at the 90s deadline
+    expect(jest.getTimerCount()).toBe(0); // gave up at the deadline
     expect(client.getState).toHaveBeenCalledTimes(1); // at-most-one-in-flight guard held
     // Self-heal: the broken auth is cleared and a disconnect surfaced so the lifecycle re-pairs (QR).
     expect(rmSpy).toHaveBeenCalledWith(expect.stringContaining('session-sess-1'), {
@@ -2388,7 +2388,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     });
 
     client.emit('authenticated');
-    await jest.advanceTimersByTimeAsync(95_000); // past the 90s give-up deadline
+    await jest.advanceTimersByTimeAsync(READY_RECONCILE_TIMEOUT_MS + 5_000); // past the give-up deadline
 
     const timeout = warnSpy.mock.calls.find(([message]) => /Timed out waiting/i.test(String(message)));
     expect(timeout).toBeDefined();
