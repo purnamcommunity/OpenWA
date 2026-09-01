@@ -154,7 +154,7 @@ export class WwebjsChats {
    * Resolving the chat first turns that into the 400 the contract already promises. It deliberately
    * does NOT wrap the pin/mute call itself: a page-side rejection for a chat that DOES exist is the
    * one signal a renamed page internal produces, and demoting it to "bad input" would hide a total
-   * capability failure — the shape `createGroup` turned out to have. `getChatById` is the same
+   * capability failure. `getChatById` is the same
    * resolution five neighbours here already trust, and it reports an unknown chat either way it can,
    * by resolving undefined or by rejecting.
    */

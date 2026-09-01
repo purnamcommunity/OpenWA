@@ -104,8 +104,8 @@ describe('WwebjsChats.muteChat', () => {
   /**
    * The other half of the same fix, and the reason the guard resolves the chat instead of wrapping
    * the mute call: a page-side rejection for a chat that DOES exist is exactly what a renamed page
-   * internal produces, and that is how `createGroup` was caught. Demoting it to 400 would relabel a
-   * dead capability as the caller's bad input.
+   * internal produces, and that is how a capability whose page module has moved gets caught. Demoting
+   * it to 400 would relabel a dead capability as the caller's bad input.
    */
   it('a page failure on a chat that DOES resolve stays a server error, not a 400', async () => {
     const { chats, client } = makeChats();

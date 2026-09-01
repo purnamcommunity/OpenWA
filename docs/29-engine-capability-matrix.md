@@ -294,7 +294,7 @@ socket is caught by the transport instead. No REST route: the session watchdog p
 
 | Method                           | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST     |
 | -------------------------------- | ------------------- | ---------------- | --------------- |
-| `createGroup`                    | ✅                  | ❌               | ✅              |
+| `createGroup`                    | ✅                  | ✅               | ✅              |
 | `getGroups`                      | ✅                  | ✅               | ✅              |
 | `getGroupInfo`                   | ✅                  | ✅               | ✅              |
 | `addParticipants`                | ✅                  | ✅               | ✅              |
@@ -389,8 +389,8 @@ answers 501.
 | `rejectCall`          | ✅                  | ✅               | ✅              |
 | `createCallLink`      | ✅                  | ✅               | ✅              |
 
-**Totals:** 113 methods → 226 adapter cells: **200 ✅, 26 ❌** (2 adapter-gaps, 24
-library-limitations, 0 uncertain) across 25 methods. From the REST caller's side: **90** methods
+**Totals:** 113 methods → 226 adapter cells: **201 ✅, 25 ❌** (2 adapter-gaps, 23
+library-limitations, 0 uncertain) across 24 methods. From the REST caller's side: **91** methods
 work on any engine (89 fully supported + 2 store-backed status reads), **11** are Baileys-only,
 **10** are wwjs-only (the 2 store-backed rows excluded); `sendCatalog`, unavailable on both engines,
 is not exposed.
@@ -679,7 +679,7 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 | -------------------------------- | ----------------------------------- |
 | `acceptInvite`                   | ✅ `joinGroupViaInviteCode`         |
 | `approveGroupMembershipRequests` | ✅ `approveGroupMembershipRequests` |
-| `createGroup`                    | ❌ not-available (29.6.2)           |
+| `createGroup`                    | ✅ `createGroup`                    |
 | `getCommonGroups`                | ❌ **not exposed**                  |
 | `getGroupMembershipRequests`     | ✅ `getGroupMembershipRequests`     |
 | `getInviteInfo`                  | ✅ `getGroupJoinInfo`               |
@@ -853,12 +853,11 @@ adapter boundary — none silently stubs.
 | `votePoll`              | lib   | No vote-send helper at all; the library only _decrypts incoming_ votes (`decryptPollVote`). Sending needs a hand-built `proto.Message.PollUpdateMessage` with HMAC-SHA256 encryption keyed by the poll creation's `messageSecret`.                                                                                                                       |
 | `getPollVotes`          | lib   | Same root cause from the read side: an incoming poll update arrives encrypted and `decryptPollVote` needs the poll creation's `messageSecret`, so the library keeps no decrypted vote table to read back. WhatsApp Web stores one (`WAWebPollsVotesSchema`), which is why the wwjs cell is ✅.                                                           |
 
-### 29.6.2 wwjs adapter (13 cells)
+### 29.6.2 wwjs adapter (12 cells)
 
 | Method                     | Cause | What's missing (evidence)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | -------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `subscribeToChannel`       | gap   | `Client.subscribeToChannel(channelId)` (`Client.js:2542`) takes a channel **id** and resolves a boolean — it cannot satisfy the subscribe-by-invite-code contract alone. Correct wiring is two-step: `getChannelByInviteCode(inviteCode)` (`Client.js:1716`) → `subscribeToChannel(channel.id)`, unverified against a live session (the previous one-step call was a phantom success). The one remaining wwjs adapter-gap.                                                                                                                                                                                                                                                                                                                     |
-| `createGroup`              | lib   | `Client.createGroup` exists and is typed `Promise<CreateGroupResult \| string>`, but its injected evaluate reaches a WhatsApp Web internal that no longer exposes `findImpl` (`Client.js:2325`). Measured live on **two** builds — `2.3000.1044858477-alpha` auto-resolved and `2.3000.1044770897-alpha` pinned — both `TypeError: this.findImpl is not a function`, reaching the caller as a bare 500. Bare and `@c.us`-qualified participant ids fail identically, so the id shape is not the variable; varying the build is what separates this from registry pin drift. `findImpl` is in neither the installed `Client.js` nor any OpenWA patcher, so it belongs to the page and cannot be patched around. Baileys serves this capability. |
 | `demoteChannelAdmin`       | lib   | `Client.demoteChannelAdmin` exists (`index.d.ts:35`) but its page body calls `window.require('WAWebDemoteNewsletterAdminAction').demoteNewsletterAdmin` (`Client.js:1907-1925`), and a module probe on a live session (Web `2.3000.1044824727-alpha`, unpinned) returned that module resolving with `demoteNewsletterAdmin: undefined`. The sibling path used inside `transferChannelOwnership` (`WAWebNewsletterDemoteAdminJob.demoteNewsletterAdminAction`) is undefined too, so there is nothing to retarget. Baileys serves this capability.                                                                                                                                                                                               |
 | `transferChannelOwnership` | lib   | `Client.transferChannelOwnership` exists (`index.d.ts:375`) and its page function `WAWebChangeNewsletterOwnerAction.changeNewsletterOwnerAction` is present, but on Web `2.3000.1044824727-alpha` it rejects every call **locally** with `contact-not-found-in-newsletter-subscriber-list` — 4-9ms against a 352-531ms known-server baseline measured in the same page, so it never reaches WhatsApp. Unchanged by subscribing the target, promoting it to admin, or restarting the session; the only repopulation path, `WAWebCollections.NewsletterMetadataCollection.update`, is `undefined`. Baileys serves this capability.                                                                                                               |
 | `upsertLabel`              | lib   | 1.34.7 reads labels and assigns them (`getLabels`, `getLabelById`, `getChatLabels`, `getChatsByLabelId`, `addOrRemoveLabels`, `index.d.ts:129-154`) but exposes nothing that creates/edits a label definition.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -951,20 +950,20 @@ adapter boundary — none silently stubs.
 Recomputed from `engine-capability-matrix.ts`, `upstream-surface.snapshot.json`, and a scan of the
 adapter sources — re-derive the same way when anything changes:
 
-- **113** interface methods → **226** adapter cells: **200 ✅** / **26 ❌** (2 adapter-gaps, 24
-  library-limitations, 0 uncertain), spanning **25** methods.
-- Of the 200 ✅ cells, **10 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
+- **113** interface methods → **226** adapter cells: **201 ✅** / **25 ❌** (2 adapter-gaps, 23
+  library-limitations, 0 uncertain), spanning **24** methods.
+- Of the 201 ✅ cells, **10 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
   1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 3 × 🔧⁷ participant arity, 1 × 🔧⁹ group
   description) and one baileys cell
   does (1 × 🔧⁶ newsletter-create parse); the whole wwjs column additionally
   depends on 🔧¹, the whole Baileys column on 🔧⁵ — so every row rests on a patch on each side,
   even though no row carries a row-level mark on both.
-- REST caller's view: **90** engine-neutral (88 + 2 store-backed status reads), **12** Baileys-only,
+- REST caller's view: **91** engine-neutral (89 + 2 store-backed status reads), **11** Baileys-only,
   **10** wwjs-only; `sendCatalog` (unavailable on both engines) is not exposed.
 - Full engine inventory (29.5), split by the exposure legend rather than lumped: Baileys **152**
   socket methods — 48 wired into interface methods, 5 internal wiring, 29 plumbing, **70 ❌ not
-  exposed** (incl. the whole 23-method community cluster); wwjs **81** Client methods — 44 wired,
-  2 internal wiring, 1 class plumbing, **34 ❌ not exposed** (26 real capabilities + 8
+  exposed** (incl. the whole 23-method community cluster); wwjs **81** Client methods — 45 wired,
+  2 internal wiring, 1 class plumbing, **33 ❌ not exposed** (25 real capabilities + 8
   session/transport settings that are not WhatsApp capabilities). The backlog is the ❌ rows minus
   those 8 settings; 🔩 plumbing is correctly never exposed.
 - Events: Baileys **34** (15 consumed / 19 dropped), wwjs **31** (17 consumed / 14 dropped).

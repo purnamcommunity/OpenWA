@@ -160,28 +160,100 @@ export class WwebjsGroups {
   }
 
   /**
-   * Not available on this engine, despite `Client.createGroup` existing and being typed
-   * `Promise<CreateGroupResult | string>` (`index.d.ts`).
+   * Group creation needs the New Group bundle pulled in first.
    *
-   * Its page body reaches a WhatsApp Web internal that no longer exposes `findImpl`
-   * (`Client.js:2325`, inside the injected evaluate). Measured against a live session on two
-   * different WhatsApp Web builds — `2.3000.1044858477-alpha` auto-resolved from the registry, and
-   * `2.3000.1044770897-alpha` pinned explicitly — with identical results:
-   * `TypeError: this.findImpl is not a function`, reaching the caller as a bare 500. Bare and
-   * `@c.us`-qualified participant ids fail the same way, so the id shape is not the variable.
+   * `WAWebGroupCreateJob` ships in a chunk WhatsApp Web fetches only when a human opens the New
+   * Group flow. A headless session never opens it, so the module is absent from the page's registry
+   * altogether — `require('__debug').modulesMap` has no such key — and `window.require` answers
+   * `undefined` for it instead of throwing. whatsapp-web.js reads `.createGroup` straight off that
+   * `undefined` inside a `catch` that discards the error (`Client.js:2366-2388`), which is why this
+   * read as a permanent library limitation rather than a missing chunk.
    *
-   * The build was varied deliberately because this registry pin moves on its own between restarts;
-   * two builds failing the same way is what separates a library limitation from build drift. The
-   * Baileys engine creates groups normally on the same account.
+   * `WAWebNewGroupFlowLoadable.requireBundle()` loads it (~1,150 modules, `WAWebGroupCreateJob`,
+   * `WASmaxOutGroupsCreateRequest` and `WAWebCreateGroupAction` among them) and the stock wwjs path
+   * then works unchanged — measured live: group created, server-assigned JID returned, every
+   * participant resolved through `WAWebApiContact.getPhoneNumber`.
    *
-   * Nothing here can be patched around: `findImpl` belongs to the page, not to whatsapp-web.js —
-   * it appears in neither the installed `Client.js` nor any OpenWA patcher. Restore this method
-   * when upstream adopts a page API that WhatsApp Web still provides.
+   * The preload is per call, not once at ready: WhatsApp Web caches the bundle so repeat calls are
+   * cheap, and a page reload drops it, so binding it to the call is what stays correct across a
+   * reconnect.
    */
-  /* eslint-disable-next-line @typescript-eslint/require-await, @typescript-eslint/no-unused-vars */
-  async createGroup(_name: string, _participants: string[]): Promise<Group> {
+  async createGroup(name: string, participants: string[]): Promise<Group> {
     this.host.ensureReady();
-    throw new EngineNotSupportedError('createGroup');
+    await this.ensureGroupCreateBundle();
+    try {
+      const result = await this.client().createGroup(name, participants.map(toParticipantWid));
+
+      // wwjs resolves a STRING instead of throwing when the page rejects the creation, so the
+      // union member — not an exception — is the failure path that has to be checked.
+      if (typeof result === 'string') {
+        throw new EngineRefusedError(`Failed to create group ${name}: ${result}`);
+      }
+
+      const id = readWid(result.gid);
+      if (!id) {
+        throw new EngineRefusedError(`Group ${name} was created but WhatsApp returned no id for it`);
+      }
+
+      // Every entry WhatsApp accepted, the creator's own superadmin entry included. Participants it
+      // refused carry their own non-200 code and are not members, so they must not be counted.
+      const admitted = Object.values(result.participants ?? {}).filter(p => p.statusCode === 200);
+
+      return {
+        id,
+        name: result.title ?? name,
+        participantsCount: admitted.length,
+        // The account that creates a group is always its superadmin.
+        isAdmin: true,
+        linkedParentJID: null,
+      };
+    } catch (error) {
+      this.host.reportIfPageTransportError(error, 'createGroup');
+      throw error;
+    }
+  }
+
+  /**
+   * Load the lazy New Group bundle and confirm the job it carries is actually callable.
+   *
+   * Verifying rather than assuming is the point: if WhatsApp Web moves this module again, the
+   * failure surfaces here naming the module instead of as a bare 500 from a property read on
+   * `undefined` deep inside whatsapp-web.js — which is exactly what made the previous breakage read
+   * as unfixable. `requireBundle` throwing is not itself fatal (the bundle may already be in), so
+   * only the callability check decides.
+   *
+   * A bundle that will not load is a 503, not a 501: the engine does support group creation, and
+   * `EngineNotSupportedError` here would also make this cell `not-available` under the matrix's
+   * throws-⇔-not-available invariant, pressing a false cell back into the matrix.
+   */
+  private async ensureGroupCreateBundle(): Promise<void> {
+    const page = (
+      this.client() as unknown as {
+        pupPage?: { evaluate: <T>(fn: () => T) => Promise<T> };
+      }
+    ).pupPage;
+    if (!page) {
+      throw new EngineTransportError('The WhatsApp Web page is gone; cannot create a group');
+    }
+
+    const ready = await page.evaluate(async () => {
+      const w = window as unknown as {
+        require: (module: string) => { requireBundle?: () => Promise<void>; createGroup?: unknown } | undefined;
+      };
+      try {
+        await w.require('WAWebNewGroupFlowLoadable')?.requireBundle?.();
+      } catch {
+        // Already loaded, or the loadable itself moved — the check below is what decides.
+      }
+      return typeof w.require('WAWebGroupCreateJob')?.createGroup === 'function';
+    });
+
+    if (!ready) {
+      this.host.logger.warn('WAWebGroupCreateJob is unavailable after loading the New Group bundle');
+      throw new EngineTransportError(
+        'WhatsApp Web did not provide WAWebGroupCreateJob after loading the New Group bundle',
+      );
+    }
   }
 
   async addParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {

@@ -100,7 +100,7 @@ describe('WwebjsChats.pinChat', () => {
   });
 
   // The guard resolves the chat rather than wrapping the pin call, so a page-side break on a chat
-  // that DOES exist still reaches the caller — the signal that caught wwjs `createGroup`.
+  // that DOES exist still reaches the caller — the signal a moved page internal produces.
   it('a page failure on a chat that DOES resolve stays a server error, not a 400', async () => {
     const { chats, client } = makeChats();
     client.pinChat.mockRejectedValue(new TypeError('this.findImpl is not a function'));

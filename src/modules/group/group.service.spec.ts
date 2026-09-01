@@ -143,7 +143,7 @@ describe('GroupService', () => {
     expect(pacing.chargeGroupReachouts).not.toHaveBeenCalled();
   });
 
-  it('does not charge the budget when createGroup fails (whatsapp-web.js always 501s)', async () => {
+  it('does not charge the budget when createGroup fails', async () => {
     const createGroup = jest.fn().mockRejectedValue(new Error('EngineNotSupportedError'));
     const { svc, pacing } = makeServiceWithPacing(
       { createGroup },

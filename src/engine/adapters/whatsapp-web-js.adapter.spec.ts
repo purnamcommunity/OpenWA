@@ -4892,7 +4892,7 @@ describe('WhatsAppWebJsAdapter message_ack (unreadable id)', () => {
   });
 });
 
-describe('WhatsAppWebJsAdapter createGroup (not available on this engine)', () => {
+describe('WhatsAppWebJsAdapter createGroup (needs the lazy New Group bundle)', () => {
   const readyAdapter = (client: unknown): WhatsAppWebJsAdapter => {
     const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
     (adapter as unknown as { status: EngineStatus }).status = EngineStatus.READY;
@@ -4900,18 +4900,83 @@ describe('WhatsAppWebJsAdapter createGroup (not available on this engine)', () =
     return adapter;
   };
 
-  // The library's own method is typed and present, so the only thing that shows it cannot work is a
-  // live call: its injected evaluate reaches a WhatsApp Web internal with no `findImpl`
-  // (`Client.js:2325`), which reached callers as a bare 500. Measured on two builds — one
-  // auto-resolved, one pinned — so this is a library limitation, not registry pin drift.
-  it('throws EngineNotSupportedError instead of calling the library', async () => {
+  /**
+   * The page evaluate the adapter runs before calling the library. `bundled` decides what the
+   * callability probe reports, which is the whole contract: the adapter must not reach the library
+   * until `WAWebGroupCreateJob` is actually present.
+   */
+  const pupPage = (bundled: boolean) => ({ evaluate: jest.fn().mockResolvedValue(bundled) });
+
+  it('loads the New Group bundle before calling the library', async () => {
+    const page = pupPage(true);
+    const createGroup = jest.fn().mockResolvedValue({
+      title: 'team',
+      gid: { _serialized: '12036@g.us' },
+      participants: {
+        '628123456789@c.us': { statusCode: 200, message: 'ok', isGroupCreator: false, isInviteV4Sent: false },
+        '628999999999@c.us': { statusCode: 200, message: 'ok', isGroupCreator: true, isInviteV4Sent: false },
+      },
+    });
+
+    const group = await readyAdapter({ createGroup, pupPage: page }).createGroup('team', ['628123456789@c.us']);
+
+    expect(page.evaluate).toHaveBeenCalled();
+    expect(createGroup).toHaveBeenCalled();
+    // The creator's own entry counts: it is a real member of the group it just made.
+    expect(group).toEqual({
+      id: '12036@g.us',
+      name: 'team',
+      participantsCount: 2,
+      isAdmin: true,
+      linkedParentJID: null,
+    });
+  });
+
+  it('counts only the participants WhatsApp admitted', async () => {
+    const createGroup = jest.fn().mockResolvedValue({
+      title: 'team',
+      gid: { _serialized: '12036@g.us' },
+      participants: {
+        '628999999999@c.us': { statusCode: 200, message: 'ok', isGroupCreator: true, isInviteV4Sent: false },
+        // Invite-only and not-on-WhatsApp are NOT members — counting them would report a group
+        // larger than the one WhatsApp actually made.
+        '628123456789@c.us': { statusCode: 403, message: 'invite only', isGroupCreator: false, isInviteV4Sent: true },
+        '628000000000@c.us': {
+          statusCode: 404,
+          message: 'not registered',
+          isGroupCreator: false,
+          isInviteV4Sent: false,
+        },
+      },
+    });
+
+    const group = await readyAdapter({ createGroup, pupPage: pupPage(true) }).createGroup('team', [
+      '628123456789@c.us',
+      '628000000000@c.us',
+    ]);
+
+    expect(group.participantsCount).toBe(1);
+  });
+
+  it('reports a 503 and never calls the library when the bundle does not yield the job', async () => {
     const createGroup = jest.fn();
 
-    await expect(readyAdapter({ createGroup }).createGroup('team', ['628123456789@c.us'])).rejects.toBeInstanceOf(
-      EngineNotSupportedError,
-    );
-    // The point of the demotion: the caller gets a 501 and the broken page call is never made.
+    await expect(
+      readyAdapter({ createGroup, pupPage: pupPage(false) }).createGroup('team', ['628123456789@c.us']),
+    ).rejects.toBeInstanceOf(EngineTransportError);
+    // A 501 here would also mark this cell not-available in the matrix; the engine does support it.
     expect(createGroup).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the string whatsapp-web.js resolves instead of throwing as a refusal', async () => {
+    // wwjs resolves a STRING rather than rejecting when the page declines the creation.
+    const createGroup = jest
+      .fn()
+      .mockResolvedValue('CreateGroupError: An unknown error occupied while creating a group');
+
+    await expect(
+      readyAdapter({ createGroup, pupPage: pupPage(true) }).createGroup('team', ['628123456789@c.us']),
+    ).rejects.toBeInstanceOf(EngineRefusedError);
   });
 
   it('refuses before the engine is ready, like every other guarded method', async () => {
