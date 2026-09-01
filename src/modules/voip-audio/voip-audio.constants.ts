@@ -19,7 +19,9 @@ export const FRAME_BYTES = (PCM_SAMPLE_RATE / 1000) * FRAME_MS * PCM_CHANNELS * 
 /**
  * Ceiling on audio buffered toward the gateway's microphone. PulseAudio does not drop late audio —
  * it plays everything eventually, so a client that sends faster than realtime (or a stalled pipe)
- * builds unbounded delay that never recovers within the call. Past this the oldest frames are
- * dropped: a caller would rather lose a syllable than fall a minute behind.
+ * builds unbounded delay that never recovers within the call. Past this the INCOMING frame is
+ * dropped — audio already written to the pipe cannot be recalled — so the cap is also the bound on
+ * the standing delay this leg carries for the rest of the call: a generous cap is not slack, it is
+ * latency the far end hears. A caller would rather lose a syllable than fall behind.
  */
-export const MAX_MIC_BACKLOG_BYTES = FRAME_BYTES * 25; // ~500 ms
+export const MAX_MIC_BACKLOG_BYTES = FRAME_BYTES * 8; // ~160 ms

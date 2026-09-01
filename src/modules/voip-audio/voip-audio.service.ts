@@ -1,7 +1,14 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { spawn, type ChildProcessByStdio } from 'child_process';
 import type { Readable, Writable } from 'stream';
-import { FRAME_BYTES, MAX_MIC_BACKLOG_BYTES, PCM_CHANNELS, PCM_FORMAT, PCM_SAMPLE_RATE } from './voip-audio.constants';
+import {
+  FRAME_BYTES,
+  MAX_MIC_BACKLOG_BYTES,
+  PCM_BYTES_PER_SAMPLE,
+  PCM_CHANNELS,
+  PCM_FORMAT,
+  PCM_SAMPLE_RATE,
+} from './voip-audio.constants';
 
 /**
  * Carries a call's audio between the operator's browser and the gateway's headless Chromium.
@@ -29,7 +36,17 @@ interface Bridge {
   out: AudioProcess;
   /** Bytes handed to pacat but not yet drained — the backlog the cap is enforced against. */
   pending: number;
+  /** High-water mark of `pending` and total bytes refused at the cap, reported when the bridge
+   *  closes — the standing delay a call built up is invisible in any single frame. */
+  peakPending: number;
+  droppedBytes: number;
+  statsTimer: NodeJS.Timeout | null;
   closed: boolean;
+}
+
+/** Bytes of s16le mono 48 kHz as milliseconds of audio — the unit delay is felt in. */
+function msOf(bytes: number): number {
+  return Math.round(bytes / ((PCM_SAMPLE_RATE / 1000) * PCM_BYTES_PER_SAMPLE * PCM_CHANNELS));
 }
 
 @Injectable()
@@ -90,8 +107,18 @@ export class VoipAudioService implements OnModuleDestroy {
       '--client-name=openwa-voip-out',
     ]);
 
-    const bridge: Bridge = { mic, out, pending: 0, closed: false };
+    const bridge: Bridge = { mic, out, pending: 0, peakPending: 0, droppedBytes: 0, statsTimer: null, closed: false };
     this.bridges.set(sessionId, bridge);
+
+    // Once-a-second backlog report while the bridge is up. Debug level: it is diagnosis traffic,
+    // and the close summary carries the part worth keeping. unref so a bridge left open in a test
+    // cannot hold the process alive.
+    bridge.statsTimer = setInterval(() => {
+      this.logger.debug(
+        `VoIP audio ${sessionId}: mic backlog ${msOf(bridge.pending)}ms (peak ${msOf(bridge.peakPending)}ms, dropped ${msOf(bridge.droppedBytes)}ms)`,
+      );
+    }, 1000);
+    bridge.statsTimer.unref?.();
 
     out.stdout.on('data', (chunk: Buffer) => {
       if (!bridge.closed) onRemoteAudio(chunk);
@@ -130,12 +157,14 @@ export class VoipAudioService implements OnModuleDestroy {
     if (!bridge || bridge.closed) return false;
 
     // PulseAudio plays everything it is given, so a client sending faster than realtime builds
-    // delay that never drains. Dropping the newest chunk keeps the call live rather than letting
+    // delay that never drains. Dropping the incoming chunk keeps the call live rather than letting
     // it slide permanently behind.
     if (bridge.pending + chunk.length > MAX_MIC_BACKLOG_BYTES) {
+      bridge.droppedBytes += chunk.length;
       return false;
     }
     bridge.pending += chunk.length;
+    if (bridge.pending > bridge.peakPending) bridge.peakPending = bridge.pending;
     bridge.mic.stdin.write(chunk, () => {
       bridge.pending = Math.max(0, bridge.pending - chunk.length);
     });
@@ -148,6 +177,7 @@ export class VoipAudioService implements OnModuleDestroy {
     if (!bridge) return;
     bridge.closed = true;
     this.bridges.delete(sessionId);
+    if (bridge.statsTimer) clearInterval(bridge.statsTimer);
     for (const proc of [bridge.mic, bridge.out]) {
       try {
         proc.stdin.end();
@@ -160,7 +190,9 @@ export class VoipAudioService implements OnModuleDestroy {
         /* already gone */
       }
     }
-    this.logger.log(`VoIP audio bridge closed for ${sessionId}`);
+    this.logger.log(
+      `VoIP audio bridge closed for ${sessionId} (peak mic backlog ${msOf(bridge.peakPending)}ms, dropped ${msOf(bridge.droppedBytes)}ms)`,
+    );
   }
 
   isOpen(sessionId: string): boolean {
