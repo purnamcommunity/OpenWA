@@ -64,6 +64,7 @@ describe('probeMessageComments', () => {
           revoked: false,
           fromMe: true,
           ack: 1,
+          revokes: null,
         },
       ],
     });
@@ -194,6 +195,7 @@ describe('mapPageComments', () => {
     revoked: false,
     fromMe: false,
     ack: 1,
+    revokes: null,
     ...over,
   });
 
@@ -206,6 +208,25 @@ describe('mapPageComments', () => {
     // A reply with no id or author cannot be shown or acted on, and a half-row would render as a
     // blank entry that silently inflates the thread.
     expect(mapPageComments(PARENT, [row({ id: null }), row({ author: null })])).toEqual([]);
+  });
+
+  it('shows a deleted reply once, not twice, while both rows exist', () => {
+    // Deleting does not edit the comment: WhatsApp writes a separate revoke row naming it and
+    // removes the original a moment later. Both are present in between, and rendering them as they
+    // come showed one deleted reply twice — once still carrying its text.
+    const out = mapPageComments(PARENT, [
+      row({ id: 'original', body: 'oops', timestamp: 10 }),
+      row({ id: 'the-revoke', revoked: true, body: null, revokes: 'original', timestamp: 20 }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ id: 'original', revoked: true, body: null });
+  });
+
+  it('keeps a revoke whose original has already gone, which is the steady state', () => {
+    // Once WhatsApp removes the original, the revoke row IS the deleted entry — dropping it would
+    // shrink the thread below the count the message advertises.
+    const out = mapPageComments(PARENT, [row({ id: 'the-revoke', revoked: true, body: null, revokes: 'long-gone' })]);
+    expect(out).toEqual([expect.objectContaining({ id: 'the-revoke', revoked: true, body: null })]);
   });
 
   it('withholds the body of a deleted reply while keeping the reply', () => {
