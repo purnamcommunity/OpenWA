@@ -36,6 +36,41 @@ const pageWith = (rows: unknown[]): PageRequire => {
   };
 };
 
+/**
+ * These two functions are STRINGIFIED and evaluated inside the browser, so anything they reference
+ * from this module is undefined at the only moment that matters. Calling them directly — as every
+ * other test here does — runs them in module scope, where such a reference resolves and the bug is
+ * invisible.
+ *
+ * It is not a hypothetical: a settle timeout held in a module constant threw `ReferenceError` in the
+ * page AFTER the send had already been dispatched, so the reply was posted and the caller was told
+ * it had failed. These rebuild each function from its own source, exactly as the page does.
+ */
+describe('the page functions close over nothing from this module', () => {
+  const rebuild = (fn: unknown) => new Function(`return (${String(fn)})`)() as typeof fn;
+
+  const sendable: PageRequire = (name: string) => {
+    if (name === 'WAWebSendCommentMessageAction') {
+      return { sendCommentMessage: () => Promise.resolve() };
+    }
+    if (name === 'WAWebCollections') return { Msg: { get: (id: string) => ({ id }) } };
+    throw new Error(`module not found: ${name}`);
+  };
+
+  it('probeMessageComments runs with only page globals in scope', async () => {
+    const rebuilt = rebuild(probeMessageComments) as typeof probeMessageComments;
+    const result = await withPageRequire(pageWith([]), () => rebuilt(PARENT));
+    expect(result).toEqual({ comments: [] });
+  });
+
+  it('submitMessageComment runs with only page globals in scope', async () => {
+    // The regression: this threw ReferenceError here while passing every direct-call test above.
+    const rebuilt = rebuild(submitMessageComment) as typeof submitMessageComment;
+    const result = await withPageRequire(sendable, () => rebuilt({ parentMessageId: PARENT, text: 'x' }));
+    expect(result).toEqual({ sent: true, confirmed: true });
+  });
+});
+
 describe('probeMessageComments', () => {
   it('reads a reply, taking the serialized id from the minified alias', async () => {
     // WhatsApp Web exposes a message key's string as `_serialized` on Wid objects but as a minified

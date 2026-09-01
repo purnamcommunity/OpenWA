@@ -108,13 +108,6 @@ export async function probeMessageComments(parentMessageId: string): Promise<Pag
 export type PageCommentSendResult = { sent: true; confirmed: boolean } | { unsupported: string } | { notFound: true };
 
 /**
- * How long the page waits for `sendCommentMessage` to settle before reporting the reply as sent but
- * unconfirmed. Generous enough that a normally-settling send is reported as confirmed, short enough
- * that a caller is not left holding an open request.
- */
-const SEND_SETTLE_TIMEOUT_MS = 8000;
-
-/**
  * Runs INSIDE the page: posts a reply into an announcement's thread.
  *
  * `sendCommentMessage(parentMessage, text)` is what WhatsApp Web's own "Add a reply" box calls, and
@@ -169,7 +162,11 @@ export async function submitMessageComment(input: {
   // reply for one the thread already carries.
   const settled = await Promise.race([
     action.sendCommentMessage(parent, input.text).then(() => true),
-    new Promise<boolean>(resolve => setTimeout(() => resolve(false), SEND_SETTLE_TIMEOUT_MS)),
+    // 8s, written here rather than as a module constant: this body is stringified into the page and
+    // closes over nothing from this file. A reference to one throws INSIDE the page — after
+    // sendCommentMessage has already been called, because the array above evaluates left to right,
+    // so the reply goes out and the caller is told it failed.
+    new Promise<boolean>(resolve => setTimeout(() => resolve(false), 8000)),
   ]);
   return { sent: true, confirmed: settled };
 }
