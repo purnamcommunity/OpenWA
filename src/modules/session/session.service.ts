@@ -69,8 +69,26 @@ function isTransientLaunchFailure(error: unknown): boolean {
   return /connection|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|terminating connection/i.test(error.message);
 }
 
-/** Pause between sequential auto-start launches so a burst of Chromium boots does not spike the host. */
-export const AUTOSTART_THROTTLE_MS = 2_000;
+/**
+ * Pause between sequential auto-start launches.
+ *
+ * Not merely load-smoothing: `start()` resolves when a browser LAUNCHES, not when it is ready, so a
+ * short pause still leaves two Chromium instances cold-starting on top of each other. On a small
+ * host they starve each other, the second session's event bridge then takes longer to attach than
+ * the readiness watchdog allows, the watchdog reloads a still-attaching page, and WhatsApp answers
+ * that by UNLINKING the device — which costs a QR re-scan to undo. So this is sized to let one
+ * session get most of the way up before the next is launched, not just to flatten a CPU spike.
+ *
+ * `SESSION_AUTOSTART_THROTTLE_MS` overrides it — 0 disables it outright, which suits a host with
+ * cores to spare and keeps tests from sleeping through a real pause.
+ */
+export const AUTOSTART_THROTTLE_MS = 45_000;
+
+/** Read per run, not at import, so the value is never frozen by whenever this module loaded. */
+export function autostartThrottleMs(): number {
+  const raw = Number(process.env.SESSION_AUTOSTART_THROTTLE_MS ?? AUTOSTART_THROTTLE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : AUTOSTART_THROTTLE_MS;
+}
 
 /**
  * The session-record API: CRUD over the sessions table, aggregate stats, and the thin engine query
@@ -234,8 +252,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         });
       }
       // Throttle between sequential Chromium launches; no need to wait after the last one.
-      if (i < sessions.length - 1) {
-        await setTimeout(AUTOSTART_THROTTLE_MS);
+      const throttle = autostartThrottleMs();
+      if (i < sessions.length - 1 && throttle > 0) {
+        await setTimeout(throttle);
       }
     }
   }

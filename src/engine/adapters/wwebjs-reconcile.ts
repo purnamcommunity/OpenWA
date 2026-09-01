@@ -25,7 +25,7 @@ export interface WwebjsReadyReconcileHost {
 }
 
 const READY_RECONCILE_INTERVAL_MS = 2000;
-export const READY_RECONCILE_TIMEOUT_MS = 90_000;
+export const READY_RECONCILE_TIMEOUT_MS = 240_000;
 
 // How long after `authenticated` the event bridge is allowed to still be attaching before a reload is
 // considered. whatsapp-web.js clears `eventsAttached` in its constructor (Client.js:109) and sets it
@@ -36,7 +36,15 @@ export const READY_RECONCILE_TIMEOUT_MS = 90_000;
 // re-exposing the bridge and cannot be retried (#1081). Must exceed upstream's own 30s poll with room
 // for the rest of the pipeline, and stay well under READY_RECONCILE_TIMEOUT_MS so a reload that IS
 // warranted still has time to reinject before the deadline.
-export const READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS = 45_000;
+//
+// **The cost of reloading too early is the WhatsApp link itself, not a slow start.** A reload issued
+// while the page is still attaching can leave WhatsApp holding what looks like a conflicting session
+// for that device, and WhatsApp answers by unlinking it — after which whatsapp-web.js deletes the
+// stored credentials and only a fresh QR scan brings the number back. A host cold-starting more than
+// one Chromium at once (two sessions on two cores is enough) routinely needs longer than a minute to
+// attach, so this grace is sized for the slow host rather than the idle one: waiting out a healthy
+// attach costs seconds, reloading through one costs the link.
+export const READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS = 120_000;
 
 export class WwebjsReadyReconcile {
   private readyReconcileTimer: ReturnType<typeof setTimeout> | null = null;
