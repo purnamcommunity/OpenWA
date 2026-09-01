@@ -226,6 +226,18 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     evidence:
       'baileys no getLabel/fetchLabel in lib/**/*.d.ts; chats.d.ts:69-73 + business.d.ts:162-166 expose ONLY writes; derivable only from an app-state-sync event cache; wwjs Client.getLabels (Client.js:2760)',
   },
+  sendMessageComment: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'not-available', rootCause: 'library-limitation' },
+    evidence:
+      'Replying INTO an announcement thread is not replyToMessage: a quoted reply is an ordinary ' +
+      'message to the whole group, this is an add-on only the thread shows. WhatsApp Web sends it ' +
+      'with WAWebSendCommentMessageAction.sendCommentMessage(parentMsg, text) — the call its own ' +
+      '"Add a reply" box makes, taking the message MODEL exactly as sendReactionToMsg does. wwjs ' +
+      'exposes nothing for it, so the adapter resolves the model the way Client.js resolves one for ' +
+      'a reaction and calls through the page, feature-detected (see wwebjs-comments.ts). baileys ' +
+      'models no add-on send.',
+  },
   getMessageComments: {
     wwjs: { status: 'supported' },
     baileys: { status: 'not-available', rootCause: 'library-limitation' },

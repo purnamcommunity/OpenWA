@@ -183,6 +183,18 @@ class MessagesResource
     }
 
     /**
+     * Reply in a community announcement's thread. Not a quoted reply: that sends an ordinary
+     * message to the whole group, while this goes only into the thread.
+     *
+     * @param array<string,mixed> $body
+     * @return array<string,mixed>
+     */
+    public function sendComment(string $sessionId, string $chatId, string $messageId, array $body): array
+    {
+        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($messageId)}/comments", [], $body) ?? [];
+    }
+
+    /**
      * Pin a message in its chat.
      *
      * @param array<string,mixed> $body chatId, messageId and an optional durationSeconds of

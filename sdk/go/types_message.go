@@ -326,6 +326,11 @@ type ReactionRecord struct {
 	Senders []ReactionSender `json:"senders"`
 }
 
+// SendCommentRequest is a reply to post into a community announcement's thread.
+type SendCommentRequest struct {
+	Text string `json:"text"`
+}
+
 // CommentRecord is one reply in a community announcement's reply thread. These are
 // add-ons on the announcement rather than chat messages, so they appear in no history
 // read. Body is empty for a deleted reply and for one carrying no text.

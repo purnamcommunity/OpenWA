@@ -669,6 +669,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.messaging.getMessageComments(chatId, messageId);
   }
 
+  sendMessageComment(chatId: string, messageId: string, text: string): Promise<void> {
+    return this.messaging.sendMessageComment(chatId, messageId, text);
+  }
+
   // Labels (Phase 3) - WhatsApp Business only
   getLabels(): Promise<Label[]> {
     return this.labels.getLabels();

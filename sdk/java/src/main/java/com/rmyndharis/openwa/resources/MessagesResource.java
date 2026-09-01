@@ -18,6 +18,7 @@ import com.rmyndharis.openwa.model.MessageResponse;
 import com.rmyndharis.openwa.model.PinMessageRequest;
 import com.rmyndharis.openwa.model.ReactMessageRequest;
 import com.rmyndharis.openwa.model.CommentRecord;
+import com.rmyndharis.openwa.model.SendCommentRequest;
 import com.rmyndharis.openwa.model.ReactionRecord;
 import com.rmyndharis.openwa.model.ReplyMessageRequest;
 import com.rmyndharis.openwa.model.SendBulkRequest;
@@ -290,6 +291,28 @@ public final class MessagesResource {
             null,
             null,
             CommentRecord.class);
+    }
+
+    /**
+     * Reply in a community announcement's thread.
+     *
+     * <p>Not a quoted reply: that sends an ordinary message to the whole group, while this goes into
+     * the thread behind the announcement's "N replies" and is seen only by whoever opens it.
+     */
+    public SuccessResult sendComment(
+        String sessionId, String chatId, String messageId, SendCommentRequest body) {
+        return client.request(
+            HttpMethod.POST,
+            "/api/sessions/"
+                + encodeSegment(sessionId)
+                + "/messages/"
+                + encodeSegment(chatId)
+                + "/"
+                + encodeSegment(messageId)
+                + "/comments",
+            null,
+            body,
+            SuccessResult.class);
     }
 
     /**

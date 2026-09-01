@@ -263,6 +263,23 @@ export class PinMessageDto {
 /** Cap on how many options one vote may select — WhatsApp polls hold at most 12. */
 export const POLL_VOTE_MAX_OPTIONS = 12;
 
+/**
+ * A reply posted into a community announcement's thread.
+ *
+ * Deliberately not a `replyToMessage` with a quote: that sends an ordinary message to the whole
+ * group, while this goes into the thread behind the announcement's "N replies" and is seen only by
+ * whoever opens it.
+ */
+export class SendMessageCommentDto {
+  @ApiProperty({
+    description: 'The reply text. Goes into the announcement’s thread, not into the chat.',
+    example: 'Detachment 🕊️',
+  })
+  @IsString()
+  @IsNotEmpty()
+  text!: string;
+}
+
 export class VotePollDto {
   @ApiProperty()
   @IsString()

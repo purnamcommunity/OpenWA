@@ -43,6 +43,7 @@ import {
   EditMessageDto,
   PinMessageDto,
   StarMessageDto,
+  SendMessageCommentDto,
   VotePollDto,
   UnpinMessageDto,
 } from './dto/message-actions.dto';
@@ -463,6 +464,32 @@ export class MessageController {
     @Param('messageId') messageId: string,
   ) {
     return this.messageService.getMessageComments(sessionId, chatId, messageId);
+  }
+
+  @Post(':chatId/:messageId/comments')
+  @HttpCode(HttpStatus.OK)
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Reply in a community announcement’s thread' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'chatId', description: 'Chat ID containing the announcement' })
+  @ApiParam({ name: 'messageId', description: 'The announcement being replied to' })
+  @ApiResponse({ status: 200, description: 'Reply posted', type: MessageActionResponseDto })
+  @ApiResponse({ status: 400, description: 'Session not active' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 404, description: MESSAGE_NOT_FOUND_404 })
+  @ApiResponse({
+    status: 422,
+    description:
+      'This WhatsApp Web build no longer exposes the reply thread. The response names the module ' + 'that moved.',
+  })
+  @ApiResponse({ status: 501, description: ENGINE_NOT_SUPPORTED_501 })
+  async sendComment(
+    @Param('sessionId') sessionId: string,
+    @Param('chatId') chatId: string,
+    @Param('messageId') messageId: string,
+    @Body() dto: SendMessageCommentDto,
+  ): Promise<{ success: boolean }> {
+    return this.messageService.sendMessageComment(sessionId, chatId, messageId, dto.text);
   }
 
   // Three path segments, so it never collides with `:chatId/history` (two) regardless of

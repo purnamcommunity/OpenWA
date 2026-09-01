@@ -3193,6 +3193,79 @@
         "tags": [
           "messages"
         ]
+      },
+      "post": {
+        "operationId": "MessageController_sendComment",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "chatId",
+            "required": true,
+            "in": "path",
+            "description": "Chat ID containing the announcement",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "messageId",
+            "required": true,
+            "in": "path",
+            "description": "The announcement being replied to",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageCommentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reply posted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageActionResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session not active"
+          },
+          "404": {
+            "description": "No such message — the id is outside the engine's lookup window (roughly the last hundred messages of the chat, or absent from the Baileys store) or the message was revoked."
+          },
+          "409": {
+            "description": "The session is not connected — an engine exists for it but is not `ready`: disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it — for those few seconds the answer is a `409` naming the reload; retry shortly."
+          },
+          "422": {
+            "description": "This WhatsApp Web build no longer exposes the reply thread. The response names the module that moved."
+          },
+          "501": {
+            "description": "The active engine cannot serve this operation. It is part of the engine contract, but the engine currently running has no implementation for it."
+          }
+        },
+        "summary": "Reply in a community announcement’s thread",
+        "tags": [
+          "messages"
+        ]
       }
     },
     "/api/sessions/{sessionId}/messages/{chatId}/{messageId}/media": {
@@ -12148,6 +12221,19 @@
           "timestamp",
           "revoked",
           "fromMe"
+        ]
+      },
+      "SendMessageCommentDto": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The reply text. Goes into the announcement’s thread, not into the chat.",
+            "example": "Detachment 🕊️"
+          }
+        },
+        "required": [
+          "text"
         ]
       },
       "DeleteMessageDto": {

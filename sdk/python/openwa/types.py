@@ -580,6 +580,12 @@ class ReactionRecord(TypedDict, total=False):
     senders: list[ReactionSender]
 
 
+class SendCommentRequest(TypedDict, total=False):
+    """A reply to post into a community announcement's thread."""
+
+    text: str
+
+
 class CommentRecord(TypedDict, total=False):
     """One reply in a community announcement's reply thread (server returns MessageComment[])."""
 

@@ -3,7 +3,7 @@
 Three-way comparison of every capability: the **Baileys library** (`@whiskeysockets/baileys`
 7.0.0-rc13), the **whatsapp-web.js library** (1.34.7), and what **OpenWA actually exposes** through
 its adapter layer and REST API — including which "supported" cells only work because OpenWA patches
-the installed library. Coverage is total: all 113 `IWhatsAppEngine` methods (29.4), **all 152
+the installed library. Coverage is total: all 114 `IWhatsAppEngine` methods (29.4), **all 152
 Baileys + 81 whatsapp-web.js library methods** (29.5), all 34 + 31 library events (29.5.4), and all
 8 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
 
@@ -25,7 +25,7 @@ Statuses used in the tables:
 
 Two complementary views:
 
-- **29.4 — the OpenWA contract view.** Rows are the 113 `IWhatsAppEngine` methods; use it to see
+- **29.4 — the OpenWA contract view.** Rows are the 114 `IWhatsAppEngine` methods; use it to see
   what a REST caller gets per engine. Source of truth: `src/engine/engine-capability-matrix.ts`
   (per-cell `evidence` strings cite the exact library `file:symbol` inspected).
 - **29.5 — the full engine inventory.** Rows are **every method the installed libraries expose**,
@@ -37,14 +37,14 @@ Two complementary views:
 ## 29.2 Adapter architecture
 
 OpenWA never calls a WhatsApp library directly from a controller. Every session owns one engine
-instance behind the neutral `IWhatsAppEngine` interface (113 methods +
+instance behind the neutral `IWhatsAppEngine` interface (114 methods +
 `EngineEventCallbacks`), and all modules go through it:
 
 ```mermaid
 flowchart LR
     subgraph OpenWA["OpenWA"]
         API["REST API controllers"] --> SVC["Modules / services"]
-        SVC --> IF["IWhatsAppEngine - 113 methods"]
+        SVC --> IF["IWhatsAppEngine - 114 methods"]
         IF --> WA["WhatsAppWebJsAdapter"]
         IF --> BA["BaileysAdapter"]
         SVC --> STORE["OpenWA-side stores"]
@@ -194,7 +194,7 @@ opens `if (!channel) return false;` before its try, so its `false` conflates _ch
 _WhatsApp refused_, and the adapter answers 403 for both. That distinction is ours to make in our own
 adapter and involves no library change.
 
-## 29.4 Full capability matrix — the OpenWA contract view (113 methods)
+## 29.4 Full capability matrix — the OpenWA contract view (114 methods)
 
 Legend recap: **✅** supported · **✅🔧ⁿ** supported via OpenWA patch `🔧ⁿ` (29.3) ·
 **❌ gap** adapter-gap · **❌ lib** library-limitation. Column headers carry the engine-wide
@@ -255,6 +255,7 @@ socket is caught by the transport instead. No REST route: the session watchdog p
 | `unpinMessage`        | ✅                  | ✅               | ✅           |
 | `getMessageReactions` | ❌ lib              | ✅               | ⚠️ wwjs only |
 | `getMessageComments`  | ❌ lib              | ✅               | ⚠️ wwjs only |
+| `sendMessageComment`  | ❌ lib              | ✅               | ⚠️ wwjs only |
 | `votePoll`            | ❌ lib              | ✅               | ⚠️ wwjs only |
 
 ### 29.4.4 Chats
@@ -387,7 +388,7 @@ answers 501.
 | `rejectCall`          | ✅                  | ✅               | ✅              |
 | `createCallLink`      | ✅                  | ✅               | ✅              |
 
-**Totals:** 113 methods → 226 adapter cells: **200 ✅, 26 ❌** (2 adapter-gaps, 23
+**Totals:** 114 methods → 228 adapter cells: **201 ✅, 27 ❌** (2 adapter-gaps, 23
 library-limitations, 0 uncertain) across 24 methods. From the REST caller's side: **90** methods
 work on any engine (89 fully supported + 2 store-backed status reads), **11** are Baileys-only,
 **9** are wwjs-only (the 2 store-backed rows excluded); `sendCatalog`, unavailable on both engines,
@@ -846,6 +847,7 @@ adapter boundary — none silently stubs.
 | `getChatHistory`        | lib   | Only `fetchMessageHistory(count, oldestKey, oldestTs)` (`Socket/business.d.ts:25`), which returns a sync-token _string_; messages arrive later via the `messaging-history.set` event. No synchronous per-chat `fetchMessages`.                                                                                                                           |
 | `getMessageReactions`   | lib   | No on-demand fetch; reactions exist only as event-augmented `WAMessage.reactions` via the `messages.reaction` event, and the adapter does not persist them into its store. Inbound reaction _events_ (`onMessageReaction`) work fine — only the read-back is unavailable.                                                                                |
 | `getMessageComments`    | lib   | Community announcement replies are message _add-ons_, not messages: WhatsApp Web keeps them in the add-on table beside reactions and poll votes, keyed by parent message. Baileys keeps no add-on store to read, and the replies reach no message event on either engine.                                                                                |
+| `sendMessageComment`    | lib   | Sending one is an add-on write (`sendCommentMessage(parentMsg, text)` in WhatsApp Web), not a quoted reply — a quoted reply is an ordinary message to the whole group. Baileys models no add-on send.                                                                                                                                                    |
 | `getContactStatus`      | lib   | `fetchStatus` (`Socket/chats.d.ts:42`, via `USyncStatusProtocol`) returns the _about/profile text_ line, not 24h stories. Stories surface only as `status@broadcast` messages. REST reads are store-backed — see ‡ above.                                                                                                                                |
 | `getContactStatuses`    | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                           |
 | `sendCatalog`           | lib   | `AnyMessageContent` (`Types/Message.d.ts:166-210`) has only `{product}` (single product); the catalog CRUD nodes (`Socket/business.js:294-362`) mutate the catalog, they don't send it.                                                                                                                                                                  |
@@ -949,9 +951,9 @@ adapter boundary — none silently stubs.
 Recomputed from `engine-capability-matrix.ts`, `upstream-surface.snapshot.json`, and a scan of the
 adapter sources — re-derive the same way when anything changes:
 
-- **113** interface methods → **226** adapter cells: **200 ✅** / **26 ❌** (2 adapter-gaps, 23
+- **114** interface methods → **228** adapter cells: **201 ✅** / **27 ❌** (2 adapter-gaps, 23
   library-limitations, 0 uncertain), spanning **24** methods.
-- Of the 200 ✅ cells, **9 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
+- Of the 201 ✅ cells, **9 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
   1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 3 × 🔧⁷ participant arity) and one baileys cell
   does (1 × 🔧⁶ newsletter-create parse); the whole wwjs column additionally
   depends on 🔧¹, the whole Baileys column on 🔧⁵ — so every row rests on a patch on each side,

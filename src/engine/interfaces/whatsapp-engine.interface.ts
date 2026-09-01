@@ -974,6 +974,19 @@ export interface MessageOperationsCapability {
    */
   getMessageComments(chatId: string, messageId: string): Promise<MessageComment[]>;
 
+  /**
+   * Post a reply into a community announcement's reply thread.
+   *
+   * NOT the same as replying to the announcement with a quote: a quoted reply is an ordinary
+   * message sent to the whole group, while this goes into the thread WhatsApp shows behind the
+   * message's "N replies" and reaches only whoever opens it. In an announcement group, where
+   * ordinary members cannot post at all, the two differ in audience as well as in placement.
+   *
+   * Answers when WhatsApp has accepted the reply; the thread is re-read to see it, since replies
+   * raise no event.
+   */
+  sendMessageComment(chatId: string, messageId: string, text: string): Promise<void>;
+
   deleteMessage(chatId: string, messageId: string, forEveryone?: boolean): Promise<void>;
 
   /**

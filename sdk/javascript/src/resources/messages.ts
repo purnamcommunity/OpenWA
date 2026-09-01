@@ -22,6 +22,7 @@ import type {
   MessageResponse,
   PinMessageRequest,
   CommentRecord,
+  SendCommentRequest,
   ReactionRecord,
   ReactMessageRequest,
   ReplyMessageRequest,
@@ -194,6 +195,20 @@ export class MessagesResource {
     return this.client.request<CommentRecord[]>({
       method: 'GET',
       path: `/api/sessions/${encodeSegment(sessionId)}/messages/${encodeSegment(chatId)}/${encodeSegment(messageId)}/comments`,
+    });
+  }
+
+  /**
+   * Reply in a community announcement's thread.
+   *
+   * Not a quoted reply: that sends an ordinary message to the whole group, while this goes into the
+   * thread behind the announcement's "N replies" and is seen only by whoever opens it.
+   */
+  sendComment(sessionId: string, chatId: string, messageId: string, body: SendCommentRequest): Promise<SuccessResult> {
+    return this.client.request<SuccessResult>({
+      method: 'POST',
+      path: `/api/sessions/${encodeSegment(sessionId)}/messages/${encodeSegment(chatId)}/${encodeSegment(messageId)}/comments`,
+      body,
     });
   }
 

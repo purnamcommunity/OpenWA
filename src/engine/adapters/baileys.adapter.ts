@@ -550,6 +550,10 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.unsupported('getMessageComments');
   }
 
+  sendMessageComment(_chatId: string, _messageId: string, _text: string): Promise<void> {
+    return this.unsupported('sendMessageComment');
+  }
+
   // Baileys exposes label WRITES only — chats.d.ts:69-73 has addLabel/addChatLabel/removeChatLabel
   // and no query of any kind, and Types/Label.d.ts is types-only. Listing the chats on a label would
   // mean maintaining an app-state cache fed by the label-association sync events, which is a
