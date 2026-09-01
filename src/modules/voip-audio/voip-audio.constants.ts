@@ -25,3 +25,15 @@ export const FRAME_BYTES = (PCM_SAMPLE_RATE / 1000) * FRAME_MS * PCM_CHANNELS * 
  * latency the far end hears. A caller would rather lose a syllable than fall behind.
  */
 export const MAX_MIC_BACKLOG_BYTES = FRAME_BYTES * 8; // ~160 ms
+
+/**
+ * Slack in the microphone pacing budget: how far ahead of realtime a client may run before the
+ * incoming frame is dropped. The backlog cap above only sees bytes pacat has not yet taken off the
+ * pipe — the OS pipe buffer itself silently holds ~680 ms more, so a client that BURSTS (a bug, a
+ * stale bundle, a hostile token holder) can plant most of a second of standing delay the cap never
+ * notices. The budget is cumulative against the wall clock from the first frame, so a network
+ * stall followed by a legitimate catch-up burst passes — nothing was accepted during the stall —
+ * and only genuinely faster-than-realtime audio is trimmed, which is exactly the audio the far
+ * end must not hear late.
+ */
+export const MIC_PACING_SLACK_BYTES = FRAME_BYTES * 12; // ~240 ms

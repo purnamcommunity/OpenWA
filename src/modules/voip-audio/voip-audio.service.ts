@@ -4,6 +4,7 @@ import type { Readable, Writable } from 'stream';
 import {
   FRAME_BYTES,
   MAX_MIC_BACKLOG_BYTES,
+  MIC_PACING_SLACK_BYTES,
   PCM_BYTES_PER_SAMPLE,
   PCM_CHANNELS,
   PCM_FORMAT,
@@ -40,6 +41,11 @@ interface Bridge {
    *  closes — the standing delay a call built up is invisible in any single frame. */
   peakPending: number;
   droppedBytes: number;
+  /** Wall-clock anchor of the pacing budget: when the first microphone frame arrived. Null until
+   *  then — anchoring at bridge open would hand a client that connects late a free burst budget. */
+  firstFrameAt: number | null;
+  /** Bytes accepted toward pacat since `firstFrameAt` — what the pacing budget is charged against. */
+  acceptedBytes: number;
   statsTimer: NodeJS.Timeout | null;
   closed: boolean;
 }
@@ -107,7 +113,17 @@ export class VoipAudioService implements OnModuleDestroy {
       '--client-name=openwa-voip-out',
     ]);
 
-    const bridge: Bridge = { mic, out, pending: 0, peakPending: 0, droppedBytes: 0, statsTimer: null, closed: false };
+    const bridge: Bridge = {
+      mic,
+      out,
+      pending: 0,
+      peakPending: 0,
+      droppedBytes: 0,
+      firstFrameAt: null,
+      acceptedBytes: 0,
+      statsTimer: null,
+      closed: false,
+    };
     this.bridges.set(sessionId, bridge);
 
     // Backlog report while the bridge is up — but only when the numbers MOVE. A healthy call sits
@@ -153,11 +169,25 @@ export class VoipAudioService implements OnModuleDestroy {
 
   /**
    * Feed one chunk of the operator's microphone toward the call. Returns false when the chunk was
-   * dropped — either no bridge is open, or the backlog cap was hit.
+   * dropped — no bridge is open, the backlog cap was hit, or the pacing budget was exceeded.
    */
   writeMic(sessionId: string, chunk: Buffer): boolean {
     const bridge = this.bridges.get(sessionId);
     if (!bridge || bridge.closed) return false;
+
+    // Pacing: never accept more than realtime-plus-slack since the first frame. The backlog cap
+    // below cannot see audio the OS pipe buffer already holds (~680 ms), so a bursting client
+    // would otherwise plant standing delay the far end hears for the rest of the call. Cumulative
+    // against the wall clock, so a post-stall catch-up burst of realtime audio still passes.
+    const now = Date.now();
+    if (bridge.firstFrameAt === null) bridge.firstFrameAt = now;
+    const budget =
+      ((now - bridge.firstFrameAt) / 1000) * PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * PCM_CHANNELS +
+      MIC_PACING_SLACK_BYTES;
+    if (bridge.acceptedBytes + chunk.length > budget) {
+      bridge.droppedBytes += chunk.length;
+      return false;
+    }
 
     // PulseAudio plays everything it is given, so a client sending faster than realtime builds
     // delay that never drains. Dropping the incoming chunk keeps the call live rather than letting
@@ -166,6 +196,7 @@ export class VoipAudioService implements OnModuleDestroy {
       bridge.droppedBytes += chunk.length;
       return false;
     }
+    bridge.acceptedBytes += chunk.length;
     bridge.pending += chunk.length;
     if (bridge.pending > bridge.peakPending) bridge.peakPending = bridge.pending;
     bridge.mic.stdin.write(chunk, () => {

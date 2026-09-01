@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { VoipAudioService, type AudioProcess } from './voip-audio.service';
-import { FRAME_BYTES, MAX_MIC_BACKLOG_BYTES } from './voip-audio.constants';
+import { FRAME_BYTES, MAX_MIC_BACKLOG_BYTES, MIC_PACING_SLACK_BYTES } from './voip-audio.constants';
 
 /** A pacat/parec stand-in: an emitter with the two streams the service touches. */
 function fakeProcess() {
@@ -153,6 +153,54 @@ describe('VoipAudioService backlog cap', () => {
     mic().proc.drain();
 
     expect(service.writeMic('s1', frame())).toBe(true);
+  });
+});
+
+describe('VoipAudioService pacing budget', () => {
+  it('trims a faster-than-realtime burst to the slack, and recovers with the clock', () => {
+    const { service, mic } = serviceWith();
+    service.open('s1', () => {});
+    const t0 = Date.now();
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(t0);
+    try {
+      let accepted = 0;
+      for (let i = 0; i < 30; i++) {
+        if (service.writeMic('s1', frame())) accepted++;
+        // Drain after every write so the backlog cap stays out of the picture — this test is
+        // about the pacing budget, which the pipe buffer would otherwise hide from.
+        mic().proc.drain();
+      }
+      expect(accepted).toBe(MIC_PACING_SLACK_BYTES / FRAME_BYTES);
+
+      // A second later the budget has grown by a second of realtime audio.
+      clock.mockReturnValue(t0 + 1000);
+      expect(service.writeMic('s1', frame())).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('lets a post-stall catch-up burst of realtime audio through', () => {
+    const { service, mic } = serviceWith();
+    service.open('s1', () => {});
+    const t0 = Date.now();
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(t0);
+    try {
+      expect(service.writeMic('s1', frame())).toBe(true); // anchors the budget at the first frame
+      mic().proc.drain();
+
+      // 500 ms of network stall, then the delayed 500 ms of audio arrives all at once. Nothing
+      // was accepted during the stall, so the cumulative budget covers the whole catch-up.
+      clock.mockReturnValue(t0 + 500);
+      let accepted = 0;
+      for (let i = 0; i < 25; i++) {
+        if (service.writeMic('s1', frame())) accepted++;
+        mic().proc.drain();
+      }
+      expect(accepted).toBe(25);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });
 
