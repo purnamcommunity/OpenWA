@@ -1295,7 +1295,7 @@ export interface CallCapability {
    * Answer a ringing incoming call. Like rejectCall, only a call still inside the ringing window is
    * answerable — an unknown or expired callId fails with a not-found error (HTTP 404).
    */
-  answerCall(callId: string): Promise<void>;
+  answerCall(callId: string, withVideo?: boolean): Promise<void>;
 
   /** Hang up the call this session is on. */
   endCall(callId: string): Promise<void>;

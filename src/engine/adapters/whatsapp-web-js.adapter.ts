@@ -559,8 +559,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   /** See ./wwebjs-voip — answerable only while still ringing, so the live-call cache decides
    *  whether this is a 404, exactly as rejectCall does. */
-  async answerCall(callId: string): Promise<void> {
-    return this.voip.answerCall(callId, id => this.calls.liveCalls.has(id));
+  async answerCall(callId: string, withVideo = false): Promise<void> {
+    return this.voip.answerCall(callId, id => this.calls.liveCalls.has(id), withVideo);
   }
 
   /** See ./wwebjs-voip. */

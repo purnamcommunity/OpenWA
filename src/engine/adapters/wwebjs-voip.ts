@@ -98,9 +98,20 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
   );
 }
 
-/** Page function: answer or hang up through the VOIP stack interface, the same object the call
- *  UI's accept and reject buttons drive. Only the `web` stack type exists in a browser session. */
-function pageCallAction(arg: { action: 'accept' | 'end'; callId: string }): Promise<PageResult> {
+/**
+ * Page function: answer or hang up through the VoIP stack interface — the same object the call
+ * UI's accept and hang-up buttons drive.
+ *
+ * Neither call takes an id: the stack holds ONE call, so `acceptCall(withAudio, withVideo)` answers
+ * whatever is ringing and `endCall(reason, true)` ends whatever is running. The id the caller asked
+ * for is therefore checked against the collection's active call first — without that, answering a
+ * stale id would silently answer a different call.
+ */
+function pageCallAction(arg: {
+  action: 'accept' | 'end';
+  callId: string;
+  withVideo: boolean;
+}): Promise<PageResult> {
   const req = (name: string): Record<string, unknown> | undefined => {
     try {
       return (window as unknown as { require: (n: string) => Record<string, unknown> }).require(name);
@@ -117,20 +128,29 @@ function pageCallAction(arg: { action: 'accept' | 'end'; callId: string }): Prom
     (iface) => {
       if (iface == null) return { refused: 'the VoIP stack is not running' } as PageResult;
       if (iface.type !== 'web') return { unsupported: `voip stack type ${String(iface.type)}` } as PageResult;
+
       if (arg.action === 'accept') {
-        const accept = iface.acceptCall as ((callId: string) => Promise<unknown>) | undefined;
+        // The stack answers the call it holds, so make sure that is the one asked for.
+        const active = (req('WAWebCallCollection')?.activeCall ?? null) as { id?: string } | null;
+        if (active?.id != null && active.id !== arg.callId) {
+          return { refused: `call ${arg.callId} is no longer the ringing call` } as PageResult;
+        }
+        const accept = iface.acceptCall as ((withAudio: boolean, withVideo: boolean) => Promise<unknown>) | undefined;
         if (typeof accept !== 'function') return { unsupported: 'voipStackInterface.acceptCall' } as PageResult;
-        return accept(arg.callId).then(
+        // Answer unmuted; video only when the caller asked for it.
+        return accept(true, arg.withVideo).then(
           () => ({ ok: true }) as PageResult,
           (e: unknown) => ({ refused: `accept failed: ${String(e)}` }) as PageResult,
         );
       }
-      // Ending is `rejectCall()` on this interface — it is what the UI's hang-up drives, and it
-      // takes no id because the stack acts on the one call it holds. `endCall` is preferred when
-      // the build exposes it.
-      const end = (iface.endCall ?? iface.rejectCall) as (() => Promise<unknown>) | undefined;
-      if (typeof end !== 'function') return { unsupported: 'voipStackInterface.endCall/rejectCall' } as PageResult;
-      return end().then(
+
+      const end = iface.endCall as ((reason: number, notifyPeer: boolean) => Promise<unknown>) | undefined;
+      if (typeof end !== 'function') return { unsupported: 'voipStackInterface.endCall' } as PageResult;
+      // EndCallReason.Self — this side hung up. The trailing true tells the peer, which is what the
+      // UI's own hang-up passes; without it the other end keeps ringing.
+      const reasons = req('WAWebVoipSignalingEnums')?.EndCallReason as Record<string, number> | undefined;
+      const self = typeof reasons?.Self === 'number' ? reasons.Self : 2;
+      return end(self, true).then(
         () => ({ ok: true }) as PageResult,
         (e: unknown) => ({ refused: `end failed: ${String(e)}` }) as PageResult,
       );
@@ -206,20 +226,20 @@ export class WwebjsVoip {
    * Answer a ringing incoming call. The id must be one still live in the calls delegate's cache —
    * an unknown or expired id is a 404 rather than a page error, matching rejectCall.
    */
-  async answerCall(callId: string, isLive: (callId: string) => boolean): Promise<void> {
+  async answerCall(callId: string, isLive: (callId: string) => boolean, withVideo = false): Promise<void> {
     this.host.ensureReady();
     if (!isLive(callId)) {
       throw new CallNotFoundError(callId);
     }
     await this.ensureVoipReady();
-    await this.run('answerCall', pageCallAction, { action: 'accept', callId });
+    await this.run('answerCall', pageCallAction, { action: 'accept', callId, withVideo });
     this.host.logger.log(`Answered call ${callId}`);
   }
 
   /** Hang up the call this session is on. */
   async endCall(callId: string): Promise<void> {
     this.host.ensureReady();
-    await this.run('endCall', pageCallAction, { action: 'end', callId });
+    await this.run('endCall', pageCallAction, { action: 'end', callId, withVideo: false });
     this.host.logger.log(`Ended call ${callId}`);
   }
 }

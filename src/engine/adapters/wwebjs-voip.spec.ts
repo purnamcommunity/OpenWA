@@ -48,14 +48,21 @@ const readyModules = (over: Partial<Modules> = {}): Modules => ({
   WAWebEnsureVoipInited: { ensureVoipInitialized: jest.fn().mockResolvedValue(undefined) },
   WAWebVoipStartCall: { startWAWebVoipCall: jest.fn().mockResolvedValue(undefined) },
   WAWebWidFactory: { createWid: (jid: string) => ({ toString: () => jid }) },
-  WAWebCallCollection: { pendingOutgoingCall: null, isInConnectedCall: false, lastActiveCall: { id: 'CALL1' } },
+  WAWebCallCollection: {
+    pendingOutgoingCall: null,
+    isInConnectedCall: false,
+    lastActiveCall: { id: 'CALL1' },
+    activeCall: { id: 'CALL1' },
+  },
   WAWebVoipStackInterface: {
     getVoipStackInterface: jest.fn().mockResolvedValue({
       type: 'web',
       acceptCall: jest.fn().mockResolvedValue(undefined),
+      endCall: jest.fn().mockResolvedValue(undefined),
       rejectCall: jest.fn().mockResolvedValue(undefined),
     }),
   },
+  WAWebVoipSignalingEnums: { EndCallReason: { Unknown: 0, Timeout: 1, Self: 2 } },
   ...over,
 });
 
@@ -162,13 +169,32 @@ describe('WwebjsVoip.placeCall', () => {
 });
 
 describe('WwebjsVoip.answerCall', () => {
-  it('answers a call that is still ringing', async () => {
+  it('answers unmuted and without video by default', async () => {
     const mods = readyModules();
     const { host } = hostWith(pageWith(mods));
 
     await expect(new WwebjsVoip(host).answerCall('CALL1', () => true)).resolves.toBeUndefined();
     const iface = await (mods.WAWebVoipStackInterface!.getVoipStackInterface as jest.Mock)();
-    expect(iface.acceptCall).toHaveBeenCalledWith('CALL1');
+    // The stack answers the one call it holds, so acceptCall takes flags, never an id.
+    expect(iface.acceptCall).toHaveBeenCalledWith(true, false);
+  });
+
+  it('answers with video when asked', async () => {
+    const mods = readyModules();
+    await new WwebjsVoip(hostWith(pageWith(mods)).host).answerCall('CALL1', () => true, true);
+    const iface = await (mods.WAWebVoipStackInterface!.getVoipStackInterface as jest.Mock)();
+
+    expect(iface.acceptCall).toHaveBeenCalledWith(true, true);
+  });
+
+  it('refuses when the ringing call is no longer the one asked for', async () => {
+    const mods = readyModules({
+      WAWebCallCollection: { pendingOutgoingCall: null, isInConnectedCall: false, activeCall: { id: 'OTHER' } },
+    });
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).answerCall('CALL1', () => true)).rejects.toThrow(
+      /no longer the ringing call/,
+    );
   });
 
   it('reports an unknown or expired call as not-found without reaching the page', async () => {
@@ -189,28 +215,36 @@ describe('WwebjsVoip.answerCall', () => {
 });
 
 describe('WwebjsVoip.endCall', () => {
-  it('prefers endCall when the build exposes it', async () => {
+  it('hangs up with EndCallReason.Self and tells the peer', async () => {
     const endCall = jest.fn().mockResolvedValue(undefined);
-    const rejectCall = jest.fn().mockResolvedValue(undefined);
     const mods = readyModules({
-      WAWebVoipStackInterface: {
-        getVoipStackInterface: () => Promise.resolve({ type: 'web', endCall, rejectCall }),
-      },
+      WAWebVoipStackInterface: { getVoipStackInterface: () => Promise.resolve({ type: 'web', endCall }) },
     });
 
     await new WwebjsVoip(hostWith(pageWith(mods)).host).endCall('C');
-    expect(endCall).toHaveBeenCalled();
-    expect(rejectCall).not.toHaveBeenCalled();
+    // Without the trailing true the other end keeps ringing.
+    expect(endCall).toHaveBeenCalledWith(2, true);
   });
 
-  it('falls back to the interface reject the hang-up button drives', async () => {
-    const rejectCall = jest.fn().mockResolvedValue(undefined);
+  it('falls back to the documented Self value when the build exposes no enum', async () => {
+    const endCall = jest.fn().mockResolvedValue(undefined);
     const mods = readyModules({
-      WAWebVoipStackInterface: { getVoipStackInterface: () => Promise.resolve({ type: 'web', rejectCall }) },
+      WAWebVoipStackInterface: { getVoipStackInterface: () => Promise.resolve({ type: 'web', endCall }) },
+      WAWebVoipSignalingEnums: {},
     });
 
     await new WwebjsVoip(hostWith(pageWith(mods)).host).endCall('C');
-    expect(rejectCall).toHaveBeenCalled();
+    expect(endCall).toHaveBeenCalledWith(2, true);
+  });
+
+  it('reports a build with no endCall rather than silently leaving the call up', async () => {
+    const mods = readyModules({
+      WAWebVoipStackInterface: { getVoipStackInterface: () => Promise.resolve({ type: 'web' }) },
+    });
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).endCall('C')).rejects.toBeInstanceOf(
+      EngineNotSupportedError,
+    );
   });
 });
 
