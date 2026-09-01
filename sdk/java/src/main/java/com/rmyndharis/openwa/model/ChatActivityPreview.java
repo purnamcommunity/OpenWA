@@ -8,4 +8,4 @@ package com.rmyndharis.openwa.model;
  * without this the chat rises showing its previous message and the reason is invisible.
  */
 public record ChatActivityPreview(
-    String kind, String senderId, long timestamp, String parentMessageId) {}
+    String kind, String senderId, boolean isMe, long timestamp, String parentMessageId) {}

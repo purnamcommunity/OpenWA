@@ -21,10 +21,12 @@ const withPageRequire = <T>(require: PageRequire | undefined, run: () => T): T =
 };
 
 const pageWith =
-  (models: unknown[]): PageRequire =>
+  (models: unknown[], me: string[] = []): PageRequire =>
   (name: string) => {
-    if (name !== 'WAWebCollections') throw new Error(`module not found: ${name}`);
-    return { Chat: { getModelsArray: () => models } };
+    if (name === 'WAWebCollections') return { Chat: { getModelsArray: () => models } };
+    // Whether the account caused an add-on is the page's to answer — see the isMe tests below.
+    if (name === 'WAWebUserPrefsMeUser') return { isSerializedWidMe: (wid: string) => me.includes(wid) };
+    throw new Error(`module not found: ${name}`);
   };
 
 describe('probeChatActivity', () => {
@@ -51,6 +53,7 @@ describe('probeChatActivity', () => {
           chatId: '120363@g.us',
           kind: 'comment',
           senderId: '234@lid',
+          isMe: false,
           timestampMs: 1788256182000,
           parentMessageId: 'false_120363@g.us_ABC_53331@lid',
         },
@@ -82,11 +85,42 @@ describe('probeChatActivity', () => {
   });
 });
 
+describe('probeChatActivity — whose activity it is', () => {
+  const chatWith = (sender: string) => ({
+    id: { _serialized: 'c@g.us' },
+    attributes: {
+      chatlistPreview: { type: 'comment', sender: { _serialized: sender }, timestamp: 1, parentMsgKey: null },
+    },
+  });
+
+  it('marks the account’s own activity, across the lid it uses in a group', () => {
+    // The point of asking the page: in a group this account is an @lid sharing no digits with its
+    // own phone number, so nothing outside the page could match the two.
+    const result = withPageRequire(pageWith([chatWith('234@lid')], ['234@lid']), () => probeChatActivity());
+    expect(result).toMatchObject({ activity: [{ isMe: true }] });
+  });
+
+  it('does not claim someone else’s activity as the account’s own', () => {
+    const result = withPageRequire(pageWith([chatWith('999@lid')], ['234@lid']), () => probeChatActivity());
+    expect(result).toMatchObject({ activity: [{ isMe: false }] });
+  });
+
+  it('reports not-me when the page cannot say', () => {
+    // A wrong name on the line is recoverable; a wrong "You" is not.
+    const require: PageRequire = (name: string) => {
+      if (name === 'WAWebCollections') return { Chat: { getModelsArray: () => [chatWith('234@lid')] } };
+      throw new Error('no me-user module on this build');
+    };
+    expect(withPageRequire(require, () => probeChatActivity())).toMatchObject({ activity: [{ isMe: false }] });
+  });
+});
+
 describe('indexChatActivity', () => {
   const row = (over: Partial<PageChatActivity> = {}): PageChatActivity => ({
     chatId: 'c@g.us',
     kind: 'comment',
     senderId: '234@lid',
+    isMe: false,
     timestampMs: 1788256182000,
     parentMessageId: null,
     ...over,

@@ -24,6 +24,8 @@ export interface PageChatActivity {
   chatId: string;
   kind: PageActivityKind;
   senderId: string | null;
+  /** True when this account caused it — the difference between "You replied" and a name. */
+  isMe: boolean;
   /** Unix MILLIseconds, unlike the chat's own `timestamp`, which is seconds. */
   timestampMs: number | null;
   parentMessageId: string | null;
@@ -61,6 +63,37 @@ export function probeChatActivity(): PageChatActivityResult {
     return null;
   };
 
+  // Whether the account itself caused an add-on cannot be decided by comparing digits: in a group
+  // this account is an `@lid` that shares none with its own phone number. The page knows, and is
+  // asked once for the whole list. A build without the predicate falls back to its own two ids,
+  // and failing that reports isMe false rather than guessing.
+  let isMine: (wid: string) => boolean = () => false;
+  try {
+    const me = req('WAWebUserPrefsMeUser') as {
+      isSerializedWidMe?: (wid: string) => boolean;
+      getMaybeMePnUser?: () => { _serialized?: string } | undefined;
+      getMaybeMeLidUser?: () => { _serialized?: string } | undefined;
+    };
+    if (typeof me?.isSerializedWidMe === 'function') {
+      isMine = (wid: string) => {
+        try {
+          return Boolean(me.isSerializedWidMe?.(wid));
+        } catch {
+          return false;
+        }
+      };
+    } else {
+      const own = new Set(
+        [me?.getMaybeMePnUser?.()?._serialized, me?.getMaybeMeLidUser?.()?._serialized].filter(
+          (id): id is string => typeof id === 'string',
+        ),
+      );
+      isMine = (wid: string) => own.has(wid);
+    }
+  } catch {
+    // Left as "not me": a wrong name on the line is better than a wrong "You".
+  }
+
   const activity: PageChatActivity[] = [];
   for (const model of chats) {
     const chat = (model ?? {}) as { id?: unknown; attributes?: Record<string, unknown> };
@@ -68,10 +101,12 @@ export function probeChatActivity(): PageChatActivityResult {
     const preview = chat.attributes?.chatlistPreview as
       { type?: unknown; sender?: unknown; timestamp?: unknown; parentMsgKey?: unknown } | undefined;
     if (!chatId || !preview || typeof preview.type !== 'string') continue;
+    const senderId = serialize(preview.sender);
     activity.push({
       chatId,
       kind: preview.type,
-      senderId: serialize(preview.sender),
+      senderId,
+      isMe: senderId ? isMine(senderId) : false,
       timestampMs: typeof preview.timestamp === 'number' ? preview.timestamp : null,
       parentMessageId: serialize(preview.parentMsgKey),
     });
@@ -92,6 +127,7 @@ export function indexChatActivity(rows: PageChatActivity[]): Map<string, ChatAct
     byChat.set(row.chatId, {
       kind: row.kind,
       senderId: row.senderId ?? '',
+      isMe: row.isMe,
       // Seconds, to match every other timestamp this interface carries.
       timestamp: Math.floor(row.timestampMs / 1000),
       ...(row.parentMessageId ? { parentMessageId: row.parentMessageId } : {}),

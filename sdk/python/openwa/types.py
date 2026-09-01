@@ -888,6 +888,7 @@ class ChatActivityPreview(TypedDict, total=False):
 
     kind: str
     senderId: str
+    isMe: bool
     timestamp: int
     parentMessageId: str
 

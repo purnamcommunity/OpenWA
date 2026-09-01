@@ -112,7 +112,10 @@ type ChatActivityPreview struct {
 	// Kind is "comment", "reaction", "poll_vote", and whatever WhatsApp adds next.
 	Kind string `json:"kind"`
 	// SenderID may be an @lid privacy id, which carries no phone number.
-	SenderID        string `json:"senderId"`
+	SenderID string `json:"senderId"`
+	// IsMe is true when this account caused it; the engine decides, since a group lid
+	// shares no digits with the account's own number.
+	IsMe bool `json:"isMe"`
 	Timestamp       int64  `json:"timestamp"`
 	ParentMessageID string `json:"parentMessageId,omitempty"`
 }

@@ -942,6 +942,8 @@ export interface ChatActivityPreview {
   kind: string;
   /** May be an `@lid` privacy id, which carries no phone number. */
   senderId: string;
+  /** True when this account caused it — the engine decides, since a group lid shares no digits with the account's number. */
+  isMe: boolean;
   /** Unix seconds. */
   timestamp: number;
   parentMessageId?: string;
