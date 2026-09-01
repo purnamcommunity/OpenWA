@@ -13,7 +13,9 @@ import { EngineNotSupportedError } from '../../common/errors/engine-not-supporte
 type Modules = Record<string, Record<string, unknown> | undefined>;
 
 /** A page whose evaluate runs the function in-process with `window.require` served from `modules`. */
-const pageWith = (modules: Modules) => ({
+const pageWith = (modules: Modules, overridePermissions = jest.fn().mockResolvedValue(undefined)) => ({
+  browserContext: () => ({ overridePermissions }),
+  overridePermissions,
   evaluate: jest.fn(async (fn: (arg: unknown) => unknown, arg: unknown) => {
     const prev = (globalThis as { window?: unknown }).window;
     (globalThis as { window?: unknown }).window = {
@@ -248,6 +250,23 @@ describe('WwebjsVoip.endCall', () => {
     await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).endCall('C')).rejects.toBeInstanceOf(
       EngineNotSupportedError,
     );
+  });
+});
+
+describe('WwebjsVoip microphone grant', () => {
+  it('grants the microphone to WhatsApp Web before booting the stack', async () => {
+    const page = pageWith(readyModules());
+    await new WwebjsVoip(hostWith(page).host).ensureVoipReady();
+
+    // A headless profile denies the prompt with nobody there to override it, and Debian's chromium
+    // has no --use-fake-ui-for-media-stream, so the grant must come over CDP.
+    expect(page.overridePermissions).toHaveBeenCalledWith('https://web.whatsapp.com', ['microphone']);
+  });
+
+  it('still reaches the call when the context cannot grant permissions', async () => {
+    const page = pageWith(readyModules(), jest.fn().mockRejectedValue(new Error('unsupported')));
+
+    await expect(new WwebjsVoip(hostWith(page).host).ensureVoipReady()).resolves.toBeUndefined();
   });
 });
 

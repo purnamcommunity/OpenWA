@@ -166,7 +166,12 @@ function pageCallAction(arg: { action: 'accept' | 'end'; callId: string; withVid
 
 interface EvaluatablePage {
   evaluate: <T, A>(fn: (arg: A) => T | Promise<T>, arg?: A) => Promise<T>;
+  /** Puppeteer's context handle, used only to grant the microphone. */
+  browserContext?: () => { overridePermissions?: (origin: string, perms: string[]) => Promise<void> };
 }
+
+/** The origin the session runs on — the only one the microphone is granted for. */
+const WA_ORIGIN = 'https://web.whatsapp.com';
 
 export class WwebjsVoip {
   constructor(private readonly host: WwebjsEngineHost) {}
@@ -215,8 +220,30 @@ export class WwebjsVoip {
    */
   async ensureVoipReady(): Promise<void> {
     this.host.ensureReady();
+    await this.grantMicrophone();
     await this.run('ensureVoipReady', pageEnsureVoipReady);
     this.host.logger.log('VoIP stack ready');
+  }
+
+  /**
+   * Grant the microphone to WhatsApp Web over CDP.
+   *
+   * A headless profile answers the permission prompt with a denial nobody is there to override, so
+   * `getUserMedia` fails `NotAllowedError` even once the container HAS a capture device — and
+   * WhatsApp then aborts the call before signalling. The usual
+   * `--use-fake-ui-for-media-stream` is unavailable here: the flag is absent from Debian's chromium
+   * binary, so the grant has to come through the DevTools protocol instead.
+   *
+   * Best-effort: a build whose context cannot override permissions still reaches the call, which
+   * then fails with WhatsApp's own device error rather than one invented here.
+   */
+  private async grantMicrophone(): Promise<void> {
+    try {
+      const context = this.page().browserContext?.();
+      await context?.overridePermissions?.(WA_ORIGIN, ['microphone']);
+    } catch (error) {
+      this.host.logger.warn(`Could not grant the microphone to ${WA_ORIGIN}: ${String(error)}`);
+    }
   }
 
   /** Place a 1:1 voice or video call. Resolves once the offer is away, not when it is answered. */
