@@ -71,6 +71,21 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
   if (typeof start !== 'function') return Promise.resolve({ unsupported: 'WAWebVoipStartCall.startWAWebVoipCall' });
   if (typeof createWid !== 'function') return Promise.resolve({ unsupported: 'WAWebWidFactory.createWid' });
 
+  // WhatsApp gates web calling per ACCOUNT with a server-assigned flag (`enable_web_calling`),
+  // and `startWAWebVoipCall` consults it and silently no-ops when it is off — the offer resolves,
+  // no call is ever published, and nothing rings, with no error anywhere. Refuse loudly instead.
+  // Guarded on the module existing so a WhatsApp build that moves it degrades to the old
+  // behaviour rather than blocking calls for everyone.
+  const gating = req('WAWebVoipGatingUtils');
+  const callingEnabled = gating?.isCallingEnabled as (() => boolean) | undefined;
+  if (typeof callingEnabled === 'function' && !callingEnabled()) {
+    return Promise.resolve({
+      refused:
+        'WhatsApp has not enabled web calling for this account (server-side enable_web_calling flag) — ' +
+        'calls from its phone still work, and the flag may be granted over time',
+    });
+  }
+
   // The stack holds one call. Starting a second is silently ignored upstream ("outgoing call
   // already pending"), which would look like success, so it is refused here instead.
   if (calls?.pendingOutgoingCall != null) {

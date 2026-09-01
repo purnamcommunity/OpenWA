@@ -100,6 +100,25 @@ describe('WwebjsVoip.ensureVoipReady', () => {
 });
 
 describe('WwebjsVoip.placeCall', () => {
+  it('refuses loudly when WhatsApp has web calling disabled for the account', async () => {
+    // With enable_web_calling off, startWAWebVoipCall itself resolves while publishing NO call —
+    // silence that read as a placed call that never rang anybody.
+    const mods = readyModules({ WAWebVoipGatingUtils: { isCallingEnabled: () => false } });
+    const { host } = hostWith(pageWith(mods));
+
+    await expect(new WwebjsVoip(host).placeCall('919876543210@c.us', false)).rejects.toThrow(
+      /has not enabled web calling for this account/,
+    );
+    expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).not.toHaveBeenCalled();
+  });
+
+  it('places normally when the account has web calling enabled', async () => {
+    const mods = readyModules({ WAWebVoipGatingUtils: { isCallingEnabled: () => true } });
+    const { host } = hostWith(pageWith(mods));
+
+    await expect(new WwebjsVoip(host).placeCall('919876543210@c.us', false)).resolves.toBe('CALL1');
+  });
+
   it('places the call and reads the id back off the collection', async () => {
     const mods = readyModules();
     const { host } = hostWith(pageWith(mods));
