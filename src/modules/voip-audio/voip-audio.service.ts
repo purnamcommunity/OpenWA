@@ -110,13 +110,16 @@ export class VoipAudioService implements OnModuleDestroy {
     const bridge: Bridge = { mic, out, pending: 0, peakPending: 0, droppedBytes: 0, statsTimer: null, closed: false };
     this.bridges.set(sessionId, bridge);
 
-    // Once-a-second backlog report while the bridge is up. Debug level: it is diagnosis traffic,
-    // and the close summary carries the part worth keeping. unref so a bridge left open in a test
-    // cannot hold the process alive.
+    // Backlog report while the bridge is up — but only when the numbers MOVE. A healthy call sits
+    // at 0ms backlog for its whole length, and a line a second saying so drowns the log the one
+    // time it matters. Debug level: diagnosis traffic; the close summary carries the part worth
+    // keeping. unref so a bridge left open in a test cannot hold the process alive.
+    let lastReported = '';
     bridge.statsTimer = setInterval(() => {
-      this.logger.debug(
-        `VoIP audio ${sessionId}: mic backlog ${msOf(bridge.pending)}ms (peak ${msOf(bridge.peakPending)}ms, dropped ${msOf(bridge.droppedBytes)}ms)`,
-      );
+      const line = `mic backlog ${msOf(bridge.pending)}ms (peak ${msOf(bridge.peakPending)}ms, dropped ${msOf(bridge.droppedBytes)}ms)`;
+      if (line === lastReported) return;
+      lastReported = line;
+      this.logger.debug(`VoIP audio ${sessionId}: ${line}`);
     }, 1000);
     bridge.statsTimer.unref?.();
 
