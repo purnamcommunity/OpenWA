@@ -6618,6 +6618,48 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/calls/state": {
+      "get": {
+        "description": "Polled rather than pushed: an outgoing call raises no event when the far end answers — the call events report outcomes, which arrive once a call is over — so a client showing \"ringing\" and then a duration has to ask.",
+        "operationId": "CallController_state",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The current call, or a null callId",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallStateResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started"
+          },
+          "409": {
+            "description": "The session is not connected — an engine exists for it but is not `ready`: disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it — for those few seconds the answer is a `409` naming the reload; retry shortly."
+          },
+          "501": {
+            "description": "The active engine cannot report call state"
+          }
+        },
+        "summary": "What this session's current call is doing",
+        "tags": [
+          "calls"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/calls/{callId}/reject": {
       "post": {
         "operationId": "CallController_reject",
@@ -15619,6 +15661,39 @@
             "default": false
           }
         }
+      },
+      "CallStateResponseDto": {
+        "type": "object",
+        "properties": {
+          "callId": {
+            "type": "object",
+            "description": "The call this session currently holds, or null when there is none.",
+            "example": "A1B2C3",
+            "nullable": true
+          },
+          "connected": {
+            "type": "boolean",
+            "description": "Whether the call is connected — media is flowing. False while an outgoing call is still ringing, which is the distinction no event reports.",
+            "example": false
+          },
+          "outgoing": {
+            "type": "boolean",
+            "description": "Whether this side placed the call.",
+            "example": true
+          },
+          "peer": {
+            "type": "object",
+            "description": "The other party, as WhatsApp addresses them.",
+            "example": "919876543210@c.us",
+            "nullable": true
+          }
+        },
+        "required": [
+          "callId",
+          "connected",
+          "outgoing",
+          "peer"
+        ]
       },
       "LabelDto": {
         "type": "object",

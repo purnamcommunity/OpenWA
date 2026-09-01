@@ -51,6 +51,11 @@ export class CallService {
     return this.getEngine(sessionId).answerCall(callId, withVideo);
   }
 
+  /** What this session's current call is doing. `callId: null` means no call is up. */
+  callState(sessionId: string) {
+    return this.getEngine(sessionId).callState();
+  }
+
   /** Hang up the call this session is on. */
   endCall(sessionId: string, callId: string): Promise<void> {
     return this.getEngine(sessionId).endCall(callId);

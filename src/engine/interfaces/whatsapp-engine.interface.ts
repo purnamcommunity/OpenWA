@@ -1348,6 +1348,15 @@ export interface CallCapability {
    */
   answerCall(callId: string, withVideo?: boolean): Promise<void>;
 
+  /**
+   * What this session's current call is doing, or `callId: null` when there is none.
+   *
+   * Read rather than pushed: an OUTGOING call raises no event when the far end answers — the
+   * call events report outcomes, which arrive once a call is over — so a caller that wants to
+   * show "ringing" and then a duration has to ask.
+   */
+  callState(): Promise<{ callId: string | null; connected: boolean; outgoing: boolean; peer: string | null }>;
+
   /** Hang up the call this session is on. */
   endCall(callId: string): Promise<void>;
 

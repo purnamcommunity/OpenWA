@@ -174,6 +174,58 @@ function pageCallAction(arg: { action: 'accept' | 'end'; callId: string; withVid
   );
 }
 
+/**
+ * Page function: what the one call this session holds is doing right now.
+ *
+ * There is no event for "they picked up" on an OUTGOING call — the engine's call events report
+ * outcomes, which arrive once a call is over. Without this the UI cannot tell ringing from
+ * answered and has to guess, which it did: it announced "on call" the moment its own microphone
+ * opened, while the other end was still ringing.
+ */
+function pageCallState(): Promise<
+  PageResult<{
+    callId: string | null;
+    connected: boolean;
+    outgoing: boolean;
+    peer: string | null;
+  }>
+> {
+  const req = (name: string): Record<string, unknown> | undefined => {
+    try {
+      return (window as unknown as { require: (n: string) => Record<string, unknown> }).require(name);
+    } catch {
+      return undefined;
+    }
+  };
+  const calls = req('WAWebCallCollection');
+  if (!calls) return Promise.resolve({ unsupported: 'WAWebCallCollection' });
+
+  const active: unknown = calls.activeCall;
+  if (typeof active !== 'object' || active === null) {
+    return Promise.resolve({ ok: true, callId: null, connected: false, outgoing: false, peer: null });
+  }
+  const call = active as { id?: unknown; outgoing?: unknown; peerJid?: unknown };
+  // peerJid is a Wid OBJECT, not a string. String() on it yields "[object Object]" unless its own
+  // toString runs, so the result is taken only when it actually looks like a jid.
+  const peerRaw: unknown = call.peerJid;
+  const peerText =
+    typeof peerRaw === 'string'
+      ? peerRaw
+      : typeof (peerRaw as { toString?: unknown })?.toString === 'function'
+        ? (peerRaw as { toString: () => string }).toString()
+        : '';
+  const peer = /@[a-z.]+$/i.test(peerText) ? peerText : null;
+  return Promise.resolve({
+    ok: true,
+    callId: typeof call.id === 'string' ? call.id : null,
+    // isInConnectedCall is the collection's own answer to "is media flowing", which is exactly
+    // the moment a duration should start counting.
+    connected: calls.isInConnectedCall === true,
+    outgoing: call.outgoing === true,
+    peer,
+  });
+}
+
 interface EvaluatablePage {
   evaluate: <T, A>(fn: (arg: A) => T | Promise<T>, arg?: A) => Promise<T>;
   /** Puppeteer's context handle, used only to grant the microphone. */
@@ -281,6 +333,25 @@ export class WwebjsVoip {
   }
 
   /** Hang up the call this session is on. */
+  /**
+   * What this session's current call is doing, or a null callId when there is none.
+   *
+   * Read rather than pushed: an outgoing call raises no event when the far end answers, so a
+   * caller that wants to show "ringing" then a duration has to ask.
+   */
+  async callState(): Promise<{ callId: string | null; connected: boolean; outgoing: boolean; peer: string | null }> {
+    this.host.ensureReady();
+    // Projected rather than returned whole: run() carries the page protocol's own `ok` flag, and
+    // that is an internal detail, not part of the answer a caller gets.
+    const state = await this.run('callState', pageCallState);
+    return {
+      callId: state.callId,
+      connected: state.connected,
+      outgoing: state.outgoing,
+      peer: state.peer,
+    };
+  }
+
   async endCall(callId: string): Promise<void> {
     this.host.ensureReady();
     await this.run('endCall', pageCallAction, { action: 'end', callId, withVideo: false });

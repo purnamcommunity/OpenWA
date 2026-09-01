@@ -794,6 +794,10 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.unsupported('answerCall');
   }
 
+  callState(): Promise<{ callId: string | null; connected: boolean; outgoing: boolean; peer: string | null }> {
+    return this.unsupported('callState');
+  }
+
   endCall(): Promise<void> {
     return this.unsupported('endCall');
   }
