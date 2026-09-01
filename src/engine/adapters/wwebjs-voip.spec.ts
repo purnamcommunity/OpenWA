@@ -115,13 +115,34 @@ describe('WwebjsVoip.placeCall', () => {
     expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).toHaveBeenCalledWith(expect.anything(), true, 0);
   });
 
-  it('returns null when the offer went out but no id was published yet', async () => {
+  it('waits for the id the collection publishes just after the offer', async () => {
+    // startWAWebVoipCall resolves before the collection has the call, so an immediate read is null.
+    const collection: Record<string, unknown> = {
+      pendingOutgoingCall: null,
+      isInConnectedCall: false,
+      activeCall: null,
+      lastActiveCall: null,
+    };
+    const mods = readyModules({ WAWebCallCollection: collection });
+    setTimeout(() => {
+      collection.activeCall = { id: 'LATE1' };
+    }, 250);
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).resolves.toBe('LATE1');
+  });
+
+  it('still reports the call as placed when no id is ever published', async () => {
     const mods = readyModules({
-      WAWebCallCollection: { pendingOutgoingCall: null, isInConnectedCall: false, lastActiveCall: null },
+      WAWebCallCollection: {
+        pendingOutgoingCall: null,
+        isInConnectedCall: false,
+        activeCall: null,
+        lastActiveCall: null,
+      },
     });
 
     await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).resolves.toBeNull();
-  });
+  }, 10_000);
 
   it('refuses a second call rather than letting the stack silently drop it', async () => {
     const mods = readyModules({
