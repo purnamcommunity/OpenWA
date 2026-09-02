@@ -216,6 +216,14 @@ export default () => ({
           .split(/[\s,]+/)
           .filter(Boolean),
       ),
+      // The browser identity WhatsApp Web is shown. Unset leaves whatsapp-web.js's own pinned
+      // default in place, which names a Chrome several years older than the binary actually
+      // running. That gap is worth closing where a session must be offered the same features a
+      // desktop browser gets: WhatsApp grants some of them per client rather than per account —
+      // `enable_web_calling` among them — and its gating code logs browser and browser version
+      // beside the value. Blank is the same as unset, so an empty forward cannot blank the
+      // library default into an empty UA string.
+      userAgent: process.env.PUPPETEER_USER_AGENT?.trim() || undefined,
       // Optional path to a system Chromium/Chrome binary. When unset, whatsapp-web.js
       // uses Puppeteer's bundled Chromium. Required on hosts where the bundled binary
       // is missing or incompatible (Alpine, ARM, custom base images).

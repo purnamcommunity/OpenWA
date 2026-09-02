@@ -149,6 +149,10 @@ services:
       - VOIP_AUDIO_OUT_SINK=${VOIP_AUDIO_OUT_SINK:-}
       - VOIP_AUDIO_SOURCE=${VOIP_AUDIO_SOURCE:-}
       - PUPPETEER_PROTOCOL_TIMEOUT_MS=${PUPPETEER_PROTOCOL_TIMEOUT_MS:-}
+      # Optional browser identity. Blank leaves whatsapp-web.js's own default, which names a Chrome far
+      # older than the binary in this image. Worth setting where WhatsApp must offer the session the
+      # same features a desktop browser gets — web calling is granted per client, not per account.
+      - PUPPETEER_USER_AGENT=${PUPPETEER_USER_AGENT:-}
       # Optional WhatsApp Web version override. DEFAULT (empty, "latest", or "auto"): OpenWA auto-resolves a
       # settled build from the third-party wppconnect-team/wa-version registry and pins its remote HTML
       # (fetched into the web.whatsapp.com origin without an integrity check). Set "off" to disable pinning

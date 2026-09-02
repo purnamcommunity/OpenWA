@@ -469,6 +469,10 @@ PUPPETEER_ARGS=--no-sandbox,--disable-setuid-sandbox
 # Optional per-browser-command budget, ms. Unset = Puppeteer's own budget. Raise only after seeing
 # "Runtime.callFunctionOn timed out"; positive integer, max 2147483647 (cost: see docs/12).
 # PUPPETEER_PROTOCOL_TIMEOUT_MS=300000
+# Optional browser identity. Unset = whatsapp-web.js's own default, which names a Chrome far older
+# than the binary that runs. Set a current one where WhatsApp must offer this session the same
+# features a desktop browser gets — some, web calling among them, are granted per client.
+# PUPPETEER_USER_AGENT=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36
 
 # ===========================================
 # SECURITY

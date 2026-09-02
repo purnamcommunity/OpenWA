@@ -370,6 +370,11 @@ export class WwebjsLifecycle {
         // Absent, puppeteer-core nullish-coalesces to its own 180 000 ms (`cdp/Connection.js`).
         ...(protocolTimeout !== undefined ? { protocolTimeout } : {}),
       },
+      // whatsapp-web.js applies `userAgent` twice — the `--user-agent=` launch flag and
+      // `page.setUserAgent` — so both the header and `navigator.userAgent` carry it. Spread only
+      // when configured, as every optional knob above is: unset must mean the library's own
+      // default, and a blank string would be applied as a blank UA rather than ignored.
+      ...(this.host.config.puppeteer?.userAgent ? { userAgent: this.host.config.puppeteer.userAgent } : {}),
       ...(authTimeoutMs !== undefined ? { authTimeoutMs } : {}),
       ...(proxyAuthentication ? { proxyAuthentication } : {}),
       ...(versionPin ?? {}),
