@@ -11,7 +11,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
-import { Repository, In, Not, IsNull, DataSource, FindManyOptions } from 'typeorm';
+import { Repository, In, Not, IsNull, LessThan, DataSource, FindManyOptions } from 'typeorm';
 import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { setTimeout } from 'node:timers/promises';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
@@ -82,6 +82,29 @@ function isTransientLaunchFailure(error: unknown): boolean {
  * `SESSION_AUTOSTART_THROTTLE_MS` overrides it — 0 disables it outright, which suits a host with
  * cores to spare and keeps tests from sleeping through a real pause.
  */
+/**
+ * The statuses that assert a running engine. A row in one of these with no engine behind it is a
+ * lie the whole product reads: the dashboard shows "waiting for QR scan" while nothing is waiting,
+ * and every `/qr` call answers "Session is not started".
+ */
+const ENGINE_BACKED_STATUSES = [
+  SessionStatus.READY,
+  SessionStatus.INITIALIZING,
+  SessionStatus.QR_READY,
+  SessionStatus.AUTHENTICATING,
+  SessionStatus.ACTION_REQUIRED,
+] as const;
+
+/** How often orphaned statuses are swept. */
+export const ORPHAN_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * How long a row may claim an engine before the sweep believes it. `start()` writes the status
+ * before the engine finishes registering, so a session seconds into launching legitimately looks
+ * orphaned — without this grace the sweep would mark a healthy start disconnected.
+ */
+export const ORPHAN_SETTLE_MS = 120_000;
+
 export const AUTOSTART_THROTTLE_MS = 45_000;
 
 /** Read per run, not at import, so the value is never frozen by whenever this module loaded. */
@@ -108,6 +131,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   private get engines(): EngineRegistry {
     return this.engineRegistry;
   }
+
+  /** Sweeps statuses that outlived their engine; see reconcileOrphanedStatuses. */
+  private orphanSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   /** The detached auto-start run; see onApplicationBootstrap. Awaited by onModuleDestroy. */
   private autoStartRun: Promise<void> = Promise.resolve();
@@ -145,13 +171,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * serving traffic. A row held by another node with an unexpired lease is therefore left alone.
    */
   async onModuleInit(): Promise<void> {
-    const activeStatuses = [
-      SessionStatus.READY,
-      SessionStatus.INITIALIZING,
-      SessionStatus.QR_READY,
-      SessionStatus.AUTHENTICATING,
-      SessionStatus.ACTION_REQUIRED,
-    ];
+    const activeStatuses = ENGINE_BACKED_STATUSES;
 
     const claimable = this.ownership?.claimableWhere() ?? [{}];
     const result = await this.sessionRepository.update(
@@ -174,6 +194,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // The watchdog owns the probe cadence and failure counting; a session it proves dead comes
     // back through the same disconnect path an engine-reported drop uses.
     this.watchdog.start((id, engine, reason) => this.engineLifecycle.handleEngineDisconnected(id, engine, reason));
+    // The watchdog only probes engines it has; a session with NO engine is invisible to it, so the
+    // orphan sweep is what keeps a stored status from outliving the browser it describes.
+    this.orphanSweepTimer = setInterval(() => {
+      void this.reconcileOrphanedStatuses().catch((error: unknown) => {
+        this.logger.warn(`Orphaned-status sweep failed: ${error instanceof Error ? error.message : String(error)}`, {
+          action: 'orphaned_status_sweep_failed',
+        });
+      });
+    }, ORPHAN_SWEEP_INTERVAL_MS);
+    this.orphanSweepTimer.unref?.();
     // A session this node has lost belongs to a peer now, which is free to start its own engine.
     // Leaving ours running would put two engines on one WhatsApp account — the thing the claim
     // exists to prevent — so the engine goes down. stopOrphanEngines is the right verb: it tears
@@ -212,6 +242,46 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * Sequential with a throttle by design — these are Chromium launches — which is exactly why it
    * cannot run inside the bootstrap hook. See onApplicationBootstrap.
    */
+
+  /**
+   * Mark any session whose stored status claims an engine that does not exist.
+   *
+   * `onModuleInit` clears these at boot; this keeps them honest for the rest of the process's life,
+   * which boot alone cannot: an engine that dies — or one that never launched, because auto-start
+   * only restores sessions that are BOTH previously authenticated and disconnected — leaves a row
+   * asserting a browser nobody is running. Nothing else notices. The liveness watchdog iterates
+   * registered engines, so a session with no engine at all is invisible to it, and the row survives
+   * every restart into a dashboard that shows a QR which will never arrive.
+   *
+   * Writing `disconnected` is what makes it recoverable: that is the status the start paths act on.
+   */
+  async reconcileOrphanedStatuses(): Promise<void> {
+    const claimable = this.ownership?.claimableWhere() ?? [{}];
+    const settledBefore = new Date(Date.now() - ORPHAN_SETTLE_MS);
+    const rows = await this.sessionRepository.find({
+      where: claimable.map(clause => ({
+        ...clause,
+        status: In([...ENGINE_BACKED_STATUSES]),
+        updatedAt: LessThan(settledBefore),
+      })),
+      select: { id: true, name: true, status: true },
+    });
+
+    const orphaned = rows.filter(row => !this.engines.has(row.id));
+    if (orphaned.length === 0) return;
+
+    await this.sessionRepository.update(
+      { id: In(orphaned.map(row => row.id)) },
+      { status: SessionStatus.DISCONNECTED },
+    );
+    for (const row of orphaned) {
+      this.logger.warn(
+        `Session ${row.name} claimed status ${row.status} with no engine running — marked disconnected`,
+        { sessionId: row.id, action: 'orphaned_status_reset', previousStatus: row.status },
+      );
+    }
+  }
+
   private async autoStartSessions(): Promise<void> {
     // Restricted to sessions this node may claim. Without it every replica scans the same rows and
     // races to launch the same engines, which is a WhatsApp account being opened twice, not merely
@@ -264,6 +334,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // may start mid-shutdown. stop() is idempotent, so a second onModuleDestroy call stays safe.
     this.shuttingDown = true;
     this.watchdog.stop();
+    if (this.orphanSweepTimer) {
+      clearInterval(this.orphanSweepTimer);
+      this.orphanSweepTimer = null;
+    }
     this.ownership?.stopHeartbeat();
     // A SIGTERM during boot can land while the detached auto-start is mid-launch. Let that one
     // settle — the flag above stops the loop taking another — so the engine it registers is torn

@@ -274,6 +274,57 @@ describe('SessionService', () => {
     });
   });
 
+  // ── orphaned status reconciliation ────────────────────────────────
+  describe('orphaned status reconciliation', () => {
+    const enginesOf = () => (service as unknown as { engines: Map<string, unknown> }).engines;
+
+    it('marks a session disconnected when its status claims an engine that does not exist', async () => {
+      // The failure this closes: the row goes on saying `qr_ready` with no browser behind it, so the
+      // dashboard shows a QR that never arrives and every /qr call answers "Session is not started".
+      (repository.find as jest.Mock).mockResolvedValue([
+        { id: 'ghost', name: 'ghost-session', status: SessionStatus.QR_READY },
+      ]);
+
+      await service.reconcileOrphanedStatuses();
+
+      expect(repository.update).toHaveBeenCalledWith(
+        { id: expect.objectContaining({ _value: ['ghost'] }) },
+        { status: SessionStatus.DISCONNECTED },
+      );
+    });
+
+    it('leaves a session alone while its engine is registered', async () => {
+      (repository.find as jest.Mock).mockResolvedValue([
+        { id: 'live', name: 'live-session', status: SessionStatus.READY },
+      ]);
+      enginesOf().set('live', { getStatus: () => 'ready' });
+
+      await service.reconcileOrphanedStatuses();
+
+      expect(repository.update).not.toHaveBeenCalled();
+      enginesOf().delete('live');
+    });
+
+    it('writes nothing when no row is orphaned', async () => {
+      (repository.find as jest.Mock).mockResolvedValue([]);
+
+      await service.reconcileOrphanedStatuses();
+
+      expect(repository.update).not.toHaveBeenCalled();
+    });
+
+    it('only considers rows that have sat in the status long enough to settle', async () => {
+      // start() writes the status before the engine registers, so a session seconds into launching
+      // legitimately has no engine yet — sweeping it would kill a healthy start.
+      (repository.find as jest.Mock).mockResolvedValue([]);
+
+      await service.reconcileOrphanedStatuses();
+
+      const where = (repository.find as jest.Mock).mock.calls[0][0].where;
+      expect(where[0].updatedAt).toBeDefined();
+    });
+  });
+
   // ── delete/stop teardown resilience ───────────────────────────────
   describe('teardown resilience', () => {
     const enginesOf = () => (service as unknown as { engines: Map<string, unknown> }).engines;
@@ -2294,7 +2345,9 @@ describe('SessionService', () => {
       try {
         service.onApplicationBootstrap();
         expect(internals().watchdog.timer).not.toBeNull();
-        expect(jest.getTimerCount()).toBe(1); // the interval itself
+        // Two intervals: the watchdog's probe, and the orphaned-status sweep beside it. Both are
+        // the service's to clear — either one left running outlives the module as an open handle.
+        expect(jest.getTimerCount()).toBe(2);
 
         await service.onModuleDestroy();
         expect(internals().watchdog.timer).toBeNull();
