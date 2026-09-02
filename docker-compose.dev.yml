@@ -11,6 +11,16 @@
 services:
   # API Backend
   openwa:
+    # Which image `up` runs. Unset — the local default — is the name compose gives its own build,
+    # so `up -d --build` behaves exactly as it always has. A deployment sets OPENWA_IMAGE to a
+    # registry reference pinned by DIGEST, never a tag: a tag can be moved, and "which image is
+    # running" then stops having an answer. Build elsewhere and pull, because building here spends
+    # the box's two shared OCPUs and its disk on work a laptop does in four minutes — and holds the
+    # container down for the duration, which for this service is a WhatsApp reconnect.
+    #
+    # `docker compose pull` SKIPS a service that has a `build:` section, so a deployment fetches
+    # with plain `docker pull <ref>` and then `docker compose up -d --no-build`.
+    image: ${OPENWA_IMAGE:-openwa-openwa}
     build:
       context: .
       dockerfile: Dockerfile
