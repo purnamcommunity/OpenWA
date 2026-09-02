@@ -128,7 +128,8 @@ describe('VoipAudioService backlog cap', () => {
   it('reports the peak backlog and the audio it refused in the close summary', () => {
     const { service } = serviceWith();
     const logged: string[] = [];
-    jest.spyOn((service as unknown as { logger: { log: (m: string) => void } }).logger, 'log')
+    jest
+      .spyOn((service as unknown as { logger: { log: (m: string) => void } }).logger, 'log')
       .mockImplementation(m => logged.push(m));
     service.open('s1', () => {});
 

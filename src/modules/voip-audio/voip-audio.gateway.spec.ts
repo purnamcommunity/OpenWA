@@ -22,11 +22,13 @@ function fakeClient(auth: Record<string, string>) {
 }
 
 function gatewayWith(overrides?: { validKey?: boolean }) {
+  // Kept as the plain mock object, not cast to VoipAudioService: assertions below reference
+  // `audio.open`, and through the class type that is an unbound method reference rather than a spy.
   const audio = {
     open: jest.fn(),
     close: jest.fn(),
     writeMic: jest.fn().mockReturnValue(true),
-  } as unknown as VoipAudioService;
+  };
   const authService = {
     validateApiKey: jest.fn().mockImplementation(() => {
       if (overrides?.validKey === false) throw new Error('bad key');
@@ -34,7 +36,7 @@ function gatewayWith(overrides?: { validKey?: boolean }) {
     }),
   } as unknown as AuthService;
   const tokens = new VoipAudioTokenService();
-  const gateway = new VoipAudioGateway(audio, authService, tokens);
+  const gateway = new VoipAudioGateway(audio as unknown as VoipAudioService, authService, tokens);
   return { gateway, audio, tokens };
 }
 
@@ -70,9 +72,9 @@ describe('VoipAudioGateway token handshake', () => {
 
     gateway.start(client, { sessionId: 'other-session' });
     expect(audio.open).not.toHaveBeenCalled();
-    expect(client.emitted.some(e => e.event === 'audio:error' && (e.payload as { code: string }).code === 'FORBIDDEN')).toBe(
-      true,
-    );
+    expect(
+      client.emitted.some(e => e.event === 'audio:error' && (e.payload as { code: string }).code === 'FORBIDDEN'),
+    ).toBe(true);
   });
 
   it('rejects a reused token — one token buys one connection', async () => {

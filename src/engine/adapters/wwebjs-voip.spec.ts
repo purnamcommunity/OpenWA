@@ -105,7 +105,10 @@ describe('raw audio capture', () => {
    * does and inspects what actually reached the browser. The point of the override is the
    * constraints it rewrites, so anything less than that asserts nothing.
    */
-  const withOverride = async (): Promise<{ seen: MediaStreamConstraints[]; media: { getUserMedia: (c?: MediaStreamConstraints) => Promise<MediaStream> } }> => {
+  const withOverride = async (): Promise<{
+    seen: MediaStreamConstraints[];
+    media: { getUserMedia: (c?: MediaStreamConstraints) => Promise<MediaStream> };
+  }> => {
     const seen: MediaStreamConstraints[] = [];
     const media = {
       getUserMedia: (c?: MediaStreamConstraints) => {

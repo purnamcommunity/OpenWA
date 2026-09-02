@@ -163,9 +163,10 @@ describe('docs/29 counts match the capability matrix', () => {
     // one baileys row-level mark, so it is excluded from the wwjs figure. The class spans every
     // superscript a patcher can carry rather than the ones that happen to be row-marked today: a
     // narrower class makes a NEW mark invisible here, so adding a patcher and marking its row would
-    // read as drift in the claim rather than agreement.
+    // read as drift in the claim rather than agreement. The mark is one-or-more superscripts, not
+    // one: past ten a single-digit class reads 🔧¹⁰ as 🔧¹ and miscounts silently instead of failing.
     const contract = section(/^## 29\.4 /m, /^## 29\.5 /m);
-    const marks = [...contract.matchAll(/✅🔧([¹²³⁴⁵⁶⁷⁸⁹])/g)].map(m => m[1]);
+    const marks = [...contract.matchAll(/✅🔧([⁰¹²³⁴⁵⁶⁷⁸⁹]+)/g)].map(m => m[1]);
     const wwjsMarks = marks.filter(m => m !== '⁶').length;
     const claimed = doc.match(/\*\*(\d+) wwjs cells carry an explicit patch dependency\*\*/);
     if (!claimed) wrong.push('patch dependency count: phrasing no longer found');

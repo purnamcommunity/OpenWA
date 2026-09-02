@@ -57,6 +57,18 @@ const REPLACE = `                internalCallMap.set = function (key, value) {
 /** Present once the patch has been applied — makes a second run a no-op rather than a failure. */
 const MARKER = 'const scalars = {};';
 
+/**
+ * The stand-down branch above as a predicate, for the startup guard (engine-patch-status.ts).
+ * Unreadable reads as applied: a tree we cannot inspect is not evidence of a broken one.
+ */
+function isApplied(wwjsDir = DEFAULT_WWJS) {
+  try {
+    return fs.readFileSync(path.join(wwjsDir, CLIENT_PATH), 'utf8').includes(MARKER);
+  } catch {
+    return true;
+  }
+}
+
 function applyCallStatePatch(wwjsDir = DEFAULT_WWJS) {
   const clientFile = path.join(wwjsDir, CLIENT_PATH);
   if (!fs.existsSync(clientFile)) {
@@ -95,4 +107,4 @@ function run() {
 
 if (require.main === module) run();
 
-module.exports = { applyCallStatePatch, FIND, REPLACE, MARKER, CLIENT_PATH };
+module.exports = { applyCallStatePatch, isApplied, FIND, REPLACE, MARKER, CLIENT_PATH };

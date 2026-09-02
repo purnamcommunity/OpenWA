@@ -7,9 +7,20 @@ const os = require('os');
 const path = require('path');
 const vm = require('vm');
 
-const { applyCallStatePatch, FIND, MARKER, CLIENT_PATH } = require('./patch-wwebjs-call-state.js');
+const { applyCallStatePatch, FIND, REPLACE, MARKER, CLIENT_PATH } = require('./patch-wwebjs-call-state.js');
 
 const REAL_CLIENT = path.join(__dirname, '..', 'node_modules', 'whatsapp-web.js', CLIENT_PATH);
+
+/**
+ * The installed Client.js as it ships, patched back out if this tree has already had postinstall
+ * run over it. Reading it raw would make every case below depend on install order: after a plain
+ * `npm install` the marker is already there, so "applies" could never hold and the lane failed on
+ * a correct tree. The round trip is safe because the transform is a single exact replacement.
+ */
+function pristineClient() {
+  const source = fs.readFileSync(REAL_CLIENT, 'utf8');
+  return source.includes(MARKER) ? source.replace(REPLACE, FIND) : source;
+}
 
 /** A wwjs tree holding `source` as Client.js. */
 function treeWith(source) {
@@ -21,14 +32,22 @@ function treeWith(source) {
 
 const readClient = (dir) => fs.readFileSync(path.join(dir, CLIENT_PATH), 'utf8');
 
+test('the installed Client.js carries one of the two shapes the patcher knows', () => {
+  const source = fs.readFileSync(REAL_CLIENT, 'utf8');
+  assert.ok(
+    source.includes(FIND) || source.includes(MARKER),
+    'installed Client.js matches neither the upstream call-map injection nor the patched one',
+  );
+});
+
 test('applies against the real upstream Client.js', () => {
-  const dir = treeWith(fs.readFileSync(REAL_CLIENT, 'utf8'));
+  const dir = treeWith(pristineClient());
   assert.deepStrictEqual(applyCallStatePatch(dir), { applied: true });
   assert.ok(readClient(dir).includes(MARKER));
 });
 
 test('leaves a file it already patched alone', () => {
-  const dir = treeWith(fs.readFileSync(REAL_CLIENT, 'utf8'));
+  const dir = treeWith(pristineClient());
   applyCallStatePatch(dir);
   const once = readClient(dir);
   assert.deepStrictEqual(applyCallStatePatch(dir), { applied: false, reason: 'already present' });
@@ -36,7 +55,7 @@ test('leaves a file it already patched alone', () => {
 });
 
 test('the patched file is still valid JavaScript', () => {
-  const dir = treeWith(fs.readFileSync(REAL_CLIENT, 'utf8'));
+  const dir = treeWith(pristineClient());
   applyCallStatePatch(dir);
   assert.doesNotThrow(() => new vm.Script(readClient(dir), { filename: 'Client.js' }));
 });

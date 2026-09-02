@@ -44,7 +44,14 @@ const ALLOWLIST = new Map<string, string>([
  * session-dimensioned when it declares a `:sessionId` route param or the class is @SessionScoped.
  */
 export function handlersMissingGlobalFence(source: string): string[] {
-  const beforeClass = source.split('export class')[0] ?? '';
+  // Everything up to the class the @Controller decorator is attached to — NOT up to the first
+  // `export class` in the file. A controller file may declare a response DTO above the controller
+  // (voip-audio.controller.ts does), and slicing at the first class then cuts @Controller out of
+  // the slice entirely: its `:sessionId` prefix goes unseen and a properly scoped route reads as an
+  // unfenced global one. Falls back to the whole file when there is no @Controller to anchor on.
+  const controllerAt = source.indexOf('@Controller(');
+  const classAt = controllerAt === -1 ? -1 : source.indexOf('export class', controllerAt);
+  const beforeClass = classAt === -1 ? (source.split('export class')[0] ?? '') : source.slice(0, classAt);
   const classIsSessionScoped = /@SessionScoped\(\)/.test(beforeClass);
   const classIsFenced = /@RequireUnscopedKey\(\)/.test(beforeClass);
   const classIsPublic = /@Public\(\)/.test(beforeClass);
@@ -151,6 +158,27 @@ export class ThingController {
 }
 `;
     expect(handlersMissingGlobalFence(scoped)).toEqual([]);
+  });
+
+  it('clears a controller whose class-level :sessionId prefix sits below a response DTO', () => {
+    // The decorator block that carries the session dimension belongs to the CONTROLLER class, which
+    // need not be the first class in the file. Anchoring on the first one instead reads this as an
+    // unfenced global route — a false alarm that pushes someone to "fix" an already-scoped route.
+    const scopedBelowDto = `
+export class TokenResponseDto {
+  token!: string;
+}
+
+@Controller('sessions/:sessionId/calls')
+export class ThingController {
+  @Post('audio-token')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  mint(): TokenResponseDto {
+    return { token: '' };
+  }
+}
+`;
+    expect(handlersMissingGlobalFence(scopedBelowDto)).toEqual([]);
   });
 
   it('clears every handler on a class-level fenced controller', () => {

@@ -25,17 +25,18 @@
  *      participant writes report which requested ids resolved to members, gated the same way.
  *   7. `node scripts/patch-wwebjs-block.js --best-effort` when present, restoring block and
  *      unblock after WhatsApp Web removed the contact resolver they used.
- *   8. `node scripts/patch-wwebjs-call-log-event.js --best-effort` when present, so a CALL is
- *      announced as a message at all (whatsapp-web.js drops it: a call log has no isNewMsg).
- *   9. `node scripts/patch-wwebjs-group-description.js --best-effort` when present, realigning the
+ *   8. `node scripts/patch-wwebjs-group-description.js --best-effort` when present, realigning the
  *      group-description job call with the options object the page now takes, gated the same way.
- *   9. `node scripts/patch-wwebjs-call-state.js --best-effort` when present, forwarding the call
+ *   9. `node scripts/patch-wwebjs-call-log-event.js --best-effort` when present, so a CALL is
+ *      announced as a message at all (whatsapp-web.js drops it: a call log has no isNewMsg).
+ *  10. `node scripts/patch-wwebjs-call-state.js --best-effort` when present, forwarding the call
  *      model's scalar fields so a call's outcome reaches the client, not just its arrival.
- *  10. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
+ *  11. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
  *      bound, gated the same way.
- *  11. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
- *      newsletter-create parse fix. Steps 10-11 are the Baileys patches, so a Baileys-only install
- *      runs those and skips 2-9.
+ *  12. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
+ *      newsletter-create parse fix. Steps 11-12 are the Baileys patches, so a Baileys-only install
+ *      runs those and skips 2-10. This list is the order `planSteps` plans, which
+ *      `scripts/postinstall.spec.js` pins against the patchers on disk.
  *
  * Structured like scripts/patch-wwebjs-201832.js: pure planning + injectable spawn, so the spec
  * (scripts/postinstall.spec.js, node:test) exercises every branch without a real npm run.
@@ -148,9 +149,7 @@ function planSteps(root, env = process.env) {
   const callLogEventPatcher = path.join(root, 'scripts', 'patch-wwebjs-call-log-event.js');
   if (fs.existsSync(callLogEventPatcher)) {
     steps.push({
-      name:
-        'whatsapp-web.js group description job signature ' +
-        '(scripts/patch-wwebjs-call-log-event.js --best-effort)',
+      name: 'whatsapp-web.js call-log message event (scripts/patch-wwebjs-call-log-event.js --best-effort)',
       command: process.execPath,
       args: [callLogEventPatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },

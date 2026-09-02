@@ -76,8 +76,7 @@ function pageRawAudioCapture(): { ok: true } {
   media.getUserMedia = (constraints?: MediaStreamConstraints): Promise<MediaStream> => {
     if (!constraints?.audio) return original(constraints);
     const raw = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
-    const audio =
-      typeof constraints.audio === 'object' ? { ...constraints.audio, ...raw } : raw;
+    const audio = typeof constraints.audio === 'object' ? { ...constraints.audio, ...raw } : raw;
     return original({ ...constraints, audio });
   };
   media.__rawAudioPatched = true;

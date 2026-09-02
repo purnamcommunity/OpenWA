@@ -9,7 +9,22 @@
  *
  * The description id comes from `WARandomHex.randomHex(8)` and an empty description is sent as
  * `null`, both as WhatsApp Web itself does: `null` selects the job's delete branch, so `''` still
- * clears rather than writing an empty body element.
+ * clears rather than writing an empty body element. `docs/06-api-specification.md` documents that
+ * empty string as clearing the description, so the mapping is part of the route's contract rather
+ * than an incidental detail of the transform.
+ *
+ * The argument shape is adopted from the open upstream fix (wwebjs/whatsapp-web.js#201895), which
+ * reports the same `Cannot read properties of undefined (reading 'toJid')` throw and the same four
+ * field names. Two divergences from it are deliberate: upstream keeps `await WAWebMsgKey.newId()`
+ * for the id, and passes the description through verbatim, so an empty string writes an empty body
+ * element instead of clearing. Both matter the day upstream lands. A tree carrying it matches
+ * neither the find below nor the replace, so this patcher stops the build instead of standing down,
+ * and retiring it means re-cutting the transform down to the `'' -> null` delta on top of the
+ * upstream shape, not deleting it.
+ *
+ * Measured on wwjs 1.34.7 against a live group: setting a description answers 200 and the new text
+ * reads back, `''` clears it, and neither throws in the page. The admin-refusal path was not
+ * exercised.
  *
  * The source transform is deliberately exact and self-disabling. An unknown shape fails the
  * production image build instead of silently shipping without the fix.
@@ -44,6 +59,19 @@ const OPTIONS_CALL = `                let newId = window.require('WARandomHex').
 
 function occurrences(source, needle) {
   return source.split(needle).length - 1;
+}
+
+/**
+ * The stand-down branch below as a predicate, for the startup guard (engine-patch-status.ts).
+ * Unreadable reads as applied: a tree we cannot inspect is not evidence of a broken one.
+ */
+function isApplied(wwjsDir = DEFAULT_WWJS) {
+  try {
+    const source = fs.readFileSync(path.join(wwjsDir, GROUP_CHAT_PATH), 'utf8');
+    return occurrences(source, OPTIONS_CALL) === 1 && occurrences(source, POSITIONAL_CALL) === 0;
+  } catch {
+    return true;
+  }
 }
 
 function applyGroupDescriptionFix(wwjsDir = DEFAULT_WWJS) {
@@ -90,4 +118,4 @@ function run() {
 
 if (require.main === module) run();
 
-module.exports = { applyGroupDescriptionFix, POSITIONAL_CALL, OPTIONS_CALL };
+module.exports = { applyGroupDescriptionFix, isApplied, POSITIONAL_CALL, OPTIONS_CALL };

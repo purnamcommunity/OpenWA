@@ -6,7 +6,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { applyGroupDescriptionFix, POSITIONAL_CALL, OPTIONS_CALL } = require('./patch-wwebjs-group-description.js');
+const {
+  applyGroupDescriptionFix,
+  isApplied,
+  POSITIONAL_CALL,
+  OPTIONS_CALL,
+} = require('./patch-wwebjs-group-description.js');
 
 function makeDependency(source) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openwa-group-description-'));
@@ -23,6 +28,16 @@ test('patches the description job call to the options object', () => {
 
   assert.deepEqual(result, { skipped: false, note: 'group description job called with an options object' });
   assert.equal(fs.readFileSync(groupChat, 'utf8'), `before\n${OPTIONS_CALL}\nafter\n`);
+});
+
+test('reports the patch as applied only once the transform has run', () => {
+  const { root } = makeDependency(`before\n${POSITIONAL_CALL}\nafter\n`);
+
+  assert.equal(isApplied(root), false);
+
+  applyGroupDescriptionFix(root);
+
+  assert.equal(isApplied(root), true);
 });
 
 test('sends an empty description as null, which clears rather than writing an empty body', () => {
