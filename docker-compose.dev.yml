@@ -300,6 +300,25 @@ services:
       - LOG_FORMAT=${LOG_FORMAT:-}
       - BASE_URL=${BASE_URL:-}
       - DASHBOARD_URL=${DASHBOARD_URL:-}
+    # Container stdout goes to the host journal instead of a container-owned json file.
+    #
+    # The reason is evidence, not disk. Under the default json-file driver the log lives inside the
+    # container directory and is deleted with the container, so every recreate destroys the record
+    # of what preceded it — exactly the record an incident needs. In the journal it outlives the
+    # container, and journald applies its own size caps, so there is no unbounded file either.
+    #
+    # `docker logs openwa-api` still works: journald is a driver Docker can read back. Host-side the
+    # same lines are `journalctl CONTAINER_NAME=openwa-api`, the form that still answers after the
+    # container is gone.
+    #
+    # It lives in this file rather than a docker-compose.override.yml because the stack is brought
+    # up with an explicit `-f docker-compose.dev.yml`, and compose auto-loads an override file only
+    # for the default docker-compose.yml. An override here would be silently ignored.
+    logging:
+      driver: journald
+      options:
+        tag: openwa-api
+
     volumes:
       - ./data:/app/data
     restart: unless-stopped
