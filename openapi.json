@@ -15017,6 +15017,11 @@
             "description": "The display name the contact set for themselves. Present even when the contact is not saved.",
             "example": "Ada"
           },
+          "verifiedName": {
+            "type": "string",
+            "description": "The name a business account publishes — WhatsApp's verified/business name. This is the only name a business the account never saved has: such a contact carries no `name` (never saved) and usually no `pushName` (a business sets a business name, not a personal one), so a client that reads only those two renders its phone number for a contact WhatsApp itself names.",
+            "example": "The Packing Company"
+          },
           "number": {
             "type": "string",
             "description": "MSISDN digits, without a leading + or any separators.",

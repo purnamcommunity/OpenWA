@@ -741,6 +741,12 @@ export interface ContactRecord {
   number?: string | null;
   /** The name the contact set on their own account. Both engines emit this as `pushName`. */
   pushName?: string | null;
+  /**
+   * The name a business account publishes. A business this account never saved has no other name —
+   * no `name` (never saved) and usually no `pushName` (a business sets a business name, not a
+   * personal one) — so read this before falling back to the number.
+   */
+  verifiedName?: string | null;
   isMyContact?: boolean;
   /**
    * Whether the account has blocked this contact. Reflects the account's real blocklist on both

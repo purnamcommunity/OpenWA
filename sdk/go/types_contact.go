@@ -12,6 +12,10 @@ type ContactRecord struct {
 	Name          *string `json:"name,omitempty"`
 	Number        *string `json:"number,omitempty"`
 	PushName      *string `json:"pushName,omitempty"`
+	// VerifiedName is the name a business account publishes. A business this account never saved has
+	// no other name — no Name (never saved) and usually no PushName — so read it before falling back
+	// to the number.
+	VerifiedName  *string `json:"verifiedName,omitempty"`
 	IsMyContact   bool    `json:"isMyContact,omitempty"`
 	IsBlocked     bool    `json:"isBlocked,omitempty"`
 	ProfilePicURL *string `json:"profilePicUrl,omitempty"`

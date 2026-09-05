@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Contacts carry `verifiedName`, the name a business account publishes. A business the account never
+  saved has no other name — no `name` (never saved) and usually no `pushName` (a business sets a
+  business name, not a personal one) — so a client reading only those two rendered a phone number for
+  a contact WhatsApp itself names on screen. Both engines report it; whatsapp-web.js dropped the
+  field entirely, and Baileys folded it into `name` with no way to tell a published business name
+  from a saved one.
+
 - Poll results are readable and live. `GET /sessions/{id}/messages/{chatId}/{messageId}/poll-votes`
   returns one entry per voter with that voter's current selection, and the new `message.poll_vote`
   webhook/WebSocket event fires as votes arrive. `?resolveContacts=true` also returns each voter's

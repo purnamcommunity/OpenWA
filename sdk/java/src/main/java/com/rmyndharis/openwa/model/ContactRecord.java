@@ -7,12 +7,17 @@ package com.rmyndharis.openwa.model;
  * query fails the field stays at its default rather than reporting "nobody is blocked", and the
  * gateway logs a warning — so a false is not proof the contact is unblocked if the link is
  * unhealthy.
+ *
+ * <p>{@code verifiedName} is the name a business account publishes. A business this account never
+ * saved has no other name — no {@code name} (never saved) and usually no {@code pushName} — so read
+ * it before falling back to the number.
  */
 public record ContactRecord(
     String id,
     String name,
     String number,
     String pushName,
+    String verifiedName,
     Boolean isMyContact,
     Boolean isBlocked,
     String profilePicUrl) {}

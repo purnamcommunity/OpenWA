@@ -30,6 +30,20 @@ export function readWid(wid: SerializedWid | string | null | undefined): string 
 }
 
 /**
+ * Read a contact's published business name, or undefined when it has none.
+ *
+ * whatsapp-web.js declares `verifiedName` as `undefined` — an unfilled `@todo` in its typings, not a
+ * statement that the field is absent — while `Contact._patch` assigns the real string and WA Web's
+ * contact model carries it for every business account. Reading it through the published type
+ * therefore yields `undefined` at compile time for a value that is present at runtime, so the
+ * correction is stated once here rather than as a cast at the callsite.
+ */
+export function readVerifiedName(contact: unknown): string | undefined {
+  const raw = (contact as { verifiedName?: unknown } | null | undefined)?.verifiedName;
+  return typeof raw === 'string' && raw ? raw : undefined;
+}
+
+/**
  * Raw group metadata as returned by `chat.groupMetadata.serialize()`.
  * The field that links a community sub-group to its parent community has
  * varied across whatsapp-web.js/WA Web versions, so multiple known

@@ -2,7 +2,7 @@ import { type Client } from 'whatsapp-web.js';
 import { Contact } from '../interfaces/whatsapp-engine.interface';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { userPart } from '../identity/wa-id';
-import { readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
+import { readVerifiedName, readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
 import { type WwebjsEngineHost } from './wwebjs-host';
 
 /** The raw whatsapp-web.js contact element type, kept local so the wwebjs `Contact` type never leaks. */
@@ -34,6 +34,11 @@ export class WwebjsContacts {
       id,
       name: c.name || undefined,
       pushName: c.pushname || undefined,
+      // A business account's own name, and the only name it has when this account never saved it:
+      // WhatsApp fills neither `name` (addressbook) nor `pushname` (a personal display name) for
+      // one, so a consumer that sees only those two fields has nothing to call a contact WhatsApp's
+      // own UI names on screen, and falls back to rendering the phone number.
+      verifiedName: readVerifiedName(c),
       number: c.number,
       isMyContact: c.isMyContact,
       isBlocked: c.isBlocked,

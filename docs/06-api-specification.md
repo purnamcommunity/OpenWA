@@ -2406,6 +2406,7 @@ The `Contact` object returned by the list and get-by-id routes has this shape:
   "id": "6281234567890@c.us",
   "name": "Jane Doe",
   "pushName": "Jane",
+  "verifiedName": "The Packing Company",
   "number": "6281234567890",
   "isMyContact": true,
   "isBlocked": false,
@@ -2413,7 +2414,14 @@ The `Contact` object returned by the list and get-by-id routes has this shape:
 }
 ```
 
-`name`, `pushName`, and `profilePicUrl` are optional and may be absent.
+`name`, `pushName`, `verifiedName`, and `profilePicUrl` are optional and may be absent.
+
+The three names answer different questions and a client picking one should read them in this order:
+`name` is what this account saved in its addressbook, `pushName` is what the contact set for
+themselves, and `verifiedName` is what a business account publishes. A business the account never
+saved has only the last of the three — no addressbook entry, and usually no personal pushname — so a
+client that reads `name` and `pushName` alone falls back to rendering a phone number for a contact
+WhatsApp itself names on screen.
 
 #### GET /api/sessions/:sessionId/contacts
 
@@ -2442,6 +2450,7 @@ List all contacts for a session, returned as an in-memory paginated window.
     "id": "6281234567890@c.us",
     "name": "Jane Doe",
     "pushName": "Jane",
+    "verifiedName": "The Packing Company",
     "number": "6281234567890",
     "isMyContact": true,
     "isBlocked": false,
@@ -2518,6 +2527,7 @@ Get a single contact by its WhatsApp id.
   "id": "6281234567890@c.us",
   "name": "Jane Doe",
   "pushName": "Jane",
+  "verifiedName": "The Packing Company",
   "number": "6281234567890",
   "isMyContact": true,
   "isBlocked": false,

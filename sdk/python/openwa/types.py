@@ -728,6 +728,9 @@ class ContactRecord(TypedDict, total=False):
     name: str | None
     number: str | None
     pushName: str | None
+    # The name a business account publishes. A business this account never saved has no other name --
+    # no name (never saved) and usually no pushName -- so read it before falling back to the number.
+    verifiedName: str | None
     isMyContact: bool
     isBlocked: bool
     profilePicUrl: str | None

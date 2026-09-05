@@ -213,6 +213,14 @@ export interface Contact {
   id: string;
   name?: string;
   pushName?: string;
+  /**
+   * The display name a business account publishes — WhatsApp's own verified/business name, which is
+   * neither an addressbook entry nor a pushname. It is the ONLY name a business that the account has
+   * never saved has at all: such a contact carries no `name` (never saved) and typically no
+   * `pushName` (a business sets a business name, not a personal one), so dropping this field leaves
+   * the consumer with nothing to call a contact WhatsApp's own UI names on screen.
+   */
+  verifiedName?: string;
   number: string;
   isMyContact: boolean;
   isBlocked: boolean;
