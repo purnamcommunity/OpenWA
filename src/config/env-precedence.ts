@@ -117,6 +117,9 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'SESSION_DATA_PATH',
   'PUPPETEER_ARGS',
   'PUPPETEER_PROTOCOL_TIMEOUT_MS',
+  // The browser identity the engine presents. Blank-forwarded by both compose files, so an empty
+  // forward would shadow a value set in .env / data/.env.generated and pin the built-in default.
+  'PUPPETEER_USER_AGENT',
   // Rate-limit values are blank-forwarded by Compose so a host value can take precedence without an
   // empty forward masking the lower-priority loaded .env / data/.env.generated value.
   'RATE_LIMIT_SHORT_TTL',
