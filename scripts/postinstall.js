@@ -31,11 +31,13 @@
  *      announced as a message at all (whatsapp-web.js drops it: a call log has no isNewMsg).
  *  10. `node scripts/patch-wwebjs-call-state.js --best-effort` when present, forwarding the call
  *      model's scalar fields so a call's outcome reaches the client, not just its arrival.
- *  11. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
+ *  11. `node scripts/patch-wwebjs-contact-alt-wid.js --best-effort` when present, so one contact
+ *      whose wid the page refuses to map cannot fail the whole address-book read.
+ *  12. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
  *      bound, gated the same way.
- *  12. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
- *      newsletter-create parse fix. Steps 11-12 are the Baileys patches, so a Baileys-only install
- *      runs those and skips 2-10. This list is the order `planSteps` plans, which
+ *  13. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
+ *      newsletter-create parse fix. Steps 12-13 are the Baileys patches, so a Baileys-only install
+ *      runs those and skips 2-11. This list is the order `planSteps` plans, which
  *      `scripts/postinstall.spec.js` pins against the patchers on disk.
  *
  * Structured like scripts/patch-wwebjs-201832.js: pure planning + injectable spawn, so the spec
@@ -161,6 +163,15 @@ function planSteps(root, env = process.env) {
       name: 'whatsapp-web.js call state forwarding (scripts/patch-wwebjs-call-state.js --best-effort)',
       command: process.execPath,
       args: [callStatePatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const contactAltWidPatcher = path.join(root, 'scripts', 'patch-wwebjs-contact-alt-wid.js');
+  if (fs.existsSync(contactAltWidPatcher)) {
+    steps.push({
+      name: 'whatsapp-web.js contact alternate-wid guard (scripts/patch-wwebjs-contact-alt-wid.js --best-effort)',
+      command: process.execPath,
+      args: [contactAltWidPatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }

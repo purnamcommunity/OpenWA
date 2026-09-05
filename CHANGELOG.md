@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A single contact WhatsApp Web will not map no longer fails the whole address book. `GET /contacts`
+  answered `500` for every read on an account holding a device-addressed contact: `getContactModel`
+  refines `isBlocked` through `getAlternateUserWid`, which throws for such a wid, and `getContacts`
+  maps every contact through it inside one page evaluation. Install-time patch 🔧¹², so the refused
+  lookup is contained and the rest of the list is returned.
 - Paged lists now tiebreak on `id`, so a walk returns every row exactly once. Neither `createdAt` nor
   a search relevance score is unique, and on PostgreSQL two identical statements could sort one tie
   group differently, silently repeating some rows and omitting others: a 5000-row message list lost

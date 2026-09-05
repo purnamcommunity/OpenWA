@@ -34,6 +34,7 @@ const EXPECTED_PATCHER_ORDER = [
   'patch-wwebjs-group-description.js',
   'patch-wwebjs-call-log-event.js',
   'patch-wwebjs-call-state.js',
+  'patch-wwebjs-contact-alt-wid.js',
   'patch-baileys-appstate.js',
   'patch-baileys-newsletter-create.js',
 ];
