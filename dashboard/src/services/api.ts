@@ -412,6 +412,12 @@ export interface Contact {
   id: string;
   name?: string;
   pushName?: string;
+  /**
+   * The name a business account publishes. The only name a business this account never saved has:
+   * it carries no `name` (never saved) and usually no `pushName` (a business sets a business name,
+   * not a personal one), so a reader that skips this field shows its phone number instead.
+   */
+  verifiedName?: string;
   /** MSISDN digits without separators — always present in the response. */
   number: string;
   isMyContact: boolean;

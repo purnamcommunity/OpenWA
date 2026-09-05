@@ -363,6 +363,10 @@ export class BaileysSessionStore {
       id: this.toNeutralJid(c.id),
       name: c.name ?? c.verifiedName,
       pushName: c.notify,
+      // Also reported on its own, not only folded into `name` above: a consumer that wants to know
+      // whether a name is one this account saved or one a business publishes cannot tell the two
+      // apart once they are collapsed, and the wwebjs engine reports the field separately.
+      verifiedName: c.verifiedName,
       number,
       // Baileys distinguishes the two names: `name` is documented as the one YOU saved on your
       // WhatsApp, `notify` as the pushname the contact set themselves. Reporting true for everyone

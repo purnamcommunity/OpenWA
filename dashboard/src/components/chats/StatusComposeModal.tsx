@@ -62,7 +62,9 @@ function StatusComposeModal({ sessionId, onClose, onPosted }: Props) {
   const composeRecipientSearchLower = composeRecipientSearch.toLowerCase();
   const filteredComposeContacts = composeContacts.filter(c =>
     // Match against every identity field — a named contact must still be findable by number/JID.
-    [c.name, c.pushName, c.number, c.id].some(v => v?.toLowerCase().includes(composeRecipientSearchLower)),
+    [c.name, c.pushName, c.verifiedName, c.number, c.id].some(v =>
+      v?.toLowerCase().includes(composeRecipientSearchLower),
+    ),
   );
 
   const resetComposeForm = useCallback(() => {
@@ -281,7 +283,9 @@ function StatusComposeModal({ sessionId, onClose, onPosted }: Props) {
                     disabled={!composeRecipients.includes(c.id) && composeRecipients.length >= STATUS_RECIPIENTS_MAX}
                     onChange={() => toggleComposeRecipient(c.id)}
                   />
-                  <span>{c.name || c.pushName || c.number || c.id}</span>
+                  {/* verifiedName before the number: a business the account never saved has no
+                      `name` and no `pushName`, so skipping it lists a business by its digits. */}
+                  <span>{c.name || c.pushName || c.verifiedName || c.number || c.id}</span>
                 </label>
               ))
             )}

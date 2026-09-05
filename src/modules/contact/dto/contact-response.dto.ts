@@ -26,6 +26,16 @@ export class ContactDto {
   })
   pushName?: string;
 
+  @ApiPropertyOptional({
+    description:
+      "The name a business account publishes — WhatsApp's verified/business name. This is the only " +
+      'name a business the account never saved has: such a contact carries no `name` (never saved) ' +
+      'and usually no `pushName` (a business sets a business name, not a personal one), so a client ' +
+      'that reads only those two renders its phone number for a contact WhatsApp itself names.',
+    example: 'The Packing Company',
+  })
+  verifiedName?: string;
+
   @ApiProperty({ description: 'MSISDN digits, without a leading + or any separators.', example: '628123456789' })
   number!: string;
 

@@ -5884,6 +5884,58 @@ describe('WhatsAppWebJsAdapter page transport error detection (wedged page fast-
     ]);
   });
 
+  // A business the account never saved has no `name` and no `pushname` — its only name is the
+  // verified/business one, which WA Web itself renders. Dropping it left every such contact showing
+  // as a bare phone number downstream.
+  it("maps a business contact's verifiedName, which is its only name", async () => {
+    const biz = {
+      id: { _serialized: '555@c.us' },
+      number: '555',
+      isBusiness: true,
+      isMyContact: false,
+      isBlocked: false,
+      verifiedName: 'The Packing Company',
+    };
+    const { adapter } = readyAdapter({
+      getContactById: jest.fn().mockResolvedValue(biz),
+      getContacts: jest.fn().mockResolvedValue([biz]),
+    });
+
+    await expect(adapter.getContactById('555@c.us')).resolves.toMatchObject({
+      name: undefined,
+      pushName: undefined,
+      verifiedName: 'The Packing Company',
+    });
+    await expect(adapter.getContacts()).resolves.toEqual([
+      {
+        id: '555@c.us',
+        name: undefined,
+        pushName: undefined,
+        verifiedName: 'The Packing Company',
+        number: '555',
+        isMyContact: false,
+        isBlocked: false,
+      },
+    ]);
+  });
+
+  // The field is absent, not empty-string or null, for everyone who is not a business: a consumer
+  // choosing between names must be able to test it with a plain truthiness check.
+  it('leaves verifiedName absent for a contact that publishes no business name', async () => {
+    const person = {
+      id: { _serialized: '666@c.us' },
+      name: 'Dana',
+      pushname: 'D',
+      number: '666',
+      isMyContact: true,
+      isBlocked: false,
+    };
+    const { adapter } = readyAdapter({ getContacts: jest.fn().mockResolvedValue([person]) });
+
+    const [mapped] = await adapter.getContacts();
+    expect(mapped.verifiedName).toBeUndefined();
+  });
+
   it('getContactById returns null for an entry with no readable id', async () => {
     const getContactById = jest.fn().mockResolvedValue({ id: {}, name: 'Ghost', number: '000' });
     const { adapter } = readyAdapter({ getContactById });

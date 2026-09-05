@@ -42,6 +42,20 @@ describe('BaileysSessionStore', () => {
     expect(store.findContact('628222@s.whatsapp.net')?.pushName).toBe('Bob');
   });
 
+  /**
+   * A business publishes its name as `verifiedName`, and a business this account never saved has no
+   * other name at all. It stays folded into `name` for a consumer that just wants something to
+   * display, and is also reported on its own so one that cares can tell a published business name
+   * apart from a name this account saved.
+   */
+  it('reports a business name both as the display name and as verifiedName', () => {
+    store.upsertContacts([{ id: '628333@s.whatsapp.net', verifiedName: 'The Packing Company' }]);
+    const c = store.findContact('628333@s.whatsapp.net');
+    expect(c).toMatchObject({ name: 'The Packing Company', verifiedName: 'The Packing Company' });
+    // Publishing a business name is not being in the addressbook.
+    expect(c?.isMyContact).toBe(false);
+  });
+
   describe('pinned and muted state', () => {
     const chatFor = (over: Record<string, unknown>) => {
       store.upsertChats([{ id: '628111@s.whatsapp.net', name: 'Alice', ...over }]);
