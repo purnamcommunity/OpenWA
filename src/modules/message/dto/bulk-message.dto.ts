@@ -17,6 +17,7 @@ import { Type } from 'class-transformer';
 import { Validate } from 'class-validator';
 import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
 import {
+  MEDIA_CAPTION_MAX_LENGTH,
   MENTIONS_DESCRIPTION,
   MENTIONS_MAX,
   MENTION_WID_MAX_LENGTH,
@@ -87,10 +88,10 @@ class BulkMessageContentDto {
   @Type(() => BulkMediaDto)
   document?: BulkMediaDto;
 
-  @ApiPropertyOptional({ description: 'Caption for media messages', maxLength: 1024 })
+  @ApiPropertyOptional({ description: 'Caption for media messages', maxLength: MEDIA_CAPTION_MAX_LENGTH })
   @IsOptional()
   @IsString()
-  @MaxLength(1024)
+  @MaxLength(MEDIA_CAPTION_MAX_LENGTH)
   caption?: string;
 
   // Applies to the text body and to a media caption alike, matching the single-send routes. Every

@@ -13,6 +13,8 @@ import {
   SEND_LOCATION_BODY_EXAMPLES,
   SEND_CONTACT_BODY_EXAMPLES,
   SEND_POLL_BODY_EXAMPLES,
+  MEDIA_CAPTION_MAX_LENGTH,
+  MESSAGE_TEXT_MAX_LENGTH,
 } from './send-message.dto';
 import { SendLocationDto, SendContactDto, SendPollDto } from './message-actions.dto';
 
@@ -210,6 +212,34 @@ describe('mentions WID shape', () => {
       mentions: ['not-a-wid!!'],
     });
     expect(errors.map(e => e.property)).toEqual(['mentions']);
+  });
+});
+
+describe('media caption length', () => {
+  // A caption long enough to have been rejected under the old 1024 cap, which cost the whole send:
+  // the caption cannot be dropped and the image kept, so a 400 here loses the image too.
+  const caption = 'x'.repeat(1228);
+
+  it('accepts a caption longer than 1024 characters', async () => {
+    const errors = await validateDto(SendMediaMessageDto, {
+      chatId: 'g@g.us',
+      url: 'https://example.com/a.jpg',
+      caption,
+    });
+    expect(errors).toHaveLength(0);
+  });
+
+  it('still rejects a caption past the shared body cap', async () => {
+    const errors = await validateDto(SendMediaMessageDto, {
+      chatId: 'g@g.us',
+      url: 'https://example.com/a.jpg',
+      caption: 'x'.repeat(MEDIA_CAPTION_MAX_LENGTH + 1),
+    });
+    expect(errors.map(e => e.property)).toEqual(['caption']);
+  });
+
+  it('is the same cap a text body gets — a caption is a body', () => {
+    expect(MEDIA_CAPTION_MAX_LENGTH).toBe(MESSAGE_TEXT_MAX_LENGTH);
   });
 });
 

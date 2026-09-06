@@ -270,7 +270,7 @@ export interface SendMediaRequest {
   mimetype?: string;
   /** Required for documents; max 255 chars. */
   filename?: string;
-  /** Max 1024 chars. */
+  /** Max 4096 chars. */
   caption?: string;
   /**
    * Quote an earlier message, turning this send into a reply. Engine-specific: whatsapp-web.js

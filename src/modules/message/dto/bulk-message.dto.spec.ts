@@ -37,6 +37,14 @@ describe('SendBulkMessageDto content length + variables validation', () => {
     expect((await validateBulk(textItem('a'.repeat(4097)))).length).toBeGreaterThan(0);
   });
 
+  it('accepts a media caption at the 4096 cap and rejects beyond it (parity with single-send)', async () => {
+    const captionItem = (caption: string) => ({
+      messages: [{ chatId: 'c@c.us', type: 'image', content: { image: { base64: 'AAAA' }, caption } }],
+    });
+    expect(await validateBulk(captionItem('a'.repeat(4096)))).toHaveLength(0);
+    expect((await validateBulk(captionItem('a'.repeat(4097)))).length).toBeGreaterThan(0);
+  });
+
   it('accepts an object variables map and rejects a non-object', async () => {
     expect(await validateBulk(textItem('hi', { variables: { name: 'Alice' } }))).toHaveLength(0);
     expect((await validateBulk(textItem('hi', { variables: 'oops' }))).length).toBeGreaterThan(0);

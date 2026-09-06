@@ -42,6 +42,23 @@ export const CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH = 1024;
 export const MESSAGE_TEXT_MAX_LENGTH = 4096;
 
 /**
+ * The cap on a media caption, which is a message body and is bounded like one.
+ *
+ * 1024 is the number every WhatsApp integration guide quotes, but it belongs to the Cloud API and
+ * to the WhatsApp Web composer's own input field — not to the protocol. This gateway sends through
+ * whatsapp-web.js, which hands the caption to the page's send API and imposes no length of its
+ * own, and captions longer than 1024 characters are delivered intact over that path. Capping here
+ * at 1024 therefore rejected sends WhatsApp would have accepted, and rejected them as a bare
+ * `Bad Request` — the caption is not separable from its image, so the whole send was lost rather
+ * than shortened.
+ *
+ * Restated by the agent-tool zod schemas and by every media DTO, which is why it is a constant:
+ * seven copies of a literal is how the bulk route and the single-send route end up disagreeing
+ * about the same documented contract.
+ */
+export const MEDIA_CAPTION_MAX_LENGTH = MESSAGE_TEXT_MAX_LENGTH;
+
+/**
  * Shared wording for the quoted-send field (issue #1271). One constant rather than five copies so
  * the two engine caveats — different id dialects, and Baileys' store requirement — cannot drift
  * apart between the endpoints that all accept the same field.
@@ -220,11 +237,11 @@ export class SendMediaMessageDto {
   @ApiPropertyOptional({
     description: 'Caption for the media',
     example: 'Check out this image!',
-    maxLength: 1024,
+    maxLength: MEDIA_CAPTION_MAX_LENGTH,
   })
   @IsOptional()
   @IsString()
-  @MaxLength(1024)
+  @MaxLength(MEDIA_CAPTION_MAX_LENGTH)
   caption?: string;
 
   @ApiPropertyOptional({ description: MENTIONS_DESCRIPTION, example: ['628123456789@c.us'], type: [String] })

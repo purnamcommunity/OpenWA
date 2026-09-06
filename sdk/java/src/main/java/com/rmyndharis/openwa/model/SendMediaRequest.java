@@ -54,7 +54,7 @@ public record SendMediaRequest(
             return this;
         }
 
-        /** Max 1024 chars. */
+        /** Max 4096 chars. */
         public Builder caption(String v) {
             this.caption = v;
             return this;

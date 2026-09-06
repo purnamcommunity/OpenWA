@@ -12159,7 +12159,7 @@
             "type": "string",
             "description": "Caption for the media",
             "example": "Check out this image!",
-            "maxLength": 1024
+            "maxLength": 4096
           },
           "mentions": {
             "description": "WIDs to @mention (e.g. [\"62811@c.us\"]). The text/caption must also contain the @<number> token.",
@@ -12212,7 +12212,7 @@
             "type": "string",
             "description": "Caption for the media",
             "example": "Check out this image!",
-            "maxLength": 1024
+            "maxLength": 4096
           },
           "mentions": {
             "description": "WIDs to @mention (e.g. [\"62811@c.us\"]). The text/caption must also contain the @<number> token.",
@@ -13131,7 +13131,7 @@
           "caption": {
             "type": "string",
             "description": "Caption for media messages",
-            "maxLength": 1024
+            "maxLength": 4096
           },
           "mentions": {
             "description": "WIDs to @mention (e.g. [\"62811@c.us\"]). The text/caption must also contain the @<number> token.",

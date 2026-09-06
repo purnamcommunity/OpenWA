@@ -71,6 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A media caption takes the message-body cap of 4096 rather than 1024, so a send is no longer
+  refused for a caption WhatsApp would have carried. The old number is the Cloud API's and the
+  WhatsApp Web composer field's, not the protocol's: whatsapp-web.js hands the caption to the
+  page's send API with no length of its own, and longer captions are delivered intact over that
+  path. A caption cannot be separated from its file, so the cap did not shorten an over-long send —
+  it lost the image with it, as a bare `400` naming neither field nor limit. The number is now one
+  exported constant, previously restated across the single-send DTO, the bulk DTO and the
+  agent-tool schemas.
 - A single contact WhatsApp Web will not map no longer fails the whole address book. `GET /contacts`
   answered `500` for every read on an account holding a device-addressed contact: `getContactModel`
   refines `isBlocked` through `getAlternateUserWid`, which throws for such a wid, and `getContacts`
