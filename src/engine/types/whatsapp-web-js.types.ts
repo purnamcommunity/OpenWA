@@ -155,6 +155,7 @@ export interface BusinessClient extends Omit<
           archived?: boolean;
           pinned?: boolean;
           isMuted?: boolean;
+          muteExpiration?: number;
         }
       | undefined
     >

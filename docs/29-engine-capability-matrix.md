@@ -1,7 +1,7 @@
 # 29 - Engine Capability Matrix
 
 Three-way comparison of every capability: the **Baileys library** (`@whiskeysockets/baileys`
-7.0.0-rc13), the **whatsapp-web.js library** (1.34.7), and what **OpenWA actually exposes** through
+7.0.0-rc14), the **whatsapp-web.js library** (1.34.7), and what **OpenWA actually exposes** through
 its adapter layer and REST API — including which "supported" cells only work because OpenWA patches
 the installed library. Coverage is total: all 120 `IWhatsAppEngine` methods (29.4), **all 152
 Baileys + 81 whatsapp-web.js library methods** (29.5), all 34 + 31 library events (29.5.4), and all
@@ -50,7 +50,7 @@ flowchart LR
         SVC --> STORE["OpenWA-side stores"]
     end
     WA --> WLIB["whatsapp-web.js 1.34.7<br/>+ 10 OpenWA patches"]
-    BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc13<br/>+ 2 OpenWA patches"]
+    BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc14<br/>+ 2 OpenWA patches"]
     WLIB --> WEB["WhatsApp Web<br/>headless Chromium"]
     BLIB --> WAS["WhatsApp servers<br/>browser-free socket"]
     WA -.->|"not-available"| E["EngineNotSupportedError<br/>HTTP 501"]
@@ -747,19 +747,19 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 
 **Contacts & numbers** (11)
 
-| Library method                 | OpenWA exposure                                       |
-| ------------------------------ | ----------------------------------------------------- |
-| `deleteAddressbookContact`     | ✅ `deleteContact`                                    |
-| `getBlockedContacts`           | ✅ `getBlockedContacts`                               |
-| `getContactById`               | ✅ `getContactById`, `blockContact`, `unblockContact` |
-| `getContactDeviceCount`        | ❌ **not exposed**                                    |
-| `getContactLidAndPhone`        | ✅ `resolveContactPhone`                              |
-| `getContacts`                  | ✅ `getContacts`                                      |
-| `getCountryCode`               | ❌ **not exposed**                                    |
-| `getFormattedNumber`           | ❌ **not exposed**                                    |
-| `getNumberId`                  | ✅ `checkNumberExists`, `getNumberId`                 |
-| `isRegisteredUser`             | ❌ **not exposed**                                    |
-| `saveOrEditAddressbookContact` | ✅ `upsertContact`                                    |
+| Library method                 | OpenWA exposure                                                  |
+| ------------------------------ | ---------------------------------------------------------------- |
+| `deleteAddressbookContact`     | ✅ `deleteContact`                                               |
+| `getBlockedContacts`           | ✅ `getBlockedContacts`                                          |
+| `getContactById`               | ✅ `getContactById`, `blockContact`, `unblockContact`            |
+| `getContactDeviceCount`        | ❌ **not exposed**                                               |
+| `getContactLidAndPhone`        | ✅ `resolveContactPhone`                                         |
+| `getContacts`                  | ⚙️ read via a direct page walk, not `Client.getContacts` (#1501) |
+| `getCountryCode`               | ❌ **not exposed**                                               |
+| `getFormattedNumber`           | ❌ **not exposed**                                               |
+| `getNumberId`                  | ✅ `checkNumberExists`, `getNumberId`                            |
+| `isRegisteredUser`             | ❌ **not exposed**                                               |
+| `saveOrEditAddressbookContact` | ✅ `upsertContact`                                               |
 
 **Business** (2)
 
@@ -989,8 +989,8 @@ adapter sources — re-derive the same way when anything changes:
   **10** wwjs-only; `sendCatalog` (unavailable on both engines) is not exposed.
 - Full engine inventory (29.5), split by the exposure legend rather than lumped: Baileys **152**
   socket methods — 48 wired into interface methods, 5 internal wiring, 29 plumbing, **70 ❌ not
-  exposed** (incl. the whole 23-method community cluster); wwjs **81** Client methods — 45 wired,
-  2 internal wiring, 1 class plumbing, **33 ❌ not exposed** (25 real capabilities + 8
+  exposed** (incl. the whole 23-method community cluster); wwjs **81** Client methods — 44 wired,
+  3 internal wiring, 1 class plumbing, **33 ❌ not exposed** (25 real capabilities + 8
   session/transport settings that are not WhatsApp capabilities). The backlog is the ❌ rows minus
   those 8 settings; 🔩 plumbing is correctly never exposed.
 - Events: Baileys **34** (15 consumed / 19 dropped), wwjs **31** (17 consumed / 14 dropped).

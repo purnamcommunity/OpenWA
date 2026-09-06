@@ -223,12 +223,46 @@ describe('MessageService', () => {
       expect(qb.skip).not.toHaveBeenCalled();
       expect(qb.getManyAndCount).not.toHaveBeenCalled();
       const [clause, params] = qb.andWhere.mock.calls[0] as [string, Record<string, unknown>];
-      expect(clause).toContain('(message.createdAt, message.id) <');
+      // rowid, not id: the stub repository carries no manager, which reads as "not postgres".
+      expect(clause).toContain('(message.createdAt, message.rowid) <');
       // The anchor's sort key is resolved in SQL; only the id crosses the JS boundary.
       expect(clause).toContain('FROM messages anchor');
       expect(params).toEqual({ after: 'm-1', sessionId: 'sess-1' });
       // `total` counts the filter match, not the post-cursor remainder, so it stays stable per page.
       expect(result.total).toBe(7);
+    });
+
+    /**
+     * The dialect split, pinned on the default test job rather than only in the postgres-gated
+     * suite: a typo in the accessor would otherwise ship a `rowid` term to PostgreSQL, where the
+     * column does not exist and every message list would 500.
+     */
+    it('keeps id as the tiebreak on postgres, where there is no rowid', async () => {
+      const qb = makeCursorQb([{ id: 'm-2' } as Message]);
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+      (repository as unknown as { manager: unknown }).manager = {
+        connection: { options: { type: 'postgres' } },
+      };
+
+      await service.getMessages('sess-1', { after: 'm-1' });
+
+      const [clause] = qb.andWhere.mock.calls[0] as [string];
+      expect(clause).toContain('(message.createdAt, message.id) <');
+      expect(clause).toContain('anchor."id"');
+      expect(clause).not.toContain('rowid');
+      expect(qb.addOrderBy).toHaveBeenCalledWith('message.id', 'DESC');
+
+      delete (repository as unknown as { manager?: unknown }).manager;
+    });
+
+    it('orders by rowid on sqlite, which is the arrival order and needs no sort', async () => {
+      const qb = makeCursorQb([{ id: 'm-2' } as Message]);
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      await service.getMessages('sess-1', { after: 'm-1' });
+
+      // The order term is applied before the cursor branch, so the cursor harness pins it too.
+      expect(qb.addOrderBy).toHaveBeenCalledWith('message.rowid', 'DESC');
     });
 
     it('rejects a cursor that names no row in this session rather than reading as end-of-history', async () => {
@@ -1076,6 +1110,38 @@ describe('MessageService', () => {
       } finally {
         if (prev === undefined) delete process.env.MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES;
         else process.env.MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES = prev;
+      }
+    });
+
+    // The budget is per response, so a walk pulls it afresh on every page. `inlineMedia: false` is
+    // how a client reading many pages asks for the rows without the bytes.
+    it('omits every payload when the caller opts out, including the one the allowance would let through', async () => {
+      const rows = Array.from(
+        { length: 3 },
+        (_, i) =>
+          ({
+            id: `m${i}`,
+            metadata: { media: { mimetype: 'image/jpeg', data: 'x'.repeat(10_000) } },
+          }) as unknown as Message,
+      );
+      const builder = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        getManyAndCount: jest.fn().mockResolvedValue([rows, 3]),
+      };
+      (repository.createQueryBuilder as unknown as jest.Mock).mockReturnValue(builder);
+
+      const result = await service.getMessages('sess-1', { limit: 100, inlineMedia: false });
+
+      expect(result.messages).toHaveLength(3); // the rows survive, only the payloads go
+      for (const message of result.messages) {
+        const media = (message.metadata as { media: Record<string, unknown> }).media;
+        expect(media.data).toBeUndefined();
+        expect(media).toMatchObject({ mimetype: 'image/jpeg', omitted: true, sizeBytes: 7500 });
       }
     });
   });

@@ -88,6 +88,8 @@
     "unreadBadge": "{{count}} mensaje sin leer",
     "unreadBadge_other": "{{count}} mensajes sin leer",
     "loadingMessages": "Cargando mensajes...",
+    "loadingOlderMessages": "Cargando mensajes anteriores...",
+    "loadOlderMessagesError": "No se pudieron cargar los mensajes anteriores. Desplázate hacia arriba para reintentar.",
     "noMessagesInChat": "Aún no hay mensajes. ¡Envía el primero para empezar!",
     "downloadDocument": "Descargar documento",
     "actions": {
@@ -245,6 +247,7 @@
   "sessions": {
     "title": "Sesiones",
     "subtitle": "Gestiona tus sesiones de WhatsApp y conexiones por código QR",
+    "feedDisconnected": "Actualizaciones en vivo desconectadas",
     "newSession": "Nueva sesión",
     "searchPlaceholder": "Buscar sesiones...",
     "filter": {
@@ -431,6 +434,7 @@
         "body": "Cuerpo del mensaje",
         "type": "Tipo de mensaje",
         "isGroup": "Es chat de grupo",
+        "kind": "Chat kind",
         "fromMe": "Enviado por mí",
         "hasMedia": "Tiene multimedia",
         "mentions": "Menciones"
@@ -609,6 +613,7 @@
     "removeFile": "Quitar archivo",
     "fileReadError": "Error al leer el archivo",
     "fileTooLarge": "El archivo es demasiado grande (máx. 18 MB)",
+    "recipientsFileTooLarge": "El archivo de destinatarios es demasiado grande (máx. 2 MB)",
     "caption": "Pie de foto",
     "filename": "Nombre de archivo",
     "captionPlaceholder": "Escribe un pie de foto...",
@@ -636,6 +641,7 @@
     "forwardMessageId": "ID del mensaje",
     "forwardMessageIdHint": "ID del mensaje que se va a reenviar",
     "bulkRecipients": "Destinatarios",
+    "bulkRecipientsUpload": "Subir CSV/TXT",
     "bulkRecipientsPlaceholder": "+62812345678",
     "bulkRecipientsHint": "Un número de teléfono o ID de chat por línea (máx. 100)",
     "bulkRecipientsCount": "Destinatarios: {{count}}",

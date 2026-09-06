@@ -91,6 +91,8 @@
     "unreadBadge_few": "{{count}} رسائل غير مقروءة",
     "unreadBadge_many": "{{count}} رسالة غير مقروءة",
     "loadingMessages": "جارٍ تحميل الرسائل...",
+    "loadingOlderMessages": "جارٍ تحميل الرسائل الأقدم...",
+    "loadOlderMessagesError": "تعذر تحميل الرسائل الأقدم. مرر لأعلى للمحاولة مرة أخرى.",
     "noMessagesInChat": "لا توجد رسائل بعد. أرسل الرسالة الأولى للبدء!",
     "downloadDocument": "تنزيل المستند",
     "actions": {
@@ -256,6 +258,7 @@
   "sessions": {
     "title": "الجلسات",
     "subtitle": "إدارة جلسات واتساب واتصالات رمز QR",
+    "feedDisconnected": "انقطعت التحديثات المباشرة",
     "newSession": "جلسة جديدة",
     "searchPlaceholder": "بحث في الجلسات...",
     "filter": {
@@ -446,6 +449,7 @@
         "body": "نص الرسالة",
         "type": "نوع الرسالة",
         "isGroup": "محادثة جماعية",
+        "kind": "Chat kind",
         "fromMe": "مُرسَلة مني",
         "hasMedia": "تحتوي على وسائط",
         "mentions": "الإشارات"
@@ -670,6 +674,7 @@
     "removeFile": "إزالة الملف",
     "fileReadError": "فشل قراءة الملف",
     "fileTooLarge": "الملف كبير جدًا (الحد الأقصى 18 ميغابايت)",
+    "recipientsFileTooLarge": "ملف المستلمين كبير جدًا (الحد الأقصى 2 ميغابايت)",
     "caption": "التعليق",
     "filename": "اسم الملف",
     "captionPlaceholder": "أدخل التعليق...",
@@ -697,6 +702,7 @@
     "forwardMessageId": "معرّف الرسالة",
     "forwardMessageIdHint": "معرّف الرسالة المراد إعادة توجيهها",
     "bulkRecipients": "المستلمون",
+    "bulkRecipientsUpload": "رفع CSV/TXT",
     "bulkRecipientsPlaceholder": "+62812345678",
     "bulkRecipientsHint": "رقم هاتف أو معرّف دردشة واحد في كل سطر (100 كحد أقصى)",
     "bulkRecipientsCount": "المستلمون: {{count}}",

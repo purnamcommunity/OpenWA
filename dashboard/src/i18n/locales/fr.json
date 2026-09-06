@@ -88,6 +88,8 @@
     "unreadBadge": "{{count}} message non lu",
     "unreadBadge_other": "{{count}} messages non lus",
     "loadingMessages": "Chargement des messages...",
+    "loadingOlderMessages": "Chargement des messages plus anciens...",
+    "loadOlderMessagesError": "Impossible de charger les messages plus anciens. Faites défiler vers le haut pour réessayer.",
     "noMessagesInChat": "Aucun message pour le moment. Envoyez le premier message pour commencer !",
     "downloadDocument": "Télécharger le document",
     "actions": {
@@ -245,6 +247,7 @@
   "sessions": {
     "title": "Sessions",
     "subtitle": "Gérez vos sessions WhatsApp et vos connexions par code QR",
+    "feedDisconnected": "Mises à jour en direct interrompues",
     "newSession": "Nouvelle session",
     "searchPlaceholder": "Rechercher des sessions...",
     "filter": {
@@ -431,6 +434,7 @@
         "body": "Corps du message",
         "type": "Type de message",
         "isGroup": "Est une discussion de groupe",
+        "kind": "Chat kind",
         "fromMe": "Envoyé par moi",
         "hasMedia": "Contient un média",
         "mentions": "Mentions"
@@ -655,6 +659,7 @@
     "removeFile": "Supprimer le fichier",
     "fileReadError": "Échec de lecture du fichier",
     "fileTooLarge": "Le fichier est trop volumineux (max 18 Mo)",
+    "recipientsFileTooLarge": "Le fichier de destinataires est trop volumineux (max 2 Mo)",
     "caption": "Légende",
     "filename": "Nom du fichier",
     "captionPlaceholder": "Entrez une légende...",
@@ -682,6 +687,7 @@
     "forwardMessageId": "ID du message",
     "forwardMessageIdHint": "ID du message à transférer",
     "bulkRecipients": "Destinataires",
+    "bulkRecipientsUpload": "Téléverser CSV/TXT",
     "bulkRecipientsPlaceholder": "+62812345678",
     "bulkRecipientsHint": "Un numéro de téléphone ou ID de chat par ligne (max 100)",
     "bulkRecipientsCount": "Destinataires : {{count}}",

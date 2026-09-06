@@ -41,6 +41,10 @@ export function mapWwebjsMessageType(raw: string): MessageType {
       return 'poll';
     case 'revoked':
       return 'revoked';
+    case 'order':
+      return 'order';
+    case 'product':
+      return 'product';
     default:
       return 'unknown';
   }
@@ -83,6 +87,16 @@ export interface RawMessageFields {
    */
   pollOptions?: (string | { name?: string; localId?: number })[];
   allowMultipleAnswers?: boolean;
+  /** Set on `order` messages: the placed order's id, and the single-order token that unlocks its items. */
+  orderId?: string;
+  token?: string;
+  /** Set on `product` messages: the shared catalog product. */
+  productId?: string;
+  /** Product title / description. whatsapp-web.js exposes these only for a product card. */
+  title?: string;
+  description?: string;
+  /** The catalog owner's JID, on a shared product card. */
+  businessOwnerJid?: string;
 }
 
 /**
@@ -175,6 +189,19 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   // cannot take replies" are different, and only the latter should be absent.
   if (typeof msg._data?.replyCount === 'number') {
     incoming.replyCount = msg._data.replyCount;
+  }
+
+  // Commerce ids, keyed off the mapped type so a stray `title` on some other message shape cannot
+  // fabricate a product. Without the id neither entry is actionable, so both are then left unset.
+  if (incoming.type === 'order' && msg.orderId) {
+    incoming.order = { orderId: msg.orderId, ...(msg.token ? { token: msg.token } : {}) };
+  } else if (incoming.type === 'product' && msg.productId) {
+    incoming.product = {
+      productId: msg.productId,
+      ...(msg.title ? { title: msg.title } : {}),
+      ...(msg.description ? { description: msg.description } : {}),
+      ...(msg.businessOwnerJid ? { businessOwnerJid: msg.businessOwnerJid } : {}),
+    };
   }
 
   return incoming;

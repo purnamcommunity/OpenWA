@@ -88,6 +88,8 @@
     "unreadBadge": "{{count}} unread message",
     "unreadBadge_other": "{{count}} unread messages",
     "loadingMessages": "Loading messages...",
+    "loadingOlderMessages": "Loading older messages...",
+    "loadOlderMessagesError": "Couldn't load older messages. Scroll up to retry.",
     "noMessagesInChat": "No messages yet. Send the first message to get started!",
     "downloadDocument": "Download document",
     "actions": {
@@ -245,6 +247,7 @@
   "sessions": {
     "title": "Sessions",
     "subtitle": "Manage your WhatsApp sessions and QR code connections",
+    "feedDisconnected": "Live updates disconnected",
     "newSession": "New Session",
     "searchPlaceholder": "Search sessions...",
     "filter": {
@@ -431,6 +434,7 @@
         "body": "Message body",
         "type": "Message type",
         "isGroup": "Is group chat",
+        "kind": "Chat kind",
         "fromMe": "Sent by me",
         "hasMedia": "Has media",
         "mentions": "Mentions"
@@ -655,6 +659,7 @@
     "removeFile": "Remove file",
     "fileReadError": "File read failed",
     "fileTooLarge": "File is too large (max 18 MB)",
+    "recipientsFileTooLarge": "The recipients file is too large (max 2 MB)",
     "caption": "Caption",
     "filename": "Filename",
     "captionPlaceholder": "Enter caption...",
@@ -682,6 +687,7 @@
     "forwardMessageId": "Message ID",
     "forwardMessageIdHint": "ID of the message to forward",
     "bulkRecipients": "Recipients",
+    "bulkRecipientsUpload": "Upload CSV/TXT",
     "bulkRecipientsPlaceholder": "+62812345678",
     "bulkRecipientsHint": "One phone number or chat ID per line (max 100)",
     "bulkRecipientsCount": "Recipients: {{count}}",

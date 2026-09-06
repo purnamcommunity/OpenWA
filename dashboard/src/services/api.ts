@@ -218,6 +218,8 @@ export interface MessageResponse {
 
 // Mirrors the backend engine ChatKind (dashboard cannot import wa-id.ts).
 export type ChatKind = 'individual' | 'group' | 'channel' | 'status' | 'broadcast' | 'unknown';
+// Mirrors CHAT_KINDS in the backend webhook filter registry (src/modules/webhook/filters/filter-types.ts).
+export const CHAT_KINDS: readonly ChatKind[] = ['individual', 'group', 'channel', 'status', 'broadcast', 'unknown'];
 
 // Chat summary returned by GET /sessions/:id/chats (mirrors the backend ChatSummary).
 /**
@@ -245,6 +247,7 @@ export interface Chat {
   archived: boolean;
   pinned: boolean;
   muted: boolean;
+  muteExpiration?: number;
 }
 
 // Engine-neutral message types (mirrors the backend's IWhatsAppEngine MessageType). The backend
@@ -263,6 +266,8 @@ export const MESSAGE_TYPES = [
   'poll',
   'call',
   'revoked',
+  'order',
+  'product',
   'masked',
   'unknown',
 ] as const;
@@ -365,6 +370,10 @@ export interface EngineHistoryMessage {
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
   /** Present on `poll` messages only: the choices, which `body` (the question) does not carry. */
   poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
+  /** Present on `order` messages only: the placed cart, plus the single-order token for its items. */
+  order?: { orderId: string; token?: string };
+  /** Present on `product` messages only: the catalog product shared into the chat. */
+  product?: { productId: string; title?: string; description?: string; businessOwnerJid?: string };
 }
 
 // Mirrors the backend engine Channel / ChannelMessage (GET /sessions/:id/channels[/:id/messages]).
@@ -835,9 +844,13 @@ export const sessionApi = {
       method: 'POST',
       body: JSON.stringify({ chatId }),
     }),
-  getChatMessages: (id: string, chatId: string, limit = 100) =>
+  // `offset` counts DB rows already fetched for this chat, never rendered rows: the thread merges
+  // these with engine history, so paging by the merged length would skip DB rows. `total` is not
+  // read to decide whether an older page exists — a page short of `limit` is; a chat with live
+  // traffic keeps growing `total` after the fact, so comparing rows-held against it stops early.
+  getChatMessages: (id: string, chatId: string, limit = 100, offset = 0) =>
     request<{ messages: ChatMessage[]; total: number }>(
-      `/sessions/${id}/messages?chatId=${encodeURIComponent(chatId)}&limit=${limit}`,
+      `/sessions/${id}/messages?chatId=${encodeURIComponent(chatId)}&limit=${limit}&offset=${offset}`,
     ),
   // Live history straight from WhatsApp (bypasses the DB) — backfills a thread the gateway never
   // captured, e.g. a freshly paired session whose persisted store is still empty.

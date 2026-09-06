@@ -22,6 +22,8 @@ const MESSAGE_TYPES: MessageType[] = [
   'poll',
   'call',
   'revoked',
+  'order',
+  'product',
   'masked',
   'unknown',
 ];
@@ -230,6 +232,33 @@ export class ChatHistoryPollDto {
   allowMultipleAnswers!: boolean;
 }
 
+export class ChatHistoryOrderDto {
+  @ApiProperty({
+    description: 'Id of the cart the customer placed from the business catalog.',
+    example: '1000000000000001',
+  })
+  orderId!: string;
+
+  @ApiPropertyOptional({
+    description: 'Opaque single-order credential that accompanies `orderId`. Pass through unchanged; do not log it.',
+  })
+  token?: string;
+}
+
+export class ChatHistoryProductDto {
+  @ApiProperty({ description: 'Id of the shared catalog product.', example: '2000000000000002' })
+  productId!: string;
+
+  @ApiPropertyOptional({ example: 'Sample product' })
+  title?: string;
+
+  @ApiPropertyOptional({ example: 'A sample product description.' })
+  description?: string;
+
+  @ApiPropertyOptional({ description: "JID of the catalog's owner.", example: '628123456789@c.us' })
+  businessOwnerJid?: string;
+}
+
 /** OpenAPI mirror of the engine `IncomingMessage` served by the live chat-history route. */
 export class ChatHistoryMessageDto {
   @ApiProperty({ example: 'true_628123456789@c.us_3EB0123456789' })
@@ -311,6 +340,12 @@ export class ChatHistoryMessageDto {
 
   @ApiPropertyOptional({ type: ChatHistoryPollDto, description: 'Set for `poll` messages.' })
   poll?: ChatHistoryPollDto;
+
+  @ApiPropertyOptional({ type: ChatHistoryOrderDto, description: 'Set for `order` messages.' })
+  order?: ChatHistoryOrderDto;
+
+  @ApiPropertyOptional({ type: ChatHistoryProductDto, description: 'Set for `product` messages.' })
+  product?: ChatHistoryProductDto;
 }
 
 /**

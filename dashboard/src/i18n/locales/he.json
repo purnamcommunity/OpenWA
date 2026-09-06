@@ -90,6 +90,8 @@
     "unreadBadge_two": "שתי הודעות שלא נקראו",
     "unreadBadge_many": "{{count}} הודעות שלא נקראו",
     "loadingMessages": "טוען הודעות...",
+    "loadingOlderMessages": "טוען הודעות ישנות יותר...",
+    "loadOlderMessagesError": "טעינת ההודעות הישנות נכשלה. גלול למעלה כדי לנסות שוב.",
     "noMessagesInChat": "אין הודעות עדיין. שלח את ההודעה הראשונה כדי להתחיל!",
     "downloadDocument": "הורדת מסמך",
     "actions": {
@@ -252,6 +254,7 @@
   "sessions": {
     "title": "Sessions",
     "subtitle": "ניהול Sessions של WhatsApp והתחברות באמצעות QR",
+    "feedDisconnected": "עדכונים בזמן אמת נותקו",
     "newSession": "Session חדש",
     "searchPlaceholder": "חיפוש Sessions...",
     "filter": {
@@ -440,6 +443,7 @@
         "body": "גוף ההודעה",
         "type": "סוג הודעה",
         "isGroup": "צ'אט קבוצתי",
+        "kind": "Chat kind",
         "fromMe": "נשלח על ידי",
         "hasMedia": "מכיל מדיה",
         "mentions": "אזכורים"
@@ -664,6 +668,7 @@
     "removeFile": "הסרת קובץ",
     "fileReadError": "קריאת הקובץ נכשלה",
     "fileTooLarge": "הקובץ גדול מדי (מקסימום 18 MB)",
+    "recipientsFileTooLarge": "קובץ הנמענים גדול מדי (מקסימום 2 MB)",
     "caption": "כיתוב",
     "filename": "שם קובץ",
     "captionPlaceholder": "יש להזין כיתוב...",
@@ -691,6 +696,7 @@
     "forwardMessageId": "מזהה הודעה",
     "forwardMessageIdHint": "מזהה ההודעה להעברה",
     "bulkRecipients": "נמענים",
+    "bulkRecipientsUpload": "העלאת CSV/TXT",
     "bulkRecipientsPlaceholder": "+62812345678",
     "bulkRecipientsHint": "מספר טלפון או מזהה צ'אט אחד בכל שורה (עד 100)",
     "bulkRecipientsCount": "נמענים: {{count}}",

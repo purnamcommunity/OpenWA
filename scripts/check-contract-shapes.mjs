@@ -44,6 +44,7 @@
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Resolve from the script's own location, not process.cwd() — same reason check-sdk-coverage.mjs
@@ -171,7 +172,7 @@ const MAPPINGS = {
 const MINIMUM_MAPPED = {
   'sdk/javascript/src/types.ts': 82,
   'dashboard/src/services/api.ts': 21,
-  'sdk/python/openwa/types.py': 77,
+  'sdk/python/openwa/types.py': 78,
   'sdk/go': 78,
   'sdk/java': 82,
 };
@@ -219,6 +220,7 @@ const PYTHON_MAPPING = {
   BulkMessageItem: 'BulkMessageItemDto',
   BulkMessageResponse: 'BulkMessageResponseDto',
   CallLinkResponse: 'CallLinkResponseDto',
+  ChatHistoryMessage: 'ChatHistoryMessageDto',
   ChatSummary: 'ChatSummaryDto',
   CreateCallLinkRequest: 'CreateCallLinkDto',
   CreateChannelRequest: 'CreateChannelDto',
@@ -1068,7 +1070,11 @@ export function parseJavaTypes(sources) {
 
 // ── CLI driver ──
 
-const isDirectRun = process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop());
+// Resolved-path comparison, not a basename match: splitting on `/` finds no separator in a Windows
+// path so the whole native path became the "basename" and never matched, and a bare `endsWith` on a
+// basename would also fire for any other script sharing this file's name. Same comparison as
+// check-sdk-docs.mjs and check-upstream-surface.mjs.
+const isDirectRun = Boolean(process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url));
 if (isDirectRun) {
   const openapi = JSON.parse(readFileSync(`${REPO_ROOT}openapi.json`, 'utf8'));
   const schemas = openapi.components.schemas;

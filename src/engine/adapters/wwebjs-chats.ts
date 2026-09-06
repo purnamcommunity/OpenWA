@@ -80,13 +80,19 @@ export class WwebjsChats {
         lastMessage: chat.lastMessage?.type === MessageTypes.LOCATION ? '📍' : chat.lastMessage?.body || undefined,
         archived: Boolean(chat.archived),
         pinned: Boolean(chat.pinned),
-        // Chat.isMuted is already the current verdict; muteExpiration is the raw stamp behind it.
+        // Chat.isMuted is the current verdict; muteExpiration is wwjs epoch SECONDS with -1 = forever.
         muted: Boolean(chat.isMuted),
         // Only when it is NEWER than the chat's last message: WhatsApp shows this line in place of
         // the message preview, and showing it for an add-on the chat has since moved past would
         // describe the chat by something that is no longer its latest news. The chat's own
         // timestamp already tracks the newest activity of either kind, so equality is the test.
         ...(activityIsNewest(activity.get(id), chat.timestamp) ? { lastActivity: activity.get(id) } : {}),
+        // Expose the expiry as ms (0 = indefinite), present only when muted, per ChatSummary.
+        muteExpiration: chat.isMuted
+          ? (chat.muteExpiration ?? 0) > 0
+            ? (chat.muteExpiration ?? 0) * 1000
+            : 0
+          : undefined,
       });
     }
 

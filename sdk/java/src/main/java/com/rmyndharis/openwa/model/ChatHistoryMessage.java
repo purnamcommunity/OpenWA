@@ -36,7 +36,9 @@ public record ChatHistoryMessage(
     QuotedMessage quotedMessage,
     Location location,
     /** Set on poll messages only: the choices, which {@code body} (the question) does not carry. */
-    Poll poll) {
+    Poll poll,
+    Order order,
+    Product product) {
 
     /** Attached media; {@code data} is absent when the payload was omitted (too large). */
     public record Media(String mimetype, String filename, String data, Boolean omitted, Long sizeBytes) {}
@@ -49,6 +51,15 @@ public record ChatHistoryMessage(
 
     /** Present on {@code call} messages only. */
     public record Call(Boolean video, Boolean missed) {}
+
+    /**
+     * Present on {@code order} messages only: the cart the customer placed from the business
+     * catalog, plus the single-order {@code token} that resolves its line items.
+     */
+    public record Order(String orderId, String token) {}
+
+    /** Present on {@code product} messages only: the catalog product shared into the chat. */
+    public record Product(String productId, String title, String description, String businessOwnerJid) {}
 
     /**
      * Sender contact info. History carries {@code pushName} only; the richer fields arrive on

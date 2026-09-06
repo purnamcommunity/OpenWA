@@ -13,11 +13,11 @@ import { type WwebjsMessaging } from './wwebjs-messaging';
  * `getChatsByLabelId` returns. A field added to one and forgotten in the other is invisible until
  * a Business account lists a label, so both mappers are held to the same shape here.
  *
- * The library reports mute as a verdict already — `Chat.isMuted` — so unlike Baileys there is no
- * end-time comparison to make; `muteExpiration` is the raw stamp behind it and is deliberately not
- * what this maps. Each field is read through `Boolean()` because the page can leave any of them
- * undefined on a chat it built from a partial record, and `undefined` must land as `false` rather
- * than escape into a required boolean.
+ * The library reports mute as a verdict (`Chat.isMuted`) plus the stamp behind it
+ * (`Chat.muteExpiration`, epoch SECONDS, `-1` = forever). `muted` maps the verdict; `muteExpiration`
+ * maps the stamp as epoch ms (`0` = indefinite), present only when muted. Boolean fields read through
+ * `Boolean()` because the page can leave any of them undefined on a chat built from a partial record,
+ * and `undefined` must land as `false` rather than escape into a required boolean.
  */
 
 const logger = createLogger('wwebjs-chat-state.spec');
@@ -65,6 +65,32 @@ describe('WwebjsChats.getChats chat state', () => {
     const summary = await listWith({ isMuted: false, muteExpiration: 1_700_000_000 });
     expect(summary.muted).toBe(false);
   });
+
+  // The all-true and all-false cases above stay green if a mapper reads archived off pinned, or
+  // muted off the wrong flag. These mixed cases pin each field to its own source: the first breaks
+  // an archived/pinned swap, the second breaks muted reading either boolean.
+  it('maps archived, pinned and muted each from its own field', async () => {
+    expect(await listWith({ archived: true, pinned: false, isMuted: false })).toMatchObject({
+      archived: true,
+      pinned: false,
+      muted: false,
+    });
+    expect(await listWith({ archived: false, pinned: false, isMuted: true })).toMatchObject({
+      archived: false,
+      pinned: false,
+      muted: true,
+    });
+  });
+
+  it('maps muteExpiration to ms when muted, 0 for -1 (forever), absent when not muted', async () => {
+    const secs = 1_786_003_600;
+    expect(await listWith({ isMuted: true, muteExpiration: secs })).toMatchObject({
+      muted: true,
+      muteExpiration: secs * 1000,
+    });
+    expect((await listWith({ isMuted: true, muteExpiration: -1 })).muteExpiration).toBe(0);
+    expect((await listWith({ isMuted: false, muteExpiration: secs })).muteExpiration).toBeUndefined();
+  });
 });
 
 describe('WwebjsLabels.getChatsByLabel chat state', () => {
@@ -82,5 +108,28 @@ describe('WwebjsLabels.getChatsByLabel chat state', () => {
   it('reports false when the label entry left them unset', async () => {
     const summary = await listWith({});
     expect(summary).toMatchObject({ archived: false, pinned: false, muted: false });
+  });
+
+  it('maps archived, pinned and muted each from its own field', async () => {
+    expect(await listWith({ archived: true, pinned: false, isMuted: false })).toMatchObject({
+      archived: true,
+      pinned: false,
+      muted: false,
+    });
+    expect(await listWith({ archived: false, pinned: false, isMuted: true })).toMatchObject({
+      archived: false,
+      pinned: false,
+      muted: true,
+    });
+  });
+
+  it('maps muteExpiration the same way as getChats', async () => {
+    const secs = 1_786_003_600;
+    expect(await listWith({ isMuted: true, muteExpiration: secs })).toMatchObject({
+      muted: true,
+      muteExpiration: secs * 1000,
+    });
+    expect((await listWith({ isMuted: true, muteExpiration: -1 })).muteExpiration).toBe(0);
+    expect((await listWith({ isMuted: false, muteExpiration: secs })).muteExpiration).toBeUndefined();
   });
 });

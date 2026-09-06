@@ -172,6 +172,9 @@ type ListMessagesQuery struct {
 	// After is a keyset cursor: the id of the last message of the previous page. Takes
 	// precedence over Offset.
 	After *string
+	// InlineMedia set to false omits inline media payloads. The budget is per response, so a
+	// walk repays it on every page.
+	InlineMedia *bool
 }
 
 func (q *ListMessagesQuery) values() url.Values {
@@ -181,6 +184,7 @@ func (q *ListMessagesQuery) values() url.Values {
 	setInt(v, "limit", q.Limit)
 	setInt(v, "offset", q.Offset)
 	setStr(v, "after", q.After)
+	setBool(v, "inlineMedia", q.InlineMedia)
 	return v
 }
 
@@ -290,7 +294,9 @@ type ChatHistoryMessage struct {
 	QuotedMessage *QuotedMessage    `json:"quotedMessage,omitempty"`
 	Location      *MessageLocation  `json:"location,omitempty"`
 	// Poll is set on poll messages only: the choices, which Body (the question) does not carry.
-	Poll *MessagePoll `json:"poll,omitempty"`
+	Poll    *MessagePoll    `json:"poll,omitempty"`
+	Order   *MessageOrder   `json:"order,omitempty"`
+	Product *MessageProduct `json:"product,omitempty"`
 }
 
 // MessagePoll is the poll block on a poll-creation message.
@@ -298,6 +304,22 @@ type MessagePoll struct {
 	Name                 string   `json:"name"`
 	Options              []string `json:"options"`
 	AllowMultipleAnswers bool     `json:"allowMultipleAnswers"`
+}
+
+// MessageOrder is the order block on a live history message, present on order messages only: the
+// cart the customer placed from the business catalog, plus the single-order token for its items.
+type MessageOrder struct {
+	OrderID string `json:"orderId"`
+	Token   string `json:"token,omitempty"`
+}
+
+// MessageProduct is the product block on a live history message, present on product messages only:
+// the catalog product shared into the chat.
+type MessageProduct struct {
+	ProductID        string `json:"productId"`
+	Title            string `json:"title,omitempty"`
+	Description      string `json:"description,omitempty"`
+	BusinessOwnerJID string `json:"businessOwnerJid,omitempty"`
 }
 
 // MessageCall is the call block on a live history message, present on call messages only.
@@ -479,6 +501,8 @@ const (
 	MsgPoll     MessageType = "poll"
 	MsgCall     MessageType = "call"
 	MsgRevoked  MessageType = "revoked"
+	MsgOrder    MessageType = "order"
+	MsgProduct  MessageType = "product"
 	MsgMasked   MessageType = "masked"
 	MsgUnknown  MessageType = "unknown"
 )
