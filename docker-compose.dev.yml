@@ -25,6 +25,12 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: openwa-api
+    # Docker's default is 10 seconds, and this container needs more: teardown closes a browser
+    # engine per session, and a SIGKILL that lands while one is writing its profile destroys the
+    # WhatsApp login — recoverable only by scanning a fresh QR with the physical phone. Baked into a
+    # container at creation, so a container recreated from an older file silently keeps the 10s
+    # default; check with `docker inspect openwa-api --format '{{.Config.StopTimeout}}'`.
+    stop_grace_period: 45s
     # Container hardening — same posture as production (same Dockerfile/entrypoint).
     security_opt:
       - 'no-new-privileges:true'

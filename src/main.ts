@@ -8,6 +8,8 @@ import { ConfigService } from '@nestjs/config';
 import { SwaggerModule } from '@nestjs/swagger';
 import { AppModule, DASHBOARD_DIST, dashboardServingEnabled, dashboardBuildPresent } from './app.module';
 import { ShutdownService } from './common/services/shutdown.service';
+import type { Server as HttpServer } from 'http';
+import { closeHttpServerAndConnections } from './common/services/http-drain';
 import { LoggerService, LogLevel, createLogger } from './common/services/logger.service';
 import { createSwaggerConfig, dropUnexpressibleOperations, exemptPublicOperations } from './config/swagger.config';
 import { registerUncaughtExceptionMonitor, registerUnhandledRejectionHandler } from './config/process-error-monitor';
@@ -127,7 +129,13 @@ async function bootstrap() {
   // Wire up graceful shutdown service
   const shutdownService = app.get(ShutdownService);
   shutdownService.setShutdownCallback(async () => {
-    await app.close();
+    // NOT a bare `app.close()`. Nest closes the HTTP server, and Node's `server.close()` waits for
+    // open connections to end rather than ending them — and this server always holds connections
+    // that never end on their own (SSE event streams, socket.io websockets, tunnel keep-alives).
+    // Without this the teardown below never runs and the process is still here when the SIGKILL
+    // lands, which is how a browser engine gets killed mid-write. See closeHttpServerAndConnections.
+    // `getHttpServer()` is typed `any` by Nest; narrowed here so the drain's contract is checked.
+    await closeHttpServerAndConnections(app.getHttpServer() as HttpServer, () => app.close());
   });
 
   // On SIGTERM/SIGINT: drain gracefully. shutdown() flips readiness to 503 immediately (the LB stops
