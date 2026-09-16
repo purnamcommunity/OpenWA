@@ -99,7 +99,15 @@ export function Sessions() {
   // proxy, and the credentials with it, that the operator never got to see.
   const [proxyLoadFailed, setProxyLoadFailed] = useState(false);
 
+  // Set while the last list read failed. Cleared as a read starts, so a connect that already triggered
+  // a reload (onReconnect) is not followed by a second read from the recovery effect below.
+  const listReadFailed = useRef(false);
+  // Spends the one retry the recovery effect below is allowed per connect. Given back by a read that
+  // actually succeeded, so a later independent failure on the same connection is retried too.
+  const retriedThisConnect = useRef(false);
+
   const fetchSessions = useCallback(async (): Promise<Session[]> => {
+    listReadFailed.current = false;
     try {
       // Background refetches — a websocket push, a mutation reloading the list — would otherwise
       // replace the whole page with a spinner for the length of a round-trip, so a restriction
@@ -107,6 +115,10 @@ export function Sessions() {
       if (!initialLoadDone.current) setLoading(true);
       const data = await sessionApi.list();
       setSessions(data);
+      // The list is current again, so an error left by an earlier failed read (or a create, whose toast
+      // already reported it) no longer describes the page, and the recovery retry is available again.
+      setError(null);
+      retriedThisConnect.current = false;
       // Keep the shared React Query cache (read by the Dashboard via useSessionsQuery /
       // useSessionStatsQuery) in sync after this page's mutations reload local state — otherwise the
       // Dashboard shows stale session counts/status. This runs on every reload (mount / WS-failed /
@@ -117,6 +129,7 @@ export function Sessions() {
       void invalidateSessionQueries(queryClient, queryKeys.sessions);
       return data;
     } catch (err) {
+      listReadFailed.current = true;
       setError(err instanceof Error ? err.message : t('sessions.create.errorDefault'));
       return [];
     } finally {
@@ -197,7 +210,7 @@ export function Sessions() {
     void fetchSessions();
   }, [fetchSessions]);
 
-  const { connectionFailed, reconnect } = useSessionFeed({
+  const { isConnected, connectionFailed, reconnect } = useSessionFeed({
     sessions,
     sessionsRef,
     onQRCode: applyQrPush,
@@ -254,6 +267,25 @@ export function Sessions() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // A connected feed means the gateway answers again, but the feed only reports a RECONNECT: a first
+  // connect that lands after socket.io's own retries (the gateway was restarting at mount) fires no
+  // onReconnect, and no status push re-reads the list, so the failed mount read would stay on screen
+  // with no cards. `error` is a dependency so a read that fails after the connect is retried too, but
+  // only once per connect: failures whose messages differ (a 502, then a 504) would otherwise each
+  // change `error` and re-read the list with no backoff for as long as the upstream stays down. The
+  // allowance (declared with `listReadFailed` above) is given back by a successful read, so the loop
+  // stays closed while a later failure on the same connection is still retried.
+  useEffect(() => {
+    if (!isConnected) {
+      retriedThisConnect.current = false;
+      return;
+    }
+    if (listReadFailed.current && !retriedThisConnect.current) {
+      retriedThisConnect.current = true;
+      void fetchSessions();
+    }
+  }, [isConnected, error, fetchSessions]);
+
   const handleDelete = async (id: string) => {
     const session = sessions.find(s => s.id === id);
     try {
@@ -276,13 +308,10 @@ export function Sessions() {
     }
   };
 
+  // Start and Reconnect only render for a card with no engine behind it, so they always call the
+  // gateway. A leftover `initializing` or `qr_ready` status (a node that died mid-pairing) is no reason
+  // to open the QR modal instead: GET /qr answers 400 until something starts the session.
   const handleStart = async (id: string) => {
-    const session = sessions.find(s => s.id === id);
-    if (session && ['initializing', 'qr_ready'].includes(session.status)) {
-      handleShowQR(id);
-      return;
-    }
-
     try {
       // Use the authoritative response instead of fabricating a status. The old code wrote a local
       // `status: 'connecting'` — a value the gateway never emits — while keeping every other field
@@ -526,7 +555,7 @@ export function Sessions() {
         <div className="error-banner" role="alert">
           <AlertCircle size={20} />
           <span className="error-banner-text">{t('sessions.feedDisconnected')}</span>
-          <button className="btn-secondary" style={{ marginLeft: 'auto' }} onClick={reconnect}>
+          <button className="btn-secondary" style={{ marginInlineStart: 'auto' }} onClick={reconnect}>
             {t('common.refresh')}
           </button>
         </div>
@@ -1063,13 +1092,17 @@ export function Sessions() {
                 <div className="qr-placeholder">
                   <QrCode size={80} className="qr-icon" />
                   <p>{session.status === 'qr_ready' ? t('sessions.qr.scanToConnect') : t('sessions.qr.preparing')}</p>
-                  <button
-                    className="btn-sm"
-                    onClick={() => handleShowQR(session.id)}
-                    disabled={session.status !== 'qr_ready'}
-                  >
-                    {session.status === 'qr_ready' ? t('sessions.qr.showQr') : t('sessions.qr.loading')}
-                  </button>
+                  {/* The QR is operator-only over REST and the socket, so a read-only key would open a
+                      modal that never gets a code. */}
+                  {canWrite && (
+                    <button
+                      className="btn-sm"
+                      onClick={() => handleShowQR(session.id)}
+                      disabled={session.status !== 'qr_ready'}
+                    >
+                      {session.status === 'qr_ready' ? t('sessions.qr.showQr') : t('sessions.qr.loading')}
+                    </button>
+                  )}
                 </div>
               ) : (
                 <div className="session-info">

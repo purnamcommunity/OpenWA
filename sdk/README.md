@@ -44,10 +44,17 @@ All five SDKs expose the same fluent resource surface:
 > ⚠️ Endpoints requiring an `OPERATOR`-level API key are noted in the inline
 > docs. Deliberately **not** exposed, matching `docs/18-sdk-design.md` exactly:
 > `auth`/api-keys, `audit`, `settings`, `stats`, `automation`, `infra`,
-> `plugins`, the `integration` management routes, `metrics`, `mcp`, `ingress`
-> and `docker`. These two lists have to agree — they did not, in both
+> `plugins`, the `integration` management routes, `metrics`, `mcp`, `ingress`,
+> `docker` and `calls`. These two lists have to agree — they did not, in both
 > directions, and a list that disagrees with its own design doc reads as an
 > accidental omission rather than a decision.
+>
+> The last of those is not administrative. It is the VoIP surface, which exists
+> only in this fork, and the clients here are for consumers of a gateway rather
+> than for the gateway's own operator — so there is nobody to expose it to yet.
+> The coverage is owed the moment that surface is raised upstream, and this entry
+> is the reminder: it records a decision that has not been taken rather than one
+> that has been made against covering it.
 >
 > Everything else the gateway publishes is exposed. That sentence used to be an
 > unqualified "all user-facing resources are", which was false for the session

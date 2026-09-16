@@ -18,6 +18,7 @@ import { createElement } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { Session } from '../services/api';
 import type { installJsdomGlobals as installJsdomGlobalsFn } from '../test-helpers/jsdom.ts';
+import { holdConnect, lastSocket, resetSocketDouble } from '../test-helpers/socket-io-double.ts';
 
 // ── Fixtures + fetch stub ────────────────────────────────────────────────────
 
@@ -94,6 +95,8 @@ function resetFetchCalls(): void {
   fetchCalls.length = 0;
   sessionProxy = { enabled: false, proxyType: null, proxyHost: null, hasCredentials: false };
   proxyGetFails = false;
+  sessionListFailures = 0;
+  distinctFailureMessages = false;
 }
 
 function findFetchCall(method: string, path: string): FetchCall | undefined {
@@ -108,6 +111,10 @@ function findFetchCall(method: string, path: string): FetchCall | undefined {
 let sessionConfig = { autoRejectCalls: false, maxReconnectAttempts: null as number | null, reconnectBaseDelay: 5000 };
 let configPatchFails = false;
 let proxyGetFails = false;
+// How many of the next GET /api/sessions reads fail, as they do while the gateway is down.
+let sessionListFailures = 0;
+// Whether each failed read carries its own message, as a 502, a 504 and a dropped connection do.
+let distinctFailureMessages = false;
 let sessionProxy = {
   enabled: false,
   proxyType: null as string | null,
@@ -131,7 +138,16 @@ function installFetchStub(): void {
     }
     fetchCalls.push({ method, path, body });
 
-    if (method === 'GET' && path === '/api/sessions') return Promise.resolve(jsonResponse(SESSIONS));
+    if (method === 'GET' && path === '/api/sessions') {
+      if (sessionListFailures > 0) {
+        sessionListFailures -= 1;
+        const message = distinctFailureMessages
+          ? `gateway unavailable (${sessionListFailures})`
+          : 'gateway unavailable';
+        return Promise.resolve(jsonResponse({ message }, 503));
+      }
+      return Promise.resolve(jsonResponse(SESSIONS));
+    }
 
     if (method === 'POST' && path === '/api/sessions') {
       const payload = body as { name?: string; proxyUrl?: string; proxyType?: string } | undefined;
@@ -236,9 +252,9 @@ before(async () => {
   // RoleProvider seeds from localStorage; 'admin' makes canWrite true, or every action button
   // (New Session, Stop/Start, Unlink, Delete, Kill Stuck) is hidden and there is nothing to test.
   window.localStorage.setItem('openwa_user_role', 'admin');
-  // Deliberately NOT setting sessionStorage['openwa_api_key']: useWebSocket.connect() reads it and
-  // bails with a console.warn when it's absent. Setting it would make socket.io actually dial
-  // http://localhost/events and hit ECONNREFUSED in this environment.
+  // Deliberately NOT setting sessionStorage['openwa_api_key'] here: useWebSocket.connect() bails
+  // with a console.warn when it's absent, so the page opens no socket. A case that drives the live
+  // feed sets the key itself; the client it reaches is the socket.io double, which dials nothing.
   // Awaited, not just imported: catalogues are fetched now, so the import only starts the load and
   // the English copy these tests query by name renders as a raw key until it arrives.
   const { i18nReady } = await import('../i18n/index.ts');
@@ -251,6 +267,8 @@ before(async () => {
 
 afterEach(() => {
   rtl.cleanup();
+  window.sessionStorage.removeItem('openwa_api_key');
+  resetSocketDouble();
   queryClient?.clear();
   queryClient = undefined;
 });
@@ -444,6 +462,28 @@ test('stopping a session dismisses its own open QR modal', async () => {
   });
 });
 
+// A node that died mid-pairing leaves a row reading `qr_ready` with no engine behind it. Reconnect on
+// that card has to start the session: the QR modal alone polls GET /qr, which answers 400 until one
+// is started.
+test('Reconnect on a qr_ready card with no engine loaded starts the session', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  SESSIONS.push({ ...SESSION_QR, id: 'sess-orphan-1', name: 'orphan-qr', engineLoaded: false });
+  try {
+    renderSessions();
+
+    await screen.findByText('orphan-qr');
+    const card = screen.getByText('orphan-qr').closest('.session-card') as HTMLElement;
+    fireEvent.click(within(card).getByRole('button', { name: 'Reconnect' }));
+
+    await waitFor(() => {
+      assert.ok(findFetchCall('POST', '/api/sessions/sess-orphan-1/start'), 'expected a POST to the start endpoint');
+    });
+  } finally {
+    SESSIONS.pop();
+  }
+});
+
 test('a restricted session shows the restriction on its card, even while it is ready', async () => {
   const { screen, within } = rtl;
   resetFetchCalls();
@@ -467,6 +507,154 @@ test('an unrestricted session shows no restriction row', async () => {
   const card = (await screen.findByText('stale-engine')).closest('.session-card') as HTMLElement;
 
   assert.equal(within(card).queryByText('Restriction'), null);
+});
+
+// ── Live feed banner ─────────────────────────────────────────────────────────
+
+test('Refresh on a feed that never connected re-reads the list once the socket is back', async () => {
+  const { screen, fireEvent, waitFor, act, within } = rtl;
+  resetFetchCalls();
+  sessionListFailures = 1;
+  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  holdConnect();
+  renderSessions();
+
+  // The gateway is down at mount: the list read fails, and nothing is rendered to go stale.
+  await screen.findByText('gateway unavailable');
+  const listReads = (): number => fetchCalls.filter(c => c.method === 'GET' && c.path === '/api/sessions').length;
+  assert.equal(listReads(), 1);
+
+  // A rejected handshake: socket.io decodes the CONNECT ack and the server's close from one polling
+  // payload, so React batches both handlers and `isConnected` never renders true on this mount.
+  const rejected = lastSocket();
+  assert.ok(rejected, 'expected the page to have opened a socket');
+  act(() => {
+    rejected.receive('connect');
+    rejected.receive('disconnect', 'io server disconnect');
+  });
+  const banner = await screen.findByRole('alert');
+  screen.getByText('Live updates disconnected');
+
+  fireEvent.click(within(banner).getByRole('button', { name: 'Refresh' }));
+  const redialed = lastSocket();
+  assert.ok(redialed && redialed !== rejected, 'expected Refresh to open a fresh socket');
+  act(() => redialed.receive('connect'));
+
+  // Every push sent while the feed was dead is gone, so the recovered page must re-read the list, and
+  // the error from the failed mount read must not sit on top of the cards it now shows.
+  await waitFor(() => assert.equal(listReads(), 2));
+  await screen.findByText('new-device');
+  // Compared as booleans: a failing assert.equal renders both operands, and a jsdom node never finishes.
+  assert.equal(
+    screen.queryByText('gateway unavailable') === null,
+    true,
+    'expected the re-read to clear the failed read error',
+  );
+  assert.equal(screen.queryByRole('alert') === null, true, 'expected the feed banner to be gone once connected');
+});
+
+test('a failed mount read is retried when the feed first connects after its own retries', async () => {
+  const { screen, waitFor, act } = rtl;
+  resetFetchCalls();
+  sessionListFailures = 1;
+  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  holdConnect();
+  renderSessions();
+
+  await screen.findByText('gateway unavailable');
+  const listReads = (): number => fetchCalls.filter(c => c.method === 'GET' && c.path === '/api/sessions').length;
+  assert.equal(listReads(), 1);
+
+  // socket.io's manager retried the handshake on its own and it went through: this is the socket's
+  // FIRST connect, so the feed reports no reconnect and nothing else re-reads the list.
+  const socket = lastSocket();
+  assert.ok(socket, 'expected the page to have opened a socket');
+  act(() => socket.receive('connect'));
+
+  await waitFor(() => assert.equal(listReads(), 2));
+  await screen.findByText('new-device');
+  assert.equal(
+    screen.queryByText('gateway unavailable') === null,
+    true,
+    'expected the retry to clear the failed read error',
+  );
+});
+
+test('a later failure on the same connection is retried too, once the first recovery succeeded', async () => {
+  const { screen, waitFor, act } = rtl;
+  resetFetchCalls();
+  sessionListFailures = 1;
+  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  holdConnect();
+  renderSessions();
+
+  await screen.findByText('gateway unavailable');
+  const listReads = (): number => fetchCalls.filter(c => c.method === 'GET' && c.path === '/api/sessions').length;
+  const socket = lastSocket();
+  assert.ok(socket, 'expected the page to have opened a socket');
+  act(() => socket.receive('connect'));
+
+  // The connect spends the one retry this connect is allowed and the read succeeds, so the page is
+  // healthy again, and the allowance must come back with it.
+  await waitFor(() => assert.equal(listReads(), 2));
+  await screen.findByText('new-device');
+
+  // Much later, on the SAME socket: a restriction push re-reads the list and that read fails. Nothing
+  // else on the page re-reads (the banner's Refresh renders only on a dead feed), so a spent allowance
+  // would leave the operator with a stale list under a red box and no control to clear it.
+  sessionListFailures = 1;
+  act(() => {
+    socket.receive('message', {
+      type: 'event',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      payload: { event: 'session.restriction', sessionId: SESSION_QR.id, data: {} },
+    });
+  });
+
+  await waitFor(() => assert.equal(listReads(), 4));
+  await waitFor(() =>
+    assert.equal(
+      screen.queryByText('gateway unavailable') === null,
+      true,
+      'expected the retry to clear the failed read error',
+    ),
+  );
+});
+
+test('a connect retries a failed list read once, even when each failure carries a new message', async () => {
+  const { screen, act } = rtl;
+  resetFetchCalls();
+  sessionListFailures = 10;
+  distinctFailureMessages = true;
+  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  holdConnect();
+  renderSessions();
+
+  await screen.findByText('gateway unavailable (9)');
+  const listReads = (): number => fetchCalls.filter(c => c.method === 'GET' && c.path === '/api/sessions').length;
+  const socket = lastSocket();
+  assert.ok(socket, 'expected the page to have opened a socket');
+  act(() => socket.receive('connect'));
+
+  await screen.findByText('gateway unavailable (8)');
+  // Give a re-read driven by the changed error time to fire before counting.
+  await act(() => new Promise(resolve => setTimeout(resolve, 50)));
+  assert.equal(listReads(), 2);
+});
+
+test('a read-only key gets no Show QR button, since the QR is operator-only', async () => {
+  const { screen, within } = rtl;
+  resetFetchCalls();
+  window.localStorage.setItem('openwa_user_role', 'viewer');
+  try {
+    renderSessions();
+    const card = (await screen.findByText('new-device')).closest('.session-card') as HTMLElement;
+    // The pairing placeholder still renders; only the action that would poll a 403 is gone.
+    assert.ok(card.querySelector('.qr-placeholder'));
+    assert.equal(within(card).queryByRole('button', { name: 'Show QR' }) === null, true);
+  } finally {
+    window.localStorage.setItem('openwa_user_role', 'admin');
+  }
 });
 
 // ── Auto-reject toggle ───────────────────────────────────────────────────────
