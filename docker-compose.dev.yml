@@ -42,6 +42,15 @@ services:
       - FOWNER
       - SETGID
       - SETUID
+      # dumb-init runs as root and forwards SIGTERM to node, which gosu has already moved to the
+      # openwa uid. Signalling across that boundary needs CAP_KILL, and kill(2) fails EPERM without
+      # it — silently, because nothing reports a refused forward. The app then never learns it
+      # should exit, sleeps out stop_grace_period with every thread intact, and is SIGKILLed from
+      # outside the container, where capabilities do not apply. The symptom is a stop that always
+      # runs its full timeout and exits 137, with not one line from the drain path; the cost is
+      # that Chromium is killed mid-write and a WhatsApp profile can be corrupted, which no backup
+      # repairs. Dropping this capability disables graceful shutdown entirely.
+      - KILL
     read_only: true
     tmpfs:
       - /tmp

@@ -77,6 +77,7 @@ services:
       - FOWNER
       - SETGID # gosu: drop to the openwa group
       - SETUID # gosu: drop to the openwa user
+      - KILL # dumb-init: forward SIGTERM to node, which gosu has moved to another uid
     read_only: true
     tmpfs:
       - /tmp
