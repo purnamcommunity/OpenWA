@@ -35,11 +35,13 @@
  *      whose wid the page refuses to map cannot fail the whole address-book read.
  *  12. `node scripts/patch-wwebjs-message-secret.js --best-effort` when present, giving every chat
  *      send a messageSecret so community announcement members can react and reply to it.
- *  13. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
+ *  13. `node scripts/patch-wwebjs-media-id.js --best-effort` when present, so a spread media model
+ *      cannot overwrite the outgoing message's id and fail every media send.
+ *  14. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
  *      bound, gated the same way.
- *  14. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
- *      newsletter-create parse fix. Steps 13-14 are the Baileys patches, so a Baileys-only install
- *      runs those and skips 2-12. This list is the order `planSteps` plans, which
+ *  15. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
+ *      newsletter-create parse fix. Steps 14-15 are the Baileys patches, so a Baileys-only install
+ *      runs those and skips 2-13. This list is the order `planSteps` plans, which
  *      `scripts/postinstall.spec.js` pins against the patchers on disk.
  *
  * Structured like scripts/patch-wwebjs-201832.js: pure planning + injectable spawn, so the spec
@@ -183,6 +185,15 @@ function planSteps(root, env = process.env) {
       name: 'whatsapp-web.js message secret on chat sends (scripts/patch-wwebjs-message-secret.js --best-effort)',
       command: process.execPath,
       args: [messageSecretPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const mediaIdPatcher = path.join(root, 'scripts', 'patch-wwebjs-media-id.js');
+  if (fs.existsSync(mediaIdPatcher)) {
+    steps.push({
+      name: 'whatsapp-web.js media send id repair (scripts/patch-wwebjs-media-id.js --best-effort)',
+      command: process.execPath,
+      args: [mediaIdPatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }
