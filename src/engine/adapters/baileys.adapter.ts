@@ -261,6 +261,11 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.lifecycle.requestPairingCode(phoneNumber);
   }
 
+  /** Nothing to undo: a Baileys pairing request leaves the socket's QR refs usable and arms no timer. */
+  cancelPairingCode(): Promise<void> {
+    return Promise.resolve();
+  }
+
   getPhoneNumber(): string | null {
     return this.lifecycle.getPhoneNumber();
   }

@@ -1079,6 +1079,13 @@ export interface SessionLifecycleCapability {
    */
   requestPairingCode(phoneNumber: string): Promise<string>;
 
+  /**
+   * Return a session to QR linking after requestPairingCode. On whatsapp-web.js the page otherwise
+   * stays in phone-number mode, re-requesting a code every 3 minutes and serving QRs that cannot link;
+   * Baileys has nothing to undo. Resolves without effect when no pairing flow is running.
+   */
+  cancelPairingCode(): Promise<void>;
+
   getPhoneNumber(): string | null;
 
   getPushName(): string | null;

@@ -455,6 +455,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.lifecycle.requestPairingCode(phoneNumber);
   }
 
+  async cancelPairingCode(): Promise<void> {
+    return this.lifecycle.cancelPairingCode();
+  }
+
   getPhoneNumber(): string | null {
     return this.lifecycle.getPhoneNumber();
   }

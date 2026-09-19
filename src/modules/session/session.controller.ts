@@ -452,6 +452,18 @@ export class SessionController {
     return this.sessionService.requestPairingCode(id, dto.phoneNumber);
   }
 
+  @Delete(':sessionId/pairing-code')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Cancel a pairing-code request and return the session to QR linking' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiResponse({ status: 204, description: 'Session is back in QR linking (also when no pairing was running)' })
+  @ApiResponse({ status: 400, description: 'Session not started' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async cancelPairingCode(@Param('sessionId', ParseUUIDPipe) id: string): Promise<void> {
+    await this.sessionService.cancelPairingCode(id);
+  }
+
   // Shares a Path Item with GroupController's POST on the same route — one parameter name for the
   // one positional segment, or the contract splits it into two entries.
   @Get(':sessionId/groups')

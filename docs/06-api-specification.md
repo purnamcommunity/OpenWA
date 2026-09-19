@@ -831,6 +831,24 @@ Request an 8-char pairing code to link via phone number (alternative to QR).
 
 **Errors:** `400` validation, or session not started, or already authenticated · `401` · `403` · `404` not found · `409` session not waiting to be linked yet; wait for `status` to read `qr_ready` and retry (after a code was accepted, wait for `ready` instead). On Baileys a session that already reads `qr_ready` can still answer `409` while its socket is closing, for up to the WebSocket close timeout (30 s); that is retryable and the status follows shortly. · `503` whatsapp-web.js only: every attempt landed while WhatsApp Web was reloading its own QR page, so the request never reached WhatsApp; retryable, and the last attempt's reason rides in the message.
 
+#### DELETE /api/sessions/:sessionId/pairing-code
+
+Cancel a pairing-code request and return the session to QR linking.
+
+On whatsapp-web.js a pairing-code request switches the shared WhatsApp Web page into phone-number linking mode, where it stays: it re-requests a code every 3 minutes (each one pushes a notification to the phone) and its QR codes cannot link. This puts it back in QR mode. `POST .../pairing-code` does the same by itself before a repeat request, since a page already in phone-number mode rejects a second start. Baileys has nothing to undo, and the call succeeds without effect there, as it does when no pairing request is running.
+
+**Auth:** API key (OPERATOR) · **Scope:** session-scoped
+
+**Path parameters**
+
+| Name        | Type   | Description  |
+| ----------- | ------ | ------------ |
+| `sessionId` | string | Session UUID |
+
+**Response** `204` — no body.
+
+**Errors:** `400` session is not started · `401` · `403` · `404` not found
+
 #### POST /api/sessions/:sessionId/presence/subscribe
 
 Ask WhatsApp to start reporting who is online or typing in a chat.

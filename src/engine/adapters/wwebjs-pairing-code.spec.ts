@@ -112,3 +112,50 @@ describe('requestPairingCode retries a mid-navigation page', () => {
     expect(requestPairingCode).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * A page already in phone-number linking mode rejects a second start with a minified `t: t`, and its
+ * QRs cannot link until it is back in QR mode, so a repeat request cancels the running flow first.
+ */
+describe('requestPairingCode cancels a running pairing flow', () => {
+  function withCancel(requestPairingCode: jest.Mock, cancelPairingCode: jest.Mock): WwebjsLifecycle {
+    const lc = makeLifecycle(requestPairingCode);
+    (lc.client as unknown as { cancelPairingCode: jest.Mock }).cancelPairingCode = cancelPairingCode;
+    return lc;
+  }
+
+  it('does not cancel before the first request', async () => {
+    const cancel = jest.fn().mockResolvedValue(undefined);
+    const lc = withCancel(jest.fn().mockResolvedValue('ABCD1234'), cancel);
+    await expect(lc.requestPairingCode('628111')).resolves.toBe('ABCD1234');
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
+  it('cancels the running flow before a repeat request', async () => {
+    const request = jest.fn().mockResolvedValueOnce('ABCD1234').mockResolvedValueOnce('EFGH5678');
+    const cancel = jest.fn().mockResolvedValue(undefined);
+    const lc = withCancel(request, cancel);
+    await lc.requestPairingCode('628111');
+    await expect(lc.requestPairingCode('628111')).resolves.toBe('EFGH5678');
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(cancel.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[1]);
+  });
+
+  it('still requests when the cancel fails', async () => {
+    const request = jest.fn().mockResolvedValueOnce('ABCD1234').mockResolvedValueOnce('EFGH5678');
+    const lc = withCancel(request, jest.fn().mockRejectedValue(new Error('page gone')));
+    await lc.requestPairingCode('628111');
+    await expect(lc.requestPairingCode('628111')).resolves.toBe('EFGH5678');
+  });
+
+  it('cancelPairingCode is a no-op until a flow was started, then cancels once', async () => {
+    const cancel = jest.fn().mockResolvedValue(undefined);
+    const lc = withCancel(jest.fn().mockResolvedValue('ABCD1234'), cancel);
+    await lc.cancelPairingCode();
+    expect(cancel).not.toHaveBeenCalled();
+    await lc.requestPairingCode('628111');
+    await lc.cancelPairingCode();
+    await lc.cancelPairingCode();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+});

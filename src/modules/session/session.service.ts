@@ -799,6 +799,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return { pairingCode, status: session.status };
   }
 
+  /** Return a started session to QR linking after a pairing-code request. See IWhatsAppEngine.cancelPairingCode. */
+  async cancelPairingCode(id: string): Promise<void> {
+    await this.findOne(id);
+    const engine = this.engines.require(
+      id,
+      () => new BadRequestException('Session is not started. Call POST /sessions/:sessionId/start first.'),
+    );
+    await engine.cancelPairingCode();
+  }
+
   getEngine(id: string): IWhatsAppEngine | undefined {
     return this.engines.get(id);
   }

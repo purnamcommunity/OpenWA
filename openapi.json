@@ -956,6 +956,35 @@
         "tags": [
           "sessions"
         ]
+      },
+      "delete": {
+        "operationId": "SessionController_cancelPairingCode",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session is back in QR linking (also when no pairing was running)"
+          },
+          "400": {
+            "description": "Session not started"
+          },
+          "404": {
+            "description": "Session not found"
+          }
+        },
+        "summary": "Cancel a pairing-code request and return the session to QR linking",
+        "tags": [
+          "sessions"
+        ]
       }
     },
     "/api/sessions/{sessionId}/groups": {

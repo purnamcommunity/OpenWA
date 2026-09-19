@@ -153,6 +153,9 @@ export class WwebjsLifecycle {
   qrCode: string | null = null;
   /** Issue and expiry of the latest QR; kept past a cleared qrCode so the next one can tell a new round. */
   private qrTiming: QrTiming | null = null;
+  /** The client a pairing-code flow was started on. That page stays in phone-number linking mode, with
+   *  its own 3-minute re-request timer, until cancelPairingCode() puts it back in QR mode. */
+  private pairingClient: Client | null = null;
   /** Own-account phone number, read once at readiness. */
   private phoneNumber: string | null = null;
   /** Own-account push name, read once at readiness. */
@@ -1049,6 +1052,15 @@ export class WwebjsLifecycle {
     if (!this.client || this.status !== EngineStatus.QR_READY) {
       throw new EngineNotReadyError('Session is not waiting to be linked. Start it and wait for the QR stage.');
     }
+    // A page already in phone-number linking mode rejects a second start with a minified `t: t`, and
+    // its QRs are built without the ADV key until it is back in QR mode. So a repeat request cancels
+    // the running flow first; a failed cancel is logged and the request still tried.
+    if (this.pairingClient === this.client) {
+      await this.cancelPairingCode().catch((error: unknown) =>
+        this.host.logger.warn('Could not cancel the running pairing-code flow', String(error)),
+      );
+    }
+    this.pairingClient = this.client;
     // WhatsApp Web reloads the QR page while UNPAIRED (roughly every 20s). A requestPairingCode that
     // lands mid-navigation runs its in-page evaluate against a destroyed context: it either rejects
     // with "Execution context was destroyed" or hangs until Puppeteer's protocol timeout (minutes),
@@ -1101,5 +1113,18 @@ export class WwebjsLifecycle {
       `Pairing code could not be generated after ${PAIRING_CODE_MAX_ATTEMPTS} attempts: ` +
         `${lastError instanceof Error ? lastError.message : String(lastError)}`,
     );
+  }
+
+  /**
+   * Put the page back in QR mode after a pairing-code request: stops the page's 3-minute code
+   * re-request timer (each one pushes a notification to the phone) and makes its QRs linkable again.
+   * A no-op when no pairing flow was started on the current client.
+   */
+  async cancelPairingCode(): Promise<void> {
+    if (!this.client || this.pairingClient !== this.client) {
+      return;
+    }
+    await this.client.cancelPairingCode();
+    this.pairingClient = null;
   }
 }
