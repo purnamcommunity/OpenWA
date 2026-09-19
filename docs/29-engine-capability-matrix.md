@@ -409,7 +409,7 @@ answers 501.
 | Method                | Baileys adapter 🔧⁵ | wwjs adapter 🔧¹ | OpenWA REST     |
 | --------------------- | ------------------- | ---------------- | --------------- |
 | `subscribeToPresence` | ✅                  | ❌ lib           | ⚠️ baileys only |
-| `rejectCall`          | ✅                  | ✅               | ✅              |
+| `rejectCall`          | ✅                  | ❌ lib           | ⚠️ baileys only |
 | `createCallLink`      | ✅                  | ✅               | ✅              |
 | `placeCall`           | ❌ lib              | ✅               | ⚠️ wwjs only    |
 | `answerCall`          | ❌ lib              | ✅               | ⚠️ wwjs only    |
@@ -801,11 +801,11 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 A row belongs here when both libraries expose a symbol for the same capability and the interface
 has no method for it, because one new interface method then wires both adapters at once.
 
-⚠️ **A symbol in `.d.ts` is not evidence the call works.** `demoteChannelAdmin` and
-`transferChannelOwnership` each have a typed `Client` method and a resolvable page module on
-whatsapp-web.js, and each fails against live WhatsApp Web — both are `not-available` there and
-detailed in 29.6.2. Add a row here from the typings; do not mark its cell `supported` until a live
-call has returned WhatsApp's own answer.
+⚠️ **A symbol in `.d.ts` is not evidence the call works.** `createGroup`, `demoteChannelAdmin`,
+`transferChannelOwnership` and `rejectCall` each have a typed method on whatsapp-web.js (a `Client`
+method, or `Call.reject()` for `rejectCall`), and each fails against live WhatsApp Web: all four
+are `not-available` there and detailed in 29.6.2. Add a row here from the typings; do not mark its
+cell `supported` until a live call has returned WhatsApp's own answer.
 
 Near-misses (both libraries have the area, but the symbol sets only partially overlap — still
 worth an interface method): **channel admin invites** (wwjs
@@ -834,7 +834,7 @@ OpenWA consumes events by normalizing them into `EngineEventCallbacks`; anything
 | `contacts.upsert`           | ✅                                                  |     | `newsletter.view`                | ❌                              |
 | `contacts.update`           | ✅                                                  |     | `settings.update`                | ❌                              |
 | `groups.update`             | ✅                                                  |     | `blocklist.set`                  | ❌                              |
-| `groups.upsert`             | ❌                                                  |     | `blocklist.update`               | ❌                              |
+| `groups.upsert`             | ✅                                                  |     | `blocklist.update`               | ❌                              |
 | `group-participants.update` | ✅                                                  |     | `labels.association`             | ❌ candidate (label-read cache) |
 | `group.join-request`        | ✅                                                  |     | `labels.edit`                    | ❌ candidate (label-read cache) |
 | `group.member-tag.update`   | ❌                                                  |     | `lid-mapping.update`             | ✅                              |
@@ -888,7 +888,7 @@ adapter boundary — none silently stubs.
 | `votePoll`              | lib   | No vote-send helper at all; the library only _decrypts incoming_ votes (`decryptPollVote`). Sending needs a hand-built `proto.Message.PollUpdateMessage` with HMAC-SHA256 encryption keyed by the poll creation's `messageSecret`.                                                                                                                       |
 | `getPollVotes`          | lib   | Same root cause from the read side: an incoming poll update arrives encrypted and `decryptPollVote` needs the poll creation's `messageSecret`, so the library keeps no decrypted vote table to read back. WhatsApp Web stores one (`WAWebPollsVotesSchema`), which is why the wwjs cell is ✅.                                                           |
 
-### 29.6.2 wwjs adapter (12 cells)
+### 29.6.2 wwjs adapter (13 cells)
 
 | Method                     | Cause | What's missing (evidence)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | -------------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -898,6 +898,7 @@ adapter boundary — none silently stubs.
 | `upsertLabel`              | lib   | 1.34.7 reads labels and assigns them (`getLabels`, `getLabelById`, `getChatLabels`, `getChatsByLabelId`, `addOrRemoveLabels`, `index.d.ts:129-154`) but exposes nothing that creates/edits a label definition.                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `deleteLabel`              | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `subscribeToPresence`      | lib   | Only `sendPresenceAvailable`/`sendPresenceUnavailable` (`index.d.ts:230,233`), which publish the _account's own_ presence; no subscribe call and no presence event is emitted.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `rejectCall`               | lib   | `Call.reject()` exists and is typed `Promise<void>` (`index.d.ts:2417`), but measured live on 2026-09-17 on OpenWA 0.23.4 with WhatsApp Web `2.3000.1047471845-alpha` the reject resolved and OpenWA logged the call as auto-rejected while the caller's phone kept ringing until it timed out. The cause is not established. The page function it runs, `WWebJS.rejectCall`, is modified by OpenWA patch 🔧¹ (`wwebjs-201832`), which reads the own user id from `getMaybeMePnUser()._serialized` or `$1`. Baileys serves this capability, and its auto-reject stopped the caller's phone at once in a live test the same day.  |
 | `getCatalog`               | lib   | No `Client.getCatalog` in `index.d.ts` (0 hits); `Product`/`Order` are inbound-only parsers.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `getProducts`              | lib   | Same as above.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `getProduct`               | lib   | Only page-internal `getProductMetadata` (`Utils.js:1290`), not a public Client fn.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -919,10 +920,10 @@ adapter boundary — none silently stubs.
   `sendAudioMessage`, `sendDocumentMessage` and `sendStickerMessage` are ✅ on wwjs for chats and
   groups, but a `<id>@newsletter` recipient throws `ChannelMediaNotSupportedError` (a
   `NotImplementedException` → HTTP 501) at `ensureNotChannelRecipient`
-  (`wwebjs-messaging.ts:354` for the media funnel, `:409` for stickers). whatsapp-web.js calls
+  (`wwebjs-messaging.ts:425` for the media funnel, `:492` for stickers). whatsapp-web.js calls
   `msg.avParams()`, removed in a recent WA Web build (upstream wwebjs#201823, unresolved).
-  Text→channel is unaffected, and Baileys has no such restriction — so these five rows are the one
-  place where an engine difference does **not** show up as a per-row ❌ in 29.4.
+  Text→channel is unaffected, and Baileys has no such restriction — so these five rows answer `501`
+  without a per-row ❌ in 29.4.
 - **`sendStickerMessage` — what each engine converts.** Both engines guarantee the payload really is
   WebP, but they reach it differently and they do not accept the same inputs. whatsapp-web.js passes
   `sendMediaAsSticker: true`, and `Util.formatToWebpSticker` converts `image/*` **and** `video/*`
@@ -1001,12 +1002,13 @@ adapter sources — re-derive the same way when anything changes:
   3 internal wiring, 1 class plumbing, **33 ❌ not exposed** (25 real capabilities + 8
   session/transport settings that are not WhatsApp capabilities). The backlog is the ❌ rows minus
   those 8 settings; 🔩 plumbing is correctly never exposed.
-- Events: Baileys **34** (15 consumed / 19 dropped), wwjs **31** (17 consumed / 14 dropped).
+- Events: Baileys **34** (16 consumed / 18 dropped), wwjs **31** (17 consumed / 14 dropped).
 - **0** capabilities in 29.5.3: every capability with first-class symbols on both libraries is
-  either wired or classified with evidence. Two of them are Baileys-only despite typed
-  whatsapp-web.js symbols — `demoteChannelAdmin`, whose page function WhatsApp Web no longer
-  provides, and `transferChannelOwnership`, whose page function rejects locally against a
-  subscriber list it cannot repopulate (both in 29.6.2). Both answer 501 on wwjs. `.d.ts` presence
+  either wired or classified with evidence. Three of them are Baileys-only despite typed
+  whatsapp-web.js symbols: `demoteChannelAdmin`, whose page function WhatsApp Web no longer
+  provides; `transferChannelOwnership`, whose page function rejects locally against a subscriber
+  list it cannot repopulate; and `rejectCall`, whose `Call.reject()` resolves while the caller's
+  phone keeps ringing (all in 29.6.2). Each answers 501 on wwjs. `.d.ts` presence
   is not capability, and only a live call distinguishes the two.
 - **15** install-time patches (13 whatsapp-web.js + 2 Baileys), all exact and self-disabling.
 - **0 phantom-support rows** — every `not-available` cell throws at the adapter boundary.
