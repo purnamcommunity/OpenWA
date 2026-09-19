@@ -1,7 +1,7 @@
 /**
  * Post-install hook (npm `postinstall`).
  *
- * Ten conditional steps, each skipped when its target is absent so the hook is a no-op where the
+ * Sixteen conditional steps, each skipped when its target is absent so the hook is a no-op where the
  * piece is missing (the Docker builder stage copies package*.json long before any source):
  *
  *   1. `npm ci` inside dashboard/ when dashboard/ exists — the dashboard carries its own lockfile and
@@ -37,11 +37,13 @@
  *      send a messageSecret so community announcement members can react and reply to it.
  *  13. `node scripts/patch-wwebjs-media-id.js --best-effort` when present, so a spread media model
  *      cannot overwrite the outgoing message's id and fail every media send.
- *  14. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
+ *  14. `node scripts/patch-wwebjs-group-invite.js --best-effort` when present, loading the lazy
+ *      invite-link bundle so the group invite-code read, revoke and join reach their jobs.
+ *  15. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
  *      bound, gated the same way.
- *  15. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
- *      newsletter-create parse fix. Steps 14-15 are the Baileys patches, so a Baileys-only install
- *      runs those and skips 2-13. This list is the order `planSteps` plans, which
+ *  16. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
+ *      newsletter-create parse fix. Steps 15-16 are the Baileys patches, so a Baileys-only install
+ *      runs those and skips 2-14. This list is the order `planSteps` plans, which
  *      `scripts/postinstall.spec.js` pins against the patchers on disk.
  *
  * Structured like scripts/patch-wwebjs-201832.js: pure planning + injectable spawn, so the spec
@@ -194,6 +196,15 @@ function planSteps(root, env = process.env) {
       name: 'whatsapp-web.js media send id repair (scripts/patch-wwebjs-media-id.js --best-effort)',
       command: process.execPath,
       args: [mediaIdPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const groupInvitePatcher = path.join(root, 'scripts', 'patch-wwebjs-group-invite.js');
+  if (fs.existsSync(groupInvitePatcher)) {
+    steps.push({
+      name: 'whatsapp-web.js group invite bundle loader (scripts/patch-wwebjs-group-invite.js --best-effort)',
+      command: process.execPath,
+      args: [groupInvitePatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }

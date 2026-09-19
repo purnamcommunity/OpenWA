@@ -19,6 +19,10 @@ const {
 };
 
 const WWJS_SRC = path.join(__dirname, '..', '..', '..', 'node_modules', 'whatsapp-web.js');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { GROUPS: GROUP_INVITE_GROUPS } = require('../../../scripts/patch-wwebjs-group-invite') as {
+  GROUPS: { file: string; find: string; replace: string }[];
+};
 /** The patcher's CLI entrypoint — the `--best-effort` cases exercise the process, not just applyBackport. */
 const SCRIPT = path.join(__dirname, '..', '..', '..', 'scripts', 'patch-wwebjs-201832.js');
 
@@ -78,6 +82,14 @@ describe('patch-wwebjs-201832 (build-time backport of upstream #201832)', () => 
     tmpDirs.push(tmp);
     const copy = path.join(tmp, 'whatsapp-web.js');
     fs.cpSync(WWJS_SRC, copy, { recursive: true });
+
+    // patch-wwebjs-group-invite rewrites acceptInvite's join line, which is context for this diff's
+    // Client.js hunk, so it is undone first or the reverse apply below cannot place that hunk.
+    for (const group of GROUP_INVITE_GROUPS) {
+      const file = path.join(copy, group.file);
+      const source = fs.readFileSync(file, 'utf8');
+      if (source.includes(group.replace)) fs.writeFileSync(file, source.replace(group.replace, group.find));
+    }
 
     const baseJs = path.join(copy, 'src', 'structures', 'Base.js');
     if (!/static _normalizeId/.test(fs.readFileSync(baseJs, 'utf8'))) return copy; // already pristine
