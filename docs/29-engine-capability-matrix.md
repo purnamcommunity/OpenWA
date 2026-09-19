@@ -422,9 +422,9 @@ answers 501.
 > Placing, answering, ending and reading a call all run through WhatsApp Web's own VoIP stack in
 > the page.
 
-**Totals:** 121 methods → 242 adapter cells: **210 ✅, 32 ❌** (2 adapter-gaps, 23
-library-limitations, 0 uncertain) across 24 methods. From the REST caller's side: **92** methods
-work on any engine (90 fully supported + 2 store-backed status reads), **11** are Baileys-only,
+**Totals:** 121 methods → 242 adapter cells: **209 ✅, 33 ❌** (2 adapter-gaps, 24
+library-limitations, 0 uncertain) across 25 methods. From the REST caller's side: **91** methods
+work on any engine (89 fully supported + 2 store-backed status reads), **12** are Baileys-only,
 **10** are wwjs-only (the 2 store-backed rows excluded); `sendCatalog`, unavailable on both engines,
 is not exposed.
 
@@ -986,15 +986,15 @@ adapter boundary — none silently stubs.
 Recomputed from `engine-capability-matrix.ts`, `upstream-surface.snapshot.json`, and a scan of the
 adapter sources — re-derive the same way when anything changes:
 
-- **121** interface methods → **242** adapter cells: **210 ✅** / **32 ❌** (2 adapter-gaps, 23
-  library-limitations, 0 uncertain), spanning **24** methods.
-- Of the 210 ✅ cells, **13 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
+- **121** interface methods → **242** adapter cells: **209 ✅** / **33 ❌** (2 adapter-gaps, 24
+  library-limitations, 0 uncertain), spanning **25** methods.
+- Of the 209 ✅ cells, **13 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
   1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 3 × 🔧⁷ participant arity, 1 × 🔧⁹ group
   description, 3 × 🔧¹⁵ group invite) and one baileys cell
   does (1 × 🔧⁶ newsletter-create parse); the whole wwjs column additionally
   depends on 🔧¹, the whole Baileys column on 🔧⁵ — so every row rests on a patch on each side,
   even though no row carries a row-level mark on both.
-- REST caller's view: **92** engine-neutral (90 + 2 store-backed status reads), **11** Baileys-only,
+- REST caller's view: **91** engine-neutral (89 + 2 store-backed status reads), **12** Baileys-only,
   **10** wwjs-only; `sendCatalog` (unavailable on both engines) is not exposed.
 - Full engine inventory (29.5), split by the exposure legend rather than lumped: Baileys **152**
   socket methods — 48 wired into interface methods, 5 internal wiring, 29 plumbing, **70 ❌ not
