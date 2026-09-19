@@ -12,25 +12,30 @@ import { EngineNotSupportedError } from '../../common/errors/engine-not-supporte
 
 type Modules = Record<string, Record<string, unknown> | undefined>;
 
-/** A page whose evaluate runs the function in-process with `window.require` served from `modules`. */
-const pageWith = (modules: Modules, overridePermissions = jest.fn().mockResolvedValue(undefined)) => ({
-  browserContext: () => ({ overridePermissions }),
-  overridePermissions,
-  evaluate: jest.fn(async (fn: (arg: unknown) => unknown, arg: unknown) => {
-    const prev = (globalThis as { window?: unknown }).window;
-    (globalThis as { window?: unknown }).window = {
-      require: (name: string) => {
-        if (!(name in modules)) throw new Error(`Cannot find module ${name}`);
-        return modules[name];
-      },
-    };
-    try {
-      return await fn(arg);
-    } finally {
-      (globalThis as { window?: unknown }).window = prev;
-    }
-  }),
-});
+/** A page whose evaluate runs the function in-process with `window.require` served from `modules`.
+ *  The one `window` persists across evaluates, as a real page's does. */
+const pageWith = (modules: Modules, overridePermissions = jest.fn().mockResolvedValue(undefined)) => {
+  const win: Record<string, unknown> = {
+    require: (name: string) => {
+      if (!(name in modules)) throw new Error(`Cannot find module ${name}`);
+      return modules[name];
+    },
+  };
+  return {
+    window: win,
+    browserContext: () => ({ overridePermissions }),
+    overridePermissions,
+    evaluate: jest.fn(async (fn: (arg: unknown) => unknown, arg: unknown) => {
+      const prev = (globalThis as { window?: unknown }).window;
+      (globalThis as { window?: unknown }).window = win;
+      try {
+        return await fn(arg);
+      } finally {
+        (globalThis as { window?: unknown }).window = prev;
+      }
+    }),
+  };
+};
 
 const hostWith = (page: unknown): { host: WwebjsEngineHost; warn: jest.Mock } => {
   const warn = jest.fn();
@@ -231,14 +236,127 @@ describe('WwebjsVoip.placeCall', () => {
     await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).resolves.toBeNull();
   }, 10_000);
 
-  it('refuses a second call rather than letting the stack silently drop it', async () => {
-    const mods = readyModules({
-      WAWebCallCollection: { pendingOutgoingCall: { id: 'X' }, isInConnectedCall: false, lastActiveCall: null },
+  /** A collection holding the placeholder WhatsApp keeps while a placement is starting, plus the
+   *  cancel WhatsApp clears it with. */
+  const placeholderModules = (collection: Record<string, unknown> = {}): Modules => {
+    const calls: Record<string, unknown> = {
+      pendingOutgoingCall: { abortController: new AbortController(), isGroup: false, isJoin: false, isVideo: false },
+      isInConnectedCall: false,
+      activeCall: null,
+      lastActiveCall: null,
+      ...collection,
+    };
+    return readyModules({
+      WAWebCallCollection: calls,
+      WAWebVoipCancelOutgoingCall: {
+        cancelPendingOutgoingCall: jest.fn(() => {
+          calls.pendingOutgoingCall = null;
+        }),
+      },
+      WAWebVoipStartCall: {
+        startWAWebVoipCall: jest.fn(() => {
+          calls.activeCall = { id: 'NEW1' };
+          return Promise.resolve();
+        }),
+      },
     });
-    const { host } = hostWith(pageWith(mods));
+  };
 
-    await expect(new WwebjsVoip(host).placeCall('9@c.us', false)).rejects.toBeInstanceOf(EngineRefusedError);
+  it('refuses a second call while a placement is still in flight', async () => {
+    const mods = placeholderModules();
+    const page = pageWith(mods);
+    page.window.__openwaPlacingSince = Date.now();
+
+    await expect(new WwebjsVoip(hostWith(page).host).placeCall('9@c.us', false)).rejects.toThrow(
+      /already being placed/,
+    );
     expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).not.toHaveBeenCalled();
+    expect(mods.WAWebVoipCancelOutgoingCall!.cancelPendingOutgoingCall).not.toHaveBeenCalled();
+  });
+
+  it('clears a placeholder no placement is waiting on, then places', async () => {
+    // What a stalled earlier attempt leaves behind: WhatsApp would ignore every start after it.
+    const mods = placeholderModules();
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).resolves.toBe('NEW1');
+    expect(mods.WAWebVoipCancelOutgoingCall!.cancelPendingOutgoingCall).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears a placeholder whose placement has run past its limit', async () => {
+    const mods = placeholderModules();
+    const page = pageWith(mods);
+    page.window.__openwaPlacingSince = Date.now() - 60_000;
+
+    await expect(new WwebjsVoip(hostWith(page).host, 45_000).placeCall('9@c.us', false)).resolves.toBe('NEW1');
+    expect(mods.WAWebVoipCancelOutgoingCall!.cancelPendingOutgoingCall).toHaveBeenCalled();
+  });
+
+  it('never clears a placeholder that has an active call behind it', async () => {
+    const mods = placeholderModules({ activeCall: { id: 'RINGING' } });
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).rejects.toThrow(
+      /already being placed/,
+    );
+    expect(mods.WAWebVoipCancelOutgoingCall!.cancelPendingOutgoingCall).not.toHaveBeenCalled();
+  });
+
+  it('refuses rather than guessing when the build has no cancel to clear a placeholder with', async () => {
+    const mods = placeholderModules();
+    delete mods.WAWebVoipCancelOutgoingCall;
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).rejects.toBeInstanceOf(
+      EngineRefusedError,
+    );
+    expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).not.toHaveBeenCalled();
+  });
+
+  it('cancels a start that never settles, so the next placement is not blocked', async () => {
+    const mods = placeholderModules({ pendingOutgoingCall: null });
+    const calls = mods.WAWebCallCollection!;
+    mods.WAWebVoipStartCall = {
+      startWAWebVoipCall: jest.fn(() => {
+        calls.pendingOutgoingCall = { abortController: new AbortController() };
+        return new Promise(() => undefined);
+      }),
+    };
+    const page = pageWith(mods);
+
+    await expect(new WwebjsVoip(hostWith(page).host, 200).placeCall('9@c.us', false)).rejects.toThrow(
+      /did not start the call within/,
+    );
+    expect(calls.pendingOutgoingCall).toBeNull();
+    expect(page.window.__openwaPlacingSince).toBeUndefined();
+  });
+
+  it('reports a call WhatsApp published while its start was still pending as placed', async () => {
+    const mods = placeholderModules({ pendingOutgoingCall: null });
+    const calls = mods.WAWebCallCollection!;
+    mods.WAWebVoipStartCall = {
+      startWAWebVoipCall: jest.fn(() => {
+        calls.pendingOutgoingCall = { abortController: new AbortController() };
+        calls.activeCall = { id: 'SLOW1' };
+        return new Promise(() => undefined);
+      }),
+    };
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host, 200).placeCall('9@c.us', false)).resolves.toBe('SLOW1');
+    expect(mods.WAWebVoipCancelOutgoingCall!.cancelPendingOutgoingCall).not.toHaveBeenCalled();
+  });
+
+  it('cancels the placeholder a failed start leaves behind', async () => {
+    const mods = placeholderModules({ pendingOutgoingCall: null });
+    const calls = mods.WAWebCallCollection!;
+    mods.WAWebVoipStartCall = {
+      startWAWebVoipCall: jest.fn(() => {
+        calls.pendingOutgoingCall = { abortController: new AbortController() };
+        return Promise.reject(new Error('signalling failed'));
+      }),
+    };
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).rejects.toThrow(
+      /signalling failed/,
+    );
+    expect(calls.pendingOutgoingCall).toBeNull();
   });
 
   it('refuses while a call is already connected', async () => {

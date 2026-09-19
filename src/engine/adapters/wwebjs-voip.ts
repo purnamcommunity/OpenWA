@@ -83,9 +83,30 @@ function pageRawAudioCapture(): { ok: true } {
   return { ok: true };
 }
 
-/** Page function: place a 1:1 call. `startWAWebVoipCall(wid, isVideo, callFromUi)` resolves once
- *  signalling is away; the id is read back from the collection because it returns none. */
-function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageResult<{ callId: string | null }>> {
+/**
+ * Page function: place a 1:1 call. `startWAWebVoipCall(wid, isVideo, callFromUi)` resolves once
+ * signalling is away; the id is read back from the collection because it returns none.
+ *
+ * `WAWebCallCollection.pendingOutgoingCall` is a placeholder WhatsApp holds from the start of a
+ * placement until the call window opens, the active call ends, or one of its failure paths
+ * cancels it. A placement that stalls or throws past those leaves it behind, and while it is set
+ * WhatsApp ignores every later start, so one bad attempt blocks the line until the page reloads.
+ * Three rules keep the placeholder from outliving its placement:
+ *
+ * - A placeholder no placement of ours is waiting on is stale, and is cleared through WhatsApp's
+ *   own `cancelPendingOutgoingCall` before placing. `window.__openwaPlacingSince` marks the one
+ *   placement in flight, and is removed when that placement settles.
+ * - A placement that has not started a call within `setupTimeoutMs` cancels its placeholder and
+ *   is refused, rather than holding the page call open until the protocol timeout.
+ * - A start that throws cancels its placeholder too.
+ *
+ * None of these cancels while WhatsApp holds an active call: that placeholder belongs to a call.
+ */
+function pagePlaceCall(arg: {
+  chatId: string;
+  isVideo: boolean;
+  setupTimeoutMs: number;
+}): Promise<PageResult<{ callId: string | null }>> {
   const req = (name: string): Record<string, unknown> | undefined => {
     try {
       return (window as unknown as { require: (n: string) => Record<string, unknown> }).require(name);
@@ -117,13 +138,29 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
     });
   }
 
-  // The stack holds one call. Starting a second is silently ignored upstream ("outgoing call
-  // already pending"), which would look like success, so it is refused here instead.
-  if (calls?.pendingOutgoingCall != null) {
-    return Promise.resolve({ refused: 'a call is already being placed on this session' });
-  }
   if ((calls?.isInConnectedCall as boolean | undefined) === true) {
     return Promise.resolve({ refused: 'this session is already in a call' });
+  }
+
+  const marker = window as unknown as { __openwaPlacingSince?: number };
+  const cancelPending = req('WAWebVoipCancelOutgoingCall')?.cancelPendingOutgoingCall as (() => void) | undefined;
+  // Cancels only a placeholder with no call behind it; see the rules above.
+  const cancelOrphan = (): void => {
+    if (calls?.pendingOutgoingCall != null && calls.activeCall == null && typeof cancelPending === 'function') {
+      cancelPending();
+    }
+  };
+
+  // The stack holds one call. Starting a second while the placeholder is set is silently ignored
+  // upstream ("outgoing call already pending"), which would look like success, so a live
+  // placement is refused and a stale one is cleared.
+  if (calls?.pendingOutgoingCall != null) {
+    const since = marker.__openwaPlacingSince;
+    const inFlight = typeof since === 'number' && Date.now() - since < arg.setupTimeoutMs;
+    if (!inFlight) cancelOrphan();
+    if (calls.pendingOutgoingCall != null) {
+      return Promise.resolve({ refused: 'a call is already being placed on this session' });
+    }
   }
 
   let wid: unknown;
@@ -140,14 +177,34 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
       ? (value as { id: string }).id
       : null;
 
+  const timedOut = { timedOut: true } as const;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<typeof timedOut>(resolve => {
+    timer = setTimeout(() => resolve(timedOut), arg.setupTimeoutMs);
+  });
+  const placing = Date.now();
+  marker.__openwaPlacingSince = placing;
+  const settle = (): void => {
+    clearTimeout(timer);
+    if (marker.__openwaPlacingSince === placing) delete marker.__openwaPlacingSince;
+  };
+
   // 0 = "not from the UI" in the call-origin enum the outgoing QPL logs.
-  return start(wid, arg.isVideo, 0).then(
-    async () => {
+  return Promise.race([start(wid, arg.isVideo, 0), limit]).then(
+    async outcome => {
+      settle();
+      if (outcome === timedOut) {
+        // A call WhatsApp published while its start was still pending is a placed call.
+        const id = readId(calls?.activeCall);
+        if (id !== null) return { ok: true, callId: id };
+        cancelOrphan();
+        const seconds = Math.round(arg.setupTimeoutMs / 1000);
+        return { refused: `WhatsApp did not start the call within ${seconds} seconds — try again` };
+      }
       // startWAWebVoipCall resolves when the offer is away, which is BEFORE the collection has
-      // published the call. Reading the id immediately therefore returned null almost every time,
-      // and a caller with no id cannot later hang the call up. Poll briefly instead — the id
-      // appears within a few hundred milliseconds, and a call that never publishes one is still
-      // reported as placed rather than failed.
+      // published the call, so an immediate read is almost always null — and a caller with no id
+      // cannot later hang the call up. The id appears within a few hundred milliseconds; a call
+      // that never publishes one is still reported as placed rather than failed.
       for (let attempt = 0; attempt < 20; attempt++) {
         const id = readId(calls?.activeCall) ?? readId(calls?.lastActiveCall);
         if (id !== null) return { ok: true, callId: id };
@@ -155,9 +212,17 @@ function pagePlaceCall(arg: { chatId: string; isVideo: boolean }): Promise<PageR
       }
       return { ok: true, callId: null };
     },
-    (error: unknown) => ({ refused: `WhatsApp refused the call: ${String(error)}` }),
+    (error: unknown) => {
+      settle();
+      cancelOrphan();
+      return { refused: `WhatsApp refused the call: ${String(error)}` };
+    },
   );
 }
+
+/** How long WhatsApp gets to start a placed call before the placement is cancelled. Well inside
+ *  the page protocol timeout, so the refusal reaches the caller instead of a transport error. */
+const CALL_SETUP_TIMEOUT_MS = 45_000;
 
 /**
  * Page function: answer or hang up through the VoIP stack interface — the same object the call
@@ -282,7 +347,10 @@ interface EvaluatablePage {
 const WA_ORIGIN = 'https://web.whatsapp.com';
 
 export class WwebjsVoip {
-  constructor(private readonly host: WwebjsEngineHost) {}
+  constructor(
+    private readonly host: WwebjsEngineHost,
+    private readonly callSetupTimeoutMs = CALL_SETUP_TIMEOUT_MS,
+  ) {}
 
   private page(): EvaluatablePage {
     const page = (this.host.getClient() as unknown as { pupPage?: EvaluatablePage }).pupPage;
@@ -374,7 +442,11 @@ export class WwebjsVoip {
     this.host.ensureReady();
     this.host.ensureNotChannelRecipient(chatId);
     await this.ensureVoipReady();
-    const result = await this.run<{ callId: string | null }>('placeCall', pagePlaceCall, { chatId, isVideo });
+    const result = await this.run<{ callId: string | null }>('placeCall', pagePlaceCall, {
+      chatId,
+      isVideo,
+      setupTimeoutMs: this.callSetupTimeoutMs,
+    });
     this.host.logger.log(`Placed ${isVideo ? 'video' : 'voice'} call to ${chatId}`);
     return result.callId;
   }
