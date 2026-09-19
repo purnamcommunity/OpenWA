@@ -91,6 +91,7 @@ describe('SessionService logout() name-scoped teardown fence', () => {
       forceDestroy: jest.fn().mockResolvedValue(undefined),
       disconnect: jest.fn().mockResolvedValue(undefined),
       getQRCode: jest.fn().mockReturnValue(null),
+      getQRCodeTiming: jest.fn().mockReturnValue(null),
     };
     engineFactory = {
       create: jest.fn().mockReturnValue(mockEngine),

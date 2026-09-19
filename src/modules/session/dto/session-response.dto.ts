@@ -143,4 +143,17 @@ export class QRCodeResponseDto {
 
   @ApiProperty({ enum: SessionStatus, example: SessionStatus.QR_READY })
   status!: SessionStatus;
+
+  @ApiPropertyOptional({
+    description: 'When the gateway received this QR code (ISO 8601)',
+    example: '2026-09-19T05:43:04.886Z',
+  })
+  issuedAt?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'When WhatsApp stops accepting this QR code (ISO 8601). The first code of a round links for 60 seconds, each later one for 20.',
+    example: '2026-09-19T05:44:04.886Z',
+  })
+  expiresAt?: string;
 }

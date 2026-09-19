@@ -405,11 +405,13 @@ Get the QR code (PNG data URL) for session authentication.
 ```json
 {
   "qrCode": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
-  "status": "qr_ready"
+  "status": "qr_ready",
+  "issuedAt": "2026-09-19T05:43:04.886Z",
+  "expiresAt": "2026-09-19T05:44:04.886Z"
 }
 ```
 
-`status` is the session's current lowercase status.
+`status` is the session's current lowercase status. `issuedAt` is when the gateway received this code and `expiresAt` when WhatsApp stops accepting it: WhatsApp issues codes in rounds, the first of a round linking for 60 seconds and each later one for 20. A round is recognised by the idle gap before its first code, since neither engine reports a code's lifetime. Both fields are omitted when the engine has no timing for the code.
 
 **Errors:** `400` session not started / QR not ready yet / already authenticated · `401` · `403` · `404` not found
 

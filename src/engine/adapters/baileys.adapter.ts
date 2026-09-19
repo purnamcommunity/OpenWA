@@ -1,4 +1,5 @@
 import { ChatLabelsUnsupportedError } from '../../common/errors/chat-labels-unsupported.error';
+import type { QrTiming } from '../qr-timing';
 import { isChannelJid } from '../identity/wa-id';
 import type * as BaileysLib from '@whiskeysockets/baileys';
 import type { WASocket } from '@whiskeysockets/baileys';
@@ -249,6 +250,10 @@ export class BaileysAdapter implements IWhatsAppEngine {
 
   getQRCode(): string | null {
     return this.lifecycle.getQRCode();
+  }
+
+  getQRCodeTiming(): QrTiming | null {
+    return this.lifecycle.getQRCodeTiming();
   }
 
   async requestPairingCode(phoneNumber: string): Promise<string> {

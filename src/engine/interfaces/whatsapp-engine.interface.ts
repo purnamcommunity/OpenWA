@@ -15,6 +15,7 @@
 // to its own dialect. Full inbound + outbound conformance is being rolled out per-engine.)
 
 import type { ChatKind } from '../identity/wa-id';
+import type { QrTiming } from '../qr-timing';
 
 export enum EngineStatus {
   DISCONNECTED = 'disconnected',
@@ -1067,6 +1068,9 @@ export interface SessionLifecycleCapability {
   probeLiveness?(): Promise<boolean>;
 
   getQRCode(): string | null;
+
+  /** When the current QR was issued and stops linking; null while there is no QR. */
+  getQRCodeTiming(): QrTiming | null;
 
   /**
    * Request an 8-char pairing code to link via phone number instead of scanning the QR. Only valid while

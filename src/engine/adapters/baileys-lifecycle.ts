@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { nextQrTiming, type QrTiming } from '../qr-timing';
 import * as fs from 'fs';
 import type { ClientRequest, IncomingMessage } from 'http';
 import type { Agent } from 'https';
@@ -179,6 +180,8 @@ export class BaileysLifecycle {
   connectedAt = 0;
   private status: EngineStatus = EngineStatus.DISCONNECTED;
   private qrCode: string | null = null;
+  /** Issue and expiry of the latest QR; kept past a cleared qrCode so the next one can tell a new round. */
+  private qrTiming: QrTiming | null = null;
   private phoneNumber: string | null = null;
   private pushName: string | null = null;
   private intentionalClose = false;
@@ -716,6 +719,7 @@ export class BaileysLifecycle {
         return;
       }
       this.qrCode = rendered;
+      this.qrTiming = nextQrTiming(this.qrTiming, Date.now());
       this.setStatus(EngineStatus.QR_READY);
       this.host.getOnQRCode()?.(this.qrCode);
     } catch (error) {
@@ -929,6 +933,10 @@ export class BaileysLifecycle {
 
   getQRCode(): string | null {
     return this.qrCode;
+  }
+
+  getQRCodeTiming(): QrTiming | null {
+    return this.qrCode ? this.qrTiming : null;
   }
 
   /**

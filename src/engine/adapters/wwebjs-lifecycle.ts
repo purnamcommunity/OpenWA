@@ -1,4 +1,5 @@
 import * as qrcode from 'qrcode';
+import { nextQrTiming, type QrTiming } from '../qr-timing';
 import * as path from 'path';
 import { HttpException } from '@nestjs/common';
 import { Client, LocalAuth, WAState } from 'whatsapp-web.js';
@@ -149,6 +150,8 @@ export class WwebjsLifecycle {
   status: EngineStatus = EngineStatus.DISCONNECTED;
   /** Last encoded QR, cleared on authentication. Aliased by the adapter's `qrCode` accessor. */
   qrCode: string | null = null;
+  /** Issue and expiry of the latest QR; kept past a cleared qrCode so the next one can tell a new round. */
+  private qrTiming: QrTiming | null = null;
   /** Own-account phone number, read once at readiness. */
   private phoneNumber: string | null = null;
   /** Own-account push name, read once at readiness. */
@@ -511,6 +514,7 @@ export class WwebjsLifecycle {
           return;
         }
         this.qrCode = encodedQr;
+        this.qrTiming = nextQrTiming(this.qrTiming, Date.now());
         this.setStatus(EngineStatus.QR_READY);
         this.host.getCallbacks().onQRCode?.(this.qrCode);
       } catch (error) {
@@ -955,6 +959,10 @@ export class WwebjsLifecycle {
 
   getQRCode(): string | null {
     return this.qrCode;
+  }
+
+  getQRCodeTiming(): QrTiming | null {
+    return this.qrCode ? this.qrTiming : null;
   }
 
   getPhoneNumber(): string | null {

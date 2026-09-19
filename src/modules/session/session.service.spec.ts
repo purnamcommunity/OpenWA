@@ -159,6 +159,7 @@ describe('SessionService', () => {
       disconnect: jest.fn().mockResolvedValue(undefined),
       logout: jest.fn().mockResolvedValue(undefined),
       getQRCode: jest.fn().mockReturnValue(null),
+      getQRCodeTiming: jest.fn().mockReturnValue(null),
       getGroups: jest.fn().mockResolvedValue([]),
       getChats: jest.fn().mockResolvedValue([]),
       sendSeen: jest.fn().mockResolvedValue(true),
@@ -4299,6 +4300,7 @@ describe('SessionService', () => {
         disconnect: jest.fn().mockResolvedValue(undefined),
         logout: jest.fn().mockResolvedValue(undefined),
         getQRCode: jest.fn().mockReturnValue(null),
+        getQRCodeTiming: jest.fn().mockReturnValue(null),
       };
       return Object.assign(engine, { callbacks: () => calls[calls.length - 1] });
     };
@@ -6165,6 +6167,22 @@ describe('SessionService', () => {
       const result = await service.getQRCode('sess-uuid-1');
 
       expect(result.qrCode).toBe('data:image/png;base64,iVBOR...');
+      expect(result).not.toHaveProperty('expiresAt');
+    });
+
+    it('should return when the QR code was issued and when it expires', async () => {
+      const session = createMockSession({ status: SessionStatus.QR_READY });
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+      mockEngine.getQRCode.mockReturnValue('data:image/png;base64,iVBOR...');
+      mockEngine.getQRCodeTiming.mockReturnValue({ issuedAt: 1_000, expiresAt: 61_000 });
+
+      const result = await service.getQRCode('sess-uuid-1');
+
+      expect(result.issuedAt).toBe(new Date(1_000).toISOString());
+      expect(result.expiresAt).toBe(new Date(61_000).toISOString());
     });
 
     it('should throw if session is READY (already authenticated)', async () => {

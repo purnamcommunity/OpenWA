@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import type { QrTiming } from '../qr-timing';
 import { MessageMedia, type Call, type Client, type Message } from 'whatsapp-web.js';
 import {
   CallLinkType,
@@ -445,6 +446,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   getQRCode(): string | null {
     return this.lifecycle.getQRCode();
+  }
+
+  getQRCodeTiming(): QrTiming | null {
+    return this.lifecycle.getQRCodeTiming();
   }
 
   async requestPairingCode(phoneNumber: string): Promise<string> {

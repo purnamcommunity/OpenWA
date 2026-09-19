@@ -752,7 +752,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.ownership.release(id);
   }
 
-  async getQRCode(id: string): Promise<{ qrCode: string; status: SessionStatus }> {
+  async getQRCode(
+    id: string,
+  ): Promise<{ qrCode: string; status: SessionStatus; issuedAt?: string; expiresAt?: string }> {
     const session = await this.findOne(id);
     const engine = this.engines.require(
       id,
@@ -768,9 +770,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       throw new BadRequestException('QR code is not ready yet. Please wait...');
     }
 
+    const timing = engine.getQRCodeTiming();
     return {
       qrCode,
       status: session.status,
+      ...(timing && {
+        issuedAt: new Date(timing.issuedAt).toISOString(),
+        expiresAt: new Date(timing.expiresAt).toISOString(),
+      }),
     };
   }
 
