@@ -50,17 +50,29 @@ const hostWith = (page: unknown): { host: WwebjsEngineHost; warn: jest.Mock } =>
   return { host, warn };
 };
 
-/** The happy-path module set: VoIP inits, a wid can be built, nothing is already ringing. */
-const readyModules = (over: Partial<Modules> = {}): Modules => ({
-  WAWebEnsureVoipInited: { ensureVoipInitialized: jest.fn().mockResolvedValue(undefined) },
-  WAWebVoipStartCall: { startWAWebVoipCall: jest.fn().mockResolvedValue(undefined) },
-  WAWebWidFactory: { createWid: (jid: string) => ({ toString: () => jid }) },
-  WAWebCallCollection: {
+/** The happy-path module set: VoIP inits, a wid can be built, nothing is already ringing, and a
+ *  start publishes its call as CALL1 the way WhatsApp's collection does. */
+const readyModules = (over: Partial<Modules> = {}): Modules => {
+  const calls: Record<string, unknown> = {
     pendingOutgoingCall: null,
     isInConnectedCall: false,
-    lastActiveCall: { id: 'CALL1' },
-    activeCall: { id: 'CALL1' },
+    lastActiveCall: null,
+    activeCall: null,
+  };
+  return readyModulesWith(calls, over);
+};
+
+const readyModulesWith = (calls: Record<string, unknown>, over: Partial<Modules> = {}): Modules => ({
+  WAWebEnsureVoipInited: { ensureVoipInitialized: jest.fn().mockResolvedValue(undefined) },
+  WAWebVoipStartCall: {
+    startWAWebVoipCall: jest.fn(() => {
+      calls.activeCall = { id: 'CALL1' };
+      calls.lastActiveCall = { id: 'CALL1' };
+      return Promise.resolve();
+    }),
   },
+  WAWebWidFactory: { createWid: (jid: string) => ({ toString: () => jid }) },
+  WAWebCallCollection: calls,
   WAWebVoipStackInterface: {
     getVoipStackInterface: jest.fn().mockResolvedValue({
       type: 'web',
@@ -299,7 +311,7 @@ describe('WwebjsVoip.placeCall', () => {
     const mods = placeholderModules({ activeCall: { id: 'RINGING' } });
 
     await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).rejects.toThrow(
-      /already being placed/,
+      /already in a call/,
     );
     expect(mods.WAWebVoipCancelOutgoingCall!.cancelPendingOutgoingCall).not.toHaveBeenCalled();
   });
@@ -361,6 +373,60 @@ describe('WwebjsVoip.placeCall', () => {
       /signalling failed/,
     );
     expect(calls.pendingOutgoingCall).toBeNull();
+  });
+
+  // The stack holds one call, and a ringing outgoing call is not "connected" yet. Starting another
+  // over it did not ring anyone: the gateway reported the call already ringing as the new one, so
+  // the caller got success, the wrong callId and the wrong peer.
+  it('refuses while another call is still ringing', async () => {
+    const mods = readyModules({
+      WAWebCallCollection: {
+        pendingOutgoingCall: null,
+        isInConnectedCall: false,
+        activeCall: { id: 'RINGING1' },
+        lastActiveCall: { id: 'RINGING1' },
+      },
+    });
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).rejects.toThrow(
+      /already in a call/,
+    );
+    expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).not.toHaveBeenCalled();
+  });
+
+  // lastActiveCall still names the PREVIOUS call until the new one is published, so reading it back
+  // unconditionally handed a placement the id of a call that had already ended.
+  it('never reports a previous call as the one just placed', async () => {
+    const calls: Record<string, unknown> = {
+      pendingOutgoingCall: null,
+      isInConnectedCall: false,
+      activeCall: null,
+      lastActiveCall: { id: 'OLD1' },
+    };
+    const mods = readyModulesWith(calls, {
+      WAWebVoipStartCall: { startWAWebVoipCall: jest.fn().mockResolvedValue(undefined) },
+    });
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).resolves.toBeNull();
+  }, 10_000);
+
+  it('still reads a new call back from lastActiveCall when it ended before being read', async () => {
+    const calls: Record<string, unknown> = {
+      pendingOutgoingCall: null,
+      isInConnectedCall: false,
+      activeCall: null,
+      lastActiveCall: { id: 'OLD1' },
+    };
+    const mods = readyModulesWith(calls, {
+      WAWebVoipStartCall: {
+        startWAWebVoipCall: jest.fn(() => {
+          calls.lastActiveCall = { id: 'NEW1' };
+          return Promise.resolve();
+        }),
+      },
+    });
+
+    await expect(new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('9@c.us', false)).resolves.toBe('NEW1');
   });
 
   it('refuses while a call is already connected', async () => {

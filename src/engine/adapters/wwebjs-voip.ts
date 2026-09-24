@@ -150,7 +150,9 @@ function pagePlaceCall(arg: {
     });
   }
 
-  if ((calls?.isInConnectedCall as boolean | undefined) === true) {
+  // The stack holds one call, and one still ringing is not "connected" yet. A start over a
+  // published call rings nobody, and the read-back below would report that call as the new one.
+  if ((calls?.isInConnectedCall as boolean | undefined) === true || calls?.activeCall != null) {
     return Promise.resolve({ refused: 'this session is already in a call' });
   }
 
@@ -194,6 +196,9 @@ function pagePlaceCall(arg: {
   const limit = new Promise<typeof timedOut>(resolve => {
     timer = setTimeout(() => resolve(timedOut), arg.setupTimeoutMs);
   });
+  // lastActiveCall still names the previous call until this one is published, so only an id that
+  // differs from it counts as this placement's.
+  const previousId = readId(calls?.lastActiveCall);
   const placing = Date.now();
   marker.__openwaPlacingSince = placing;
   const settle = (): void => {
@@ -218,7 +223,8 @@ function pagePlaceCall(arg: {
       // cannot later hang the call up. The id appears within a few hundred milliseconds; a call
       // that never publishes one is still reported as placed rather than failed.
       for (let attempt = 0; attempt < 20; attempt++) {
-        const id = readId(calls?.activeCall) ?? readId(calls?.lastActiveCall);
+        const last = readId(calls?.lastActiveCall);
+        const id = readId(calls?.activeCall) ?? (last !== previousId ? last : null);
         if (id !== null) return { ok: true, callId: id };
         await new Promise(resolve => setTimeout(resolve, 100));
       }
