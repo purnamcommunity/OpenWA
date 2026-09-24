@@ -84,8 +84,12 @@ function pageRawAudioCapture(): { ok: true } {
 }
 
 /**
- * Page function: place a 1:1 call. `startWAWebVoipCall(wid, isVideo, callFromUi)` resolves once
- * signalling is away; the id is read back from the collection because it returns none.
+ * Page function: place a 1:1 call. `startWAWebVoipCall(wid, isVideo, callFromUi, _, _, options)`
+ * resolves once signalling is away; the id is read back from the collection because it returns none.
+ *
+ * `options.entryTrust` must be `'user_gesture'`. WhatsApp treats a start without it as a deep link
+ * and first raises a "Start a WhatsApp call with …?" confirmation popup, awaiting a click nobody
+ * makes on a headless page: the start never resolves, nothing rings, and the placement times out.
  *
  * `WAWebCallCollection.pendingOutgoingCall` is a placeholder WhatsApp holds from the start of a
  * placement until the call window opens, the active call ends, or one of its failure paths
@@ -116,7 +120,15 @@ function pagePlaceCall(arg: {
   };
   const startMod = req('WAWebVoipStartCall');
   const start = startMod?.startWAWebVoipCall as
-    ((wid: unknown, isVideo: boolean, callFromUi: number) => Promise<void>) | undefined;
+    | ((
+        wid: unknown,
+        isVideo: boolean,
+        callFromUi: number,
+        unused: number,
+        unusedToo: null,
+        options: { entryTrust: 'user_gesture' },
+      ) => Promise<void>)
+    | undefined;
   const widFactory = req('WAWebWidFactory');
   const createWid = widFactory?.createWid as ((jid: string) => unknown) | undefined;
   const calls = req('WAWebCallCollection');
@@ -190,7 +202,7 @@ function pagePlaceCall(arg: {
   };
 
   // 0 = "not from the UI" in the call-origin enum the outgoing QPL logs.
-  return Promise.race([start(wid, arg.isVideo, 0), limit]).then(
+  return Promise.race([start(wid, arg.isVideo, 0, 0, null, { entryTrust: 'user_gesture' }), limit]).then(
     async outcome => {
       settle();
       if (outcome === timedOut) {

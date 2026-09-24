@@ -197,14 +197,18 @@ describe('WwebjsVoip.placeCall', () => {
     const { host } = hostWith(pageWith(mods));
 
     await expect(new WwebjsVoip(host).placeCall('919876543210@c.us', false)).resolves.toBe('CALL1');
-    expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).toHaveBeenCalledWith(expect.anything(), false, 0);
+    expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).toHaveBeenCalledWith(expect.anything(), false, 0, 0, null, {
+      entryTrust: 'user_gesture',
+    });
   });
 
   it('passes the video flag through', async () => {
     const mods = readyModules();
     await new WwebjsVoip(hostWith(pageWith(mods)).host).placeCall('919876543210@c.us', true);
 
-    expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).toHaveBeenCalledWith(expect.anything(), true, 0);
+    expect(mods.WAWebVoipStartCall!.startWAWebVoipCall).toHaveBeenCalledWith(expect.anything(), true, 0, 0, null, {
+      entryTrust: 'user_gesture',
+    });
   });
 
   it('waits for the id the collection publishes just after the offer', async () => {
