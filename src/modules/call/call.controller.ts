@@ -1,5 +1,6 @@
 import { Controller, Post, Get, Param, Body, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { CallAckResponseDto } from './dto/call-response.dto';
 import { CreateCallLinkDto } from './dto/create-call-link.dto';
 import { PlaceCallDto } from './dto/place-call.dto';
@@ -11,6 +12,20 @@ import { CallService } from './call.service';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 import { ENGINE_NOT_READY_409 } from '../../common/openapi/engine-status-responses';
+
+/**
+ * How many calls one line may place in a minute.
+ *
+ * Counted per session rather than per client address: every line is usually driven through one
+ * client, so an address bucket would let one line's calls use up another's, and WhatsApp judges
+ * calling behaviour per account. A person redialling after a missed answer stays well inside it;
+ * a script dialling in a loop does not. Overrides only the `medium` tier; `short` and `long` stay
+ * the application-wide limits.
+ */
+export const CALL_PLACEMENTS_PER_MINUTE = 5;
+
+const perSession = (req: Record<string, unknown>): Promise<string> =>
+  Promise.resolve(`call-place:${String((req.params as { sessionId?: string } | undefined)?.sessionId)}`);
 
 @ApiTags('calls')
 @Controller('sessions/:sessionId/calls')
@@ -36,6 +51,7 @@ export class CallController {
 
   @Post()
   @RequireRole(ApiKeyRole.OPERATOR)
+  @Throttle({ medium: { limit: CALL_PLACEMENTS_PER_MINUTE, ttl: 60_000, getTracker: perSession } })
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Place a voice or video call',
@@ -53,6 +69,10 @@ export class CallController {
   })
   @ApiResponse({ status: 501, description: 'The active engine cannot place calls (Baileys has no media stack)' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({
+    status: 429,
+    description: `More than ${CALL_PLACEMENTS_PER_MINUTE} calls placed on this session within a minute. \`Retry-After\` says when the next is allowed.`,
+  })
   async place(@Param('sessionId') sessionId: string, @Body() dto: PlaceCallDto): Promise<PlaceCallResponseDto> {
     const callId = await this.callService.placeCall(sessionId, dto.chatId, dto.isVideo === true);
     return { success: true, callId };

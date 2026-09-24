@@ -6597,7 +6597,7 @@ publishes the call, so the gateway waits up to two seconds for the id rather tha
 almost every time. `callId` is `null` only when none appeared in that window; the call is still
 placed, and the id arrives on the next `call.*` event.
 
-**Errors:** `400` session is not started, or an invalid `chatId` · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, WhatsApp refused the call, the id is not callable, or this session is already on a call · `409` conflict or engine not ready (retryable) · `501` the active engine cannot place calls (Baileys has no media stack) · `503` session not ready or dependency unavailable (retryable)
+**Errors:** `400` session is not started, or an invalid `chatId` · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, WhatsApp refused the call, the id is not callable, or this session is already on a call · `409` conflict or engine not ready (retryable) · `429` more than 5 calls placed on this session within a minute; `Retry-After` says when the next is allowed · `501` the active engine cannot place calls (Baileys has no media stack) · `503` session not ready or dependency unavailable (retryable)
 
 #### GET /api/sessions/:sessionId/calls/state
 

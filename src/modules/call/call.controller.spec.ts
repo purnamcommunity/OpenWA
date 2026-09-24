@@ -1,5 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
-import { CallController } from './call.controller';
+import { CALL_PLACEMENTS_PER_MINUTE, CallController } from './call.controller';
 import { CallService } from './call.service';
 import { CallNotFoundError } from '../../common/errors/call-not-found.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
@@ -49,5 +49,39 @@ describe('CallController', () => {
       rejectCall: jest.fn().mockRejectedValue(new CallNotFoundError('CALL1')),
     });
     await expect(controller.reject('s1', 'CALL1')).rejects.toBeInstanceOf(CallNotFoundError);
+  });
+
+  // Placing a call is limited per LINE, not per client IP: every line is driven through one api
+  // client, so an IP bucket would let one busy line use up another's calls — and WhatsApp judges
+  // call behaviour per account.
+  describe('call placement limit', () => {
+    // Looked up by name: the decorators write their metadata onto the handler function itself.
+    const meta = (key: string, handler: keyof CallController) =>
+      Reflect.getMetadata(
+        key,
+        Object.getOwnPropertyDescriptor(CallController.prototype, handler)!.value as object,
+      ) as unknown;
+
+    it('allows a handful of placements a minute on each line', () => {
+      expect(meta('THROTTLER:LIMITmedium', 'place')).toBe(CALL_PLACEMENTS_PER_MINUTE);
+      expect(meta('THROTTLER:TTLmedium', 'place')).toBe(60_000);
+      expect(CALL_PLACEMENTS_PER_MINUTE).toBe(5);
+    });
+
+    it('counts placements by session, whatever address they come from', async () => {
+      const tracker = meta('THROTTLER:TRACKERmedium', 'place') as (
+        req: Record<string, unknown>,
+      ) => Promise<string> | string;
+      const a = await tracker({ params: { sessionId: 's1' }, ip: '10.0.0.1' });
+      const b = await tracker({ params: { sessionId: 's1' }, ip: '10.0.0.2' });
+      const c = await tracker({ params: { sessionId: 's2' }, ip: '10.0.0.1' });
+      expect(a).toBe(b);
+      expect(a).not.toBe(c);
+    });
+
+    it('leaves the other call routes on the ordinary limits', () => {
+      expect(meta('THROTTLER:LIMITmedium', 'state')).toBeUndefined();
+      expect(meta('THROTTLER:LIMITmedium', 'end')).toBeUndefined();
+    });
   });
 });
