@@ -2931,6 +2931,39 @@ describe('SessionService', () => {
       }
     });
 
+    // Right after ready, WhatsApp Web's first sync keeps a healthy page too busy to answer the probe;
+    // the ready handler opens the watchdog's warm-up so those failures are not counted.
+    it('does not disconnect a session whose probes fail inside the warm-up after it reported ready', async () => {
+      jest.useFakeTimers();
+      try {
+        const engine = {
+          getStatus: jest.fn().mockReturnValue(EngineStatus.READY),
+          probeLiveness: jest.fn().mockResolvedValue(false),
+        };
+        seedReadySession(engine);
+        const scheduleSpy = jest.spyOn(internals(), 'scheduleReconnect');
+        (
+          lifecycle as unknown as {
+            handleEngineReady: (id: string, engine: unknown, phone: string, pushName: string) => void;
+          }
+        ).handleEngineReady('sess-uuid-1', engine, '628123', 'Tester');
+
+        service.onApplicationBootstrap();
+        await jest.advanceTimersByTimeAsync(SESSION_WATCHDOG_INTERVAL_MS * (SESSION_WATCHDOG_MAX_FAILURES + 2));
+
+        expect(engine.probeLiveness).toHaveBeenCalled();
+        expect(scheduleSpy).not.toHaveBeenCalled();
+        expect(webhookService.dispatch).not.toHaveBeenCalledWith(
+          'sess-uuid-1',
+          'session.disconnected',
+          expect.anything(),
+        );
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
     it('resets the failure counter after a successful probe (no disconnect from non-consecutive failures)', async () => {
       jest.useFakeTimers();
       try {

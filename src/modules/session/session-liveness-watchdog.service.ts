@@ -12,8 +12,8 @@ import { ShutdownService } from '../../common/services/shutdown.service';
  *
  * Split out of SessionService because it is a self-contained supervisor: one timer, one failure
  * counter, and exactly one outward effect (`onDead`). Keeping it separate means the probe timeout,
- * the failure threshold, and the observe-only ACTION_REQUIRED rules are testable with a fake clock
- * instead of a live engine.
+ * the failure threshold, the post-ready warm-up, and the observe-only ACTION_REQUIRED rules are
+ * testable with a fake clock instead of a live engine.
  */
 @Injectable()
 export class SessionLivenessWatchdog {
@@ -21,6 +21,8 @@ export class SessionLivenessWatchdog {
 
   /** Consecutive failed liveness probes per session id. Cleared on recovery or on a status change. */
   private readonly failures = new Map<string, number>();
+  /** When each session last reported ready (see markReady); the warm-up grace runs from here. */
+  private readonly readyAt = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
 
   /** Invoked when a session has failed enough consecutive probes to be treated as disconnected. */
@@ -52,18 +54,35 @@ export class SessionLivenessWatchdog {
     this.timer.unref();
   }
 
-  /** Stop the watchdog and forget all accrued failures. */
+  /** Stop the watchdog and forget all accrued failures and ready times. */
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
     this.failures.clear();
+    this.readyAt.clear();
   }
 
-  /** Forget a session's accrued failures (e.g. it just reported ready). */
+  /** Forget a session's accrued failures and its warm-up (e.g. it is being taken down for good). */
   clear(id: string): void {
     this.failures.delete(id);
+    this.readyAt.delete(id);
+  }
+
+  /**
+   * Record that a session just reported ready: its failure budget starts clean and its warm-up grace
+   * starts now. A session never marked ready (or cleared since) gets no warm-up.
+   */
+  markReady(id: string, now = Date.now()): void {
+    this.failures.delete(id);
+    this.readyAt.set(id, now);
+  }
+
+  /** Whether a session is still inside its post-ready warm-up (see sessionWatchdogWarmupMs). */
+  private isWarmingUp(id: string): boolean {
+    const readyAt = this.readyAt.get(id);
+    return readyAt !== undefined && Date.now() - readyAt < sessionWatchdogWarmupMs();
   }
 
   /** Probe all live engines in parallel; a slow/failed probe must not delay or abort the others. */
@@ -159,6 +178,18 @@ export class SessionLivenessWatchdog {
       return;
     }
 
+    // Straight after ready the page is at its busiest: WhatsApp Web's first history sync runs beside
+    // every API caller's queued reads, and a healthy page can miss the probe deadline several times
+    // in a row. Inside the warm-up a failure is logged but never counted. A browser or page that
+    // actually dies still reports at once through the engine's own death listeners.
+    if (this.isWarmingUp(id)) {
+      this.logger.warn('Liveness probe failed during the post-ready warm-up; not counted', {
+        sessionId: id,
+        action: 'watchdog_probe_failed_warmup',
+      });
+      return;
+    }
+
     if (failures < SESSION_WATCHDOG_MAX_FAILURES) {
       this.failures.set(id, failures);
       this.logger.warn('Liveness probe failed; will treat the session as dead after repeated failures', {
@@ -188,3 +219,20 @@ export const SESSION_WATCHDOG_INTERVAL_MS = 60_000;
 export const SESSION_WATCHDOG_PROBE_TIMEOUT_MS = 15_000;
 /** Consecutive failed probes before a session is treated as disconnected. */
 export const SESSION_WATCHDOG_MAX_FAILURES = 2;
+/**
+ * How long after a session reports ready a failed probe is not counted. Covers WhatsApp Web's first
+ * history sync after a pairing, when the page is busy enough to miss probe deadlines while healthy.
+ */
+export const SESSION_WATCHDOG_WARMUP_MS = 600_000;
+
+/**
+ * The warm-up in effect: `SESSION_WATCHDOG_WARMUP_MS` from the environment (0 disables it), else the
+ * default. Read per call, not at import, so the value is never frozen by whenever this module loaded;
+ * boot validation rejects a value that is not a non-negative integer.
+ */
+export function sessionWatchdogWarmupMs(): number {
+  const raw = process.env.SESSION_WATCHDOG_WARMUP_MS;
+  if (raw === undefined || raw.trim() === '') return SESSION_WATCHDOG_WARMUP_MS;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : SESSION_WATCHDOG_WARMUP_MS;
+}

@@ -88,6 +88,8 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'SESSION_LEASE_HEARTBEAT_MS',
   'SESSION_TAKEOVER_SWEEP_MS',
   'SESSION_PROXY_TIMEOUT_MS',
+  // Liveness watchdog warm-up after a session reports ready, blank-forwarded like the knobs above.
+  'SESSION_WATCHDOG_WARMUP_MS',
   // Autoreply rule cap, blank-forwarded like the knobs above so an operator who sets nothing does
   // not have an empty string shadow a value in .env / data/.env.generated.
   'AUTOMATION_MAX_PER_SESSION',

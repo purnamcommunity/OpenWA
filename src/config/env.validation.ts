@@ -197,6 +197,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'WEBHOOK_MEDIA_INLINE_MAX_BYTES', // 0 = never inline media
     'EXPORT_INLINE_MEDIA_BUDGET_BYTES', // 0 = a data export carries no inline media at all
     'MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES', // 0 = a message list carries no inline media at all
+    'SESSION_WATCHDOG_WARMUP_MS', // 0 = no post-ready warm-up for the liveness watchdog
   ]) {
     checkNonNegativeInt(key);
   }

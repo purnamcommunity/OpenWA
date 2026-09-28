@@ -751,7 +751,9 @@ Raise it by as little as the account needs. The budget bounds a command that is 
 running; it is not what protects you from a **wedged** browser. A page that stops answering is
 caught by the liveness watchdog, which probes every 60 s with a 15 s timeout and treats two
 consecutive failures as a disconnect, so a wedge is picked up in roughly 75 to 135 s whatever this
-value is. There is no measurement in this repo saying how large an account has to be before 180000
+value is. The exception is the first 10 minutes after a session reports ready
+(`SESSION_WATCHDOG_WARMUP_MS`): WhatsApp Web's first sync can keep a healthy page from answering, so
+a failed probe there is logged as `watchdog_probe_failed_warmup` and not counted. There is no measurement in this repo saying how large an account has to be before 180000
 is too small, so treat any value above it as an escape hatch you reached for after seeing the error
 above, not as a default worth pre-emptively setting.
 
