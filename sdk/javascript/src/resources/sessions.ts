@@ -148,6 +148,14 @@ export class SessionsResource {
     });
   }
 
+  /**
+   * Cancel a pairing-code request and return the session to QR linking. Succeeds without effect
+   * when no pairing request is running, and on Baileys. **OPERATOR**
+   */
+  cancelPairingCode(id: string): Promise<void> {
+    return this.client.request<void>({ method: 'DELETE', path: `/api/sessions/${encodeSegment(id)}/pairing-code` });
+  }
+
   /** Aggregate statistics across the API key's sessions. */
   stats(): Promise<SessionStatsOverview> {
     return this.client.request<SessionStatsOverview>({

@@ -31,6 +31,7 @@ func TestRouting(t *testing.T) {
 		{"Sessions.ForceKill", func(c *Client) { c.Sessions.ForceKill(ctx, "s1") }, "POST", "/api/sessions/s1/force-kill"},
 		{"Sessions.QRCode", func(c *Client) { c.Sessions.QRCode(ctx, "s1") }, "GET", "/api/sessions/s1/qr"},
 		{"Sessions.RequestPairingCode", func(c *Client) { c.Sessions.RequestPairingCode(ctx, "s1", RequestPairingCodeRequest{}) }, "POST", "/api/sessions/s1/pairing-code"},
+		{"Sessions.CancelPairingCode", func(c *Client) { c.Sessions.CancelPairingCode(ctx, "s1") }, "DELETE", "/api/sessions/s1/pairing-code"},
 		{"Sessions.SetOnlinePresence", func(c *Client) { c.Sessions.SetOnlinePresence(ctx, "s1", SetOwnPresenceRequest{}) }, "PUT", "/api/sessions/s1/presence"},
 		{"Sessions.Stats", func(c *Client) { c.Sessions.Stats(ctx) }, "GET", "/api/sessions/stats/overview"},
 

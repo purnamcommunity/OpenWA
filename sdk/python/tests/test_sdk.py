@@ -348,12 +348,16 @@ class TestSessions:
         backend = MockBackend()
         backend.on("GET", "/qr", body={"qrCode": "data:image/png;base64,xxx", "status": "qr_ready"})
         backend.on("POST", "/pairing-code", body={"pairingCode": "ABCD1234", "status": "qr_ready"})
+        backend.on("DELETE", "/pairing-code", status=204)
         backend.on("GET", "/stats/overview", body={"total": 1, "active": 1, "ready": 1, "disconnected": 0, "byStatus": {"ready": 1}})
         client = make_client(backend)
         client.sessions.get_qr_code("s1")
         assert "/sessions/s1/qr" in backend.calls[-1].url
         client.sessions.request_pairing_code("s1", {"phoneNumber": "628123456789"})
         assert backend.calls[-1].body == {"phoneNumber": "628123456789"}
+        assert client.sessions.cancel_pairing_code("s1") is None
+        assert backend.calls[-1].method == "DELETE"
+        assert backend.calls[-1].url.endswith("/sessions/s1/pairing-code")
         client.sessions.stats()
         assert "/sessions/stats/overview" in backend.calls[-1].url
 

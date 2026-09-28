@@ -153,6 +153,12 @@ func (s *SessionsService) RequestPairingCode(ctx context.Context, sessionID stri
 	return &out, nil
 }
 
+// CancelPairingCode cancels a pairing-code request and returns the session to QR linking.
+// It succeeds without effect when no pairing request is running, and on Baileys.
+func (s *SessionsService) CancelPairingCode(ctx context.Context, sessionID string) error {
+	return s.client.do(ctx, "DELETE", "/api/sessions/"+pathEscape(sessionID)+"/pairing-code", nil, nil, nil)
+}
+
 // Stats returns the aggregate session stats overview.
 func (s *SessionsService) Stats(ctx context.Context) (*SessionStatsOverview, error) {
 	var out SessionStatsOverview
