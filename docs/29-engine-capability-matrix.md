@@ -323,8 +323,8 @@ socket is caught by the transport instead. No REST route: the session watchdog p
 | `getGroupInfo`                   | ✅                  | ✅               | ✅              |
 | `addParticipants`                | ✅                  | ✅               | ✅              |
 | `removeParticipants`             | ✅                  | ✅🔧⁷            | ✅              |
-| `promoteParticipants`            | ✅                  | ✅              | ✅              |
-| `demoteParticipants`             | ✅                  | ✅              | ✅              |
+| `promoteParticipants`            | ✅                  | ✅               | ✅              |
+| `demoteParticipants`             | ✅                  | ✅               | ✅              |
 | `approveGroupMembershipRequests` | ✅                  | ✅               | ✅              |
 | `rejectGroupMembershipRequests`  | ✅                  | ✅               | ✅              |
 | `getGroupMembershipRequests`     | ✅                  | ✅               | ✅              |
@@ -853,7 +853,7 @@ OpenWA consumes events by normalizing them into `EngineEventCallbacks`; anything
 | `message_reaction`          | ✅           |     | `contact_changed`      | ❌                                                                              |
 | `message_revoke_everyone`   | ✅           |     | `group_admin_changed`  | ❌                                                                              |
 | `message_revoke_me`         | ❌ candidate |     | `loading_screen`       | ❌                                                                              |
-| `message_ciphertext`        | ❌           |     | `media_uploaded`       | ❌                                                                              |
+| `message_ciphertext`        | ❌           |     | `media_uploaded`       | ✅ — re-announces an own send once its media upload finishes                    |
 | `message_ciphertext_failed` | ❌           |     | `remote_session_saved` | ❌                                                                              |
 | `call`                      | ✅           |     | `unread_count`         | ❌ candidate                                                                    |
 | `qr`                        | ✅           |     | `vote_update`          | ✅                                                                              |
@@ -989,8 +989,8 @@ adapter sources — re-derive the same way when anything changes:
 
 - **122** interface methods → **244** adapter cells: **211 ✅** / **33 ❌** (2 adapter-gaps, 24
   library-limitations, 0 uncertain), spanning **25** methods.
-- Of the 211 ✅ cells, **13 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
-  1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 3 × 🔧⁷ participant arity, 1 × 🔧⁹ group
+- Of the 211 ✅ cells, **11 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
+  1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 1 × 🔧⁷ participant arity, 1 × 🔧⁹ group
   description, 3 × 🔧¹⁵ group invite) and one baileys cell
   does (1 × 🔧⁶ newsletter-create parse); the whole wwjs column additionally
   depends on 🔧¹, the whole Baileys column on 🔧⁵ — so every row rests on a patch on each side,
@@ -1003,7 +1003,7 @@ adapter sources — re-derive the same way when anything changes:
   3 internal wiring, 1 class plumbing, **33 ❌ not exposed** (25 real capabilities + 8
   session/transport settings that are not WhatsApp capabilities). The backlog is the ❌ rows minus
   those 8 settings; 🔩 plumbing is correctly never exposed.
-- Events: Baileys **34** (16 consumed / 18 dropped), wwjs **31** (17 consumed / 14 dropped).
+- Events: Baileys **34** (16 consumed / 18 dropped), wwjs **31** (18 consumed / 13 dropped).
 - **0** capabilities in 29.5.3: every capability with first-class symbols on both libraries is
   either wired or classified with evidence. Three of them are Baileys-only despite typed
   whatsapp-web.js symbols: `demoteChannelAdmin`, whose page function WhatsApp Web no longer

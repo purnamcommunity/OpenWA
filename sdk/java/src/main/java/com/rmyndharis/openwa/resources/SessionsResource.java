@@ -130,6 +130,14 @@ public final class SessionsResource {
         return client.request(HttpMethod.POST, "/api/sessions/" + encodeSegment(id) + "/pairing-code", null, body, PairingCodeResponse.class);
     }
 
+    /**
+     * Cancel a pairing-code request and return the session to QR linking. Succeeds without effect
+     * when no pairing request is running, and on Baileys. Requires an OPERATOR-level key.
+     */
+    public void cancelPairingCode(String id) {
+        client.requestVoid(HttpMethod.DELETE, "/api/sessions/" + encodeSegment(id) + "/pairing-code", null, null);
+    }
+
     /** Aggregate statistics across the API key's sessions. */
     public SessionStatsOverview stats() {
         return client.request(HttpMethod.GET, "/api/sessions/stats/overview", null, null, SessionStatsOverview.class);

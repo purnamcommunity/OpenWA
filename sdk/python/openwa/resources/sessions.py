@@ -127,6 +127,13 @@ class SessionsResource:
         """Request a phone-pairing code."""
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/pairing-code", body=body)
 
+    def cancel_pairing_code(self, session_id: str) -> None:
+        """Cancel a pairing-code request and return the session to QR linking.
+
+        Succeeds without effect when no pairing request is running, and on Baileys.
+        """
+        self._http.request("DELETE", f"/api/sessions/{quote_segment(session_id)}/pairing-code")
+
     def stats(self) -> SessionStatsOverview:
         """Return the aggregate session stats overview."""
         return self._http.request("GET", "/api/sessions/stats/overview")

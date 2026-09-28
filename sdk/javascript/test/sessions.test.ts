@@ -41,10 +41,11 @@ describe('SessionsResource — exact paths', () => {
     expect(t.lastCall!.url).toBe('http://x/api/sessions?name=my-bot&limit=5');
   });
 
-  it('getQrCode / requestPairingCode / stats', async () => {
+  it('getQrCode / requestPairingCode / cancelPairingCode / stats', async () => {
     const t = new MockTransport()
       .on('GET', /\/qr$/, { body: { qrCode: 'data:image/png;base64,xxx', status: 'qr_ready' } })
       .on('POST', /\/pairing-code$/, { body: { pairingCode: 'ABCD1234', status: 'qr_ready' } })
+      .on('DELETE', /\/pairing-code$/, { status: 204 })
       .on('GET', /\/stats\/overview$/, {
         body: { total: 1, active: 1, ready: 1, disconnected: 0, byStatus: { ready: 1 } },
       });
@@ -54,6 +55,9 @@ describe('SessionsResource — exact paths', () => {
     await c.sessions.requestPairingCode('s1', { phoneNumber: '628123456789' });
     expect(t.lastCall!.url).toBe('http://x/api/sessions/s1/pairing-code');
     expect(t.lastCall!.body).toEqual({ phoneNumber: '628123456789' });
+    await c.sessions.cancelPairingCode('s1');
+    expect(t.lastCall!.method).toBe('DELETE');
+    expect(t.lastCall!.url).toBe('http://x/api/sessions/s1/pairing-code');
     await c.sessions.stats();
     expect(t.lastCall!.url).toBe('http://x/api/sessions/stats/overview');
   });

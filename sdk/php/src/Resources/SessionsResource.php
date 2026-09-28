@@ -156,6 +156,15 @@ class SessionsResource
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/pairing-code", [], $body);
     }
 
+    /**
+     * Cancel a pairing-code request and return the session to QR linking. Succeeds without effect
+     * when no pairing request is running, and on Baileys.
+     */
+    public function cancelPairingCode(string $id): void
+    {
+        $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($id)}/pairing-code");
+    }
+
     /** @return array<string,mixed> */
     public function stats(): array
     {

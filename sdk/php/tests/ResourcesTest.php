@@ -54,12 +54,16 @@ class ResourcesTest extends TestCase
         $backend = new MockBackend();
         $backend->on(200, ['qrCode' => 'data:image/png;base64,xxx', 'status' => 'qr_ready']);
         $backend->on(200, ['pairingCode' => 'ABCD1234', 'status' => 'qr_ready']);
+        $backend->on(204);
         $backend->on(200, ['total' => 1, 'active' => 1, 'ready' => 1, 'disconnected' => 0, 'byStatus' => ['ready' => 1]]);
         $client = $backend->makeClient();
         $client->sessions->getQrCode('s1');
         $this->assertStringContainsString('/sessions/s1/qr', $backend->calls()[0]['url']);
         $client->sessions->requestPairingCode('s1', ['phoneNumber' => '628123456789']);
         $this->assertSame(['phoneNumber' => '628123456789'], $backend->lastCall()['body']);
+        $client->sessions->cancelPairingCode('s1');
+        $this->assertSame('DELETE', $backend->lastCall()['method']);
+        $this->assertStringEndsWith('/sessions/s1/pairing-code', $backend->lastCall()['url']);
         $client->sessions->stats();
         $this->assertStringContainsString('/sessions/stats/overview', $backend->lastCall()['url']);
     }

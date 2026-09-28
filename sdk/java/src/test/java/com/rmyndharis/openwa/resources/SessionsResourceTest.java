@@ -68,6 +68,14 @@ class SessionsResourceTest {
     }
 
     @Test
+    void cancelPairingCodeSendsDelete() {
+        tx.respond(204, "");
+        client.sessions.cancelPairingCode("s");
+        assertEquals("http://h/api/sessions/s/pairing-code", tx.lastRequest().url());
+        assertEquals(HttpMethod.DELETE, tx.lastRequest().method());
+    }
+
+    @Test
     void statsHitsOverview() {
         tx.respond(200, "{\"total\":0,\"active\":0,\"ready\":0,\"disconnected\":0}");
         client.sessions.stats();
