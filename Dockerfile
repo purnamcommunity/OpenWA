@@ -251,12 +251,24 @@ RUN npm install -g npm@12.0.2 && npm cache clean --force
 # https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json, confirm it has
 # a linux64 chrome download in known-good-versions-with-downloads.json, and update the docs that
 # repeat this command (scripts/dockerfile-patchers.spec.js fails until they match). It may be newer
-# than the revision puppeteer-core pins; the arm64 image already runs whatever chromium Debian ships.
+# than the revision puppeteer-core pins.
 # On an amd64 build, check that a session paired under the old browser still reconnects and that a
 # new whatsapp-web.js session reaches its QR code. A new major cannot be rolled back without
 # restoring sessions/ (an older Chrome deletes the IndexedDB a newer one opened), so give the bump a
 # CHANGELOG upgrade note.
+#
+# The arm64 chromium comes from Debian, whose mirrors keep only the current package, so an exact
+# version cannot be pinned without breaking the next build. Its MAJOR is pinned instead: a rebuild
+# that would bring a different major fails here rather than shipping a browser the stored session
+# profiles were not opened with. Security releases within the major pass. To move it, set
+# ARM64_CHROMIUM_MAJOR to the major Debian now ships, with the same care as a CfT bump.
+ARG ARM64_CHROMIUM_MAJOR=152
 RUN if [ "$TARGETARCH" = arm64 ]; then \
+        chromium_major=$(dpkg-query -W -f='${Version}' chromium | cut -d. -f1) && \
+        if [ "$chromium_major" != "$ARM64_CHROMIUM_MAJOR" ]; then \
+            echo "arm64 chromium major is $chromium_major, pinned is $ARM64_CHROMIUM_MAJOR: bump ARM64_CHROMIUM_MAJOR deliberately (see the note above)" >&2; \
+            exit 1; \
+        fi && \
         ln -s /usr/bin/chromium /usr/local/bin/puppeteer-chrome; \
     else \
         mkdir -p /opt/puppeteer && \
