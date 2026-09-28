@@ -174,7 +174,7 @@ row-level marks.
 | 🔧⁴ ready-sync              | `initialize` on wwjs (warm-restore readiness race). Row-marked.                                                                                                                                                                                                                                                                                                                                                                                             |
 | 🔧⁵ app-state resync bound  | No single row — keeps the Baileys socket's app-state resync from spinning (~1000 wasted 60s queries/day). Connection health under **every baileys cell**; the baileys column header carries `🔧⁵`.                                                                                                                                                                                                                                                          |
 | 🔧⁶ newsletter-create parse | `createChannel` on **baileys** — without it the call always answers 500 and leaks the channel it just created. Row-marked.                                                                                                                                                                                                                                                                                                                                  |
-| 🔧⁷ participant arity       | `removeParticipants`, `promoteParticipants`, `demoteParticipants` on **wwjs**. Without it a request naming only non-members throws an arity assertion on removal, and promote/demote answer `200` for people WhatsApp never touched; the patch returns one boolean per REQUESTED id so the adapter reports a real per-participant outcome. Row-marked.                                                                                                      |
+| 🔧⁷ participant arity       | `removeParticipants` on **wwjs**. Without it a request naming only non-members throws an arity assertion; the patch returns one boolean per REQUESTED id so the adapter reports a real per-participant outcome. Row-marked. The patch also rewrites `promoteParticipants`/`demoteParticipants` in `GroupChat.js`, but the adapter does not call them: it runs its own page function (`changeAdminStatusInPage`, `wwebjs-groups.ts`), which reports WhatsApp's refusal reasons and routes a community announcement group's admin change to the parent community. |
 | 🔧⁹ group description       | `setGroupDescription` on **wwjs**. Without it every call throws in the page and answers a bare `500`, so the capability is dead rather than degraded; `setGroupSubject` beside it is unaffected. Row-marked.                                                                                                                                                                                                                                                |
 | 🔧¹⁰ call state             | The `call.*` OUTCOME events on **wwjs**. Without it every call is reported RINGING and never resolves, so call history cannot distinguish answered from missed; the ring itself still arrives, which makes the gap look like a UI problem.                                                                                                                                                                                                                  |
 | 🔧¹² contact alternate wid  | `getContacts` on **wwjs** — the whole address-book read. Without it one contact whose wid the page refuses to map fails the entire list with a 500, and names can only be resolved one id at a time.                                                                                                                                                                                                                                                        |
@@ -186,7 +186,7 @@ row-level marks.
 
 Rows that are ✅ on **both** engines where one side is patch-dependent: `initialize` (🔧⁴ wwjs),
 `sendTextMessage` (🔧³ wwjs), `postTextStatus` / `postImageStatus` / `postVideoStatus` /
-`postVoiceStatus` (🔧² wwjs), `removeParticipants` / `promoteParticipants` / `demoteParticipants`
+`postVoiceStatus` (🔧² wwjs), `removeParticipants`
 (🔧⁷ wwjs), `setGroupDescription` (🔧⁹ wwjs), `getGroupInviteCode` / `joinGroupViaInviteCode` /
 `revokeGroupInviteCode` (🔧¹⁵ wwjs). Everything else that is ✅-both carries no row-level mark, but still
 rests on the column-wide 🔧¹ (wwjs) and 🔧⁵ (baileys) — no row runs on stock library code on both
@@ -323,8 +323,8 @@ socket is caught by the transport instead. No REST route: the session watchdog p
 | `getGroupInfo`                   | ✅                  | ✅               | ✅              |
 | `addParticipants`                | ✅                  | ✅               | ✅              |
 | `removeParticipants`             | ✅                  | ✅🔧⁷            | ✅              |
-| `promoteParticipants`            | ✅                  | ✅🔧⁷            | ✅              |
-| `demoteParticipants`             | ✅                  | ✅🔧⁷            | ✅              |
+| `promoteParticipants`            | ✅                  | ✅              | ✅              |
+| `demoteParticipants`             | ✅                  | ✅              | ✅              |
 | `approveGroupMembershipRequests` | ✅                  | ✅               | ✅              |
 | `rejectGroupMembershipRequests`  | ✅                  | ✅               | ✅              |
 | `getGroupMembershipRequests`     | ✅                  | ✅               | ✅              |

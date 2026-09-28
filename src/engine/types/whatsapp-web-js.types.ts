@@ -53,6 +53,11 @@ export interface GroupMetadataRaw {
   parentGroup?: SerializedWid | string | null;
   linkedParentGroup?: SerializedWid | string | null;
   linkedParent?: SerializedWid | string | null;
+  /**
+   * True on a community's announcement group — the linked subgroup every community member joins,
+   * whose admins are exactly the community's admins (WA Web's `LINKED_ANNOUNCEMENT_GROUP`).
+   */
+  defaultSubgroup?: boolean;
   /** Only admins can post (WA Web group model; written by GroupChat.setMessagesAdminsOnly). */
   announce?: boolean;
   /** Only admins can edit group info (written by GroupChat.setInfoAdminsOnly). */

@@ -3039,6 +3039,10 @@ No `@HttpCode`, so NestJS uses the DELETE default of `200`. `results` carries th
 
 Promote participants to group admin.
 
+A community's announcement group takes its admins from the community, so WhatsApp makes someone its admin only by making them a community admin. On whatsapp-web.js a promote (or demote) in an announcement group does exactly that, on the parent community, and each result's `message` says so. The person must already be a member of the announcement group.
+
+A participant who is already an admin counts as a success with nothing changed. When WhatsApp refuses, the `403` names the reason — this account is not an admin, the local check WhatsApp Web applies, or WhatsApp's own status and text — and a batch where every participant failed lists each one's reason.
+
 **Auth:** API key (OPERATOR)
 
 **Path parameters**

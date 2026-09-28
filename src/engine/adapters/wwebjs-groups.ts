@@ -71,6 +71,249 @@ export function normalizeWwebjsRequestMethod(raw: string | undefined): GroupMemb
   return undefined;
 }
 
+/** One entry per requested id, in request order. */
+export interface AdminChangeParticipant {
+  /** Whether the id resolved to a member of the group. */
+  member: boolean;
+  /**
+   * `unchanged` — already in the requested state, so WhatsApp was not asked; `self` — the account's
+   * own entry; `creator` — the group's creator, whom nobody can demote; `gate` — WA Web's local
+   * check refuses this member for a reason it does not name; anything else is WhatsApp's own
+   * per-participant code, `'200'` meaning done. Null for a non-member.
+   */
+  code: string | null;
+}
+
+export interface AdminChangeOutcome {
+  /** The parent community's JID when the group is that community's announcement group, else null. */
+  community: string | null;
+  participants: AdminChangeParticipant[];
+  /** Why WhatsApp Web refuses the whole batch before asking the server. */
+  refused?: string;
+  /** WhatsApp's refusal of the request itself: its status (null when it gave none) and text. */
+  error?: { status: number | null; text: string };
+}
+
+/** The slice of puppeteer's Page that {@link changeAdminStatusInPage} runs through. */
+type AdminChangePage = {
+  evaluate: (
+    fn: typeof changeAdminStatusInPage,
+    groupId: string,
+    participantIds: string[],
+    promote: boolean,
+  ) => Promise<AdminChangeOutcome>;
+};
+
+/**
+ * Runs INSIDE the WhatsApp Web page (serialised by `page.evaluate`), so it must stay self-contained:
+ * no imports, no module-level helpers.
+ *
+ * Mirrors WA Web's own promote/demote path minus its toast UI: resolve each id to a member of the
+ * group (by LID, then phone number), skip members already in the requested state, apply the local
+ * gate the UI action applies (`canPromote`/`canDemote`), then call `WAWebGroupModifyParticipantsJob`
+ * and read WhatsApp's per-participant codes off its answer. A job rejection is caught here and
+ * returned as `{status, text}`, because an error thrown across the page boundary arrives minified.
+ *
+ * A community's announcement group (`defaultSubgroup`) takes its admins from the community, and the
+ * gate refuses every promote/demote in it. There the change goes through the community-admin job on
+ * the parent community instead, for members of the announcement group — WA Web's "Make community
+ * admin" flow. WhatsApp answers `419` there when the community already has its maximum of admins,
+ * and `403` for someone who is not in the announcement group.
+ */
+export async function changeAdminStatusInPage(
+  groupId: string,
+  participantIds: string[],
+  promote: boolean,
+): Promise<AdminChangeOutcome> {
+  type Wid = { _serialized?: string; $1?: string };
+  type Member = { id: Wid; isAdmin?: boolean; isSuperAdmin?: boolean };
+  type Metadata = {
+    participants?: {
+      get(id: string): Member | undefined;
+      canPromote(m: Member): boolean;
+      canDemote(m: Member): boolean;
+    };
+    defaultSubgroup?: boolean;
+    parentGroup?: Wid | null;
+    isLidAddressingMode?: boolean;
+    isSuspendedOrTerminated?: () => boolean;
+  };
+  type JobAnswer = { participants?: Array<{ userWid: Wid; code?: string }> } | undefined;
+  type Job = (chatId: Wid, wids: Wid[], isLid: boolean) => Promise<JobAnswer>;
+  type PageWindow = {
+    require(name: 'WAWebWidFactory'): { asUserWidOrThrow(wid: Wid): Wid };
+    require(name: 'WAWebUserPrefsMeUser'): { isMeAccount(wid: Wid): boolean };
+    require(name: 'WAWebCollections'): { Chat: { get(wid: Wid): { groupMetadata?: Metadata } | undefined } };
+    require(name: 'WAWebGroupModifyParticipantsJob'): {
+      promoteGroupParticipants: Job;
+      demoteGroupParticipants: Job;
+      promoteCommunityParticipants: Job;
+      demoteCommunityParticipants: Job;
+    };
+    WWebJS: {
+      getChat(
+        id: string,
+        opts: { getAsModel: false },
+      ): Promise<{ id: Wid; groupMetadata?: Metadata; iAmAdmin(): boolean } | undefined>;
+      enforceLidAndPnRetrieval(id: string): Promise<{ lid?: Wid; phone?: Wid }>;
+    };
+  };
+  const w = (globalThis as unknown as { window: PageWindow }).window;
+  const ser = (wid?: Wid | null): string | undefined => wid?._serialized || wid?.$1 || undefined;
+
+  const chat = await w.WWebJS.getChat(groupId, { getAsModel: false });
+  const md = chat?.groupMetadata;
+  const community = md?.defaultSubgroup === true && md.parentGroup ? md.parentGroup : null;
+  const outcome: AdminChangeOutcome = {
+    community: ser(community) ?? null,
+    participants: participantIds.map(() => ({ member: false, code: null })),
+  };
+  if (!chat || !md?.participants) {
+    outcome.refused = 'WhatsApp Web holds no member list for this group on this account';
+    return outcome;
+  }
+  if (md.isSuspendedOrTerminated?.() === true) {
+    outcome.refused = 'WhatsApp has suspended or closed this group';
+    return outcome;
+  }
+  if (!chat.iAmAdmin()) {
+    outcome.refused = community
+      ? 'this account is not an admin of the community'
+      : 'this account is not an admin of the group';
+    return outcome;
+  }
+
+  const Wids = w.require('WAWebWidFactory');
+  const Me = w.require('WAWebUserPrefsMeUser');
+  const participants = md.participants;
+  const toAct: Array<{ index: number; member: Member; keys: string[] }> = [];
+  for (let index = 0; index < participantIds.length; index++) {
+    const { lid, phone } = await w.WWebJS.enforceLidAndPnRetrieval(participantIds[index]);
+    const lidKey = ser(lid);
+    const phoneKey = ser(phone);
+    const member = (lidKey && participants.get(lidKey)) || (phoneKey && participants.get(phoneKey)) || undefined;
+    if (!member) continue;
+    const entry = outcome.participants[index];
+    entry.member = true;
+    if (Boolean(member.isAdmin) === promote) {
+      entry.code = 'unchanged';
+    } else if (Me.isMeAccount(member.id)) {
+      entry.code = 'self';
+    } else if (!promote && member.isSuperAdmin) {
+      entry.code = 'creator';
+    } else if (!community && !(promote ? participants.canPromote(member) : participants.canDemote(member))) {
+      entry.code = 'gate';
+    } else {
+      toAct.push({ index, member, keys: [ser(member.id), lidKey, phoneKey].filter((k): k is string => !!k) });
+    }
+  }
+  if (!toAct.length) return outcome;
+
+  const jobs = w.require('WAWebGroupModifyParticipantsJob');
+  const job = community
+    ? promote
+      ? jobs.promoteCommunityParticipants
+      : jobs.demoteCommunityParticipants
+    : promote
+      ? jobs.promoteGroupParticipants
+      : jobs.demoteGroupParticipants;
+  // WA Web passes the addressing mode of the chat the request goes to: the parent for a community.
+  const target = community ?? chat.id;
+  const targetMd = community ? w.require('WAWebCollections').Chat.get(community)?.groupMetadata : md;
+  const isLid = (targetMd ?? md).isLidAddressingMode === true;
+  let answer: JobAnswer;
+  try {
+    answer = await job(
+      target,
+      toAct.map(a => Wids.asUserWidOrThrow(a.member.id)),
+      isLid,
+    );
+  } catch (error) {
+    const e = error as { status?: unknown; statusCode?: unknown; text?: unknown; message?: unknown; name?: unknown };
+    const status = Number(e?.status ?? e?.statusCode);
+    const text = [e?.text, e?.message, e?.name].find((t): t is string => typeof t === 'string' && t !== '');
+    outcome.error = {
+      status: Number.isFinite(status) ? status : null,
+      text: text ?? 'WhatsApp gave no detail',
+    };
+    return outcome;
+  }
+  // The answer lists each participant under the id form WhatsApp addressed it by, LID or phone
+  // number, so match on every form the member is known by. A member the answer leaves out keeps the
+  // batch's success, which is all an answer without a participant list says.
+  const codes = new Map<string, string>();
+  for (const p of answer?.participants ?? []) {
+    const key = ser(p.userWid);
+    if (key) codes.set(key, String(p.code ?? '200'));
+  }
+  for (const a of toAct) {
+    const hit = a.keys.map(k => codes.get(k)).find(c => c !== undefined);
+    outcome.participants[a.index].code = hit ?? (answer?.participants ? 'missing' : '200');
+  }
+  return outcome;
+}
+
+/** One requested id's result from a {@link changeAdminStatusInPage} entry. */
+export function adminChangeResult(
+  id: string,
+  entry: AdminChangeParticipant | undefined,
+  promote: boolean,
+  inCommunity: boolean,
+): ParticipantOperationResult {
+  const role = inCommunity ? 'a community admin' : 'an admin';
+  const fail = (status: number, message: string): ParticipantOperationResult => ({
+    id,
+    success: false,
+    status,
+    message,
+  });
+  if (!entry?.member) {
+    return fail(404, 'not a member of this group — WhatsApp was not asked to act on this participant');
+  }
+  switch (entry.code) {
+    case '200':
+      return {
+        id,
+        success: true,
+        status: 200,
+        message: inCommunity
+          ? `${promote ? 'made a community admin' : 'no longer a community admin'} — a community's announcement group takes its admins from the community`
+          : promote
+            ? 'made an admin'
+            : 'no longer an admin',
+      };
+    case 'unchanged':
+      return {
+        id,
+        success: true,
+        status: 200,
+        message: promote ? `already ${role} — nothing to change` : `not ${role} — nothing to change`,
+      };
+    case 'self':
+      return fail(403, 'an account cannot change its own admin status');
+    case 'creator':
+      return fail(403, "the group's creator cannot be removed as an admin");
+    case 'gate':
+      return fail(403, `WhatsApp Web will not ${promote ? 'promote' : 'demote'} this participant in this group`);
+    case '403':
+      return fail(
+        403,
+        inCommunity
+          ? 'WhatsApp makes community admins only of members of the announcement group'
+          : 'WhatsApp refused this participant (403)',
+      );
+    case '419':
+      if (inCommunity) return fail(419, 'the community already has as many admins as WhatsApp allows');
+      return fail(419, 'WhatsApp refused this participant (code 419)');
+    case 'missing':
+      return fail(502, "WhatsApp's answer did not mention this participant");
+    default: {
+      const code = Number(entry.code);
+      return fail(Number.isFinite(code) ? code : 500, `WhatsApp refused this participant (code ${entry.code})`);
+    }
+  }
+}
+
 export class WwebjsGroups {
   constructor(private readonly host: WwebjsEngineHost) {}
 
@@ -287,11 +530,59 @@ export class WwebjsGroups {
   }
 
   async promoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
-    return this.runStatusOnlyParticipantOp('promoteParticipants', groupId, participants);
+    return this.changeAdminStatus(true, groupId, participants);
   }
 
   async demoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
-    return this.runStatusOnlyParticipantOp('demoteParticipants', groupId, participants);
+    return this.changeAdminStatus(false, groupId, participants);
+  }
+
+  /**
+   * Promote and demote run {@link changeAdminStatusInPage} rather than whatsapp-web.js's
+   * `GroupChat.promoteParticipants`/`demoteParticipants`. Those call WA Web's UI action, which checks
+   * a local gate and, when it fails, rejects with a minified `ActionError` that crosses the page
+   * boundary as the bare text `t: t` — and a server refusal crosses the same way. The page function
+   * checks the same gate itself, calls the request job underneath the action, and hands back a reason
+   * or a server status for every refusal.
+   *
+   * A community's announcement group is the case the gate always refuses: its admins are the
+   * community's admins, so WhatsApp Web makes someone its admin only by promoting them to community
+   * admin on the parent community — its own "Make community admin" flow. The page function does
+   * exactly that, and each result says the person became (or stopped being) a community admin.
+   */
+  private async changeAdminStatus(
+    promote: boolean,
+    groupId: string,
+    participants: string[],
+  ): Promise<ParticipantOperationResult[]> {
+    const op = promote ? 'promoteParticipants' : 'demoteParticipants';
+    await this.requireGroupChat(groupId);
+    const participantIds = participants.map(toParticipantWid);
+    const page = (this.client() as unknown as { pupPage?: AdminChangePage }).pupPage;
+    if (!page) {
+      throw new EngineTransportError(`The WhatsApp Web page is gone; cannot run ${op}`);
+    }
+    const outcome = await withPage(this.host, op, () =>
+      page.evaluate(changeAdminStatusInPage, groupId, participantIds, promote),
+    );
+
+    const where = outcome.community
+      ? `community ${outcome.community} (whose admins are the admins of announcement group ${groupId})`
+      : `group ${groupId}`;
+    if (outcome.refused) {
+      throw new EngineRefusedError(`${op} refused for ${where}: ${outcome.refused}`);
+    }
+    if (outcome.error) {
+      const status = outcome.error.status === null ? 'no status' : `status ${outcome.error.status}`;
+      throw new EngineRefusedError(`WhatsApp refused ${op} for ${where} (${status}): ${outcome.error.text}`);
+    }
+    if (!Array.isArray(outcome.participants) || outcome.participants.length !== participantIds.length) {
+      throw new EngineTransportError(`${op} returned an outcome that does not match the request for ${where}`);
+    }
+    const results = participantIds.map((id, i) =>
+      adminChangeResult(id, outcome.participants[i], promote, outcome.community !== null),
+    );
+    return this.assertParticipantResults(op, groupId, results);
   }
 
   /**
@@ -309,7 +600,7 @@ export class WwebjsGroups {
    * {@link assertParticipantResults}.
    */
   private async runStatusOnlyParticipantOp(
-    op: 'removeParticipants' | 'promoteParticipants' | 'demoteParticipants',
+    op: 'removeParticipants',
     groupId: string,
     participants: string[],
   ): Promise<ParticipantOperationResult[]> {
@@ -341,7 +632,7 @@ export class WwebjsGroups {
    * as a permissions problem, the same rule the Baileys adapter states for its empty-results guard.
    */
   private async runParticipantBatch(
-    op: 'removeParticipants' | 'promoteParticipants' | 'demoteParticipants',
+    op: 'removeParticipants',
     groupId: string,
     chat: GroupChat,
     participantIds: string[],
@@ -371,7 +662,9 @@ export class WwebjsGroups {
       throw new EngineRefusedError(`${op} returned no per-participant outcome for group ${groupId}`);
     }
     if (results.every(r => !r.success)) {
-      const detail = results.map(r => `${r.id} (${r.status ?? '?'})`).join(', ');
+      // Each participant's reason, not just its code: for a single participant this message is the
+      // only explanation the caller gets.
+      const detail = results.map(r => `${r.id} (${r.status ?? '?'}${r.message ? `: ${r.message}` : ''})`).join(', ');
       throw new EngineRefusedError(
         `${op} failed for all ${results.length} participant(s) in group ${groupId}: ${detail}`,
       );

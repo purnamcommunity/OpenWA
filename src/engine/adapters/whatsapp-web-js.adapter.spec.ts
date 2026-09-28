@@ -21,6 +21,7 @@ import {
 import { EXEC_CONTEXT_DESTROYED_PROBE_TIMEOUT_MS, EXEC_CONTEXT_DESTROYED_RECHECK_MS } from './wwebjs-lifecycle';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
 import { readLeanContacts } from './wwebjs-contacts';
+import { changeAdminStatusInPage } from './wwebjs-groups';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as qrcode from 'qrcode';
@@ -6469,124 +6470,216 @@ describe('WhatsAppWebJsAdapter honest outcomes (no phantom success)', () => {
     });
   });
 
-  describe.each([['removeParticipants'], ['promoteParticipants'], ['demoteParticipants']])(
-    '%s (batch {status} is honored)',
-    op => {
-      it('falls back to batch-confirmed entries when the tree is unpatched (no matched marker)', async () => {
-        // Without scripts/patch-wwebjs-participant-arity.js the page reports only the batch status,
-        // so there is nothing per-participant to read. Keeping the old shape is the honest answer
-        // here; inventing an outcome would be the very defect this suite guards against.
-        const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 200 }) });
-        const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
-        const results = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](
-          GROUP,
-          ['628111', '628222@c.us'],
-        );
-        expect(results).toEqual([
-          {
-            id: '628111@c.us',
-            success: true,
-            status: 200,
-            message: 'confirmed with the batch — wwebjs reports no per-participant outcome',
-          },
-          {
-            id: '628222@c.us',
-            success: true,
-            status: 200,
-            message: 'confirmed with the batch — wwebjs reports no per-participant outcome',
-          },
-        ]);
-      });
+  describe.each([['removeParticipants']])('%s (batch {status} is honored)', op => {
+    it('falls back to batch-confirmed entries when the tree is unpatched (no matched marker)', async () => {
+      // Without scripts/patch-wwebjs-participant-arity.js the page reports only the batch status,
+      // so there is nothing per-participant to read. Keeping the old shape is the honest answer
+      // here; inventing an outcome would be the very defect this suite guards against.
+      const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 200 }) });
+      const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
+      const results = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](
+        GROUP,
+        ['628111', '628222@c.us'],
+      );
+      expect(results).toEqual([
+        {
+          id: '628111@c.us',
+          success: true,
+          status: 200,
+          message: 'confirmed with the batch — wwebjs reports no per-participant outcome',
+        },
+        {
+          id: '628222@c.us',
+          success: true,
+          status: 200,
+          message: 'confirmed with the batch — wwebjs reports no per-participant outcome',
+        },
+      ]);
+    });
 
-      it('reports only the participants the page resolved to members', async () => {
-        const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 200, matched: [true, false] }) });
-        const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
-        const results = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](
-          GROUP,
-          ['628111', '628222@c.us'],
-        );
-        // The second id was dropped page-side, so WhatsApp never acted on it. Reporting it as a
-        // success is what #1220 was: a removal that never happened, confirmed to the caller.
-        expect(results).toEqual([
-          expect.objectContaining({ id: '628111@c.us', success: true, status: 200 }),
-          expect.objectContaining({ id: '628222@c.us', success: false, status: 404 }),
-        ]);
-      });
+    it('reports only the participants the page resolved to members', async () => {
+      const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 200, matched: [true, false] }) });
+      const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
+      const results = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](
+        GROUP,
+        ['628111', '628222@c.us'],
+      );
+      // The second id was dropped page-side, so WhatsApp never acted on it. Reporting it as a
+      // success is what #1220 was: a removal that never happened, confirmed to the caller.
+      expect(results).toEqual([
+        expect.objectContaining({ id: '628111@c.us', success: true, status: 200 }),
+        expect.objectContaining({ id: '628222@c.us', success: false, status: 404 }),
+      ]);
+    });
 
-      it('throws EngineRefusedError when the page resolved none of the requested participants', async () => {
-        const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 200, matched: [false, false] }) });
-        const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
-        await expect(
-          (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](GROUP, [
-            '628111',
-            '628222@c.us',
-          ]),
-        ).rejects.toBeInstanceOf(EngineRefusedError);
-      });
-
-      it('ignores a matched marker whose length does not match the request', async () => {
-        // A partially applied patch must degrade to the old behaviour rather than read undefined at
-        // an index and report a real participant as untouched.
-        const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 200, matched: [true] }) });
-        const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
-        const results = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](
-          GROUP,
-          ['628111', '628222@c.us'],
-        );
-        expect(results).toEqual([
-          expect.objectContaining({ success: true }),
-          expect.objectContaining({ success: true }),
-        ]);
-      });
-
-      it('translates the empty-batch page rejection into a refusal rather than a 500', async () => {
-        const chat = groupChat({
-          [op]: jest
-            .fn()
-            .mockRejectedValue(new Error('Evaluation failed: Error: expected at least 1 children, but found 0')),
-        });
-        const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
-        await expect(
-          (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](GROUP, ['628111']),
-        ).rejects.toBeInstanceOf(EngineRefusedError);
-      });
-
-      it('rethrows an unrecognised page failure instead of calling it a refusal', async () => {
-        // A dead transport must not be sold to the caller as a permissions problem — the Baileys
-        // adapter states the same rule for its own empty-results guard.
-        const boom = new Error('Protocol error (Runtime.callFunctionOn): Target closed');
-        const chat = groupChat({ [op]: jest.fn().mockRejectedValue(boom) });
-        const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
-        const err = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)
-          [op](GROUP, ['628111'])
-          .catch((e: unknown) => e);
-        expect(err).toBe(boom);
-      });
-
-      it('throws EngineRefusedError on a non-200 batch status instead of reporting success', async () => {
-        const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 403 }) });
-        const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
-        await expect(
-          (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](GROUP, ['628111']),
-        ).rejects.toBeInstanceOf(EngineRefusedError);
-      });
-
-      it('qualifies only bare numbers, never double-qualifying an id that carries a domain', async () => {
-        // Characterisation: the old rule (`p.includes('@')`) agreed with toParticipantWid on every
-        // input that reaches here, so this pins the behaviour rather than driving the change. It is
-        // the guard against a future qualifier that appends to an already-domained id.
-        const libOp = jest.fn().mockResolvedValue({ status: 200 });
-        const chat = groupChat({ [op]: libOp });
-        const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
-        await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](GROUP, [
+    it('throws EngineRefusedError when the page resolved none of the requested participants', async () => {
+      const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 200, matched: [false, false] }) });
+      const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
+      await expect(
+        (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](GROUP, [
           '628111',
           '628222@c.us',
-          '12345678901234567890@lid',
-        ]);
-        expect(libOp).toHaveBeenCalledWith(['628111@c.us', '628222@c.us', '12345678901234567890@lid']);
+        ]),
+      ).rejects.toBeInstanceOf(EngineRefusedError);
+    });
+
+    it('ignores a matched marker whose length does not match the request', async () => {
+      // A partially applied patch must degrade to the old behaviour rather than read undefined at
+      // an index and report a real participant as untouched.
+      const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 200, matched: [true] }) });
+      const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
+      const results = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](
+        GROUP,
+        ['628111', '628222@c.us'],
+      );
+      expect(results).toEqual([expect.objectContaining({ success: true }), expect.objectContaining({ success: true })]);
+    });
+
+    it('translates the empty-batch page rejection into a refusal rather than a 500', async () => {
+      const chat = groupChat({
+        [op]: jest
+          .fn()
+          .mockRejectedValue(new Error('Evaluation failed: Error: expected at least 1 children, but found 0')),
       });
-    },
-  );
+      const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
+      await expect(
+        (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](GROUP, ['628111']),
+      ).rejects.toBeInstanceOf(EngineRefusedError);
+    });
+
+    it('rethrows an unrecognised page failure instead of calling it a refusal', async () => {
+      // A dead transport must not be sold to the caller as a permissions problem — the Baileys
+      // adapter states the same rule for its own empty-results guard.
+      const boom = new Error('Protocol error (Runtime.callFunctionOn): Target closed');
+      const chat = groupChat({ [op]: jest.fn().mockRejectedValue(boom) });
+      const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
+      const err = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)
+        [op](GROUP, ['628111'])
+        .catch((e: unknown) => e);
+      expect(err).toBe(boom);
+    });
+
+    it('throws EngineRefusedError on a non-200 batch status instead of reporting success', async () => {
+      const chat = groupChat({ [op]: jest.fn().mockResolvedValue({ status: 403 }) });
+      const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
+      await expect(
+        (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](GROUP, ['628111']),
+      ).rejects.toBeInstanceOf(EngineRefusedError);
+    });
+
+    it('qualifies only bare numbers, never double-qualifying an id that carries a domain', async () => {
+      // Characterisation: the old rule (`p.includes('@')`) agreed with toParticipantWid on every
+      // input that reaches here, so this pins the behaviour rather than driving the change. It is
+      // the guard against a future qualifier that appends to an already-domained id.
+      const libOp = jest.fn().mockResolvedValue({ status: 200 });
+      const chat = groupChat({ [op]: libOp });
+      const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat) });
+      await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)[op](GROUP, [
+        '628111',
+        '628222@c.us',
+        '12345678901234567890@lid',
+      ]);
+      expect(libOp).toHaveBeenCalledWith(['628111@c.us', '628222@c.us', '12345678901234567890@lid']);
+    });
+  });
+
+  describe('promoteParticipants / demoteParticipants (page outcome is honored)', () => {
+    const COMMUNITY = '120363999@g.us';
+    const pageAdapter = (outcome: unknown) => {
+      const evaluate = jest.fn().mockResolvedValue(outcome);
+      const chat = { ...groupChat(), promoteParticipants: jest.fn(), demoteParticipants: jest.fn() };
+      const adapter = readyAdapter({ getChatById: jest.fn().mockResolvedValue(chat), pupPage: { evaluate } });
+      return { adapter, evaluate, chat };
+    };
+
+    it("runs the adapter's own page function with qualified ids, never the wwjs UI action", async () => {
+      const { adapter, evaluate, chat } = pageAdapter({
+        community: null,
+        participants: [{ member: true, code: '200' }],
+      });
+      const results = await adapter.promoteParticipants(GROUP, ['628111']);
+      expect(evaluate).toHaveBeenCalledWith(changeAdminStatusInPage, GROUP, ['628111@c.us'], true);
+      expect(chat.promoteParticipants).not.toHaveBeenCalled();
+      expect(results).toEqual([{ id: '628111@c.us', success: true, status: 200, message: 'made an admin' }]);
+    });
+
+    it('reports a promote in an announcement group as becoming a community admin', async () => {
+      const { adapter } = pageAdapter({ community: COMMUNITY, participants: [{ member: true, code: '200' }] });
+      const [result] = await adapter.promoteParticipants(GROUP, ['628111']);
+      expect(result).toEqual(expect.objectContaining({ success: true, status: 200 }));
+      expect(result.message).toMatch(/made a community admin/);
+    });
+
+    it('treats a member already in the requested state as done, not refused', async () => {
+      const { adapter } = pageAdapter({ community: null, participants: [{ member: true, code: 'unchanged' }] });
+      const [result] = await adapter.demoteParticipants(GROUP, ['628111']);
+      expect(result).toEqual(expect.objectContaining({ success: true, status: 200 }));
+    });
+
+    it('names the refusal instead of passing on the minified page error', async () => {
+      const { adapter } = pageAdapter({
+        community: null,
+        participants: [{ member: true, code: 'gate' }],
+      });
+      const err = await adapter.promoteParticipants(GROUP, ['628111']).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EngineRefusedError);
+      expect((err as Error).message).toMatch(/WhatsApp Web will not promote this participant/);
+    });
+
+    it("throws WhatsApp's own status and text when it refuses the request", async () => {
+      const { adapter } = pageAdapter({
+        community: COMMUNITY,
+        participants: [{ member: true, code: null }],
+        error: { status: 401, text: 'not-authorized' },
+      });
+      const err = await adapter.promoteParticipants(GROUP, ['628111']).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EngineRefusedError);
+      expect((err as Error).message).toMatch(new RegExp(`community ${COMMUNITY}.*status 401.*not-authorized`));
+    });
+
+    it('throws the batch-level reason the page found before asking WhatsApp', async () => {
+      const { adapter } = pageAdapter({
+        community: null,
+        participants: [{ member: false, code: null }],
+        refused: 'this account is not an admin of the group',
+      });
+      await expect(adapter.promoteParticipants(GROUP, ['628111'])).rejects.toThrow(/not an admin of the group/);
+    });
+
+    it('refuses the batch when no requested id is a member', async () => {
+      const { adapter } = pageAdapter({ community: null, participants: [{ member: false, code: null }] });
+      const err = await adapter.promoteParticipants(GROUP, ['628111']).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EngineRefusedError);
+      expect((err as Error).message).toMatch(/failed for all 1 participant/);
+    });
+
+    it('keeps partial refusals visible per participant', async () => {
+      const { adapter } = pageAdapter({
+        community: COMMUNITY,
+        participants: [
+          { member: true, code: '200' },
+          { member: true, code: '419' },
+        ],
+      });
+      const results = await adapter.promoteParticipants(GROUP, ['628111', '628222']);
+      expect(results[1]).toEqual(expect.objectContaining({ success: false, status: 419 }));
+      expect(results[1].message).toMatch(/as many admins/);
+    });
+
+    it('rejects an outcome whose length does not match the request instead of guessing', async () => {
+      const { adapter } = pageAdapter({ community: null, participants: [] });
+      await expect(adapter.promoteParticipants(GROUP, ['628111'])).rejects.toBeInstanceOf(EngineTransportError);
+    });
+
+    it('answers 503 when the page transport dies mid-call', async () => {
+      const evaluate = jest.fn().mockRejectedValue(new Error('Protocol error (Runtime.callFunctionOn): Target closed'));
+      const adapter = readyAdapter({
+        getChatById: jest.fn().mockResolvedValue(groupChat()),
+        pupPage: { evaluate },
+      });
+      await expect(adapter.demoteParticipants(GROUP, ['628111'])).rejects.toBeInstanceOf(EngineTransportError);
+    });
+  });
 
   describe('setGroupSubject / setGroupDescription (library boolean is honored)', () => {
     it.each([
