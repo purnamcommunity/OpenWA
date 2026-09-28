@@ -855,7 +855,7 @@ OpenWA consumes events by normalizing them into `EngineEventCallbacks`; anything
 | `message_reaction`          | ✅           |     | `contact_changed`      | ❌                                                                              |
 | `message_revoke_everyone`   | ✅           |     | `group_admin_changed`  | ❌                                                                              |
 | `message_revoke_me`         | ❌ candidate |     | `loading_screen`       | ❌                                                                              |
-| `message_ciphertext`        | ❌           |     | `media_uploaded`       | ✅ — re-announces an own send once its media upload finishes                    |
+| `message_ciphertext`        | ❌           |     | `media_uploaded`       | ❌                                                                              |
 | `message_ciphertext_failed` | ❌           |     | `remote_session_saved` | ❌                                                                              |
 | `call`                      | ✅           |     | `unread_count`         | ❌ candidate                                                                    |
 | `qr`                        | ✅           |     | `vote_update`          | ✅                                                                              |
@@ -1006,7 +1006,7 @@ adapter sources — re-derive the same way when anything changes:
   3 internal wiring, 1 class plumbing, **33 ❌ not exposed** (25 real capabilities + 8
   session/transport settings that are not WhatsApp capabilities). The backlog is the ❌ rows minus
   those 8 settings; 🔩 plumbing is correctly never exposed.
-- Events: Baileys **34** (16 consumed / 18 dropped), wwjs **31** (18 consumed / 13 dropped).
+- Events: Baileys **34** (16 consumed / 18 dropped), wwjs **31** (17 consumed / 14 dropped).
 - **0** capabilities in 29.5.3: every capability with first-class symbols on both libraries is
   either wired or classified with evidence. Three of them are Baileys-only despite typed
   whatsapp-web.js symbols: `demoteChannelAdmin`, whose page function WhatsApp Web no longer
