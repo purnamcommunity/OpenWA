@@ -948,10 +948,11 @@ export class WwebjsMessaging {
       return mentions?.length ? message.edit(body, { mentions }) : message.edit(body);
     });
     if (!edited) {
-      // wwebjs RESOLVES null (instead of throwing) when the page-side edit is refused — only the
-      // account's own text messages are editable; surface the refusal, not a phantom success.
+      // wwebjs RESOLVES null (instead of throwing) when the page-side edit is refused — WhatsApp
+      // edits only the account's own text messages and the captions of its own media, and only
+      // within its edit window; surface the refusal, not a phantom success.
       throw new EngineRefusedError(
-        `the edit of message ${messageId} was rejected — only the account's own text messages can be edited`,
+        `the edit of message ${messageId} was rejected — WhatsApp edits only the account's own text messages and media captions, within about 15 minutes of sending`,
       );
     }
     this.host.logger.log(`Edited message ${messageId} in chat ${chatId}`);
