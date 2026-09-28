@@ -85,6 +85,17 @@ export const NAVIGATION_REINJECT_GRACE_MS = 60_000;
 // probe reports the truth again and the watchdog takes over.
 export const NAVIGATION_EPISODE_CAP_MS = 3 * NAVIGATION_REINJECT_GRACE_MS;
 
+// "Execution context was destroyed" is what an in-flight evaluate dies of when the page navigates,
+// and it can land BEFORE framenavigated opens the re-inject window. So outside the window the error
+// is re-checked after this delay rather than reported: long enough for the navigation to commit and
+// stamp the window, short enough that a genuinely dead page is still reported well inside one
+// watchdog interval.
+export const EXEC_CONTEXT_DESTROYED_RECHECK_MS = 6_000;
+
+// Bound on the cheap evaluate that re-check sends. A page too busy to answer inside it is left to the
+// liveness watchdog rather than reported: busy is not dead, and the watchdog owns the wedged case.
+export const EXEC_CONTEXT_DESTROYED_PROBE_TIMEOUT_MS = 10_000;
+
 // The single in-adapter retry of a navigation-killed first inject only runs while at least this much
 // of the lifecycle's outer init deadline remains — a retry the outer race SIGKILLs mid-launch would
 // surface as a bare 504 with no reason. Below it, fail with today's exact terminal shape instead.
@@ -186,6 +197,9 @@ export class WwebjsLifecycle {
   // exact jest timer counts, and a timer would also outlive the single-use adapter.
   private lastMainFrameNavigationAt = 0;
   private navigationEpisodeStartedAt = 0;
+  // The one pending re-check of an "Execution context was destroyed" transport error (see
+  // reportIfPageTransportError). Unref'd, at most one per adapter, and cleared by teardown.
+  private execContextRecheckTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly host: WwebjsLifecycleHost) {}
 
@@ -699,6 +713,7 @@ export class WwebjsLifecycle {
     if (this.tearingDown || this.status === EngineStatus.DISCONNECTED || this.status === EngineStatus.FAILED) {
       return;
     }
+    this.clearExecContextRecheck();
     this.host.clearReadyReconcile();
     this.setStatus(EngineStatus.DISCONNECTED);
     this.host.getCallbacks().onDisconnected?.(reason);
@@ -754,6 +769,8 @@ export class WwebjsLifecycle {
    * of these errors is a much earlier death signal. Detection
    * only: the error itself still propagates to the caller exactly as before, and
    * handlePuppeteerDeath's guard makes this safe during teardown and against double-reporting.
+   * "Execution context was destroyed" is the one signature reported only after a re-check (see
+   * scheduleExecContextRecheck), because a navigation produces it on a healthy page.
    */
   reportIfPageTransportError(error: unknown, context: string): void {
     if (!this.isPageTransportError(error)) {
@@ -776,10 +793,110 @@ export class WwebjsLifecycle {
       );
       return;
     }
+    // Outside the window, "Execution context was destroyed" is still a navigation signature first:
+    // Puppeteer kills in-flight evaluates as the old document goes away, which can be before
+    // framenavigated stamps the window. It proves the page navigated, not that it died, so the report
+    // waits for a re-check. Every other signature (Target closed, Session closed, …) reports now.
+    const message = error instanceof Error ? error.message : String(error);
+    if (isExecutionContextDestroyedError(message)) {
+      this.scheduleExecContextRecheck(message, context);
+      return;
+    }
     this.host.logger.warn(`Page transport error during ${context} — treating the session as dead`, {
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
     });
     this.handlePuppeteerDeath(`Page transport error during ${context}`);
+  }
+
+  /**
+   * Re-check an "Execution context was destroyed" transport error after
+   * EXEC_CONTEXT_DESTROYED_RECHECK_MS. One pending re-check per adapter: further matches while it is
+   * pending add nothing, since the re-check answers for the page as a whole. It reports death only
+   * when the page or browser is closed, or a trivial evaluate is REJECTED; a navigation window opened
+   * meanwhile, an answered evaluate, or one that is merely slow all leave the session alone. The
+   * re-check belongs to the client it was armed on: teardown clears it, and a callback that finds the
+   * adapter torn down, disconnected, or on another client does nothing.
+   */
+  private scheduleExecContextRecheck(message: string, context: string): void {
+    if (this.execContextRecheckTimer) return;
+    const client = this.client;
+    this.execContextRecheckTimer = setTimeout(() => {
+      this.execContextRecheckTimer = null;
+      void this.runExecContextRecheck(client, message, context);
+    }, EXEC_CONTEXT_DESTROYED_RECHECK_MS);
+    this.execContextRecheckTimer.unref?.();
+  }
+
+  private isRecheckStale(client: Client | null): boolean {
+    return (
+      this.tearingDown ||
+      !client ||
+      this.client !== client ||
+      this.status === EngineStatus.DISCONNECTED ||
+      this.status === EngineStatus.FAILED
+    );
+  }
+
+  private async runExecContextRecheck(client: Client | null, message: string, context: string): Promise<void> {
+    if (this.isRecheckStale(client)) return;
+    const deferred = (): void => {
+      this.host.logger.warn(
+        `Page transport error during ${context} was a navigation, not a death — session left running`,
+        { sessionId: this.host.config.sessionId, error: message, action: 'page_transport_error_navigation_deferred' },
+      );
+    };
+    // The navigation that destroyed the context has since been seen: the re-inject window owns it.
+    if (this.isInNavigationReinjectWindow()) {
+      deferred();
+      return;
+    }
+    const { pupBrowser, pupPage } = client as unknown as {
+      pupBrowser?: { isConnected?: () => boolean };
+      pupPage?: { isClosed?: () => boolean; evaluate?: (fn: () => boolean) => Promise<unknown> };
+    };
+    let deadReason: string | null = null;
+    if (pupBrowser?.isConnected?.() === false || !pupPage || pupPage.isClosed?.() === true) {
+      deadReason = 'page or browser closed';
+    } else if (typeof pupPage.evaluate === 'function') {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          pupPage.evaluate(() => true),
+          new Promise<void>(resolve => {
+            // Slow is not dead: a busy page is the watchdog's to judge, so a timeout resolves.
+            timeout = setTimeout(resolve, EXEC_CONTEXT_DESTROYED_PROBE_TIMEOUT_MS);
+            timeout.unref?.();
+          }),
+        ]);
+      } catch (probeError) {
+        const probeMessage = probeError instanceof Error ? probeError.message : String(probeError);
+        // A second navigation can kill the probe the same way; that is still a navigating page.
+        if (!isExecutionContextDestroyedError(probeMessage)) {
+          deadReason = `liveness evaluate failed: ${probeMessage}`;
+        }
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    }
+    // The await above can outlive the client; a stale re-check must not report against a successor.
+    if (this.isRecheckStale(client)) return;
+    if (deadReason === null) {
+      deferred();
+      return;
+    }
+    this.host.logger.warn(`Page transport error during ${context} — treating the session as dead`, {
+      sessionId: this.host.config.sessionId,
+      error: message,
+      recheck: deadReason,
+    });
+    this.handlePuppeteerDeath(`Page transport error during ${context}`);
+  }
+
+  private clearExecContextRecheck(): void {
+    if (this.execContextRecheckTimer) {
+      clearTimeout(this.execContextRecheckTimer);
+      this.execContextRecheckTimer = null;
+    }
   }
 
   markReadyFromClientInfo(): void {
@@ -836,6 +953,7 @@ export class WwebjsLifecycle {
     // Before the clientless early-return: a teardown must always close the navigation window, or a
     // stale stamp could grace the next generation's probe (single-use contract notwithstanding).
     this.clearNavigationReinjectWindow();
+    this.clearExecContextRecheck();
     const client = this.client;
     if (!client) return null;
 
@@ -855,6 +973,7 @@ export class WwebjsLifecycle {
     this.host.clearReadyReconcile();
     this.host.clearOnboardingWatcher();
     this.clearNavigationReinjectWindow();
+    this.clearExecContextRecheck();
   }
 
   async disconnect(): Promise<void> {

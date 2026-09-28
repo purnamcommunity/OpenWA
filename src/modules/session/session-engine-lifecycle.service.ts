@@ -820,8 +820,8 @@ export class SessionEngineLifecycle {
     if (reconnectState) {
       reconnectState.attempts = 0;
     }
-    // A fresh READY stretch starts the watchdog's failure budget clean too.
-    this.watchdog.clear(id);
+    // A fresh READY stretch starts the watchdog's failure budget clean, and opens its warm-up.
+    this.watchdog.markReady(id);
     this.sessionErrors.clear(id);
     // Being linked and ready is proof that a connection-level block is over — it is exactly what such
     // a block prevents. A reachout timelock survives: it never stopped the session connecting.

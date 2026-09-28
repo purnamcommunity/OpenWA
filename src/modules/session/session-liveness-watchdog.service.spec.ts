@@ -3,6 +3,8 @@ import {
   SESSION_WATCHDOG_INTERVAL_MS,
   SESSION_WATCHDOG_MAX_FAILURES,
   SESSION_WATCHDOG_PROBE_TIMEOUT_MS,
+  SESSION_WATCHDOG_WARMUP_MS,
+  sessionWatchdogWarmupMs,
 } from './session-liveness-watchdog.service';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { EngineStatus, IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
@@ -152,6 +154,121 @@ describe('SessionLivenessWatchdog', () => {
     });
   });
 
+  // Straight after ready, WhatsApp Web's first history sync plus queued API reads can keep a healthy
+  // page from answering the probe in time; tearing it down there costs the session its first sync.
+  describe('post-ready warm-up', () => {
+    const originalWarmup = process.env.SESSION_WATCHDOG_WARMUP_MS;
+    afterEach(() => {
+      if (originalWarmup === undefined) delete process.env.SESSION_WATCHDOG_WARMUP_MS;
+      else process.env.SESSION_WATCHDOG_WARMUP_MS = originalWarmup;
+    });
+
+    it('does not count failures inside the warm-up after markReady', async () => {
+      const engine = engineOf(EngineStatus.READY, jest.fn().mockResolvedValue(false));
+      engines.set('s1', engine as unknown as IWhatsAppEngine);
+      watchdog.start(onDead);
+      watchdog.markReady('s1');
+
+      for (let i = 0; i < SESSION_WATCHDOG_MAX_FAILURES + 2; i++) {
+        await watchdog.probe('s1', engine as unknown as IWhatsAppEngine);
+      }
+
+      expect(engine.probeLiveness).toHaveBeenCalledTimes(SESSION_WATCHDOG_MAX_FAILURES + 2);
+      expect(onDead).not.toHaveBeenCalled();
+      expect(failuresOf(watchdog).has('s1')).toBe(false);
+    });
+
+    it('logs a warm-up failure under its own action', async () => {
+      const engine = engineOf(EngineStatus.READY, jest.fn().mockResolvedValue(false));
+      engines.set('s1', engine as unknown as IWhatsAppEngine);
+      const warn = jest.spyOn((watchdog as unknown as { logger: { warn: () => void } }).logger, 'warn');
+      watchdog.markReady('s1');
+
+      await watchdog.probe('s1', engine as unknown as IWhatsAppEngine);
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ sessionId: 's1', action: 'watchdog_probe_failed_warmup' }),
+      );
+    });
+
+    it('counts failures again once the warm-up has passed', async () => {
+      const engine = engineOf(EngineStatus.READY, jest.fn().mockResolvedValue(false));
+      engines.set('s1', engine as unknown as IWhatsAppEngine);
+      watchdog.start(onDead);
+      watchdog.markReady('s1', Date.now() - SESSION_WATCHDOG_WARMUP_MS);
+
+      for (let i = 0; i < SESSION_WATCHDOG_MAX_FAILURES; i++) {
+        await watchdog.probe('s1', engine as unknown as IWhatsAppEngine);
+      }
+
+      expect(onDead).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives no warm-up to a session that was never marked ready', async () => {
+      const engine = engineOf(EngineStatus.READY, jest.fn().mockResolvedValue(false));
+      engines.set('s1', engine as unknown as IWhatsAppEngine);
+
+      await watchdog.probe('s1', engine as unknown as IWhatsAppEngine);
+
+      expect(failuresOf(watchdog).get('s1')).toBe(1);
+    });
+
+    it('clear() ends the warm-up', async () => {
+      const engine = engineOf(EngineStatus.READY, jest.fn().mockResolvedValue(false));
+      engines.set('s1', engine as unknown as IWhatsAppEngine);
+      watchdog.markReady('s1');
+
+      watchdog.clear('s1');
+      await watchdog.probe('s1', engine as unknown as IWhatsAppEngine);
+
+      expect(failuresOf(watchdog).get('s1')).toBe(1);
+    });
+
+    it('markReady() starts the failure budget clean', () => {
+      failuresOf(watchdog).set('s1', 1);
+
+      watchdog.markReady('s1');
+
+      expect(failuresOf(watchdog).has('s1')).toBe(false);
+    });
+
+    it('leaves the observe-only ACTION_REQUIRED path unchanged', async () => {
+      const engine = engineOf(EngineStatus.ACTION_REQUIRED, jest.fn().mockResolvedValue(false));
+      engines.set('s1', engine as unknown as IWhatsAppEngine);
+      watchdog.markReady('s1');
+
+      await watchdog.probe('s1', engine as unknown as IWhatsAppEngine);
+
+      expect(failuresOf(watchdog).get('s1')).toBe(1);
+    });
+
+    it('honours SESSION_WATCHDOG_WARMUP_MS, where 0 disables the warm-up', async () => {
+      process.env.SESSION_WATCHDOG_WARMUP_MS = '0';
+      const engine = engineOf(EngineStatus.READY, jest.fn().mockResolvedValue(false));
+      engines.set('s1', engine as unknown as IWhatsAppEngine);
+      watchdog.markReady('s1');
+
+      await watchdog.probe('s1', engine as unknown as IWhatsAppEngine);
+
+      expect(failuresOf(watchdog).get('s1')).toBe(1);
+    });
+
+    it.each([
+      [undefined, SESSION_WATCHDOG_WARMUP_MS],
+      ['', SESSION_WATCHDOG_WARMUP_MS],
+      ['120000', 120_000],
+      ['0', 0],
+      ['-5', SESSION_WATCHDOG_WARMUP_MS],
+      ['10m', SESSION_WATCHDOG_WARMUP_MS],
+    ])('reads SESSION_WATCHDOG_WARMUP_MS=%p as %p', (raw, expected) => {
+      if (raw === undefined) delete process.env.SESSION_WATCHDOG_WARMUP_MS;
+      else process.env.SESSION_WATCHDOG_WARMUP_MS = raw;
+
+      expect(sessionWatchdogWarmupMs()).toBe(expected);
+    });
+  });
+
   describe('ACTION_REQUIRED is observe-only', () => {
     it('probes the engine but never acts on a failure (the status is operator-owned)', async () => {
       const probe = jest.fn().mockResolvedValue(false);
@@ -230,17 +347,19 @@ describe('SessionLivenessWatchdog', () => {
       }
     });
 
-    it('stop() clears the interval and the accrued failures, and is safe to call twice', () => {
+    it('stop() clears the interval, the accrued failures and the ready times, and is safe to call twice', () => {
       jest.useFakeTimers();
       try {
         watchdog.start(onDead);
         failuresOf(watchdog).set('s1', 1);
+        watchdog.markReady('s2');
 
         watchdog.stop();
         watchdog.stop();
 
         expect(jest.getTimerCount()).toBe(0);
         expect(failuresOf(watchdog).size).toBe(0);
+        expect((watchdog as unknown as { readyAt: Map<string, number> }).readyAt.size).toBe(0);
       } finally {
         jest.useRealTimers();
       }

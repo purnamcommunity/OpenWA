@@ -18,6 +18,7 @@ import {
   NAVIGATION_REINJECT_GRACE_MS,
   NAVIGATION_EPISODE_CAP_MS,
 } from './whatsapp-web-js.adapter';
+import { EXEC_CONTEXT_DESTROYED_PROBE_TIMEOUT_MS, EXEC_CONTEXT_DESTROYED_RECHECK_MS } from './wwebjs-lifecycle';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
 import { readLeanContacts } from './wwebjs-contacts';
 import * as fs from 'fs';
@@ -5420,6 +5421,153 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
     jest.setSystemTime(Date.now() + NAVIGATION_REINJECT_GRACE_MS);
 
     await expect(adapter.getChats()).resolves.toEqual([]);
+  });
+
+  // WhatsApp Web reloads its page during first sync, and an evaluate in flight dies with "Execution
+  // context was destroyed" possibly BEFORE framenavigated opens the window above. That error proves a
+  // navigation, not a death, so outside the window it is re-checked instead of reported.
+  describe('"Execution context was destroyed" outside the re-inject window', () => {
+    const EXEC_CTX = 'Protocol error (Runtime.callFunctionOn): Execution context was destroyed.';
+
+    const wireWithPage = (
+      page: { evaluate?: jest.Mock; isClosed?: () => boolean } = {},
+    ): { adapter: WhatsAppWebJsAdapter; client: NavFakeClient; onDisconnected: jest.Mock; evaluate: jest.Mock } => {
+      const { adapter, client } = wireAdapter();
+      const evaluate = page.evaluate ?? jest.fn().mockResolvedValue(true);
+      Object.assign(client.pupPage, { evaluate, isClosed: page.isClosed ?? (() => false) });
+      const onDisconnected = jest.fn();
+      (adapter as unknown as { callbacks: unknown }).callbacks = { onDisconnected };
+      return { adapter, client, onDisconnected, evaluate };
+    };
+
+    const report = (adapter: WhatsAppWebJsAdapter, message = EXEC_CTX): void =>
+      (
+        adapter as unknown as { reportIfPageTransportError: (e: unknown, c: string) => void }
+      ).reportIfPageTransportError(new Error(message), 'getGroups');
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    it('does not report death on the error itself', () => {
+      const { adapter, onDisconnected } = wireWithPage();
+
+      report(adapter);
+
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      expect(onDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('leaves a page that answers the re-check running', async () => {
+      const { adapter, onDisconnected, evaluate } = wireWithPage();
+
+      report(adapter);
+      await jest.advanceTimersByTimeAsync(EXEC_CONTEXT_DESTROYED_RECHECK_MS);
+
+      expect(evaluate).toHaveBeenCalledTimes(1);
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      expect(onDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('leaves the session to the navigation window when framenavigated lands during the delay', async () => {
+      const { adapter, client, onDisconnected, evaluate } = wireWithPage();
+
+      report(adapter);
+      client.pupPage.emit('framenavigated', navFrame());
+      await jest.advanceTimersByTimeAsync(EXEC_CONTEXT_DESTROYED_RECHECK_MS);
+
+      expect(evaluate).not.toHaveBeenCalled();
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      expect(onDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('treats a page too busy to answer as alive (the watchdog owns the wedged case)', async () => {
+      const { adapter, onDisconnected } = wireWithPage({ evaluate: jest.fn(() => new Promise(() => {})) });
+
+      report(adapter);
+      await jest.advanceTimersByTimeAsync(EXEC_CONTEXT_DESTROYED_RECHECK_MS + EXEC_CONTEXT_DESTROYED_PROBE_TIMEOUT_MS);
+
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      expect(onDisconnected).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('reports death when the re-check evaluate is rejected', async () => {
+      const { adapter, onDisconnected } = wireWithPage({
+        evaluate: jest.fn().mockRejectedValue(new Error('Protocol error: Target closed')),
+      });
+
+      report(adapter);
+      await jest.advanceTimersByTimeAsync(EXEC_CONTEXT_DESTROYED_RECHECK_MS);
+
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect(onDisconnected).toHaveBeenCalledWith('Page transport error during getGroups');
+    });
+
+    it('reports death when the page is closed by the time of the re-check', async () => {
+      const { adapter, onDisconnected, evaluate } = wireWithPage({ isClosed: () => true });
+
+      report(adapter);
+      await jest.advanceTimersByTimeAsync(EXEC_CONTEXT_DESTROYED_RECHECK_MS);
+
+      expect(evaluate).not.toHaveBeenCalled();
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect(onDisconnected).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps one pending re-check however many evaluates die', async () => {
+      const { adapter, evaluate } = wireWithPage();
+
+      report(adapter);
+      report(adapter);
+      report(adapter);
+      expect(jest.getTimerCount()).toBe(1);
+
+      await jest.advanceTimersByTimeAsync(EXEC_CONTEXT_DESTROYED_RECHECK_MS);
+      expect(evaluate).toHaveBeenCalledTimes(1);
+    });
+
+    it('never fires after teardown', async () => {
+      const { adapter, onDisconnected, evaluate } = wireWithPage({
+        evaluate: jest.fn().mockRejectedValue(new Error('Protocol error: Target closed')),
+      });
+
+      report(adapter);
+      await adapter.disconnect();
+      expect(jest.getTimerCount()).toBe(0);
+      onDisconnected.mockClear();
+
+      await jest.advanceTimersByTimeAsync(EXEC_CONTEXT_DESTROYED_RECHECK_MS);
+
+      expect(evaluate).not.toHaveBeenCalled();
+      expect(onDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('does not report against a client that replaced the one it was armed on', async () => {
+      const { adapter, onDisconnected } = wireWithPage({
+        evaluate: jest.fn().mockRejectedValue(new Error('Protocol error: Target closed')),
+      });
+
+      report(adapter);
+      (adapter as unknown as { client: unknown }).client = Object.assign(new EventEmitter(), {
+        pupBrowser: new EventEmitter(),
+        pupPage: new EventEmitter(),
+      });
+      await jest.advanceTimersByTimeAsync(EXEC_CONTEXT_DESTROYED_RECHECK_MS);
+
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      expect(onDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('still reports any other transport signature immediately', () => {
+      const { adapter, onDisconnected } = wireWithPage();
+
+      report(adapter, 'Protocol error (Runtime.callFunctionOn): Session closed. Most likely the page has been closed.');
+
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect(onDisconnected).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
   });
 });
 
