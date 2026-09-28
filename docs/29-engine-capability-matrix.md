@@ -323,8 +323,8 @@ socket is caught by the transport instead. No REST route: the session watchdog p
 | `getGroupInfo`                   | ✅                  | ✅               | ✅              |
 | `addParticipants`                | ✅                  | ✅               | ✅              |
 | `removeParticipants`             | ✅                  | ✅🔧⁷            | ✅              |
-| `promoteParticipants`            | ✅                  | ✅              | ✅              |
-| `demoteParticipants`             | ✅                  | ✅              | ✅              |
+| `promoteParticipants`            | ✅                  | ✅               | ✅              |
+| `demoteParticipants`             | ✅                  | ✅               | ✅              |
 | `approveGroupMembershipRequests` | ✅                  | ✅               | ✅              |
 | `rejectGroupMembershipRequests`  | ✅                  | ✅               | ✅              |
 | `getGroupMembershipRequests`     | ✅                  | ✅               | ✅              |
@@ -989,8 +989,8 @@ adapter sources — re-derive the same way when anything changes:
 
 - **122** interface methods → **244** adapter cells: **211 ✅** / **33 ❌** (2 adapter-gaps, 24
   library-limitations, 0 uncertain), spanning **25** methods.
-- Of the 211 ✅ cells, **13 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
-  1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 3 × 🔧⁷ participant arity, 1 × 🔧⁹ group
+- Of the 211 ✅ cells, **11 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
+  1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 1 × 🔧⁷ participant arity, 1 × 🔧⁹ group
   description, 3 × 🔧¹⁵ group invite) and one baileys cell
   does (1 × 🔧⁶ newsletter-create parse); the whole wwjs column additionally
   depends on 🔧¹, the whole Baileys column on 🔧⁵ — so every row rests on a patch on each side,
