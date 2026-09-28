@@ -56,7 +56,10 @@ export function Templates() {
   const { t } = useTranslation();
   useDocumentTitle(t('templates.title'));
   const { canWrite } = useRole();
-  const { data: sessions = [], isLoading: loadingSessions } = useSessionsQuery();
+  const { data: sessions = [], isLoading: loadingSessions, error: sessionsError } = useSessionsQuery();
+  // A failed read is not "no sessions": the gateway may simply be restarting. A failed background refetch keeps
+  // the cached list, so only a read that never produced one counts.
+  const sessionsFailed = !!sessionsError && sessions.length === 0;
   const [selectedSessionId, setSelectedSessionId] = useState('');
   const [form, setForm] = useState<TemplateForm>(emptyForm);
   const [editingTemplate, setEditingTemplate] = useState<MessageTemplate | null>(null);
@@ -194,7 +197,9 @@ export function Templates() {
               resetForm();
             }}
           >
-            {sessions.length === 0 && <option value="">{t('templates.noSessions')}</option>}
+            {sessions.length === 0 && (
+              <option value="">{t(sessionsFailed ? 'dashboard.loadError' : 'templates.noSessions')}</option>
+            )}
             {sessions.map(session => (
               <option key={session.id} value={session.id}>
                 {session.name}
@@ -204,7 +209,13 @@ export function Templates() {
         }
       />
 
-      {sessions.length === 0 ? (
+      {sessionsFailed ? (
+        <div className="templates-empty-page" role="alert">
+          <AlertCircle size={48} strokeWidth={1} />
+          <h3>{t('dashboard.loadError')}</h3>
+          <p>{sessionsError.message}</p>
+        </div>
+      ) : sessions.length === 0 ? (
         <div className="templates-empty-page">
           <FileText size={48} strokeWidth={1} />
           <h3>{t('templates.empty.noSessionsTitle')}</h3>
@@ -271,20 +282,36 @@ export function Templates() {
                   const templatePlaceholders = extractPlaceholders(template);
                   const isSelected = editingTemplate?.id === template.id;
                   return (
-                    <button
+                    <div
                       key={template.id}
-                      className={`template-list-item ${isSelected ? 'selected' : ''}`}
-                      onClick={() => openEdit(template)}
-                      type="button"
+                      className={`template-list-row ${canWrite ? 'deletable' : ''}`}
+                      role="listitem"
                     >
-                      <span className="template-list-title">{template.name}</span>
-                      <span className="template-list-body">{template.body}</span>
-                      <span className="template-list-meta">
-                        {templatePlaceholders.length > 0
-                          ? templatePlaceholders.map(key => `{{${key}}}`).join(' ')
-                          : t('templates.noPlaceholders')}
-                      </span>
-                    </button>
+                      <button
+                        className={`template-list-item ${isSelected ? 'selected' : ''}`}
+                        onClick={() => openEdit(template)}
+                        type="button"
+                      >
+                        <span className="template-list-title">{template.name}</span>
+                        <span className="template-list-body">{template.body}</span>
+                        <span className="template-list-meta">
+                          {templatePlaceholders.length > 0
+                            ? templatePlaceholders.map(key => `{{${key}}}`).join(' ')
+                            : t('templates.noPlaceholders')}
+                        </span>
+                      </button>
+                      {canWrite && (
+                        <button
+                          className="icon-btn danger template-list-delete"
+                          title={t('common.delete')}
+                          aria-label={t('common.delete')}
+                          onClick={() => setDeleteTarget(template)}
+                          type="button"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      )}
+                    </div>
                   );
                 })}
               </div>

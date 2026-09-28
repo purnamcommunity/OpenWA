@@ -6,6 +6,7 @@ import { chatKind, isChannelJid } from '../identity/wa-id';
 import { indexChatActivity, probeChatActivity } from './wwebjs-chat-activity';
 import { WwebjsMessaging } from './wwebjs-messaging';
 import { type WwebjsEngineHost } from './wwebjs-host';
+import { isProtocolTimeout } from './wwebjs-lifecycle';
 
 /**
  * Chat-list operations extracted from WhatsAppWebJsAdapter. The adapter keeps the public methods as
@@ -48,6 +49,10 @@ export class WwebjsChats {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'getChats');
         throw new EngineTransportError('Transport died while listing chats');
+      }
+      // A read that outran the protocol budget got no answer: a 503, but no death.
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer the chat list read in time');
       }
       throw error;
     }
@@ -146,6 +151,9 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'sendSeen');
         throw new EngineTransportError('Transport died while marking a chat as read');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while marking a chat as read');
+      }
       this.host.logger.error(`Error marking chat ${chatId} as read`, String(error));
       return false;
     }
@@ -166,6 +174,9 @@ export class WwebjsChats {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'clearChatMessages');
         throw new EngineTransportError('Transport died while clearing a chat');
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while clearing a chat');
       }
       this.host.logger.error(`Error clearing messages in chat ${chatId}`, String(error));
       return false;
@@ -199,6 +210,9 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'archiveChat');
         throw new EngineTransportError('Transport died while archiving a chat');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while archiving a chat');
+      }
       this.host.logger.error(`Error ${archive ? 'archiving' : 'unarchiving'} chat ${chatId}`, String(error));
       return false;
     }
@@ -228,6 +242,9 @@ export class WwebjsChats {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'requireResolvableChat');
         throw new EngineTransportError('Transport died while resolving a chat');
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while resolving a chat');
       }
       chat = undefined; // an unknown chat rejects too — that is the 400 below
     }
@@ -286,6 +303,9 @@ export class WwebjsChats {
         this.host.reportIfPageTransportError(error, 'markUnread');
         throw new EngineTransportError('Transport died while marking a chat as unread');
       }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while marking a chat as unread');
+      }
       this.host.logger.error(`Error marking chat ${chatId} as unread`, String(error));
       return false;
     }
@@ -308,6 +328,9 @@ export class WwebjsChats {
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'deleteChat');
         throw new EngineTransportError('Transport died while deleting a chat');
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError('WhatsApp Web did not answer in time while deleting a chat');
       }
       this.host.logger.error(`Error deleting chat ${chatId}`, String(error));
       return false;

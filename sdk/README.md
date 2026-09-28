@@ -22,24 +22,24 @@ hand-written resource methods.
 
 All five SDKs expose the same fluent resource surface:
 
-| Resource    | Methods                                                                                                                                                                                                                                                                                    |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `sessions`  | list, get, getConfig, updateConfig, getProxy, updateProxy, create, delete, start, stop, logout, forceKill, getQrCode, requestPairingCode, cancelPairingCode, setOnlinePresence, stats                                                                                                      |
-| `messages`  | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, sendPoll, reply, forward, react, delete, editMessage, history, reactions, pollVotes, comments, sendComment, media, pin, unpin, star, votePoll, sendBulk, batchStatus, cancelBatch         |
-| `contacts`  | list, get, check, profilePicture, profilePictures, phone, upsert, delete, block, unblock, listBlocked                                                                                                                                                                                      |
-| `groups`    | list, get, create, joinGroup, joinInfo, add/remove/promote/demoteParticipants, setSubject, setDescription, get/updateGroupSettings, leave, getPicture, setPicture, deletePicture, inviteCode, revokeInviteCode, getMembershipRequests, approveMembershipRequests, rejectMembershipRequests |
-| `webhooks`  | list, listAll, deliveryFailures, get, create, update, delete, test                                                                                                                                                                                                                         |
-| `chats`     | list, markRead, markUnread, archive, pin, mute, clearMessages, delete, sendState, subscribePresence, getPresence                                                                                                                                                                           |
-| `labels`    | list, get, chats, forChat, upsert, delete, addToChat, removeFromChat _(WhatsApp Business)_                                                                                                                                                                                                 |
-| `channels`  | list, get, messages, create, delete, mute, subscribe, unsubscribe, demoteAdmin, transferOwnership _(Newsletters)_                                                                                                                                                                          |
-| `catalog`   | info, products, product, sendProduct _(WhatsApp Business)_                                                                                                                                                                                                                                 |
-| `status`    | list, fromContact, media, sendText, sendImage, sendVideo, sendVoice, delete _(Stories)_                                                                                                                                                                                                    |
-| `search`    | search _(Operator)_                                                                                                                                                                                                                                                                        |
-| `templates` | list, get, create, update, delete                                                                                                                                                                                                                                                          |
-| `profile`   | setProfileName, setProfileStatus, setProfilePicture, deleteProfilePicture _(OPERATOR)_                                                                                                                                                                                                     |
-| `calls`     | rejectCall, createLink _(OPERATOR)_                                                                                                                                                                                                                                                        |
-| `media`     | conversionStatus, convertVoice, convertVideo _(OPERATOR)_                                                                                                                                                                                                                                  |
-| `health`    | check, live, ready                                                                                                                                                                                                                                                                         |
+| Resource    | Methods                                                                                                                                                                                                                                                                                         |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessions`  | list, get, getConfig, updateConfig, getProxy, updateProxy, create, delete, start, stop, logout, forceKill, getQrCode, requestPairingCode, cancelPairingCode, setOnlinePresence, stats                                                                                                           |
+| `messages`  | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, sendPoll, reply, forward, react, delete, editMessage, history, reactions, pollVotes, comments, sendComment, media, pin, unpin, star, votePoll, sendBulk, batchStatus, cancelBatch, clickButton |
+| `contacts`  | list, get, check, profilePicture, profilePictures, phone, upsert, delete, block, unblock, listBlocked                                                                                                                                                                                           |
+| `groups`    | list, get, create, joinGroup, joinInfo, add/remove/promote/demoteParticipants, setSubject, setDescription, get/updateGroupSettings, leave, getPicture, setPicture, deletePicture, inviteCode, revokeInviteCode, getMembershipRequests, approveMembershipRequests, rejectMembershipRequests      |
+| `webhooks`  | list, listAll, deliveryFailures, get, create, update, delete, test                                                                                                                                                                                                                              |
+| `chats`     | list, markRead, markUnread, archive, pin, mute, clearMessages, delete, sendState, subscribePresence, getPresence                                                                                                                                                                                |
+| `labels`    | list, get, chats, forChat, upsert, delete, addToChat, removeFromChat _(WhatsApp Business)_                                                                                                                                                                                                      |
+| `channels`  | list, get, messages, create, delete, mute, subscribe, unsubscribe, demoteAdmin, transferOwnership _(Newsletters)_                                                                                                                                                                               |
+| `catalog`   | info, products, product, sendProduct _(WhatsApp Business)_                                                                                                                                                                                                                                      |
+| `status`    | list, fromContact, media, sendText, sendImage, sendVideo, sendVoice, delete _(Stories)_                                                                                                                                                                                                         |
+| `search`    | search _(Operator)_                                                                                                                                                                                                                                                                             |
+| `templates` | list, get, create, update, delete                                                                                                                                                                                                                                                               |
+| `profile`   | setProfileName, setProfileStatus, setProfilePicture, deleteProfilePicture _(OPERATOR)_                                                                                                                                                                                                          |
+| `calls`     | rejectCall, createLink _(OPERATOR)_                                                                                                                                                                                                                                                             |
+| `media`     | conversionStatus, convertVoice, convertVideo _(OPERATOR)_                                                                                                                                                                                                                                       |
+| `health`    | check, live, ready                                                                                                                                                                                                                                                                              |
 
 > ⚠️ Endpoints requiring an `OPERATOR`-level API key are noted in the inline
 > docs. Deliberately **not** exposed, matching `docs/18-sdk-design.md` exactly:
@@ -68,6 +68,11 @@ All five SDKs expose the same fluent resource surface:
 > documented by hand in `docs/06-api-specification.md`, and the docs-contract
 > gate names `POST /mcp` as the one heading allowed outside the contract.
 
+Every example below addresses a session by its id: the UUID that
+`sessions.create()` returns, not the name passed to it. Create a session once (a
+second `create` with the same name answers `409`); afterwards, find its id with
+`sessions.list` filtered by `name`.
+
 ## JavaScript / TypeScript
 
 ```bash
@@ -82,8 +87,9 @@ const client = new OpenWAClient({
   apiKey: 'owa_k1_…',
 });
 
-await client.sessions.start('my-session');
-const result = await client.messages.sendText('my-session', {
+const session = await client.sessions.create({ name: 'my-session' });
+await client.sessions.start(session.id);
+const result = await client.messages.sendText(session.id, {
   chatId: '628123456789@c.us',
   text: 'Hello from the OpenWA SDK!',
 });
@@ -120,8 +126,9 @@ client = OpenWAClient(
     api_key="owa_k1_…",
 )
 
-client.sessions.start("my-session")
-result = client.messages.send_text("my-session", {
+session = client.sessions.create({"name": "my-session"})
+client.sessions.start(session["id"])
+result = client.messages.send_text(session["id"], {
     "chatId": "628123456789@c.us",
     "text": "Hello from the OpenWA Python SDK!",
 })
@@ -146,8 +153,9 @@ $client = new Client([
     'apiKey'  => 'owa_k1_…',
 ]);
 
-$client->sessions->start('my-session');
-$result = $client->messages->sendText('my-session', [
+$session = $client->sessions->create(['name' => 'my-session']);
+$client->sessions->start($session['id']);
+$result = $client->messages->sendText($session['id'], [
     'chatId' => '628123456789@c.us',
     'text'   => 'Hello from the OpenWA PHP SDK!',
 ]);
@@ -169,13 +177,16 @@ handler is a `MockHandler` — no global state, no network.
 
 ```java
 import com.rmyndharis.openwa.OpenWAClient;
+import com.rmyndharis.openwa.model.CreateSessionRequest;
 import com.rmyndharis.openwa.model.MessageResponse;
 import com.rmyndharis.openwa.model.SendTextRequest;
+import com.rmyndharis.openwa.model.SessionResponse;
 
 OpenWAClient client = new OpenWAClient("http://localhost:2785", "owa_k1_…");
 
-client.sessions.start("my-session");
-MessageResponse result = client.messages.sendText("my-session",
+SessionResponse session = client.sessions.create(CreateSessionRequest.builder().name("my-session").build());
+client.sessions.start(session.id());
+MessageResponse result = client.messages.sendText(session.id(),
     SendTextRequest.builder()
         .chatId("628123456789@c.us")
         .text("Hello from the OpenWA Java SDK!")
@@ -209,8 +220,12 @@ if err != nil {
 }
 
 ctx := context.Background()
-client.Sessions.Start(ctx, "my-session")
-res, err := client.Messages.SendText(ctx, "my-session", openwa.SendTextRequest{
+session, err := client.Sessions.Create(ctx, openwa.CreateSessionRequest{Name: "my-session"})
+if err != nil {
+    log.Fatal(err)
+}
+client.Sessions.Start(ctx, session.ID)
+res, err := client.Messages.SendText(ctx, session.ID, openwa.SendTextRequest{
     ChatID: "628123456789@c.us",
     Text:   "Hello from the OpenWA Go SDK!",
 })
@@ -232,7 +247,10 @@ testing, retry, tracing, or metrics. See [`go/README.md`](go/README.md).
   for `429`). The injectable transport (`fetch` / `transport` / `httpClient`) is
   the extension point for retry or observability middleware. The Go client is
   the exception: it ships an opt-in policy (`WithRetry(DefaultRetryPolicy())`)
-  that handles `429`/`5xx`, honors `Retry-After`, and rewinds request bodies —
+  that retries idempotent requests on network errors and `429`/`5xx`, retries a
+  `POST`/`PATCH` only on `429`/`503` (never after a network error), never
+  retries a send-pacing `429` (`code: "SEND_PACING_LIMITED"`), honors
+  `Retry-After`, and rewinds request bodies —
   still off unless you ask for it.
 - **Redirects are never followed.** A `3xx` surfaces to the caller rather than
   being followed, so the API key is never re-sent to a redirect target.

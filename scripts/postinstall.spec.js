@@ -38,6 +38,7 @@ const EXPECTED_PATCHER_ORDER = [
   'patch-wwebjs-message-secret.js',
   'patch-wwebjs-media-id.js',
   'patch-wwebjs-group-invite.js',
+  'patch-wwebjs-send-error.js',
   'patch-baileys-appstate.js',
   'patch-baileys-newsletter-create.js',
 ];

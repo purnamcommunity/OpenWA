@@ -1,97 +1,75 @@
 'use strict';
 
 const test = require('node:test');
-const assert = require('node:assert');
+const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { applyMediaIdPatch, isApplied, FIND, REPLACE, UPSTREAM_FIX, UTILS_PATH } = require('./patch-wwebjs-media-id.js');
+const { applyBackport, isApplied, ANCHOR, FIX } = require('./patch-wwebjs-media-id.js');
 
-function fakeWwjs(body) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wwjs-media-id-'));
-  fs.mkdirSync(path.join(dir, path.dirname(UTILS_PATH)), { recursive: true });
-  fs.writeFileSync(path.join(dir, UTILS_PATH), body);
-  return dir;
-}
-const read = dir => fs.readFileSync(path.join(dir, UTILS_PATH), 'utf8');
+// The real shape around the anchor: the outgoing message object closes, then the bot comment.
+const BEFORE = `            ...extraOptions,\n        };\n\n${ANCHOR}        if (botOptions) {\n`;
+const AFTER = `            ...extraOptions,\n        };\n\n${FIX}${ANCHOR}        if (botOptions) {\n`;
 
-/** The send's message literal as upstream writes it, ending where FIND ends. */
-const MESSAGE_LITERAL = `        const message = {
-            ...options,
-            id: newMsgKey,
-            ...mediaOptions,
-            ...(mediaOptions.toJSON ? mediaOptions.toJSON() : {}),
-${FIND}
-        if (botOptions) {
-            delete message.canonicalUrl;
-        }
-        return message;`;
-
-/** Runs the patched literal with a media model that carries the private id, as current builds do. */
-function buildMessage(source) {
-  const body = source.slice(source.indexOf('const message = {'));
-  const mediaOptions = { __x_id: undefined, mimetype: 'image/png', type: 'image' };
-  return new Function('options', 'newMsgKey', 'mediaOptions', 'extraOptions', 'botOptions', body)(
-    {},
-    'msg-key',
-    mediaOptions,
-    {},
-    undefined,
-  );
+function makeDependency(source) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openwa-media-id-'));
+  const utils = path.join(root, 'src', 'util', 'Injected', 'Utils.js');
+  fs.mkdirSync(path.dirname(utils), { recursive: true });
+  fs.writeFileSync(utils, source);
+  return { root, utils };
 }
 
-test("keeps the message's own id when the media model carries a private one", () => {
-  const dir = fakeWwjs(MESSAGE_LITERAL);
-  assert.ok('__x_id' in buildMessage(read(dir)), 'the unpatched literal lets the private id through');
+test('strips the media model id from the outgoing message before it is built', () => {
+  const { root, utils } = makeDependency(`head\n${BEFORE}tail\n`);
 
-  assert.deepStrictEqual(applyMediaIdPatch({ wwjsDir: dir }), { applied: true });
-  const message = buildMessage(read(dir));
+  const result = applyBackport(root);
 
-  assert.ok(!('__x_id' in message));
-  assert.strictEqual(message.id, 'msg-key');
-  assert.strictEqual(message.mimetype, 'image/png');
+  assert.deepEqual(result, { skipped: false, note: 'media model id stripped from outgoing messages' });
+  assert.equal(fs.readFileSync(utils, 'utf8'), `head\n${AFTER}tail\n`);
 });
 
-test('is idempotent, so a second install changes nothing', () => {
-  const dir = fakeWwjs(`prefix\n${FIND}\n suffix`);
-  applyMediaIdPatch({ wwjsDir: dir });
-  const after = read(dir);
+test('is idempotent once the fix is present', () => {
+  const { root, utils } = makeDependency(`head\n${AFTER}tail\n`);
+  const original = fs.readFileSync(utils, 'utf8');
 
-  assert.deepStrictEqual(applyMediaIdPatch({ wwjsDir: dir }), { applied: false, reason: 'already present' });
-  assert.strictEqual(read(dir), after);
+  assert.deepEqual(applyBackport(root), {
+    skipped: true,
+    reason: 'installed whatsapp-web.js already strips the media model id',
+  });
+  assert.equal(fs.readFileSync(utils, 'utf8'), original);
 });
 
-test('stands down once the library ships the upstream fix', () => {
-  const upstream = `        };\n\n        ${UPSTREAM_FIX}\n`;
-  const dir = fakeWwjs(upstream);
+test('reports the patch as applied only once the transform has run', () => {
+  const { root } = makeDependency(`head\n${BEFORE}tail\n`);
 
-  assert.deepStrictEqual(applyMediaIdPatch({ wwjsDir: dir }), { applied: false, reason: 'already present' });
-  assert.strictEqual(read(dir), upstream);
-  assert.strictEqual(isApplied(dir), true);
+  assert.equal(isApplied(root), false);
+  applyBackport(root);
+  assert.equal(isApplied(root), true);
 });
 
-test('refuses to patch an unrecognised shape rather than shipping without the fix', () => {
-  const dir = fakeWwjs('const message = { ...mediaOptions };');
+test('rejects an unknown dependency shape without changing it', () => {
+  const { root, utils } = makeDependency('window.WWebJS.sendMessage = async () => {};\n');
+  const original = fs.readFileSync(utils, 'utf8');
 
-  assert.throws(() => applyMediaIdPatch({ wwjsDir: dir }), /refusing to patch blind/);
-  assert.strictEqual(read(dir), 'const message = { ...mediaOptions };');
+  assert.throws(() => applyBackport(root), /unsupported Utils\.js shape/);
+  assert.equal(fs.readFileSync(utils, 'utf8'), original);
 });
 
-test('fails loudly when Utils.js is missing', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wwjs-empty-'));
+test('rejects an ambiguous dependency shape without changing it', () => {
+  const { root, utils } = makeDependency(`${BEFORE}${BEFORE}`);
+  const original = fs.readFileSync(utils, 'utf8');
 
-  assert.throws(() => applyMediaIdPatch({ wwjsDir: dir }), /Utils\.js not found/);
+  assert.throws(() => applyBackport(root), /unsupported Utils\.js shape/);
+  assert.equal(fs.readFileSync(utils, 'utf8'), original);
 });
 
-test('reports its own state to the startup guard, and reads an unreadable tree as applied', () => {
-  const dir = fakeWwjs(`prefix\n${FIND}\n suffix`);
-  assert.strictEqual(isApplied(dir), false);
+// The patch stands down when the fix is already there, so a shape carrying both the fix and a
+// second anchor is not one it understands either.
+test('rejects a fix present alongside a second anchor', () => {
+  const { root, utils } = makeDependency(`${AFTER}${BEFORE}`);
+  const original = fs.readFileSync(utils, 'utf8');
 
-  applyMediaIdPatch({ wwjsDir: dir });
-  assert.strictEqual(isApplied(dir), true);
-  assert.ok(REPLACE.includes(UPSTREAM_FIX));
-
-  // A tree we cannot inspect is not evidence of a broken one; a false alarm every boot is worse.
-  assert.strictEqual(isApplied(path.join(dir, 'nope')), true);
+  assert.throws(() => applyBackport(root), /unsupported Utils\.js shape/);
+  assert.equal(fs.readFileSync(utils, 'utf8'), original);
 });

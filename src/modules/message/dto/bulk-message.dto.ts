@@ -155,6 +155,9 @@ class BulkMessageOptionsDto {
   stopOnError?: boolean;
 }
 
+/** Max recipients in one bulk request. The guard applies the same cap BEFORE its per-chat lookups. */
+export const BULK_MESSAGES_MAX = 100;
+
 export class SendBulkMessageDto {
   @ApiPropertyOptional({ description: 'Custom batch ID (auto-generated if not provided)' })
   @IsOptional()
@@ -167,7 +170,7 @@ export class SendBulkMessageDto {
     type: [BulkMessageItemDto],
   })
   @IsArray()
-  @ArrayMaxSize(100)
+  @ArrayMaxSize(BULK_MESSAGES_MAX)
   @ValidateNested({ each: true })
   @Type(() => BulkMessageItemDto)
   messages!: BulkMessageItemDto[];

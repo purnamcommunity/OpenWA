@@ -1,20 +1,17 @@
 /**
- * Keep an outgoing media message's own id when the media model is spread into it.
+ * Strip the media model's private id from the outgoing message whatsapp-web.js builds.
  *
- * `window.WWebJS.sendMessage` builds the outgoing message by spreading `mediaOptions` — the
- * `MediaData` model `processMediaData` returns — into it, both directly and through its `toJSON()`.
- * Current WhatsApp Web builds give that model a private `__x_id` field, which is the same private
- * field the outgoing `Msg` model keeps its id in. The spread overwrites the message's `MsgKey`, and
- * `Msg` initialization fails inside the page with `Data passed to getter must include an id property
- * (it's how we memoize) but got undefined`, so every image, video, audio and document send answers
- * 500 while text sends keep working.
+ * `window.WWebJS.sendMessage` builds the outgoing message with `id: newMsgKey` and then spreads
+ * the media model returned by `processMediaData` into it. On the WhatsApp Web builds rolled out
+ * on 2026-09-17 that model carries an enumerable private `__x_id`, which lands on the plain object
+ * and clobbers the id when the `Msg` model initialises: every media send fails with "Data passed
+ * to getter must include an id property (it's how we memoize) but got undefined" while text keeps
+ * working. Upstream carries the one-line fix in whatsapp-web.js PR #201923, unmerged, with no
+ * release after 1.34.7; this applies the same line.
  *
- * The field is deleted after the spread, so the message is initialized with the `id` it was built
- * with. Adopted from the open upstream fix (wwebjs/whatsapp-web.js#201923, issue #201921); the
- * patcher stands down once the installed library carries that same deletion.
- *
- * Exact and self-disabling: an unknown shape fails the build rather than silently shipping without
- * the fix, matching the sibling patchers.
+ * The source transform is deliberately exact and self-disabling. An unknown shape fails the
+ * production image build instead of silently shipping without the fix, and the patch stands down
+ * once the installed tree carries the line itself.
  */
 'use strict';
 
@@ -23,26 +20,40 @@ const path = require('path');
 
 const DEFAULT_WWJS = path.join(__dirname, '..', 'node_modules', 'whatsapp-web.js');
 const UTILS_PATH = path.join('src', 'util', 'Injected', 'Utils.js');
+// The comment that follows the outgoing message object in sendMessage, unique in the file.
+const ANCHOR = "        // Bot's won't reply if canonicalUrl is set (linking)\n";
+const FIX = '        delete message.__x_id;\n\n';
 
-/** The end of the outgoing message literal and the line after it, byte-exact. */
-const FIND = `            ...extraOptions,
-        };
+function occurrences(source, needle) {
+  return source.split(needle).length - 1;
+}
 
-        // Bot's won't reply if canonicalUrl is set (linking)`;
+function applyBackport(wwjsDir = DEFAULT_WWJS) {
+  const utilsFile = path.join(wwjsDir, UTILS_PATH);
+  if (!fs.existsSync(utilsFile)) {
+    throw new Error(`whatsapp-web.js Utils.js not found at ${utilsFile}`);
+  }
 
-/** The same, with the media model's private id removed before the message is initialized. */
-const REPLACE = `            ...extraOptions,
-        };
+  const source = fs.readFileSync(utilsFile, 'utf8');
+  const anchorCount = occurrences(source, ANCHOR);
+  const fixCount = occurrences(source, FIX + ANCHOR);
 
-        // A spread MediaData model carries a private __x_id, the same field Msg keeps its id in.
-        // Left in place it replaces the MsgKey above and Msg initialization throws "Data passed to
-        // getter must include an id property", failing every media send.
-        delete message.__x_id;
+  if (anchorCount === 1 && fixCount === 1) {
+    return {
+      skipped: true,
+      reason: 'installed whatsapp-web.js already strips the media model id',
+    };
+  }
+  if (anchorCount !== 1 || fixCount !== 0) {
+    throw new Error(
+      `unsupported Utils.js shape (anchors: ${anchorCount}, fixes: ${fixCount}); ` +
+        're-evaluate the media id backport against the installed whatsapp-web.js',
+    );
+  }
 
-        // Bot's won't reply if canonicalUrl is set (linking)`;
-
-/** The upstream fix's own statement; its presence means the library no longer needs this patch. */
-const UPSTREAM_FIX = 'delete message.__x_id;';
+  fs.writeFileSync(utilsFile, source.replace(ANCHOR, FIX + ANCHOR));
+  return { skipped: false, note: 'media model id stripped from outgoing messages' };
+}
 
 /**
  * The stand-down branch above as a predicate, for the startup guard (engine-patch-status.ts).
@@ -50,38 +61,21 @@ const UPSTREAM_FIX = 'delete message.__x_id;';
  */
 function isApplied(wwjsDir = DEFAULT_WWJS) {
   try {
-    return fs.readFileSync(path.join(wwjsDir, UTILS_PATH), 'utf8').includes(UPSTREAM_FIX);
+    const source = fs.readFileSync(path.join(wwjsDir, UTILS_PATH), 'utf8');
+    return occurrences(source, ANCHOR) === 1 && occurrences(source, FIX + ANCHOR) === 1;
   } catch {
     return true;
   }
 }
 
-function applyMediaIdPatch({ wwjsDir = DEFAULT_WWJS } = {}) {
-  const utilsFile = path.join(wwjsDir, UTILS_PATH);
-  if (!fs.existsSync(utilsFile)) {
-    throw new Error(`whatsapp-web.js Utils.js not found at ${utilsFile}`);
-  }
-  const source = fs.readFileSync(utilsFile, 'utf8');
-
-  if (source.includes(UPSTREAM_FIX)) {
-    return { applied: false, reason: 'already present' };
-  }
-  if (source.split(FIND).length - 1 !== 1) {
-    throw new Error(`unexpected outgoing message shape in ${UTILS_PATH}: refusing to patch blind`);
-  }
-
-  fs.writeFileSync(utilsFile, source.replace(FIND, REPLACE));
-  return { applied: true };
-}
-
 function run() {
   const bestEffort = process.argv.includes('--best-effort');
   try {
-    const result = applyMediaIdPatch();
-    console.log(`patch-wwebjs-media-id: ${result.applied ? 'applied' : `skipped (${result.reason})`}`);
+    const result = applyBackport();
+    console.log(`patch-wwebjs-media-id: ${result.skipped ? `skipped: ${result.reason}` : result.note}`);
   } catch (error) {
     if (bestEffort) {
-      console.warn(`patch-wwebjs-media-id: skipped, ${error.message}`);
+      console.warn(`patch-wwebjs-media-id: skipped: ${error.message}`);
       return;
     }
     console.error(`patch-wwebjs-media-id: ${error.message}`);
@@ -91,4 +85,4 @@ function run() {
 
 if (require.main === module) run();
 
-module.exports = { applyMediaIdPatch, isApplied, FIND, REPLACE, UPSTREAM_FIX, UTILS_PATH };
+module.exports = { applyBackport, isApplied, ANCHOR, FIX };

@@ -29,7 +29,7 @@ export const OMITTED_MEDIA = { mimetype: '', omitted: true } as const;
  *   and an empty object would be noise).
  */
 export function buildMessageMetadata(
-  message: Pick<IncomingMessage, 'media' | 'quotedMessage' | 'call' | 'poll' | 'type'>,
+  message: Pick<IncomingMessage, 'media' | 'quotedMessage' | 'call' | 'poll' | 'buttons' | 'type'>,
   synthesizeOmittedMedia = false,
 ): Record<string, unknown> | undefined {
   const metadata: Record<string, unknown> = {};
@@ -49,6 +49,10 @@ export function buildMessageMetadata(
   // recover them (the engine's own history is the only other copy, and it ages out).
   if (message.poll) {
     metadata.poll = message.poll;
+  }
+  // Business prompt choices (Baileys). Kept so the dashboard can re-render clickable buttons after reload.
+  if (message.buttons?.length) {
+    metadata.buttons = message.buttons;
   }
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
