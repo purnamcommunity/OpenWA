@@ -71,5 +71,4 @@ describe('SessionsResource — exact paths', () => {
     expect(t.lastCall!.url).toBe('http://x/api/sessions/s1/presence');
     expect(t.lastCall!.body).toEqual({ available: false });
   });
-
 });
