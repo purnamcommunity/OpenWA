@@ -139,6 +139,7 @@ interface WireChatHistoryMessage {
   media?: { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
   quotedMessage?: { id: string; body: string };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   order?: { orderId: string; token?: string };
   product?: { productId: string; title?: string; description?: string; businessOwnerJid?: string };
 }
