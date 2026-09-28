@@ -80,6 +80,31 @@ export interface SessionResponse {
    * with no engine. Absent from a gateway that predates the field.
    */
   engineLoaded: boolean;
+  /**
+   * How far WhatsApp is through delivering the line's chats and history, as the engine observes it.
+   * `null` while the session is not connected, and always on the Baileys engine. Absent from a
+   * gateway that predates the field.
+   */
+  sync: SessionSync | null;
+}
+
+/**
+ * Chat/history sync progress of a connected session.
+ *
+ * `offline` is the catch-up of messages that arrived while the line was away (every connect has one,
+ * usually brief); `history` is the older-message sync after a new link, which can run for many
+ * minutes. `unknown` means the engine cannot tell, never that the sync is done.
+ */
+export interface SessionSync {
+  state: 'syncing' | 'synced' | 'unknown';
+  /** The running delivery while `syncing`; `null` otherwise. */
+  phase: 'offline' | 'history' | null;
+  /** Percent complete as WhatsApp reports it for the running phase, or `null` when it has not said. */
+  progress: number | null;
+  /** WhatsApp paused the history sync because the phone stopped sending; it resumes on its own. */
+  paused: boolean;
+  /** ISO timestamp of the last change to `state`, `phase`, `progress` or `paused`. */
+  updatedAt: string;
 }
 
 /**

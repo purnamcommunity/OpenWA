@@ -10714,6 +10714,55 @@
           "code"
         ]
       },
+      "SessionSyncDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "syncing",
+              "synced",
+              "unknown"
+            ],
+            "description": "`syncing` while WhatsApp is still delivering chats or history to the line; `synced` once the engine has seen that delivery finish; `unknown` when the engine cannot tell — its sync signals are unreadable, or WhatsApp stopped reporting progress before it finished.",
+            "example": "syncing"
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "offline",
+              "history"
+            ],
+            "nullable": true,
+            "description": "Which delivery is running while `syncing`: `offline` is the catch-up of messages that arrived while the line was away (every connect has one, usually brief); `history` is the older-message sync after a new link, which can run for many minutes. Null unless `syncing`.",
+            "example": "history"
+          },
+          "progress": {
+            "type": "number",
+            "nullable": true,
+            "description": "Percent complete as WhatsApp reports it for the running phase, or null when it has not said.",
+            "example": 42
+          },
+          "paused": {
+            "type": "boolean",
+            "description": "WhatsApp paused the history sync because the phone stopped sending; it resumes on its own once the phone is online.",
+            "example": false
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When `state`, `phase`, `progress` or `paused` last changed.",
+            "example": "2026-09-28T10:00:00.000Z"
+          }
+        },
+        "required": [
+          "state",
+          "phase",
+          "progress",
+          "paused",
+          "updatedAt"
+        ]
+      },
       "SessionResponseDto": {
         "type": "object",
         "properties": {
@@ -10791,6 +10840,16 @@
             "type": "boolean",
             "description": "Whether the gateway currently holds a live engine for this session. This is the precondition the lifecycle routes actually enforce, and `status` alone does not imply it: a `disconnected` session keeps its engine for the duration of an automatic reconnect backoff, while a session stopped through `POST /sessions/:sessionId/stop` carries the same status with no engine. When `true`, `stop`, `logout` and `force-kill` can act and `start` answers 400; when `false`, the reverse. Derived per request from live process state, so it is never persisted and never historical.",
             "example": true
+          },
+          "sync": {
+            "nullable": true,
+            "description": "How far WhatsApp is through delivering the line's chats and history, as the engine observes it. Null while the session is not connected, and always null on the Baileys engine, which does not report it. Derived per request from live engine state, so it is never persisted.",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionSyncDto"
+              }
+            ]
           }
         },
         "required": [
@@ -10799,7 +10858,8 @@
           "status",
           "createdAt",
           "updatedAt",
-          "engineLoaded"
+          "engineLoaded",
+          "sync"
         ]
       },
       "SessionConfigResponseDto": {

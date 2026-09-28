@@ -25,6 +25,7 @@ import {
   projectSessionProxy,
 } from './dto';
 import { EngineRegistry } from '../../engine/engine-registry.service';
+import { readEngineSyncState } from '../../engine/sync-state';
 import { SessionLivenessWatchdog } from './session-liveness-watchdog.service';
 import { SessionErrorStore } from './session-error-store.service';
 import { SessionRestrictionStore } from './session-restriction-store.service';
@@ -453,12 +454,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
-   * Attach the transient fields no column carries: why the session last failed, and whether
-   * WhatsApp is restricting its account. See SessionErrorStore / SessionRestrictionStore — each map
-   * and its projection live together.
+   * Attach the transient fields no column carries: why the session last failed, whether WhatsApp is
+   * restricting its account (SessionErrorStore / SessionRestrictionStore — each map and its
+   * projection live together), and how far the engine is through syncing the line's chats, read
+   * live from the engine when it reports one.
    */
   private attachRuntimeState(session: Session): Session {
-    return this.sessionRestrictions.attachTo(this.sessionErrors.attachTo(session));
+    const attached = this.sessionRestrictions.attachTo(this.sessionErrors.attachTo(session));
+    attached.sync = readEngineSyncState(this.engines.get(session.id));
+    return attached;
   }
 
   /**

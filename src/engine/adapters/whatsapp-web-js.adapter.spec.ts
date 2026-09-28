@@ -19,6 +19,7 @@ import {
   NAVIGATION_EPISODE_CAP_MS,
 } from './whatsapp-web-js.adapter';
 import { EXEC_CONTEXT_DESTROYED_PROBE_TIMEOUT_MS, EXEC_CONTEXT_DESTROYED_RECHECK_MS } from './wwebjs-lifecycle';
+import { BaileysAdapter } from './baileys.adapter';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
 import { readLeanContacts } from './wwebjs-contacts';
 import { changeAdminStatusInPage } from './wwebjs-groups';
@@ -8114,5 +8115,108 @@ describe('WhatsAppWebJsAdapter raw-id extraction hardening', () => {
     expect(info.id).toBe('120363000@g.us');
     expect(info.owner).toBe('628111@c.us');
     expect(info.participantCount).toBe(3);
+  });
+});
+
+describe('WhatsAppWebJsAdapter sync progress', () => {
+  type SyncClient = EventEmitter & {
+    info: { wid: { user: string }; pushname: string };
+    getState: jest.Mock;
+    destroy: jest.Mock;
+    pupPage: { exposeFunction: jest.Mock; evaluate: jest.Mock };
+  };
+  const idle = {
+    offline: { started: true, complete: true, progress: 100 },
+    history: { incomplete: false, realProgress: null, inProgress: false, paused: false, pausedOut: false },
+    recentHistoryComplete: false,
+  };
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  };
+  const setup = (): { adapter: WhatsAppWebJsAdapter; client: SyncClient } => {
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sync-1',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      destroy: jest.fn().mockResolvedValue(undefined),
+      // The onboarding watcher evaluates too; only the sync watcher's evaluate carries the binding name.
+      pupPage: {
+        exposeFunction: jest.fn().mockResolvedValue(undefined),
+        evaluate: jest.fn((_fn: unknown, arg?: unknown) =>
+          Promise.resolve(arg === 'openwaOnSyncProgress' ? idle : { modalPresent: false, dismissed: false }),
+        ),
+      },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    (adapter as unknown as { callbacks: unknown }).callbacks = {};
+    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    return { adapter, client };
+  };
+  const syncEvaluates = (client: SyncClient): number =>
+    (client.pupPage.evaluate.mock.calls as unknown[][]).filter(call => call[1] === 'openwaOnSyncProgress').length;
+  const push = (client: SyncClient, snapshot: unknown): void =>
+    ((client.pupPage.exposeFunction.mock.calls as unknown[][])[0][1] as (s: unknown) => void)(snapshot);
+
+  it('is null before the line is ready', () => {
+    const { adapter } = setup();
+    expect(adapter.getSyncState()).toBeNull();
+  });
+
+  it('reads a restored line as synced once ready, and re-arms on a re-emitted ready', async () => {
+    const { adapter, client } = setup();
+    client.emit('authenticated');
+    client.emit('ready');
+    await flush();
+
+    expect(adapter.getSyncState()).toMatchObject({ state: 'synced', phase: null });
+    expect(syncEvaluates(client)).toBe(1);
+
+    // A navigation re-inject replaces the document: the watcher is installed again, the binding kept.
+    client.emit('ready');
+    await flush();
+    expect(syncEvaluates(client)).toBe(2);
+    expect(client.pupPage.exposeFunction).toHaveBeenCalledTimes(1);
+
+    await adapter.destroy();
+  });
+
+  it('holds a line linked from a QR at syncing until WhatsApp confirms the history is done', async () => {
+    const { adapter, client } = setup();
+    client.emit('qr', 'qr-payload');
+    await flush();
+    client.emit('authenticated');
+    client.emit('ready');
+    await flush();
+
+    expect(adapter.getSyncState()).toMatchObject({ state: 'syncing', phase: 'history', progress: null });
+
+    push(client, { ...idle, history: { ...idle.history, incomplete: true, inProgress: true, realProgress: 40 } });
+    expect(adapter.getSyncState()).toMatchObject({ state: 'syncing', phase: 'history', progress: 40 });
+
+    push(client, { ...idle, history: { ...idle.history, realProgress: 100 } });
+    expect(adapter.getSyncState()).toMatchObject({ state: 'synced' });
+
+    await adapter.destroy();
+  });
+
+  it('drops the state when the line disconnects, and ignores a late push', async () => {
+    const { adapter, client } = setup();
+    client.emit('authenticated');
+    client.emit('ready');
+    await flush();
+    expect(adapter.getSyncState()).not.toBeNull();
+
+    client.emit('disconnected', 'NAVIGATION');
+    expect(adapter.getSyncState()).toBeNull();
+    push(client, { ...idle, offline: { started: true, complete: false, progress: 5 } });
+    expect(adapter.getSyncState()).toBeNull();
+  });
+
+  it('is not reported by the Baileys engine', () => {
+    expect('getSyncState' in BaileysAdapter.prototype).toBe(false);
   });
 });

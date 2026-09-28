@@ -99,6 +99,23 @@ const (
 	RestrictionProxyBlock       AccountRestrictionKind = "proxy_block"
 )
 
+// SessionSyncState is whether WhatsApp is still delivering a session's chats and history.
+type SessionSyncState string
+
+const (
+	SessionSyncSyncing SessionSyncState = "syncing"
+	SessionSyncSynced  SessionSyncState = "synced"
+	SessionSyncUnknown SessionSyncState = "unknown"
+)
+
+// SessionSyncPhase is the delivery running while a session is syncing.
+type SessionSyncPhase string
+
+const (
+	SessionSyncPhaseOffline SessionSyncPhase = "offline"
+	SessionSyncPhaseHistory SessionSyncPhase = "history"
+)
+
 // PresenceState is a subscribed contact's presence.
 type PresenceState string
 
@@ -144,6 +161,26 @@ type AccountRestriction struct {
 	ExpiresAt *string `json:"expiresAt,omitempty"`
 }
 
+// SessionSync is the chat/history sync progress of a connected session.
+//
+// "offline" is the catch-up of messages that arrived while the line was away (every connect has one,
+// usually brief); "history" is the older-message sync after a new link, which can run for many
+// minutes. "unknown" means the engine cannot tell, never that the sync is done.
+type SessionSync struct {
+	// State is one of: syncing, synced, unknown.
+	State SessionSyncState `json:"state"`
+	// Phase is the running delivery while syncing (offline or history); nil otherwise.
+	Phase *SessionSyncPhase `json:"phase"`
+	// Progress is the percent complete WhatsApp reports for the running phase; nil when it has not
+	// said.
+	Progress *float64 `json:"progress"`
+	// Paused reports that WhatsApp paused the history sync because the phone stopped sending; it
+	// resumes on its own.
+	Paused bool `json:"paused"`
+	// UpdatedAt is an ISO timestamp of the last change to State, Phase, Progress or Paused.
+	UpdatedAt string `json:"updatedAt"`
+}
+
 // SessionResponse describes a WhatsApp session. Status is one of: created,
 // initializing, qr_ready, authenticating, ready, disconnected, action_required,
 // failed.
@@ -166,6 +203,9 @@ type SessionResponse struct {
 	// "disconnected" covers both a session mid automatic-reconnect (engine present) and one stopped
 	// with no engine. Nil from a gateway that predates the field.
 	EngineLoaded bool `json:"engineLoaded"`
+	// Sync reports how far WhatsApp is through delivering the line's chats and history, as the
+	// engine observes it. Nil while the session is not connected, and always on the Baileys engine.
+	Sync *SessionSync `json:"sync"`
 }
 
 // ProxyType is the scheme of a session proxy.

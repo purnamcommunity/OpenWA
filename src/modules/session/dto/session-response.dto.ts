@@ -34,6 +34,54 @@ export class AccountRestrictionDto {
   expiresAt?: Date | null;
 }
 
+export class SessionSyncDto {
+  @ApiProperty({
+    enum: ['syncing', 'synced', 'unknown'],
+    description:
+      '`syncing` while WhatsApp is still delivering chats or history to the line; `synced` once the ' +
+      'engine has seen that delivery finish; `unknown` when the engine cannot tell — its sync signals ' +
+      'are unreadable, or WhatsApp stopped reporting progress before it finished.',
+    example: 'syncing',
+  })
+  state!: 'syncing' | 'synced' | 'unknown';
+
+  @ApiProperty({
+    type: String,
+    enum: ['offline', 'history'],
+    nullable: true,
+    description:
+      'Which delivery is running while `syncing`: `offline` is the catch-up of messages that arrived ' +
+      'while the line was away (every connect has one, usually brief); `history` is the older-message ' +
+      'sync after a new link, which can run for many minutes. Null unless `syncing`.',
+    example: 'history',
+  })
+  phase!: 'offline' | 'history' | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: 'Percent complete as WhatsApp reports it for the running phase, or null when it has not said.',
+    example: 42,
+  })
+  progress!: number | null;
+
+  @ApiProperty({
+    description:
+      'WhatsApp paused the history sync because the phone stopped sending; it resumes on its own ' +
+      'once the phone is online.',
+    example: false,
+  })
+  paused!: boolean;
+
+  @ApiProperty({
+    type: String,
+    format: 'date-time',
+    description: 'When `state`, `phase`, `progress` or `paused` last changed.',
+    example: '2026-09-28T10:00:00.000Z',
+  })
+  updatedAt!: string;
+}
+
 export class SessionResponseDto {
   @ApiProperty({ example: '0a941dac-a965-45e7-b318-74ae8be134f0' })
   id!: string;
@@ -98,6 +146,16 @@ export class SessionResponseDto {
   })
   engineLoaded!: boolean;
 
+  @ApiProperty({
+    type: SessionSyncDto,
+    nullable: true,
+    description:
+      "How far WhatsApp is through delivering the line's chats and history, as the engine observes " +
+      'it. Null while the session is not connected, and always null on the Baileys engine, which does ' +
+      'not report it. Derived per request from live engine state, so it is never persisted.',
+  })
+  sync!: SessionSyncDto | null;
+
   /**
    * Map a Session entity to the public response shape, stripping sensitive
    * engine config fields (`config`, `proxyUrl`, `proxyType`) that must not
@@ -130,6 +188,7 @@ export class SessionResponseDto {
           }
         : null,
       engineLoaded,
+      sync: session.sync ?? null,
     };
   }
 }
