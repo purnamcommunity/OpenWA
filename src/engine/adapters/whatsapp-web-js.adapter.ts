@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import type { QrTiming } from '../qr-timing';
+import type { EngineSyncState, EngineSyncStateReporter } from '../sync-state';
 import { MessageMedia, type Client, type Message } from 'whatsapp-web.js';
 import {
   CallLinkType,
@@ -132,7 +133,7 @@ export {
 } from './wwebjs-lifecycle';
 export { READY_RECONCILE_TIMEOUT_MS, READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS } from './wwebjs-reconcile';
 
-export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
+export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine, EngineSyncStateReporter {
   private readonly logger = createLogger('WhatsAppWebJsAdapter');
   // Bound concurrent inbound media downloads: downloadMedia() materialises the full base64 blob, so an
   // unbounded burst could stack many multi-MB allocations.
@@ -465,6 +466,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   getPushName(): string | null {
     return this.lifecycle.getPushName();
+  }
+
+  getSyncState(): EngineSyncState | null {
+    return this.lifecycle.getSyncState();
   }
 
   private recoverFromStuckAuth(): Promise<void> {

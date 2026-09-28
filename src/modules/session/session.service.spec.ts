@@ -911,6 +911,34 @@ describe('SessionService', () => {
 
       await expect(service.findOne('nonexistent')).rejects.toThrow(NotFoundException);
     });
+
+    it("attaches the live engine's sync state, read at request time", async () => {
+      const sync = {
+        state: 'syncing',
+        phase: 'offline',
+        progress: 12,
+        paused: false,
+        updatedAt: '2026-09-28T10:00:00.000Z',
+      };
+      const getSyncState = jest.fn().mockReturnValue(sync);
+      (service as unknown as { engines: Map<string, unknown> }).engines.set('sess-uuid-1', { getSyncState });
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+
+      const result = await service.findOne('sess-uuid-1');
+
+      expect(result.sync).toEqual(sync);
+      expect(getSyncState).toHaveBeenCalledTimes(1);
+    });
+
+    it('attaches null sync when no engine is loaded, or the engine does not report one', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      expect((await service.findOne('sess-uuid-1')).sync).toBeNull();
+
+      // An engine without getSyncState (Baileys) reads as null rather than throwing.
+      (service as unknown as { engines: Map<string, unknown> }).engines.set('sess-uuid-1', {});
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      expect((await service.findOne('sess-uuid-1')).sync).toBeNull();
+    });
   });
 
   // ── start (concurrency) ───────────────────────────────────────────

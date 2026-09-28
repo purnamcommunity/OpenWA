@@ -3,6 +3,7 @@ import { SessionController as SessionControllerClass } from './session.controlle
 import { SessionStatus } from './entities/session.entity';
 import type { Session } from './entities/session.entity';
 import type { SessionService } from './session.service';
+import { SessionResponseDto } from './dto/session-response.dto';
 import type { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import type { ApiKey } from '../auth/entities/api-key.entity';
@@ -71,7 +72,21 @@ describe('SessionController — create() response contract', () => {
       lastError: null,
       restriction: null,
       engineLoaded: false,
+      sync: null,
     });
+  });
+
+  it('passes the sync state the service attached through unchanged', () => {
+    const sync = {
+      state: 'syncing' as const,
+      phase: 'history' as const,
+      progress: 40,
+      paused: false,
+      updatedAt: '2026-09-28T10:00:00.000Z',
+    };
+    const result = SessionResponseDto.fromEntity({ ...entity, sync }, true);
+
+    expect(result.sync).toEqual(sync);
   });
 
   // engineLoaded is live process state, not an entity column, so the only thing that can get it wrong

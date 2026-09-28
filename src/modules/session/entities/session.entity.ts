@@ -2,6 +2,7 @@ import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateCol
 import { DateTransformer } from '../../../common/transformers/date.transformer';
 import { jsonColumnType, dateColumnType } from '../../../common/utils/column-types';
 import type { AccountRestriction } from '../../../engine/interfaces/whatsapp-engine.interface';
+import type { EngineSyncState } from '../../../engine/sync-state';
 
 export enum SessionStatus {
   CREATED = 'created',
@@ -100,4 +101,10 @@ export class Session {
    * why it is runtime state rather than a column.
    */
   restriction?: AccountRestriction | null;
+
+  /**
+   * Transient (non-persisted) chat/history sync progress of the session's engine, or null when the
+   * engine is not connected or does not report one. Read live at request time.
+   */
+  sync?: EngineSyncState | null;
 }

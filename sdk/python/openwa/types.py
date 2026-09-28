@@ -232,6 +232,25 @@ class AccountRestriction(TypedDict):
     expiresAt: NotRequired[str | None]
 
 
+class SessionSync(TypedDict):
+    """Chat/history sync progress of a connected session.
+
+    'offline' is the catch-up of messages that arrived while the line was away (every connect has
+    one, usually brief); 'history' is the older-message sync after a new link, which can run for
+    many minutes. 'unknown' means the engine cannot tell, never that the sync is done.
+    """
+
+    state: Literal["syncing", "synced", "unknown"]
+    # The running delivery while 'syncing'; None otherwise.
+    phase: Literal["offline", "history"] | None
+    # Percent complete as WhatsApp reports it for the running phase, or None when it has not said.
+    progress: float | None
+    # WhatsApp paused the history sync because the phone stopped sending; it resumes on its own.
+    paused: bool
+    # ISO timestamp of the last change to state, phase, progress or paused.
+    updatedAt: str
+
+
 class SessionResponse(TypedDict):
     id: str
     name: str
@@ -251,6 +270,9 @@ class SessionResponse(TypedDict):
     # session mid automatic-reconnect (engine present) and one stopped with no engine. Absent from a
     # gateway that predates the field (the TypedDict is total=False).
     engineLoaded: bool
+    # How far WhatsApp is through delivering the line's chats and history, as the engine observes
+    # it. None while the session is not connected, and always on the Baileys engine.
+    sync: SessionSync | None
 
 
 class SessionProxy(TypedDict):

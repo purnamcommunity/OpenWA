@@ -21,6 +21,8 @@ import { unappliedPatches, unappliedPatchesMessage } from './engine-patch-status
 import { type WhatsAppWebJsConfig } from './whatsapp-web-js.adapter';
 import { AUTH_FAILURE_REASON, STALE_PROFILE_ADVICE } from '../terminal-engine-failure';
 import { wwjsAuthDir } from '../auth-dir-paths';
+import { type EngineSyncState } from '../sync-state';
+import { WwebjsSyncTracker } from './wwebjs-sync-progress';
 
 /**
  * Detect Puppeteer's "Execution context was destroyed" error. During `Client.inject()` this is most
@@ -200,8 +202,18 @@ export class WwebjsLifecycle {
   // The one pending re-check of an "Execution context was destroyed" transport error (see
   // reportIfPageTransportError). Unref'd, at most one per adapter, and cleared by teardown.
   private execContextRecheckTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set once this adapter shows a QR: a line linked here has its history sync still ahead of it. */
+  private linkedFromQr = false;
+  /** Chat/history sync progress of the READY client (./wwebjs-sync-progress). */
+  private readonly syncTracker: WwebjsSyncTracker;
 
-  constructor(private readonly host: WwebjsLifecycleHost) {}
+  constructor(private readonly host: WwebjsLifecycleHost) {
+    this.syncTracker = new WwebjsSyncTracker({
+      logger: host.logger,
+      sessionId: host.config.sessionId,
+      isCurrent: client => this.client === client && !this.tearingDown && !this.disconnectReported,
+    });
+  }
 
   async initialize(): Promise<void> {
     this.setStatus(EngineStatus.INITIALIZING);
@@ -533,6 +545,7 @@ export class WwebjsLifecycle {
         }
         this.qrCode = encodedQr;
         this.qrTiming = nextQrTiming(this.qrTiming, Date.now());
+        this.linkedFromQr = true;
         this.setStatus(EngineStatus.QR_READY);
         this.host.getCallbacks().onQRCode?.(this.qrCode);
       } catch (error) {
@@ -582,7 +595,12 @@ export class WwebjsLifecycle {
         });
         return;
       }
+      // A re-emitted 'ready' on a line that is already READY follows a navigation re-inject: the new
+      // document has none of the sync watcher's listeners, so arm it again. The first READY arms it
+      // inside markReadyFromClientInfo, which also covers a promotion by the readiness reconcile.
+      const alreadyUp = this.status === EngineStatus.READY || this.status === EngineStatus.ACTION_REQUIRED;
       this.markReadyFromClientInfo();
+      if (alreadyUp && this.client) this.syncTracker.arm(this.client, this.linkedFromQr);
     });
 
     // Message/group/call domain events: registered through the adapter's attachDomainEvents seam,
@@ -922,6 +940,7 @@ export class WwebjsLifecycle {
     // gets the companion unlinked (~5m later → disconnected: LOGOUT, #982). Dismiss it best-effort
     // and fall back to ACTION_REQUIRED. Started after READY so a non-ready session never arms it.
     this.host.startOnboardingWatcher();
+    if (this.client) this.syncTracker.arm(this.client, this.linkedFromQr);
   }
 
   /** The single status-transition funnel: latches disconnectReported, fires the callback, re-emits
@@ -940,6 +959,10 @@ export class WwebjsLifecycle {
     // dead QR to be served over GET /qr for the whole reconnect backoff.
     if (status !== EngineStatus.QR_READY) {
       this.qrCode = null;
+    }
+    // Sync progress describes a connected page; it ends with the connection, whichever path ends it.
+    if (status === EngineStatus.DISCONNECTED || status === EngineStatus.FAILED) {
+      this.syncTracker.reset();
     }
     this.status = status;
     this.host.getCallbacks().onStateChanged?.(status);
@@ -1089,6 +1112,12 @@ export class WwebjsLifecycle {
 
   getPhoneNumber(): string | null {
     return this.phoneNumber;
+  }
+
+  /** Chat/history sync progress while the line is connected; null otherwise. */
+  getSyncState(): EngineSyncState | null {
+    if (this.status !== EngineStatus.READY && this.status !== EngineStatus.ACTION_REQUIRED) return null;
+    return this.syncTracker.getState();
   }
 
   getPushName(): string | null {

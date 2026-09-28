@@ -224,7 +224,14 @@ List all sessions, scoped to the API key's `allowedSessions`, ordered `createdAt
     "updatedAt": "2026-06-25T09:01:55.000Z",
     "lastError": null,
     "restriction": null,
-    "engineLoaded": true
+    "engineLoaded": true,
+    "sync": {
+      "state": "synced",
+      "phase": null,
+      "progress": null,
+      "paused": false,
+      "updatedAt": "2026-06-25T08:16:40.000Z"
+    }
   }
 ]
 ```
@@ -240,6 +247,16 @@ List all sessions, scoped to the API key's `allowedSessions`, ordered `createdAt
 | `proxy_block`       | WhatsApp Web refuses the egress address the session connects from (`PROXYBLOCK`) — about the route, not the account.                                                                      | whatsapp-web.js |
 
 `code` is the engine's own token for the cause, passed through verbatim (`TOS_BLOCK`, `BIZ_QUALITY`, `WEB_COMPANION_ONLY`, …), so a value newer than your gateway build still reaches you rather than being flattened. Because `tos_block`/`proxy_block` prevent the session from linking at all, neither can appear alongside a `ready` status; a `reachout_timelock` can, and usually does. Like `engineLoaded`, the field is derived from live engine state, never persisted, and re-established on the next connect. Changes are also delivered as the `session.restriction` webhook.
+
+`sync` reports how far WhatsApp is through delivering the line's chats and history, as the engine observes it. It is `null` while the session is not connected (any status other than `ready` or `action_required`), and always `null` on the Baileys engine, which does not report it. Otherwise it is `{ state, phase, progress, paused, updatedAt }`:
+
+| `state`   | Meaning                                                                                                                                                                                                                                                             |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `syncing` | WhatsApp is still delivering. `phase` says which delivery: `offline` is the catch-up of messages that arrived while the line was away (every connect has one, usually brief); `history` is the older-message sync after a new link, which can run for many minutes. |
+| `synced`  | The engine has seen the delivery finish.                                                                                                                                                                                                                            |
+| `unknown` | The engine cannot tell: WhatsApp Web's sync signals are unreadable, or WhatsApp stopped reporting progress on a new link before confirming it finished.                                                                                                             |
+
+`progress` is the percent WhatsApp reports for the running phase, or `null` before it has said. `paused` is `true` while WhatsApp has paused the history sync because the phone stopped sending; it resumes on its own. `updatedAt` is when any of the other four last changed. The field is read from live engine state per request and never persisted; a line that reconnects starts again from its catch-up.
 
 `engineLoaded` reports whether the gateway holds a live engine for the session at the moment of the response. It is the precondition the lifecycle routes enforce, and **`status` is not a substitute for it**: `disconnected` covers both a session whose engine is still registered while an automatic reconnect backs off — where `POST /start` answers `400` — and one stopped through `POST /stop`, which has no engine and does need a start. When `engineLoaded` is `true`, `stop`, `logout` and `force-kill` can act; when it is `false`, `start` is the applicable route. The field is derived per request from live process state, so it is never persisted and never appears in historical/exported data.
 
@@ -271,7 +288,14 @@ Get a single session by ID.
   "createdAt": "2026-06-20T11:30:00.000Z",
   "updatedAt": "2026-06-25T09:01:55.000Z",
   "lastError": null,
-  "engineLoaded": true
+  "engineLoaded": true,
+  "sync": {
+    "state": "syncing",
+    "phase": "history",
+    "progress": 42,
+    "paused": false,
+    "updatedAt": "2026-06-25T09:01:50.000Z"
+  }
 }
 ```
 
@@ -611,7 +635,8 @@ by the proxy, so the connection there cannot be pinned to the address that was v
   "createdAt": "2026-06-25T09:00:00.000Z",
   "updatedAt": "2026-06-25T09:00:00.000Z",
   "lastError": null,
-  "engineLoaded": false
+  "engineLoaded": false,
+  "sync": null
 }
 ```
 
@@ -647,7 +672,8 @@ No request body.
   "createdAt": "2026-06-20T11:30:00.000Z",
   "updatedAt": "2026-06-25T09:05:00.000Z",
   "lastError": null,
-  "engineLoaded": true
+  "engineLoaded": true,
+  "sync": null
 }
 ```
 
@@ -683,7 +709,8 @@ No request body.
   "createdAt": "2026-06-20T11:30:00.000Z",
   "updatedAt": "2026-06-25T09:10:00.000Z",
   "lastError": null,
-  "engineLoaded": false
+  "engineLoaded": false,
+  "sync": null
 }
 ```
 
@@ -751,7 +778,8 @@ No request body.
   "createdAt": "2026-06-20T11:30:00.000Z",
   "updatedAt": "2026-06-25T09:11:00.000Z",
   "lastError": null,
-  "engineLoaded": false
+  "engineLoaded": false,
+  "sync": null
 }
 ```
 
@@ -789,7 +817,8 @@ No request body.
   "createdAt": "2026-06-20T11:30:00.000Z",
   "updatedAt": "2026-06-25T09:12:00.000Z",
   "lastError": null,
-  "engineLoaded": false
+  "engineLoaded": false,
+  "sync": null
 }
 ```
 

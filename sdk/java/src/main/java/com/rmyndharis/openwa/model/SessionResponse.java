@@ -24,4 +24,9 @@ public record SessionResponse(
      * session mid automatic-reconnect (engine present) and one stopped with no engine. {@code null}
      * from a gateway older than the field.
      */
-    Boolean engineLoaded) {}
+    Boolean engineLoaded,
+    /**
+     * How far WhatsApp is through delivering the line's chats and history, as the engine observes
+     * it. {@code null} while the session is not connected, and always on the Baileys engine.
+     */
+    SessionSync sync) {}
