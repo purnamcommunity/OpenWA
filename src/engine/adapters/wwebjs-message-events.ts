@@ -1,4 +1,4 @@
-import { type Client, MessageTypes } from 'whatsapp-web.js';
+import { type Client, type Message, MessageTypes } from 'whatsapp-web.js';
 import {
   type IncomingMessage,
   type RevokedMessage,
@@ -10,6 +10,19 @@ import { buildEditedMessage, buildIncomingMessageBase, mapContactFields } from '
 import { mapWwebjsPollVoteEvent, type RawWwebjsPollVote } from './wwebjs-poll-votes';
 import { extractWwebjsCall, wwebjsAckToDeliveryStatus } from './wwebjs-messaging';
 import { type WwebjsEngineHost } from './wwebjs-host';
+
+/** Message types whose content is an upload, and so can be announced before it exists. */
+const UPLOADED_MEDIA_TYPES = new Set<string>([
+  MessageTypes.IMAGE,
+  MessageTypes.VIDEO,
+  MessageTypes.AUDIO,
+  MessageTypes.VOICE,
+  MessageTypes.DOCUMENT,
+  MessageTypes.STICKER,
+]);
+
+/** How many own sends may wait for their upload at once; the oldest is forgotten past this. */
+const AWAITING_UPLOAD_MAX = 500;
 
 /**
  * Message-domain client events (message, message_create, ack, revoke, reaction, edit) extracted
@@ -88,6 +101,40 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
     }
   });
 
+  // Own sends whose `message_create` fired before their upload finished. whatsapp-web.js reports
+  // `hasMedia` only once the upload has a `directPath`, so such an echo carries the thumbnail as its
+  // body — no caption, no media. A forward composed on WhatsApp Web is the usual case. The id waits
+  // here for `media_uploaded`, which announces the same message again, complete. Bounded: an upload
+  // that never finishes must not grow this set for the life of the process.
+  const awaitingUpload = new Set<string>();
+
+  const emitOwnSend = async (msg: Message): Promise<void> => {
+    const incomingMessage = buildIncomingMessageBase(msg);
+    // Call-log detail, exactly as the incoming path attaches it. Every OUTGOING call log arrives
+    // here rather than through `message`, so without it a placed call reaches a consumer as a
+    // bodiless `call` message with nothing to say whether it was video, or answered.
+    const call = extractWwebjsCall(msg);
+    if (call) incomingMessage.call = call;
+    // Enrich with the media payload through the same capped path the incoming handler uses — the
+    // base builder is sync and carries none, so a phone-sent image would otherwise persist and
+    // render as a bare 📎 marker even though the media is downloadable right here.
+    if (msg.hasMedia) {
+      try {
+        incomingMessage.media = await host.capInboundMediaFor(msg);
+      } catch (error) {
+        host.logger.warn('Own-send media download failed; emitting echo without media', {
+          msgId: msg.id?._serialized,
+          error: String(error),
+        });
+      }
+    }
+    try {
+      host.getCallbacks().onMessageCreate?.(incomingMessage);
+    } catch (error) {
+      host.logger.error('Error processing outgoing message', String(error));
+    }
+  };
+
   client.on('message_create', msg => {
     // `message_create` fires for every message the account creates — including ones composed on a
     // linked phone, which the `message` event above never delivers. Incoming messages are already
@@ -96,34 +143,24 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
     if (!msg.fromMe) {
       return;
     }
+    const id = msg.id?._serialized;
+    if (id && !msg.hasMedia && UPLOADED_MEDIA_TYPES.has(msg.type)) {
+      if (awaitingUpload.size >= AWAITING_UPLOAD_MAX) {
+        const oldest = awaitingUpload.values().next().value;
+        if (oldest !== undefined) awaitingUpload.delete(oldest);
+      }
+      awaitingUpload.add(id);
+    }
+    void emitOwnSend(msg);
+  });
 
-    void (async () => {
-      const incomingMessage = buildIncomingMessageBase(msg);
-      // Call-log detail, exactly as the incoming path attaches it. Every OUTGOING call log arrives
-      // here rather than through `message`, so leaving it off meant a placed call reached a
-      // consumer as a bodiless `call` message with nothing to say whether it was video, or
-      // answered — and a consumer keying call history off that record logged nothing at all.
-      const call = extractWwebjsCall(msg);
-      if (call) incomingMessage.call = call;
-      // Enrich with the media payload through the same capped path the incoming handler uses —
-      // the base builder is sync and carries none, so a phone-sent image would otherwise persist
-      // and render as a bare 📎 marker even though the media is downloadable right here.
-      if (msg.hasMedia) {
-        try {
-          incomingMessage.media = await host.capInboundMediaFor(msg);
-        } catch (error) {
-          host.logger.warn('Own-send media download failed; emitting echo without media', {
-            msgId: msg.id?._serialized,
-            error: String(error),
-          });
-        }
-      }
-      try {
-        host.getCallbacks().onMessageCreate?.(incomingMessage);
-      } catch (error) {
-        host.logger.error('Error processing outgoing message', String(error));
-      }
-    })();
+  // Re-announces only an echo that went out incomplete (see `awaitingUpload`). An own send whose
+  // first echo already carried its media is not repeated, so a consumer sees a second
+  // `message.sent` for an id only when the first one was missing its caption and media.
+  client.on('media_uploaded', msg => {
+    const id = msg.id?._serialized;
+    if (!id || !awaitingUpload.delete(id)) return;
+    void emitOwnSend(msg);
   });
 
   client.on('message_ack', (msg, ack) => {
