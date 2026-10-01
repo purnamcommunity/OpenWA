@@ -5,7 +5,7 @@ Three-way comparison of every capability: the **Baileys library** (`@whiskeysock
 its adapter layer and REST API — including which "supported" cells only work because OpenWA patches
 the installed library. Coverage is total: all 123 `IWhatsAppEngine` methods (29.4), **all 152
 Baileys + 81 whatsapp-web.js library methods** (29.5), all 34 + 31 library events (29.5.4), and all
-17 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
+18 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
 
 ## 29.1 How to read this matrix
 
@@ -49,7 +49,7 @@ flowchart LR
         IF --> BA["BaileysAdapter"]
         SVC --> STORE["OpenWA-side stores"]
     end
-    WA --> WLIB["whatsapp-web.js 1.34.7<br/>+ 15 OpenWA patches"]
+    WA --> WLIB["whatsapp-web.js 1.34.7<br/>+ 16 OpenWA patches"]
     BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc14<br/>+ 2 OpenWA patches"]
     WLIB --> WEB["WhatsApp Web<br/>headless Chromium"]
     BLIB --> WAS["WhatsApp servers<br/>browser-free socket"]
@@ -127,7 +127,7 @@ wrong interface method. Those three remain reader-verified.
 
 ## 29.3 Install-time patches OpenWA applies to the libraries
 
-OpenWA ships seventeen exact, self-disabling source transforms over the installed engines. Each runs at
+OpenWA ships eighteen exact, self-disabling source transforms over the installed engines. Each runs at
 `npm install` (`scripts/postinstall.js`, `--best-effort`) and again in the Docker production stage
 (**without** best-effort — dependency drift fails the image build). "Self-disabling" means the
 patcher no-ops once the fix is present upstream, and an unrecognized source shape fails loudly
@@ -140,7 +140,7 @@ it is missing as it starts (`src/engine/adapters/engine-patch-status.ts`; 🔧¹
 check described below). The report is diagnostic, not preventive: startup continues, so a session
 reaching READY is not evidence that every patch landed. See docs/12 for the operator procedure.
 
-### 29.3.1 The seventeen patches
+### 29.3.1 The eighteen patches
 
 | #    | Patcher                                                    | Library target                              | What it repairs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Stand-down predicate                                                                                                                                                                                                                                                                                                                                                  |
 | ---- | ---------------------------------------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -161,10 +161,11 @@ reaching READY is not evidence that every patch landed. See docs/12 for the oper
 | 🔧¹⁵ | `scripts/patch-wwebjs-group-invite.js`                     | whatsapp-web.js `GroupChat.js`, `Client.js` | `WAWebMexFetchGroupInviteCodeJob` and `WAWebGroupInviteJob` ship in the lazy bundle WhatsApp Web loads only when a human opens "Invite to group via link", so on a headless page `window.require` answers `undefined` for both. `GroupChat.getInviteCode()` and `Client.acceptInvite()` then read their job off `undefined`, and `GroupChat.revokeInvite()` still calls `resetGroupInviteCode` on `WAWebGroupQueryJob`, which no longer has it: it lives in `WAWebGroupInviteJob` now. The patch loads the bundle through `WAWebGroupInviteLinkDrawerLoadable.requireBundle()` whenever the job is missing, points the revoke at `WAWebGroupInviteJob`, passes the invite's `membershipApprovalMode` to `joinGroupViaInvite` (without it a group that requires approval throws `UnexpectedJoinGroupViaInviteResponse`), and reads the MEX job's "invite code is null" error as no code. The loader is the one the open upstream fix #201917 (issue #201916) uses; that fix covers the code read and the join but not the revoke.                                                                                                                   | exact-shape match per call; a call already carrying the upstream loader stands down on its own; unknown shape fails the build.                                                                                                                                                                                                                                        |
 | 🔧¹⁶ | `scripts/patch-wwebjs-send-error.js`                       | whatsapp-web.js `Client.js`                 | Without it, a send the page refuses reaches OpenWA as the minified `t: t`, with nothing but Node frames: puppeteer rebuilds a page-side exception from its class name and description only, and WhatsApp Web's own error classes are minified to one letter and keep their detail in their own properties. The patch wraps the `window.WWebJS.sendMessage` call inside `Client.sendMessage`'s evaluate. A plain `Error`, which is what whatsapp-web.js's own send failures and WhatsApp Web's `No LID for user` already are, is rethrown as the same object, so its text and OpenWA's matching on it are unchanged. Anything else is rethrown as an `Error` reading `page threw {...}`, a capped JSON summary of the WhatsApp Web build actually running, the constructor name, `name`, `message`, `stack` and the value's own properties. Diagnostic only: a successful send returns what it returned before, and the dead-page classifier never reads a captured error as a transport death.                                                                                                                                                     | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
 | 🔧¹⁷ | `scripts/patch-wwebjs-download-mimetype.js`                | whatsapp-web.js `Message.js`                | Every download of inbound media the page had not decrypted before failed on current WhatsApp Web builds, so webhooks, the chat-media archive and `history?includeMedia=true` carried the `omitted` marker and the media route answered `404`. `Message#downloadMedia()` calls `downloadAndMaybeDecrypt()` without a `mimetype`; WhatsApp Web defaults the missing value to `application/octet-stream`, rejects it as the wrong type for the media, and the `InvalidMediaFileType` it throws reaches OpenWA as `t: t`. A file the page already decrypted comes from a cache keyed by file hash and skips that check, which is why some downloads kept working. The patch passes `msg.mimetype` to the call, the fix diagnosed in whatsapp-web.js issue #201908 (no release after 1.34.7). It stands down once the installed tree carries that line.                                                                                                                                                                                                                                                                                                 | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
+| 🔧¹⁸ | `scripts/patch-wwebjs-forward-bundle.js`                   | whatsapp-web.js `Injected/Utils.js`         | `WAWebChatForwardMessage` ships in the lazy bundle WhatsApp Web loads only when a human opens the forward dialog, so on a headless page `window.require` answers `undefined` for it and `window.WWebJS.forwardMessage` fails reading `.forwardMessages` off `undefined`: every forward answered an opaque `500`. The patch calls `WAWebForwardMessageFlowLoadable.requireBundle()` inside the helper when the module is still missing; a page that already holds the bundle pays nothing, and a page reload drops it, so the check runs on every forward. `forwardMessages` keeps the options object whatsapp-web.js passes. It stands down once the installed tree loads the bundle itself.                                                                                                                                                                                                                                                                                                                                                                                                                                                       | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
 
 ### 29.3.2 Which matrix rows depend on which patch
 
-This is the patch visibility the matrix cells refer to. Every patch is engine-specific (15 on wwjs,
+This is the patch visibility the matrix cells refer to. Every patch is engine-specific (16 on wwjs,
 2 on Baileys), and **no row carries a row-level patch mark on both engines**. The two column-wide
 patches are a separate matter: 🔧¹ underwrites every wwjs cell and 🔧⁵ every baileys cell, so in
 that sense every row does depend on a patch on each side. "Patch-dependent" below means a patch
@@ -190,13 +191,14 @@ class of sends rather than a row (🔧¹⁰, 🔧¹¹, 🔧¹³, 🔧¹⁶, 🔧
 | 🔧¹⁵ group invite           | `getGroupInviteCode`, `revokeGroupInviteCode`, `joinGroupViaInviteCode` on **wwjs**. Without it the code read and the revoke answer an opaque `500`, and a join is reported as an invalid invite (`400`) for every code, because the adapter reads any page-side rejection as a refused invite. The invite preview (`getGroupJoinInfo`) stays in an eagerly loaded module and keeps working, which makes the failure look confined to one side. Row-marked.                                                                                                      |
 | 🔧¹⁶ send error capture     | No row. Every **wwjs** send that fails in the page reports what the page threw instead of `t: t`, but no cell's outcome depends on it: a send that works without the patch works the same way with it.                                                                                                                                                                                                                                                                                                                                                           |
 | 🔧¹⁷ download mimetype      | No single row. Every **wwjs** media download goes through `Message#downloadMedia()`: inbound message media (webhook, chat-media archive, the media route), the own-send echo, `getChatHistory` with `includeMedia`, and received statuses. Without it, media the page has not decrypted before arrives as the `omitted` marker instead of its bytes; the messages themselves still arrive.                                                                                                                                                                       |
+| 🔧¹⁸ forward bundle         | `forwardMessage` on **wwjs**. Without it every forward answers an opaque `500`, because the page function it calls is not loaded on a headless page. Row-marked.                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 Rows that are ✅ on **both** engines where one side is patch-dependent: `initialize` (🔧⁴ wwjs),
 `sendTextMessage` (🔧³ wwjs), `postTextStatus` / `postImageStatus` / `postVideoStatus` /
 `postVoiceStatus` (🔧² wwjs), `removeParticipants`
 (🔧⁷ wwjs), `setGroupDescription` (🔧⁹ wwjs), `getGroupInviteCode` / `joinGroupViaInviteCode` /
 `revokeGroupInviteCode` (🔧¹⁵ wwjs), `sendImageMessage` / `sendVideoMessage` / `sendAudioMessage` /
-`sendDocumentMessage` (🔧¹⁴ wwjs), `getContacts` (🔧¹² wwjs), `blockContact` / `unblockContact`
+`sendDocumentMessage` (🔧¹⁴ wwjs), `forwardMessage` (🔧¹⁸ wwjs), `getContacts` (🔧¹² wwjs), `blockContact` / `unblockContact`
 (🔧⁸ wwjs). Everything else that is ✅-both carries no row-level mark, but still
 rests on the column-wide 🔧¹ (wwjs) and 🔧⁵ (baileys) — no row runs on stock library code on both
 sides.
@@ -272,7 +274,7 @@ socket is caught by the transport instead. No REST route: the session watchdog p
 | `sendProduct`         | ✅                  | ❌ lib           | ⚠️ baileys only |
 | `sendCatalog`         | ❌ lib              | ❌ lib           | ❌ not exposed  |
 | `replyToMessage`      | ✅                  | ✅               | ✅              |
-| `forwardMessage`      | ✅                  | ✅               | ✅              |
+| `forwardMessage`      | ✅                  | ✅🔧¹⁸           | ✅              |
 | `sendChatState`       | ✅                  | ✅               | ✅              |
 | `sendSeen`            | ✅                  | ✅               | ✅              |
 
@@ -1040,10 +1042,10 @@ adapter sources — re-derive the same way when anything changes:
 
 - **123** interface methods → **246** adapter cells: **212 ✅** / **34 ❌** (2 adapter-gaps, 32
   library-limitations, 0 uncertain), spanning **33** methods.
-- Of the 212 ✅ cells, **18 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
+- Of the 212 ✅ cells, **19 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
   1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 1 × 🔧⁷ participant arity, 2 × 🔧⁸
   block/unblock, 1 × 🔧⁹ group description, 1 × 🔧¹² contact alternate wid, 4 × 🔧¹⁴ media send
-  id, 3 × 🔧¹⁵ group invite) and one baileys cell
+  id, 3 × 🔧¹⁵ group invite, 1 × 🔧¹⁸ forward bundle) and one baileys cell
   does (1 × 🔧⁶ newsletter-create parse); the whole wwjs column additionally
   depends on 🔧¹, the whole Baileys column on 🔧⁵ — so every row rests on a patch on each side,
   even though no row carries a row-level mark on both.
@@ -1063,7 +1065,7 @@ adapter sources — re-derive the same way when anything changes:
   list it cannot repopulate; and `rejectCall`, whose `Call.reject()` resolves while the caller's
   phone keeps ringing (all in 29.6.2). Each answers 501 on wwjs. `.d.ts` presence
   is not capability, and only a live call distinguishes the two.
-- **17** install-time patches (15 whatsapp-web.js + 2 Baileys), all exact and self-disabling.
+- **18** install-time patches (16 whatsapp-web.js + 2 Baileys), all exact and self-disabling.
 - **0 phantom-support rows** — every `not-available` cell throws at the adapter boundary.
 - Remaining adapter-gaps (fixable in this repo, ranked): **#1** `getChannelMessages` (Baileys —
   fetch is one line, `BinaryNode`→`ChannelMessage` parser is the work); **#2** `subscribeToChannel`
