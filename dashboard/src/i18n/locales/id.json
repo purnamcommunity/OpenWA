@@ -524,6 +524,7 @@
       "message.revoked": "Saat pesan dihapus untuk semua orang",
       "message.reaction": "Saat reaksi ditambahkan, diubah atau dihapus",
       "message.edited": "Saat pesan diedit",
+      "message.poll_vote": "Saat seseorang memberikan suara pada polling atau mengubah suaranya",
       "session.status": "Saat status sesi berubah",
       "session.qr": "Saat kode QR dibuat",
       "session.authenticated": "Saat sesi tertaut dan siap",
