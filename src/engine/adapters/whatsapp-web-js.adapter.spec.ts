@@ -2829,7 +2829,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     Object.assign((adapter as unknown as { callbacks: object }).callbacks, { onError, onDisconnected });
 
     client.emit('authenticated'); // no 'qr' first: a restore of saved credentials
-    await jest.advanceTimersByTimeAsync(95_000);
+    await jest.advanceTimersByTimeAsync(READY_RECONCILE_TIMEOUT_MS + 5_000); // past the give-up deadline
 
     expect(rmSpy).not.toHaveBeenCalled();
     expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
