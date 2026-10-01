@@ -270,7 +270,7 @@ RUN npm install -g npm@12.1.0 && npm cache clean --force
 # that would bring a different major fails here rather than shipping a browser the stored session
 # profiles were not opened with. Security releases within the major pass. To move it, set
 # ARM64_CHROMIUM_MAJOR to the major Debian now ships, with the same care as a CfT bump.
-ARG ARM64_CHROMIUM_MAJOR=152
+ARG ARM64_CHROMIUM_MAJOR=154
 RUN if [ "$TARGETARCH" = arm64 ]; then \
         chromium_major=$(dpkg-query -W -f='${Version}' chromium | cut -d. -f1) && \
         if [ "$chromium_major" != "$ARM64_CHROMIUM_MAJOR" ]; then \
