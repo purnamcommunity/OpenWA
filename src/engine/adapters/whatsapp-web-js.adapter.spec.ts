@@ -20,6 +20,7 @@ import {
 } from './whatsapp-web-js.adapter';
 import { EXEC_CONTEXT_DESTROYED_PROBE_TIMEOUT_MS, EXEC_CONTEXT_DESTROYED_RECHECK_MS } from './wwebjs-lifecycle';
 import { BaileysAdapter } from './baileys.adapter';
+import { resolveOnboardingContinueLabels } from './wwebjs-onboarding';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
 import { readLeanContacts } from './wwebjs-contacts';
 import { changeAdminStatusInPage } from './wwebjs-groups';
@@ -443,6 +444,52 @@ describe('WhatsAppWebJsAdapter initialize() retry on a navigation-killed first i
     expect(onError).not.toHaveBeenCalled();
     // Attempt 2 starts from a clean INITIALIZING, not attempt 1's leftover AUTHENTICATING.
     expect(adapter.getStatus()).toBe(EngineStatus.INITIALIZING);
+  });
+});
+
+// A stored proxy that bypassed DTO validation used to be dropped with a warning, so Chromium
+// launched and the session egressed from the host's own address. It must fail like Baileys (#859).
+describe('WhatsAppWebJsAdapter initialize() with an unusable stored proxy', () => {
+  let rmSpy: jest.SpyInstance;
+  let clientInitSpy: jest.SpyInstance;
+  let savedWebVersion: string | undefined;
+
+  beforeEach(() => {
+    savedWebVersion = process.env.WWEBJS_WEB_VERSION;
+    process.env.WWEBJS_WEB_VERSION = 'off';
+    rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    clientInitSpy = jest
+      .spyOn(Client.prototype as unknown as { initialize: () => Promise<void> }, 'initialize')
+      .mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    rmSpy.mockRestore();
+    clientInitSpy.mockRestore();
+    if (savedWebVersion === undefined) {
+      delete process.env.WWEBJS_WEB_VERSION;
+    } else {
+      process.env.WWEBJS_WEB_VERSION = savedWebVersion;
+    }
+  });
+
+  it.each([
+    ['proxy.example.com:8080', /not a supported http\(s\)\/socks4\/socks5 URL/],
+    ['http://u:p%zz@h:1', /malformed percent-encoded credentials/],
+  ])('fails the session without launching for %s', async (url, reason) => {
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-bad-proxy',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+      proxy: { url, type: 'http' },
+    });
+    const onError = jest.fn();
+
+    await expect(adapter.initialize({ onError })).rejects.toThrow(reason);
+
+    expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
+    expect(onError).toHaveBeenCalledWith(expect.stringMatching(reason));
+    expect(clientInitSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -1072,6 +1119,9 @@ describe('WhatsAppWebJsAdapter.forwardMessage (returns the real sent id, not a s
     expect(forward).toHaveBeenCalledWith('dest@c.us');
     expect(result.id).toBe('REAL_FWD');
     expect(result.id).not.toMatch(/^fwd_/);
+    // No limit on either read: with one, whatsapp-web.js pages earlier history in until it has that
+    // many own messages, which in a chat this account rarely writes to walks the whole history.
+    expect(destChat.fetchMessages.mock.calls).toEqual([[{ fromMe: true }], [{ fromMe: true }]]);
   });
 
   it('returns an explicit-unknown id (empty, not a real/synthetic id) when the sent copy cannot be identified', async () => {
@@ -1895,6 +1945,10 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
 
     return { client, onReady, onStateChanged };
   };
+  // The readiness deadline clears credentials only for a pairing this engine showed a QR for.
+  const markFreshPairing = (adapter: WhatsAppWebJsAdapter): void => {
+    (adapter as unknown as { lifecycle: { qrShown: boolean } }).lifecycle.qrShown = true;
+  };
   const deferredVoid = (): { promise: Promise<void>; resolve: () => void } => {
     let resolve = (): void => undefined;
     const promise = new Promise<void>(res => {
@@ -2166,6 +2220,45 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     expect(onReady).toHaveBeenCalledTimes(1);
   });
 
+  it('drops a late ready from the old client while stuck-auth recovery has nulled it', async () => {
+    jest.useFakeTimers();
+    const rm = deferredVoid();
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockReturnValue(rm.promise);
+
+    const adapter = newAdapter();
+    const { client, onReady } = attachFakeClient(adapter, { destroy: jest.fn().mockResolvedValue(undefined) });
+    client.emit('authenticated');
+
+    const recover = (adapter as unknown as { recoverFromStuckAuth: () => Promise<void> }).recoverFromStuckAuth.bind(
+      adapter,
+    );
+    const recovery = recover();
+    // The client is nulled and the profile rm is still pending: the old page flushes its READY.
+    expect(() => client.emit('ready')).not.toThrow();
+    expect(adapter.getStatus()).toBe(EngineStatus.AUTHENTICATING);
+    expect(onReady).not.toHaveBeenCalled();
+
+    rm.resolve();
+    await recovery;
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+    expect(() => client.emit('ready')).not.toThrow();
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+    expect(onReady).not.toHaveBeenCalled();
+    rmSpy.mockRestore();
+  });
+
+  it('drops a late ready from a client that was torn down', async () => {
+    const adapter = newAdapter();
+    const { client, onReady } = attachFakeClient(adapter, { destroy: jest.fn().mockResolvedValue(undefined) });
+    client.emit('authenticated');
+
+    await adapter.destroy();
+
+    expect(() => client.emit('ready')).not.toThrow();
+    expect(adapter.getStatus()).not.toBe(EngineStatus.READY);
+    expect(onReady).not.toHaveBeenCalled();
+  });
+
   it('deduplicates the genuine ready event after reconciliation promotes the adapter', async () => {
     jest.useFakeTimers();
 
@@ -2303,7 +2396,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     client.emit('authenticated'); // re-fire near the end — must not restart the window
     await jest.advanceTimersByTimeAsync(11_000); // now past the deadline since the FIRST authenticated
 
-    expect(adapter.getStatus()).toBe(EngineStatus.AUTHENTICATING);
+    expect(adapter.getStatus()).toBe(EngineStatus.FAILED); // a restore gives up at the deadline
     expect(jest.getTimerCount()).toBe(0); // gave up at the deadline; not reset by the re-fire
   });
 
@@ -2592,6 +2685,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     });
     const onDisconnected = jest.fn();
     (adapter as unknown as { callbacks: { onDisconnected?: jest.Mock } }).callbacks.onDisconnected = onDisconnected;
+    markFreshPairing(adapter);
 
     client.emit('authenticated');
     await jest.advanceTimersByTimeAsync(READY_RECONCILE_TIMEOUT_MS - 10_000);
@@ -2704,6 +2798,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
       getState: jest.fn().mockReturnValue(new Promise<never>(() => {})),
       destroy: jest.fn().mockResolvedValue(undefined),
     });
+    markFreshPairing(adapter);
 
     client.emit('authenticated');
     await jest.advanceTimersByTimeAsync(READY_RECONCILE_TIMEOUT_MS + 5_000); // past the give-up deadline
@@ -2713,6 +2808,112 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     expect(timeout?.[1]).toMatchObject({ sessionId: 'sess-1' });
 
     warnSpy.mockRestore();
+    rmSpy.mockRestore();
+  });
+
+  // A restore never showed a QR, so nothing says its saved credentials are bad; a stuck restore is
+  // usually an incompatible WhatsApp Web build, which deleting the only copy of the link cannot fix.
+  it('keeps the saved credentials of a restored session stuck past the deadline and marks it failed', async () => {
+    jest.useFakeTimers();
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+
+    const adapter = newAdapter();
+    const logger = (adapter as unknown as { logger: { error: jest.Mock } }).logger;
+    const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const { client } = attachFakeClient(adapter, {
+      getState: jest.fn().mockReturnValue(new Promise<never>(() => {})),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    });
+    const onError = jest.fn();
+    const onDisconnected = jest.fn();
+    Object.assign((adapter as unknown as { callbacks: object }).callbacks, { onError, onDisconnected });
+
+    client.emit('authenticated'); // no 'qr' first: a restore of saved credentials
+    await jest.advanceTimersByTimeAsync(95_000);
+
+    expect(rmSpy).not.toHaveBeenCalled();
+    expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('credentials were kept'));
+    // A FAILED session has no engine, so a logout answers 400; only a delete clears the credentials.
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('to pair again, delete it'));
+    expect(onError).not.toHaveBeenCalledWith(expect.stringContaining('log it out'));
+    expect(onDisconnected).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
+    const failed = errorSpy.mock.calls.find(
+      ([, , meta]) => (meta as { action?: string })?.action === 'ready_reconcile_timeout_restored',
+    );
+    expect(failed?.[2]).toMatchObject({ sessionId: 'sess-1' });
+
+    errorSpy.mockRestore();
+    rmSpy.mockRestore();
+  });
+
+  it('records a shown QR as a fresh pairing, but not one dropped by a finished adapter', () => {
+    const adapter = newAdapter();
+    const lifecycle = (adapter as unknown as { lifecycle: { qrShown: boolean } }).lifecycle;
+    const { client } = attachFakeClient(adapter);
+
+    client.emit('qr', '2@abc');
+    expect(lifecycle.qrShown).toBe(true);
+
+    const finished = newAdapter();
+    const finishedLifecycle = (finished as unknown as { lifecycle: { qrShown: boolean; disconnectReported: boolean } })
+      .lifecycle;
+    const { client: finishedClient } = attachFakeClient(finished);
+    finishedLifecycle.disconnectReported = true;
+
+    finishedClient.emit('qr', '2@abc');
+    expect(finishedLifecycle.qrShown).toBe(false);
+  });
+
+  it('drops a qr from a client that is no longer the live one', async () => {
+    (qrcode.toDataURL as unknown as jest.Mock).mockClear();
+    const adapter = newAdapter();
+    const lifecycle = (adapter as unknown as { lifecycle: { qrShown: boolean } }).lifecycle;
+    const { client: stale } = attachFakeClient(adapter);
+    const onQRCode = jest.fn();
+    (adapter as unknown as { callbacks: { onQRCode: jest.Mock } }).callbacks.onQRCode = onQRCode;
+    // A replacement client is live while the old one still has its listeners.
+    (adapter as unknown as { client: unknown }).client = new EventEmitter();
+
+    stale.emit('qr', '2@stale');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(qrcode.toDataURL as unknown as jest.Mock).not.toHaveBeenCalled();
+    expect(lifecycle.qrShown).toBe(false);
+    expect(adapter.getStatus()).not.toBe(EngineStatus.QR_READY);
+    expect(onQRCode).not.toHaveBeenCalled();
+  });
+
+  // The wedged Chromium still writes into the profile being removed; killing it first stops that. The
+  // kill fires the browser's 'disconnected', which must not report a second disconnect mid-removal.
+  it('kills the browser before clearing the saved session, and reports the disconnect once', async () => {
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    const adapter = newAdapter();
+    const pupBrowser = new EventEmitter();
+    const kill = jest.fn(() => pupBrowser.emit('disconnected'));
+    Object.assign(pupBrowser, { process: () => ({ kill }) });
+    attachFakeClient(adapter, {
+      pupBrowser,
+      pupPage: Object.assign(new EventEmitter(), { evaluate: jest.fn().mockResolvedValue(true) }),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    } as never);
+    (adapter as unknown as { lifecycle: { status: EngineStatus } }).lifecycle.status = EngineStatus.AUTHENTICATING;
+    (adapter as unknown as { attachPuppeteerLifecycleListeners: () => void }).attachPuppeteerLifecycleListeners();
+    const onDisconnected = jest.fn();
+    Object.assign((adapter as unknown as { callbacks: object }).callbacks, {
+      onDisconnected,
+      claimStuckAuthRecovery: () => true,
+    });
+
+    await (adapter as unknown as { recoverFromStuckAuth: () => Promise<void> }).recoverFromStuckAuth.call(adapter);
+
+    expect(kill).toHaveBeenCalledWith('SIGKILL');
+    expect(kill.mock.invocationCallOrder[0]).toBeLessThan(rmSpy.mock.invocationCallOrder[0]);
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).toHaveBeenCalledWith(expect.stringContaining('cleared for re-pairing'));
+
     rmSpy.mockRestore();
   });
 
@@ -5889,20 +6090,21 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
   });
 
   it('answers engine operations with a retryable 409 while the page is re-injecting', async () => {
-    const getChats = jest.fn();
-    const { adapter, client } = wireAdapter({ getChats });
+    const { adapter, client } = wireAdapter();
+    const evaluate = jest.fn().mockResolvedValue([]);
+    (client.pupPage as unknown as { evaluate: jest.Mock }).evaluate = evaluate;
 
     client.pupPage.emit('framenavigated', navFrame());
 
     await expect(adapter.getChats()).rejects.toBeInstanceOf(EngineNotReadyError);
     await expect(adapter.getChats()).rejects.toThrow(/reload/i);
-    expect(getChats).not.toHaveBeenCalled();
+    expect(evaluate).not.toHaveBeenCalled();
   });
 
   it('lets engine operations through again once the window has expired', async () => {
     jest.useFakeTimers();
-    const getChats = jest.fn().mockResolvedValue([]);
-    const { adapter, client } = wireAdapter({ getChats });
+    const { adapter, client } = wireAdapter();
+    (client.pupPage as unknown as { evaluate: jest.Mock }).evaluate = jest.fn().mockResolvedValue([]);
 
     client.pupPage.emit('framenavigated', navFrame());
     jest.setSystemTime(Date.now() + NAVIGATION_REINJECT_GRACE_MS);
@@ -6223,10 +6425,10 @@ describe('WhatsAppWebJsAdapter orphaned Chromium sweep (pre-launch)', () => {
 
   it('does not mutate the caller-owned puppeteer args array shared across sessions', async () => {
     // Every adapter receives the SAME array instance — ConfigService.get() returns a live reference
-    // into the cached config tree, via the plugin path (engine/builtin/whatsapp-web-js) and the
-    // factory fallback alike. Appending in place therefore rewrites global config for the rest of
-    // the process lifetime, leaking one session's flags (proxy, session marker) into every later
-    // launch. Without the defensive copy this assertion sees both session markers accumulate.
+    // into the cached config tree, via the plugin path (engine/builtin/whatsapp-web-js). Appending
+    // in place therefore rewrites global config for the rest of the process lifetime, leaking one
+    // session's flags (proxy, session marker) into every later launch. Without the defensive copy
+    // this assertion sees both session markers accumulate.
     const sharedArgs = ['--no-sandbox'];
     const argsFor = async (sessionId: string): Promise<string[] | undefined> => {
       const adapter = new WhatsAppWebJsAdapter({
@@ -6501,10 +6703,17 @@ describe('WhatsAppWebJsAdapter page transport error detection (wedged page fast-
   it('fails the read when WhatsApp Web could not read any contact', async () => {
     const evaluate = jest.fn().mockResolvedValue({ rows: [], failed: 3, firstError: 'x is not a function' });
     const { adapter, onDisconnected } = readyAdapter({ pupPage: { evaluate } });
+    const logger = (adapter as unknown as { logger: { error: (m: string) => void } }).logger;
+    const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const reason =
+      'WhatsApp Web could not read any unblocked contact (3 failed, 0 without an id, 0 blocked read): x is not a function';
 
-    await expect(adapter.getContacts()).rejects.toThrow(
-      'WhatsApp Web could not read any unblocked contact (3 failed, 0 without an id, 0 blocked read): x is not a function',
-    );
+    const failure = adapter.getContacts();
+    await expect(failure).rejects.toThrow(reason);
+    // The documented 500 carries its reason: a bare Error would answer Nest's context-free one.
+    await expect(failure).rejects.toBeInstanceOf(InternalServerErrorException);
+    // Nest does not log an HttpException, so the page-wide failure needs its own server log line.
+    expect(errorSpy).toHaveBeenCalledWith(reason);
     expect(onDisconnected).not.toHaveBeenCalled();
   });
 
@@ -8064,6 +8273,23 @@ describe('probeOnboardingModal (in-page onboarding modal detection)', () => {
     expect(button.click).not.toHaveBeenCalled();
   });
 
+  // The unrecognised-dialog warning prints a label with whitespace runs collapsed, and operators are
+  // told to copy it into WWEBJS_ONBOARDING_CONTINUE_LABELS: a multi-word label must match as printed.
+  it.each([
+    ['split over elements and lines', 'Tudo\n  certo'],
+    ['joined by a non-breaking space', 'Tudo\u00a0certo'],
+  ])('dismisses a confirm button whose text is %s, with the label as the warning prints it', (_how, text) => {
+    const button = el(text, { button: true });
+    nest(el('Novidades', { dialog: true }), button);
+    install([button]);
+
+    expect(probeOnboardingModal({ labels: ['Continue', 'Tudo certo'], headingOptionalFor: ['Tudo certo'] })).toEqual({
+      modalPresent: true,
+      dismissed: true,
+    });
+    expect(button.click).toHaveBeenCalledTimes(1);
+  });
+
   it('matches the label exactly, so a longer string containing it is not a confirm button', () => {
     const button = el('Continuar con la copia de seguridad', { button: true });
     install([button]);
@@ -8081,6 +8307,21 @@ describe('probeOnboardingModal (in-page onboarding modal detection)', () => {
 // another language — shows up in the logs instead of failing silently. `collectDialogDiagnostics` is
 // a self-contained function for the same reason as the probe: it is stringified into the page, and
 // being plain means the DOM work is unit-testable here directly.
+describe('resolveOnboardingContinueLabels', () => {
+  const original = process.env.WWEBJS_ONBOARDING_CONTINUE_LABELS;
+
+  afterEach(() => {
+    if (original === undefined) delete process.env.WWEBJS_ONBOARDING_CONTINUE_LABELS;
+    else process.env.WWEBJS_ONBOARDING_CONTINUE_LABELS = original;
+  });
+
+  it('collapses whitespace runs in a configured label, as the probe compares it', () => {
+    process.env.WWEBJS_ONBOARDING_CONTINUE_LABELS = ' Tudo   certo ,Weiter,Tudo\u00a0certo, ';
+
+    expect(resolveOnboardingContinueLabels()).toEqual(['Continue', 'Tudo certo', 'Weiter', 'Tudo certo']);
+  });
+});
+
 describe('collectDialogDiagnostics (in-page dialog diagnostics)', () => {
   type FakeEl = {
     tagName: string;
@@ -8196,6 +8437,15 @@ describe('collectDialogDiagnostics (in-page dialog diagnostics)', () => {
     install([dialog, button]);
 
     expect(collectDialogDiagnostics()).toEqual([{ heading: "What's new on WhatsApp Web", buttons: ['Continue'] }]);
+  });
+
+  // The other half of the copy contract the probe spec pins: this is the label operators copy.
+  it('prints a multi-word button label with its whitespace runs collapsed', () => {
+    const button = el('Tudo\n  certo', { tag: 'BUTTON' });
+    const dialog = nest(el('', { role: 'dialog' }), button);
+    install([dialog, button]);
+
+    expect(collectDialogDiagnostics()).toEqual([{ heading: null, buttons: ['Tudo certo'] }]);
   });
 
   // Captured page text goes straight into the logs: a newline in it would forge extra log lines.
@@ -8663,7 +8913,9 @@ describe('WhatsAppWebJsAdapter transport death is not a not-found', () => {
   // while the status still said READY, and the early-death signal never fired (#1081).
   it('getChats answers 503 for a dead page and feeds the death signal', async () => {
     const adapter = readyAdapter({
-      getChats: jest.fn().mockRejectedValue(new Error('Protocol error (Runtime.callFunctionOn): Target closed')),
+      pupPage: {
+        evaluate: jest.fn().mockRejectedValue(new Error('Protocol error (Runtime.callFunctionOn): Target closed')),
+      },
     });
 
     await expect(adapter.getChats()).rejects.toBeInstanceOf(EngineTransportError);
@@ -8672,7 +8924,7 @@ describe('WhatsAppWebJsAdapter transport death is not a not-found', () => {
 
   it('getChats rethrows a non-transport failure untouched', async () => {
     const boom = new TypeError("Cannot read properties of undefined (reading 'getChats')");
-    const adapter = readyAdapter({ getChats: jest.fn().mockRejectedValue(boom) });
+    const adapter = readyAdapter({ pupPage: { evaluate: jest.fn().mockRejectedValue(boom) } });
 
     await expect(adapter.getChats()).rejects.toBe(boom);
   });
@@ -8848,5 +9100,85 @@ describe('WhatsAppWebJsAdapter sync progress', () => {
 
   it('is not reported by the Baileys engine', () => {
     expect('getSyncState' in BaileysAdapter.prototype).toBe(false);
+  });
+});
+
+// A chat, contact or group id belongs to a third party, and a serialized message id embeds the chat JID:
+// the per-action lines keep them out of info-level output and carry them as debug metadata only.
+describe('WhatsAppWebJsAdapter per-action log lines', () => {
+  const CHAT = '628123@c.us';
+  const MESSAGE_ID = `false_${CHAT}_3EB0ABC`;
+  const GROUP = '120363777000@g.us';
+
+  const readyAdapter = (client: unknown): WhatsAppWebJsAdapter => {
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    (adapter as unknown as { status: EngineStatus }).status = EngineStatus.READY;
+    (adapter as unknown as { client: unknown }).client = client;
+    return adapter;
+  };
+
+  it.each<[string, () => unknown, (a: WhatsAppWebJsAdapter) => Promise<unknown>, string, string, object]>([
+    [
+      'deleteContact',
+      () => ({ deleteAddressbookContact: jest.fn().mockResolvedValue(undefined) }),
+      a => a.deleteContact(CHAT),
+      '628123',
+      'Deleted addressbook contact',
+      { contactId: CHAT },
+    ],
+    [
+      'blockContact',
+      () => ({ getContactById: jest.fn().mockResolvedValue({ block: jest.fn().mockResolvedValue(true) }) }),
+      a => a.blockContact(CHAT),
+      '628123',
+      'Blocked contact',
+      { contactId: CHAT },
+    ],
+    [
+      'reactToMessage',
+      () => ({
+        getChatById: jest.fn().mockResolvedValue({
+          fetchMessages: jest
+            .fn()
+            .mockResolvedValue([{ id: { _serialized: MESSAGE_ID }, react: jest.fn().mockResolvedValue(undefined) }]),
+        }),
+      }),
+      a => a.reactToMessage(CHAT, MESSAGE_ID, 'x'),
+      '628123',
+      'Reacted to message',
+      { messageId: MESSAGE_ID },
+    ],
+    [
+      'addLabelToChat',
+      () => ({
+        getChatById: jest.fn().mockResolvedValue({ getLabels: jest.fn().mockResolvedValue([]) }),
+        getLabels: jest.fn().mockResolvedValue([{ id: 'L1', name: 'L1', hexColor: '#fff' }]),
+        addOrRemoveLabels: jest.fn().mockResolvedValue(undefined),
+      }),
+      a => a.addLabelToChat(CHAT, 'L1'),
+      '628123',
+      'Added label to chat',
+      { labelId: 'L1', chatId: CHAT },
+    ],
+    [
+      'getGroupInviteCode',
+      () => ({
+        getChatById: jest.fn().mockResolvedValue({ isGroup: true, getInviteCode: jest.fn().mockResolvedValue('C0DE') }),
+      }),
+      a => a.getGroupInviteCode(GROUP),
+      '120363777000',
+      'Got group invite code',
+      { groupId: GROUP },
+    ],
+  ])('%s logs the id at debug only', async (_name, client, call, id, message, meta) => {
+    const adapter = readyAdapter(client());
+    const logger = (adapter as unknown as { logger: { log: () => void; debug: () => void } }).logger;
+    const log = jest.spyOn(logger, 'log');
+    const debug = jest.spyOn(logger, 'debug').mockImplementation(() => undefined);
+
+    await call(adapter);
+
+    expect(JSON.stringify(log.mock.calls)).not.toContain(id);
+    expect(debug).toHaveBeenCalledWith(message, expect.objectContaining(meta));
   });
 });

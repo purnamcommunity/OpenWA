@@ -8,6 +8,7 @@
 // RoleProvider (harmless here, kept for parity with App.tsx) → ToastProvider (useToast throws
 // without it). No Router — the page uses no router hooks.
 import '../test-helpers/register-hooks.ts';
+import { readFileSync } from 'node:fs';
 import { test, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement } from 'react';
@@ -285,6 +286,18 @@ test('Infrastructure renders and the config form hydrates from /status and /conf
   });
 });
 
+// An empty field saves the gateway's DEFAULT_PUPPETEER_ARGS, so the placeholder must name that list: an
+// operator who copies a shorter one drops flags such as the /dev/shm crash guard.
+test('the Browser Arguments placeholder is the default an empty field saves', async () => {
+  const source = readFileSync(new URL('../../../src/config/configuration.ts', import.meta.url), 'utf8');
+  const list = /DEFAULT_PUPPETEER_ARGS[^=]*=\s*\[([^\]]*)\]/.exec(source)?.[1];
+  assert.ok(list, 'DEFAULT_PUPPETEER_ARGS not found');
+  const defaults = [...list.matchAll(/'([^']+)'/g)].map(m => m[1]).join(' ');
+  const { container } = renderInfrastructure();
+  await rtl.screen.findByText('Database Configuration');
+  assert.equal(fieldInput(container, 'Browser Arguments').placeholder, defaults);
+});
+
 // The detail fields (username, database, schema, bucket, engine options) come only from /config.
 // Rendered without it, the form holds its built-in defaults, and a Save would write them over the
 // stored external database, S3 and engine settings.
@@ -556,6 +569,48 @@ test('the pending-restart note survives a successful save', async () => {
   assert.ok(screen.queryByText(PENDING_RESTART_NOTE), 'the pending-restart note must not vanish once a save succeeds');
 });
 
+/** The pin note rendered inside a text field's form group, or null. */
+function fieldPinNote(container: HTMLElement, labelText: string): string | null {
+  return fieldInput(container, labelText).closest('.form-group')?.querySelector('.env-pin-note')?.textContent ?? null;
+}
+
+test('fields the Quick Start stack pins show the env-pin note naming their variable', async () => {
+  const { screen, waitFor } = rtl;
+  resetFetchCalls();
+  overrides = { status: { ...INFRA_STATUS, envPinned: ['SESSION_DATA_PATH', 'STORAGE_LOCAL_PATH'] } };
+  const { container } = renderInfrastructure();
+
+  await screen.findByText('Database Configuration');
+  await awaitConfigHydrated(container);
+  await waitFor(() => {
+    assert.match(fieldPinNote(container, 'Session Data Path') ?? '', /SESSION_DATA_PATH/);
+    assert.match(fieldPinNote(container, 'Storage Path') ?? '', /STORAGE_LOCAL_PATH/);
+  });
+  assert.equal(fieldPinNote(container, 'Browser Arguments'), null, 'an unpinned field must carry no note');
+  const notes = Array.from(container.querySelectorAll('.env-pin-note')).map(note => note.textContent ?? '');
+  assert.ok(!notes.some(note => note.includes('PUPPETEER_ARGS') || note.includes('PUPPETEER_HEADLESS')));
+});
+
+test('without a reported pin those fields show no note, even when running and saved values differ', async () => {
+  const { screen } = rtl;
+  resetFetchCalls();
+  // The stock fixtures disagree on headless (running true, saved false): a pin-only note must not
+  // read that as a pin or as a pending restart.
+  overrides = { status: { ...INFRA_STATUS, envPinned: [] } };
+  const { container } = renderInfrastructure();
+
+  await screen.findByText('Database Configuration');
+  await awaitConfigHydrated(container);
+  for (const label of ['Session Data Path', 'Browser Arguments', 'Storage Path']) {
+    assert.equal(fieldPinNote(container, label), null, `unexpected note under ${label}`);
+  }
+  const headlessRow = toggleInput(container, 'Headless Mode').closest('.toggle-row');
+  assert.ok(
+    !headlessRow?.nextElementSibling?.classList.contains('env-pin-note'),
+    'unexpected note under Headless Mode',
+  );
+});
+
 test('the engine radio seeds from the effective engine when ENGINE_TYPE is pinned', async () => {
   const { screen, waitFor } = rtl;
   resetFetchCalls();
@@ -738,7 +793,7 @@ test(
       fireEvent.click(within(dialog).getByRole('button', { name: 'Restart Now' }));
 
       await within(dialog).findByText(
-        'The proxy timed out before the server answered. The restart may still be in progress; reload in a minute to check.',
+        'The proxy returned an error before the server answered, so it is not known whether the restart is in progress. Reload in a minute to check.',
       );
       assert.equal(within(dialog).queryByText('Restart failed'), null);
       assert.equal(within(dialog).queryByText('HTTP 504'), null);
@@ -777,7 +832,7 @@ test('a proxy 502 without a gateway code on the restart request reports an unkno
   const dialog = await clickRestartNow();
 
   await within(dialog).findByText(
-    'The proxy timed out before the server answered. The restart may still be in progress; reload in a minute to check.',
+    'The proxy returned an error before the server answered, so it is not known whether the restart is in progress. Reload in a minute to check.',
   );
   assert.equal(within(dialog).queryByText('Restart failed'), null);
 });
@@ -790,6 +845,23 @@ test('a 502 the gateway stamped with a code is a refusal, not an unknown outcome
 
   await within(dialog).findByText('Restart failed');
   assert.ok(within(dialog).getByText('Compose rejected the profile'), 'the server reason is not shown');
+});
+
+test('the restart progress bar measures the server estimate, not a fixed 30 s', async () => {
+  const { within } = rtl;
+  resetFetchCalls();
+  overrides = {
+    readyFails: true,
+    restart: () =>
+      jsonResponse({ message: 'restarting', restarting: true, profiles: [], profilesToRemove: [], estimatedTime: 35 }),
+  };
+  const dialog = await clickRestartNow();
+
+  // One second into a 35 s estimate. Against a fixed 30 s total the width would be negative, which
+  // the style drops, leaving the bar empty until the countdown fell under 30.
+  await within(dialog).findByText('Server restarting... 34s', undefined, { timeout: 2_000 });
+  const fill = dialog.querySelector<HTMLElement>('.restart-progress-fill');
+  assert.equal(fill?.style.width, `${(1 / 35) * 100}%`);
 });
 
 test(

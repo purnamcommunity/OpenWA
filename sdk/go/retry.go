@@ -142,11 +142,16 @@ func parseRetryAfter(resp *http.Response) (time.Duration, bool) {
 	if resp == nil {
 		return 0, false
 	}
-	v := resp.Header.Get("Retry-After")
+	return retryAfterHeader(resp.Header)
+}
+
+// retryAfterHeader reads Retry-After as whole seconds or an HTTP date.
+func retryAfterHeader(h http.Header) (time.Duration, bool) {
+	v := h.Get("Retry-After")
 	if v == "" {
 		return 0, false
 	}
-	if secs, err := strconv.Atoi(v); err == nil {
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
 		return time.Duration(secs) * time.Second, true
 	}
 	if t, err := http.ParseTime(v); err == nil {
@@ -240,7 +245,7 @@ func retryMiddleware(p RetryPolicy, log Logger) Middleware {
 				}
 
 				log.Log(req.Context(), LevelWarn, "openwa retrying request",
-					"method", req.Method, "url", req.URL.String(),
+					"method", req.Method, "url", req.URL.Redacted(),
 					"attempt", attempt+1, "delay_ms", delay.Milliseconds())
 
 				timer := time.NewTimer(delay)

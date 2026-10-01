@@ -7,7 +7,7 @@ import { Session, SessionStatus } from '../session/entities/session.entity';
 import { SessionOwnershipService } from '../session/session-ownership.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { SessionService } from '../session/session.service';
-import { BulkMessageService } from '../message/bulk-message.service';
+import { SessionStoppedException } from '../session/session-engine-controls';
 
 /**
  * Statuses worth adopting from a lapsed node. They all mean "an engine was (or should be) running".
@@ -57,9 +57,9 @@ const STRANDED_LEASE_TTL_MULTIPLE = 2;
  * for lapsed-lease sessions and starts them here through the ordinary start path, so the claim
  * stays race-safe against peers doing the same.
  *
- * Lives in its own module (not SessionModule) because adopting a session also reconciles its
- * in-flight bulk batches via BulkMessageService — which sits in MessageModule, which imports
- * SessionModule; importing it back from SessionModule would close the cycle.
+ * The lapsed holder's unfinished bulk batches are failed after the claim, by the adoption handler
+ * BulkMessageService registers with SessionOwnershipService, the same as for an explicit POST
+ * /start, so the sweep only starts sessions.
  */
 @Injectable()
 export class SessionTakeoverService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -78,7 +78,6 @@ export class SessionTakeoverService implements OnApplicationBootstrap, OnModuleD
   constructor(
     private readonly sessionService: SessionService,
     private readonly ownership: SessionOwnershipService,
-    private readonly bulkMessages: BulkMessageService,
     @Optional()
     private readonly configService?: ConfigService,
     // The drain signal, not module destruction. `onModuleDestroy` runs at app.close(), AFTER the
@@ -168,11 +167,11 @@ export class SessionTakeoverService implements OnApplicationBootstrap, OnModuleD
           fromNode: session.nodeId,
           action: 'session_takeover',
         });
-        // The dead node's in-flight batches can never complete; surface them as FAILED now rather
-        // than leaving them stuck in PROCESSING until some node happens to reboot.
-        await this.bulkMessages.reapProcessingBatches(session.id, 'session adopted from a lapsed node');
       } catch (error) {
-        if (error instanceof ConflictException) {
+        if (error instanceof SessionStoppedException) {
+          // Stopped between the sweep's read and this start; the start refused it, as it should.
+          this.logger.debug(`Session ${session.name} skipped: stopped by an operator`, { sessionId: session.id });
+        } else if (error instanceof ConflictException) {
           // A peer won the race — exactly the claim doing its job.
           this.logger.debug(`Session ${session.name} was adopted by another node first`, { sessionId: session.id });
         } else {
@@ -190,7 +189,8 @@ export class SessionTakeoverService implements OnApplicationBootstrap, OnModuleD
 
   private isEligible(session: Session): boolean {
     // Only authenticated sessions (phone set): an engine is worth relaunching exactly when the
-    // saved credentials can restore the link without a human scanning anything.
-    return Boolean(session.phone) && TAKEOVER_STATUSES.has(session.status);
+    // saved credentials can restore the link without a human scanning anything. A session an
+    // operator stopped stays down until an explicit start, wherever its claim lapsed.
+    return Boolean(session.phone) && TAKEOVER_STATUSES.has(session.status) && session.desiredState !== 'stopped';
   }
 }

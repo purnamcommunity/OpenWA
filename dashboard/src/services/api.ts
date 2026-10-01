@@ -2,6 +2,8 @@
 // Centralized API client with TypeScript types
 
 import { warnIfInsecureHttpUrl } from '../utils/urlSecurity';
+import { isKeyUnusable } from '../utils/authLifecycle';
+import { fetchAllPages } from '../utils/fetchAllPages';
 
 // Resolve the API base URL. By default this is the same-origin relative path '/api',
 // correct when the dashboard and API are served from the same origin (the default
@@ -152,6 +154,26 @@ export interface Webhook {
   lastTriggeredAt?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+// Request bodies for webhook writes. `secret` and `headers` are write-only: no webhook read returns them.
+export interface CreateWebhookRequest {
+  url: string;
+  events: string[];
+  filters?: WebhookFilters | null;
+  secret?: string;
+  headers?: Record<string, string>;
+}
+
+export interface UpdateWebhookRequest {
+  url?: string;
+  events?: string[];
+  active?: boolean;
+  filters?: WebhookFilters | null;
+  /** An empty string removes the stored secret. */
+  secret?: string;
+  /** Replaces the stored map wholesale; `{}` removes every custom header. */
+  headers?: Record<string, string>;
 }
 
 export interface MessageTemplate {
@@ -713,24 +735,24 @@ export interface SearchResults {
 // API Client
 // =============================================================================
 
-// Shared failure handling for every response shape (json/text/blob). On 401 the stored API key is
-// invalid/expired/revoked — clear it and return to login so the user isn't stuck on a dashboard that
-// 401s every request; the never-settling promise halts this request's chain so callers neither flash
-// a generic error toast nor receive an undefined payload while the page navigates away. Otherwise
-// throw an Error carrying the HTTP status and, when the gateway supplied one, its machine code.
+// Shared failure handling for every response shape (json/text/blob). When the stored API key is
+// unusable (a 401 for an invalid/expired/revoked key, or a 403 because its allowedIps refuse this
+// client) clear it and return to login so the user isn't stuck on a dashboard where every request
+// fails; the never-settling promise halts this request's chain so callers neither flash a generic
+// error toast nor receive an undefined payload while the page navigates away. Otherwise throw an
+// Error carrying the HTTP status and, when the gateway supplied one, its machine code.
 async function handleErrorResponse<T>(response: Response): Promise<T> {
-  if (response.status === 401) {
+  // On a non-JSON body (e.g. a reverse-proxy 502/503/504 HTML page) fall through to `HTTP <status>`
+  // rather than statusText: the toast folds an exact `HTTP 502`/`HTTP 503` into its connection-lost
+  // toast (a 504 keeps its own), and statusText is empty over HTTP/2 anyway.
+  const error = await response.json().catch(() => ({}));
+  if (isKeyUnusable(response.status, error.message)) {
     sessionStorage.removeItem('openwa_api_key');
     if (typeof window !== 'undefined') {
       window.location.assign('/');
       return new Promise<T>(() => {});
     }
   }
-
-  // On a non-JSON body (e.g. a reverse-proxy 502/503/504 HTML page) fall through to `HTTP <status>`
-  // rather than statusText: the status code is what the toast connection-lost de-dup matches on,
-  // and statusText is empty over HTTP/2 anyway.
-  const error = await response.json().catch(() => ({}));
   // Carry the HTTP status on the Error (message unchanged, so the toast de-dup still matches) so
   // callers can tell apart a permission 403 from a real server 5xx instead of guessing from text.
   // Carry the machine `code` too: the gateway's stable codes (SESSION_LOGOUT_INCOMPLETE,
@@ -914,12 +936,12 @@ export const sessionApi = {
 export const webhookApi = {
   listBySession: (sessionId: string) => request<Webhook[]>(`/sessions/${sessionId}/webhooks`),
   listAll: () => request<Webhook[]>('/webhooks'),
-  create: (sessionId: string, data: { url: string; events: string[]; filters?: WebhookFilters | null }) =>
+  create: (sessionId: string, data: CreateWebhookRequest) =>
     request<Webhook>(`/sessions/${sessionId}/webhooks`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  update: (sessionId: string, id: string, data: Partial<Webhook>) =>
+  update: (sessionId: string, id: string, data: UpdateWebhookRequest) =>
     request<Webhook>(`/sessions/${sessionId}/webhooks/${id}`, {
       method: 'PUT',
       body: JSON.stringify(data),
@@ -969,7 +991,18 @@ export interface ProfilePictureResponse {
 }
 
 export const contactApi = {
-  list: (sessionId: string) => request<Contact[]>(`/sessions/${sessionId}/contacts`),
+  // The route caps a response at 1000 contacts; walk the pages so an address book past that is complete.
+  list: async (sessionId: string) =>
+    (
+      await fetchAllPages(
+        async (limit, offset) => {
+          const data = await request<Contact[]>(`/sessions/${sessionId}/contacts?limit=${limit}&offset=${offset}`);
+          // The route answers a bare array with no total: a short page is the last one.
+          return { data, total: data.length < limit ? offset + data.length : Infinity };
+        },
+        { pageSize: 1000 },
+      )
+    ).items,
   checkNumber: (sessionId: string, number: string) =>
     request<CheckNumberResponse>(`/sessions/${sessionId}/contacts/check/${encodeURIComponent(number)}`),
   // Returns the contact/group profile picture URL. Both engines return null when the user hid their
@@ -984,7 +1017,7 @@ export const contactApi = {
       `/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/phone`,
     ),
   // Batch-resolve profile picture URLs for a whole sidebar in ONE request — the per-chat burst of
-  // parallel single fetches exhausts the per-IP throttle (429s). Engine lookups run 3 at a time
+  // parallel single fetches exhausts the per-IP throttle (429s). Engine lookups run 5 at a time
   // server-side; ids beyond the backend's 50-id cap are dropped client-side too.
   profilePictures: (sessionId: string, contactIds: string[]) =>
     request<{ pictures: Record<string, string | null> }>(
@@ -1020,7 +1053,8 @@ export const apiKeyApi = {
       role?: string;
       allowedIps?: string[];
       allowedSessions?: string[];
-      expiresAt?: string;
+      /** null removes the expiry. */
+      expiresAt?: string | null;
       allowedChats?: string[];
     },
   ) =>

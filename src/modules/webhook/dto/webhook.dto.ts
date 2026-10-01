@@ -9,7 +9,6 @@ import {
   IsString,
   IsUrl,
   Max,
-  MaxLength,
   Min,
   MinLength,
   ValidateIf,
@@ -21,6 +20,7 @@ import type { FilterOperator, WebhookFilters } from '../filters/filter-types';
 import { IsValidWebhookFilters } from '../filters/filter-validation';
 import { IsHeaderMap } from './is-header-map.validator';
 import { ToStrictBoolean, ToStrictNumber } from '../../../common/utils/strict-boolean';
+import { MaxCodePoints } from '../../../common/validation/max-code-points';
 
 /**
  * Swagger metadata for the smart-filter shape — `WebhookFilters` in filters/filter-types.ts is a
@@ -58,6 +58,9 @@ class WebhookFiltersDto {
 
 const FILTERS_API_DESCRIPTION =
   'Optional smart pre-filter. When set, every condition must match (AND) for the webhook to fire. Omit or null to fire on every subscribed event.';
+// An update applies `filters` only when the field is present, so omission keeps the stored filter.
+const UPDATE_FILTERS_API_DESCRIPTION =
+  'Optional smart pre-filter. When set, every condition must match (AND) for the webhook to fire. Omit to keep the stored filters; send null or { conditions: [] } to clear them, so the webhook fires on every subscribed event.';
 const FILTERS_API_EXAMPLE = {
   conditions: [
     { field: 'sender', operator: 'is', value: ['1234567890@c.us'] },
@@ -99,14 +102,21 @@ export const WEBHOOK_EVENTS = [
   ...WEBHOOK_RESERVED_EVENTS,
 ] as const;
 
+const WEBHOOK_URL_OPTIONS = { require_tld: false, require_protocol: true, protocols: ['http', 'https'] };
+
 export class CreateWebhookDto {
   @ApiProperty({
     description: 'Webhook URL to receive events',
     example: 'https://your-server.com/webhook',
+    maxLength: 2048,
   })
   // require_tld:false allows hostnames without a dot (e.g. http://localhost:3000); the SSRF
-  // guard still decides whether the host is actually allowed to be delivered to.
-  @IsUrl({ require_tld: false })
+  // guard still decides whether the host is actually allowed to be delivered to. The scheme is
+  // required and must be http(s): the defaults also took 'example.com/hook' and 'ftp://...', which
+  // were stored and then failed every delivery. 2048 is the column width; PostgreSQL refuses a
+  // longer value on insert with a 500.
+  @IsUrl(WEBHOOK_URL_OPTIONS)
+  @MaxCodePoints(2048)
   url!: string;
 
   @ApiPropertyOptional({
@@ -141,13 +151,14 @@ export class CreateWebhookDto {
   // A short secret signs webhooks badly: HMAC-SHA256 over a 4-char key is brute-forcible from one
   // observed signature. 16 is the floor, not a recommendation.
   @MinLength(16)
-  @MaxLength(255)
+  @MaxCodePoints(255)
   secret?: string;
 
   @ApiPropertyOptional({
     description:
-      'Custom headers to include in webhook requests. Never returned by any webhook route. At delivery, ' +
-      '`content-type` and `x-openwa-*` names are stripped so a custom header cannot shadow a system one, ' +
+      'Custom headers to include in webhook requests. Names must be unique ignoring case. Never returned by ' +
+      'any webhook route. At delivery, `content-type`, `user-agent` and `x-openwa-*` names are stripped so a ' +
+      'custom header cannot shadow a system one, ' +
       'and so are the connection-level names the HTTP client owns (`connection`, `content-length`, ' +
       '`expect`, `keep-alive`, `te`, `trailer`, `transfer-encoding`, `upgrade`).',
     example: { 'X-Custom-Header': 'value' },
@@ -188,11 +199,12 @@ export class CreateWebhookDto {
 }
 
 export class UpdateWebhookDto {
-  @ApiPropertyOptional({ description: 'Webhook URL' })
+  @ApiPropertyOptional({ description: 'Webhook URL', maxLength: 2048 })
   // Not @IsOptional: that also skips validation for null, which these NOT NULL columns cannot store
   // (save() then failed with a 500). Only an omitted field means "leave unchanged".
   @ValidateIf((_: UpdateWebhookDto, v: unknown) => v !== undefined)
-  @IsUrl({ require_tld: false })
+  @IsUrl(WEBHOOK_URL_OPTIONS)
+  @MaxCodePoints(2048)
   url?: string;
 
   @ApiPropertyOptional({
@@ -229,7 +241,7 @@ export class UpdateWebhookDto {
   // (the service stores null for it); a non-string value is still rejected by @IsString.
   @ValidateIf((o: UpdateWebhookDto) => o.secret !== '')
   @MinLength(16)
-  @MaxLength(255)
+  @MaxCodePoints(255)
   secret?: string;
 
   @ApiPropertyOptional({
@@ -246,7 +258,7 @@ export class UpdateWebhookDto {
   // sends and accepts.
   @ApiPropertyOptional({
     type: WebhookFiltersDto,
-    description: FILTERS_API_DESCRIPTION,
+    description: UPDATE_FILTERS_API_DESCRIPTION,
     example: FILTERS_API_EXAMPLE,
     nullable: true,
   })
@@ -350,7 +362,10 @@ export class WebhookResponseDto {
   }
 }
 
-/** A webhook delivery that exhausted every retry — the shape `GET /webhooks/delivery-failures` serves. */
+/**
+ * A webhook delivery that exhausted its retries, or one not sent (attempts 0) that the outbox replays; the
+ * shape `GET /webhooks/delivery-failures` serves. A later successful delivery removes the row.
+ */
 export class WebhookDeliveryFailureDto {
   @ApiProperty({ example: '0a941dac-a965-45e7-b318-74ae8be134f0' })
   id!: string;
@@ -377,7 +392,10 @@ export class WebhookDeliveryFailureDto {
   @ApiPropertyOptional({ type: String, nullable: true })
   deliveryId?: string | null;
 
-  @ApiProperty({ description: 'Total attempts made before giving up.', example: 5 })
+  @ApiProperty({
+    description: 'Attempts recorded for the delivery; 0 when it was shed, refused or failed before sending.',
+    example: 5,
+  })
   attempts!: number;
 
   @ApiPropertyOptional({
@@ -391,7 +409,7 @@ export class WebhookDeliveryFailureDto {
   @ApiProperty({ example: 'connect ECONNREFUSED 10.0.0.1:443' })
   lastError!: string;
 
-  @ApiProperty({ type: String, format: 'date-time', description: 'When the delivery was finally abandoned.' })
+  @ApiProperty({ type: String, format: 'date-time', description: 'When the failure was first recorded.' })
   createdAt!: Date;
 }
 

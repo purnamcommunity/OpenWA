@@ -53,10 +53,11 @@ export async function clearDeliveryFailureRows(
 }
 
 /**
- * Append a durable record of a webhook delivery that exhausted all retries. Called from BOTH terminal
- * paths — the BullMQ processor's final attempt and the direct-fallback's last attempt. Wrapped in its
- * own try/catch: persisting the failure is best-effort bookkeeping and must never throw back into (and
- * re-poison) the delivery result or the fire-and-forget dispatch loop.
+ * Record a webhook delivery that exhausted its retries (the BullMQ processor's final attempt, the direct
+ * path's last attempt) or was not sent (attempts 0, from recordUndelivered: shed, refused at shutdown,
+ * oversize or a preflight failure). Wrapped in its own try/catch: persisting the failure is best-effort
+ * bookkeeping and must never throw back into (and re-poison) the delivery result or the fire-and-forget
+ * dispatch loop.
  */
 export async function recordWebhookDeliveryFailure(
   repo: Repository<WebhookDeliveryFailure>,
@@ -103,13 +104,18 @@ export async function recordWebhookDeliveryFailure(
                 },
               ),
             );
+        } else {
+          // A crash or a failed delete right after an earlier terminal insert can leave the
+          // attempts-0 row behind; nothing else reconciles it, so every repeat finishes the job.
+          await clearDeliveryFailureRows(repo, logger, input.webhookId, input.idempotencyKey, true);
         }
         return false;
       }
     }
     await repo.insert({ ...input, lastStatusCode: input.lastStatusCode ?? null });
     if (terminal) {
-      // Only after the insert, so a crash in between leaves both rows, never none.
+      // Only after the insert, so a crash in between leaves both rows, never none. A later terminal
+      // record of the same delivery repeats this clear.
       await clearDeliveryFailureRows(repo, logger, input.webhookId, input.idempotencyKey, true);
     }
     return true;

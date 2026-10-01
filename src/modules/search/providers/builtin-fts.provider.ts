@@ -1,4 +1,5 @@
-import { BadRequestException, Injectable, Logger, NotImplementedException, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, Injectable, NotImplementedException, OnModuleInit } from '@nestjs/common';
+import { createLogger } from '../../../common/services/logger.service';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import type { MessageType } from '../../../engine/interfaces/whatsapp-engine.interface';
@@ -38,7 +39,7 @@ type PlaceholderFn = () => string;
 export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
   readonly id = 'builtin-fts';
   readonly label = 'Built-in database full-text search';
-  private readonly logger = new Logger('BuiltInFtsProvider');
+  private readonly logger = createLogger('BuiltInFtsProvider');
 
   // OpenWA has two TypeORM connections (main: auth/audit SQLite, data: messages). Bind explicitly to
   // 'data' so the provider queries the connection that owns the `messages` table + the FTS migration,
@@ -251,7 +252,7 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
 
   async health(): Promise<{ ok: boolean; detail?: string }> {
     // Reflects FTS availability (not just raw connectivity): a non-FTS5 build reports unhealthy here
-    // so /health and the registry surface the true state. DB errors still map to { ok: false }.
+    // for callers of health(). DB errors still map to { ok: false }.
     try {
       const ok = await this.probeFts();
       return { ok, detail: ok ? undefined : 'full-text index absent' };

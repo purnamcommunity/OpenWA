@@ -4,7 +4,7 @@
   overflow-x: hidden;
 }
 
-.templates-page .templates-loading,
+.templates-page.templates-loading,
 .templates-page .templates-loading-inline,
 .templates-page .templates-empty-page,
 .templates-page .templates-empty-list {
@@ -13,7 +13,7 @@
   justify-content: center;
 }
 
-.templates-page .templates-loading {
+.templates-page.templates-loading {
   min-height: 400px;
 }
 
@@ -192,7 +192,7 @@
 .templates-page .template-list-meta {
   overflow: hidden;
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
   font-size: 0.6875rem;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -318,7 +318,7 @@
   border-radius: 8px;
   background: var(--bg-white);
   color: var(--text-primary);
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
   font-size: 0.875rem;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -345,7 +345,7 @@
 
 .templates-page .placeholder-list label > span {
   color: var(--primary-text);
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-family: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
 }
 
 .templates-page .template-muted {

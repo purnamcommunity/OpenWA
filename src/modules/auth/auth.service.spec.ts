@@ -4,12 +4,14 @@ jest.mock('fs', () => ({ __esModule: true, ...jest.requireActual<typeof import('
 
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { UnauthorizedException, NotFoundException, ConflictException } from '@nestjs/common';
+import { Repository, type QueryDeepPartialEntity } from 'typeorm';
+import { UnauthorizedException, NotFoundException, ConflictException, ForbiddenException } from '@nestjs/common';
 import { createHash, createHmac } from 'crypto';
 import * as fs from 'fs';
 import { AuthService, resolveSeedApiKey, bannerKeyLine, UnresolvedApiKeyException } from './auth.service';
 import { ApiKeyUsageTracker } from './api-key-usage-tracker.service';
+import { getRequestActor, runWithRequestId } from '../../common/services/request-context';
+import { ActiveKeyIndex } from './active-key-index';
 import { ApiKey, ApiKeyRole } from './entities/api-key.entity';
 
 // Helpers
@@ -111,8 +113,10 @@ describe('AuthService', () => {
   let committedWrites: Array<{ mode: 'update' | 'delete'; patch?: Record<string, unknown>; guarded: boolean }>;
   /** The raw AND-fragment the last-admin guard binds, so the SQL predicate itself is asserted. */
   let lastAdminFragments: string[];
+  let keyIndex: { refreshSoon: jest.Mock };
 
   beforeEach(async () => {
+    keyIndex = { refreshSoon: jest.fn() };
     repository = {
       count: jest.fn(),
       find: jest.fn(),
@@ -134,6 +138,7 @@ describe('AuthService', () => {
           provide: getRepositoryToken(ApiKey, 'main'),
           useValue: repository,
         },
+        { provide: ActiveKeyIndex, useValue: keyIndex },
       ],
     }).compile();
 
@@ -205,7 +210,12 @@ describe('AuthService', () => {
           const guardPasses =
             !this.guarded ||
             !isUsableAdminRow(target) ||
-            [...keys.values()].some(k => k.id !== target.id && isUsableAdminRow(k));
+            [...keys.values()].some(
+              k =>
+                k.id !== target.id &&
+                isUsableAdminRow(k) &&
+                (!k.expiresAt || (!!target.expiresAt && k.expiresAt >= target.expiresAt)),
+            );
           if (!guardPasses) return Promise.resolve({ affected: 0 });
           if (this.mode === 'delete') keys.delete(this.targetId as string);
           else Object.assign(target, this.patch ?? {});
@@ -412,6 +422,22 @@ describe('AuthService', () => {
       await expect(service.delete('uuid-1')).resolves.toBeUndefined();
       await expect(service.findOne('uuid-1')).rejects.toThrow(NotFoundException); // one delete committed
       await expect(service.findOne('uuid-2')).resolves.toBeDefined(); // the survivor is intact
+    });
+  });
+
+  describe('active key index', () => {
+    it('is refreshed after every key write', async () => {
+      (repository.create as jest.Mock).mockImplementation((dto: Partial<ApiKey>) => ({ ...dto, id: 'uuid-new' }));
+      await service.createApiKey({ name: 'new' });
+      expect(keyIndex.refreshSoon).toHaveBeenCalledTimes(1);
+
+      setupKeys([createMockApiKey({ id: 'uuid-1' }), createMockApiKey({ id: 'uuid-2' })]);
+      await service.update('uuid-1', { name: 'renamed' });
+      expect(keyIndex.refreshSoon).toHaveBeenCalledTimes(2);
+      await service.revoke('uuid-1');
+      expect(keyIndex.refreshSoon).toHaveBeenCalledTimes(3);
+      await service.delete('uuid-2');
+      expect(keyIndex.refreshSoon).toHaveBeenCalledTimes(4);
     });
   });
 
@@ -707,6 +733,19 @@ describe('AuthService', () => {
       await expect(service.validateApiKey(` ${rawKey}\n`)).resolves.toMatchObject({ id: key.id });
     });
 
+    it('leaves the usage stats alone when the caller opts out of recording', async () => {
+      const rawKey = 'gate-key';
+      const key = createMockApiKey({ keyHash: hashKey(rawKey), lastUsedAt: new Date(Date.now() - 5 * 60_000) });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+
+      const result = await service.validateApiKey(rawKey, undefined, undefined, { recordUsage: false });
+
+      expect(result.id).toBe(key.id);
+      expect(result.usageCount).toBe(0);
+      expect(repository.update).not.toHaveBeenCalled();
+      expect(repository.increment).not.toHaveBeenCalled();
+    });
+
     it('coalesces the usage-stat write within the throttle window', async () => {
       const rawKey = 'recent-key';
       const key = createMockApiKey({ keyHash: hashKey(rawKey), lastUsedAt: new Date(), usageCount: 5 });
@@ -733,10 +772,14 @@ describe('AuthService', () => {
 
       // Scoped to the usage columns: persisting the whole entity here would write back the
       // authorisation state this request loaded, reverting any concurrent administrator change.
-      const [criteria, patch] = (repository.update as jest.Mock).mock.calls[0] as [{ id: string }, Partial<ApiKey>];
+      const [criteria, patch] = (repository.update as jest.Mock).mock.calls[0] as [
+        { id: string },
+        QueryDeepPartialEntity<ApiKey>,
+      ];
       expect(criteria).toEqual({ id: key.id });
       expect(Object.keys(patch).sort()).toEqual(['lastUsedAt', 'usageCount']);
-      expect(patch.usageCount).toBe(6);
+      // An increment by this request's delta, not the loaded value plus it.
+      expect((patch.usageCount as () => string)()).toBe('"usageCount" + 1');
       expect(repository.save).not.toHaveBeenCalled();
     });
 
@@ -767,6 +810,24 @@ describe('AuthService', () => {
       expect(revoked).not.toBeInstanceOf(UnresolvedApiKeyException);
     });
 
+    it.each([
+      ['revoked', { isActive: false }, undefined, undefined],
+      ['expired', { expiresAt: new Date(Date.now() - 60_000) }, undefined, undefined],
+      ['IP-refused', { allowedIps: ['10.0.0.1'] }, '192.168.1.1', undefined],
+      ['session-refused', { allowedSessions: ['session-A'] }, undefined, 'session-B'],
+    ])('stamps the request actor with a %s key before refusing it', async (_label, overrides, ip, session) => {
+      (repository.findOne as jest.Mock).mockResolvedValue(
+        createMockApiKey({ id: 'key-9', name: 'Leaked', ...overrides }),
+      );
+
+      const actor = await runWithRequestId('req-1', async () => {
+        await expect(service.validateApiKey('raw', ip, session)).rejects.toThrow();
+        return getRequestActor();
+      });
+
+      expect(actor).toMatchObject({ apiKeyId: 'key-9', apiKeyName: 'Leaked' });
+    });
+
     it('should throw UnauthorizedException for expired key', async () => {
       const expired = new Date();
       expired.setDate(expired.getDate() - 1);
@@ -776,14 +837,16 @@ describe('AuthService', () => {
       await expect(service.validateApiKey('expired')).rejects.toThrow('API key has expired');
     });
 
-    it('should throw UnauthorizedException when IP is not allowed', async () => {
+    it('answers 403, not 401, when the IP is not allowed', async () => {
       const key = createMockApiKey({
         allowedIps: ['10.0.0.1'],
         keyHash: hashKey('ip-restricted'),
       });
       (repository.findOne as jest.Mock).mockResolvedValue(key);
 
-      await expect(service.validateApiKey('ip-restricted', '192.168.1.1')).rejects.toThrow('IP address not allowed');
+      const err = await service.validateApiKey('ip-restricted', '192.168.1.1').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect((err as Error).message).toBe('IP address not allowed');
     });
 
     it('should pass when client IP matches allowed IPs', async () => {
@@ -805,7 +868,9 @@ describe('AuthService', () => {
       });
       (repository.findOne as jest.Mock).mockResolvedValue(key);
 
-      await expect(service.validateApiKey('ip-no-client')).rejects.toThrow('Client IP could not be determined');
+      const err = await service.validateApiKey('ip-no-client').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect((err as Error).message).toBe('Client IP could not be determined');
     });
 
     it('rejects a malformed client IP instead of coercing it into an allowed range', async () => {
@@ -820,16 +885,24 @@ describe('AuthService', () => {
       await expect(service.validateApiKey('ip-malformed', '10.0.0.1abc')).rejects.toThrow('IP address not allowed');
     });
 
-    it('should throw UnauthorizedException when session not in allowedSessions', async () => {
+    it('answers 403, not 401, when the session is not in allowedSessions', async () => {
       const key = createMockApiKey({
         allowedSessions: ['session-A'],
         keyHash: hashKey('sess-restricted'),
       });
       (repository.findOne as jest.Mock).mockResolvedValue(key);
 
-      await expect(service.validateApiKey('sess-restricted', undefined, 'session-B')).rejects.toThrow(
-        'API key not authorized for this session',
-      );
+      const err = await service.validateApiKey('sess-restricted', undefined, 'session-B').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect((err as Error).message).toBe('API key not authorized for this session');
+    });
+
+    it('keeps 401 for a revoked or expired key', async () => {
+      for (const overrides of [{ isActive: false }, { expiresAt: new Date(Date.now() - 60_000) }]) {
+        (repository.findOne as jest.Mock).mockResolvedValue(createMockApiKey(overrides));
+        const err = await service.validateApiKey('raw').catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(UnauthorizedException);
+      }
     });
   });
 
@@ -854,8 +927,8 @@ describe('AuthService', () => {
       // Still due on the next request (DB lastUsedAt was never written) → the retry persists the
       // failed delta plus this request's increment — nothing is lost.
       await service.validateApiKey(rawKey);
-      const writes = (repository.update as jest.Mock).mock.calls as Array<[unknown, Partial<ApiKey>]>;
-      expect(writes[1][1].usageCount).toBe(7); // DB 5 + failed delta 1 + this request 1
+      const writes = (repository.update as jest.Mock).mock.calls as Array<[unknown, QueryDeepPartialEntity<ApiKey>]>;
+      expect((writes[1][1].usageCount as () => string)()).toBe('"usageCount" + 2'); // failed delta 1 + this request 1
 
       // The successful retry drained the accumulator — nothing left for the shutdown flush.
       await service.onModuleDestroy();

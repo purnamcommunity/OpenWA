@@ -41,8 +41,9 @@ class SessionsResource
     }
 
     /**
-     * Update a RUNNING session's configuration — no re-link and no QR scan. All three fields were
-     * fixed at creation before this route existed.
+     * Update a session's configuration, in any state, without a restart, re-link or QR scan (all three
+     * fields were fixed at creation before this route existed). `autoRejectCalls` applies immediately;
+     * `maxReconnectAttempts` and `reconnectBaseDelay` apply on the next start.
      *
      * @param array<string,mixed> $body autoRejectCalls, maxReconnectAttempts, reconnectBaseDelay
      *
@@ -65,7 +66,7 @@ class SessionsResource
 
     /**
      * Update per-session proxy settings. No restart — changes apply on the next start.
-     * Send proxyUrl: null to clear. OPERATOR role required.
+     * Send proxyUrl: null to clear. Unscoped ADMIN key required.
      *
      * @param array{proxyUrl?: ?string} $body
      * @return array{enabled: bool, proxyType: ?string, proxyHost: ?string, hasCredentials: bool}
@@ -82,6 +83,8 @@ class SessionsResource
     }
 
     /**
+     * Create a session. Requires an OPERATOR-level key; setting proxyUrl requires an ADMIN key.
+     *
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */

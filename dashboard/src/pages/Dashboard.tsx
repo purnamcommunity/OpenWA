@@ -14,17 +14,18 @@ import {
   useStatsOverviewQuery,
 } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
+import { isSessionStarted } from '../utils/sessionActions';
 import './Dashboard.css';
 
-// recharts is heavy (~150kB gzip); load the analytics section on demand so it never bloats the
-// main/login bundle and only ships when the dashboard actually renders.
+// recharts is heavy (~116 kB gzip); load the analytics section on demand so it never bloats the
+// main/login bundle, and only for an admin key: /stats/messages refuses every other role.
 const DashboardCharts = lazy(() => import('../components/DashboardCharts').then(m => ({ default: m.DashboardCharts })));
 
 export function Dashboard() {
   const { t } = useTranslation();
   useDocumentTitle(t('dashboard.title'));
   const navigate = useNavigate();
-  const { canWrite } = useRole();
+  const { canWrite, isAdmin } = useRole();
   const toast = useToast();
   const {
     data: sessions = [],
@@ -33,10 +34,11 @@ export function Dashboard() {
     isLoadingError: sessionsNeverLoaded,
   } = useSessionsQuery();
   const { data: stats } = useSessionStatsQuery();
-  const { data: webhooks, isError: webhooksFailed } = useWebhooksQuery();
-  // /stats/overview is ADMIN-only; for a non-admin key it 403s → overview stays undefined and the
-  // message cards fall back to '—' without breaking the (un-gated) session cards.
-  const { data: overview } = useStatsOverviewQuery();
+  // GET /webhooks is OPERATOR-only and /stats/overview ADMIN-only. A key without the role is not sent
+  // them, since the gateway audits every refusal as a failed authentication; their cards show the
+  // unavailable placeholder.
+  const { data: webhooks, isError: webhooksFailed } = useWebhooksQuery(canWrite);
+  const { data: overview } = useStatsOverviewQuery(isAdmin);
   const stopMutation = useStopSessionMutation();
   const unavailable = '—';
   const messagesToday = overview ? overview.messages.today.sent + overview.messages.today.received : unavailable;
@@ -49,9 +51,9 @@ export function Dashboard() {
       ? sessionsError.message
       : t('dashboard.loadError')
     : null;
-  // GET /webhooks is OPERATOR-only, so a viewer key always fails it: a failed read is not zero webhooks.
+  // A viewer is not sent the webhook read, and a failed read is not zero webhooks either.
   // A failed background refetch keeps the cached list, which still counts.
-  const webhookCount = webhooksFailed && !webhooks ? unavailable : (webhooks ?? []).length;
+  const webhookCount = !canWrite || (webhooksFailed && !webhooks) ? unavailable : (webhooks ?? []).length;
 
   const handleDisconnect = async (id: string) => {
     try {
@@ -136,9 +138,11 @@ export function Dashboard() {
         ))}
       </div>
 
-      <Suspense fallback={null}>
-        <DashboardCharts />
-      </Suspense>
+      {isAdmin && (
+        <Suspense fallback={null}>
+          <DashboardCharts />
+        </Suspense>
+      )}
 
       <section className="sessions-section">
         <div className="section-header">
@@ -177,7 +181,7 @@ export function Dashboard() {
                     {t('dashboard.view')}
                   </button>
                   {/* Stopping a session is an operator write; a read-only key would only collect a 403. */}
-                  {canWrite && ['ready', 'initializing', 'qr_ready'].includes(session.status) && (
+                  {canWrite && isSessionStarted(session) && (
                     <button className="btn-sm danger" onClick={() => handleDisconnect(session.id)}>
                       {t('dashboard.disconnect')}
                     </button>

@@ -10,6 +10,7 @@ jest.mock('undici', () => {
   return { __esModule: true, ...actual, fetch: jest.fn() };
 });
 
+import { createHmac } from 'crypto';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { getQueueToken } from '@nestjs/bullmq';
@@ -20,6 +21,7 @@ import { fetch as undiciFetch } from 'undici';
 import { WebhookService } from './webhook.service';
 import { WebhookOutboxService } from './webhook-outbox.service';
 import { WebhookDeliveryService } from './webhook-delivery.service';
+import { buildDeliveryHeaders } from './utils/deliver-once';
 import { Webhook } from './entities/webhook.entity';
 import { WebhookDeliveryFailure } from './entities/webhook-delivery-failure.entity';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
@@ -393,6 +395,40 @@ describe('WebhookService', () => {
       expect(webhook.url).toBe('https://example.com/webhook');
       expect(repository.save).not.toHaveBeenCalled();
     });
+
+    describe('with the SSRF guard on', () => {
+      const origProtect = process.env.WEBHOOK_SSRF_PROTECT;
+      beforeEach(() => delete process.env.WEBHOOK_SSRF_PROTECT); // default: on
+      afterEach(() => {
+        if (origProtect === undefined) delete process.env.WEBHOOK_SSRF_PROTECT;
+        else process.env.WEBHOOK_SSRF_PROTECT = origProtect;
+      });
+
+      it('saves an edit that re-sends an unchanged URL the guard would now refuse', async () => {
+        const webhook = createMockWebhook({ url: 'https://169.254.169.254/hook' });
+        (repository.findOne as jest.Mock).mockResolvedValue(webhook);
+        (repository.save as jest.Mock).mockImplementation(w => Promise.resolve(w));
+
+        const result = await service.update('sess-1', 'wh-uuid-1', {
+          url: 'https://169.254.169.254/hook',
+          active: false,
+        });
+
+        expect(result.active).toBe(false);
+        expect(repository.save).toHaveBeenCalledWith(expect.objectContaining({ active: false }));
+      });
+
+      it('still refuses a changed URL the guard blocks', async () => {
+        const webhook = createMockWebhook();
+        (repository.findOne as jest.Mock).mockResolvedValue(webhook);
+
+        await expect(
+          service.update('sess-1', 'wh-uuid-1', { url: 'https://169.254.169.254/hook', active: false }),
+        ).rejects.toMatchObject({ status: 400 });
+        expect(webhook.url).toBe('https://example.com/webhook');
+        expect(repository.save).not.toHaveBeenCalled();
+      });
+    });
   });
 
   // ── delete ────────────────────────────────────────────────────────
@@ -494,6 +530,41 @@ describe('WebhookService', () => {
       expect(keys).toHaveLength(2);
       expect(keys[0]).not.toBe(keys[1]);
       for (const key of keys) expect(key.endsWith(`_${webhook.id}`)).toBe(true);
+    });
+
+    // The probe must carry exactly what a real delivery would, or a receiver that passes the test can
+    // still reject live traffic (a stripped header, a signature over different bytes).
+    it('test() sends the headers of a real delivery, signed over the exact body', async () => {
+      const webhook = createMockWebhook({
+        secret: 'probe-secret',
+        headers: { 'X-Custom': 'a', 'X-OpenWA-Event': 'forged', 'Content-Type': 'text/plain', Connection: 'close' },
+      });
+      (repository.findOne as jest.Mock).mockResolvedValue(webhook);
+      mockFetch.mockResolvedValue({ ok: true, status: 200 });
+
+      await expect(service.test('sess-1', webhook.id)).resolves.toEqual({ success: true, statusCode: 200 });
+
+      const [, init] = mockFetch.mock.calls[0] as [string, { headers: Record<string, string>; body: string }];
+      const sent = JSON.parse(init.body) as { idempotencyKey: string; deliveryId: string };
+      expect(init.headers).toEqual(
+        buildDeliveryHeaders(webhook, 'test', sent.idempotencyKey, sent.deliveryId, init.body),
+      );
+      expect(init.headers).toMatchObject({
+        'X-Custom': 'a',
+        'X-OpenWA-Event': 'test',
+        'Content-Type': 'application/json',
+        'X-OpenWA-Retry-Count': '0',
+        'X-OpenWA-Signature': `sha256=${createHmac('sha256', 'probe-secret').update(init.body).digest('hex')}`,
+      });
+      expect(init.headers).not.toHaveProperty('Connection');
+    });
+
+    it('test() reports a non-2xx receiver answer as a status, without throwing', async () => {
+      const webhook = createMockWebhook();
+      (repository.findOne as jest.Mock).mockResolvedValue(webhook);
+      mockFetch.mockResolvedValue({ ok: false, status: 500 });
+
+      await expect(service.test('sess-1', webhook.id)).resolves.toEqual({ success: false, statusCode: 500 });
     });
 
     // A literal link-local IP is rejected synchronously by the SSRF guard before any fetch/DNS, so this

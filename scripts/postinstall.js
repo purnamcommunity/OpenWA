@@ -1,7 +1,7 @@
 /**
  * Post-install hook (npm `postinstall`).
  *
- * Seventeen conditional steps, each skipped when its target is absent so the hook is a no-op where the
+ * Eighteen conditional steps, each skipped when its target is absent so the hook is a no-op where the
  * piece is missing (the Docker builder stage copies package*.json long before any source):
  *
  *   1. `npm ci` inside dashboard/ when dashboard/ exists — the dashboard carries its own lockfile and
@@ -42,12 +42,15 @@
  *  15. `node scripts/patch-wwebjs-send-error.js --best-effort` when present, making a failed send
  *      report what the page threw instead of `t: t`. It runs after every other Client.js patcher
  *      (steps 2, 5, 9, 10 and 14), so theirs still meet the tree they were written for.
- *  16. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
+ *  16. `node scripts/patch-wwebjs-download-mimetype.js --best-effort` when present, passing the
+ *      message's mimetype to the media download so inbound media downloads work again, gated the
+ *      same way.
+ *  17. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
  *      bound, gated the same way.
- *  17. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
- *      newsletter-create parse fix. Steps 16-17 are the Baileys patches, so a Baileys-only install
- *      runs those and skips 2-15. This list is the order `planSteps` plans, which
- *      `scripts/postinstall.spec.js` pins against the patchers on disk.
+ *  18. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
+ *      newsletter-create parse fix. Steps 17-18 are the Baileys patches. Every patcher runs whenever
+ *      its script is present, whatever ENGINE_TYPE is set to. This list is the order `planSteps`
+ *      plans, which `scripts/postinstall.spec.js` pins against the patchers on disk.
  *
  * Structured like scripts/patch-wwebjs-201832.js: pure planning + injectable spawn, so the spec
  * (scripts/postinstall.spec.js, node:test) exercises every branch without a real npm run.
@@ -217,6 +220,15 @@ function planSteps(root, env = process.env) {
       name: 'whatsapp-web.js send error capture (scripts/patch-wwebjs-send-error.js --best-effort)',
       command: process.execPath,
       args: [sendErrorPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const downloadMimetypePatcher = path.join(root, 'scripts', 'patch-wwebjs-download-mimetype.js');
+  if (fs.existsSync(downloadMimetypePatcher)) {
+    steps.push({
+      name: 'whatsapp-web.js media download mimetype (scripts/patch-wwebjs-download-mimetype.js --best-effort)',
+      command: process.execPath,
+      args: [downloadMimetypePatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }

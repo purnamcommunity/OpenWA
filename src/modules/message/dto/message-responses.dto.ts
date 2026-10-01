@@ -57,7 +57,8 @@ export class MessageListItemDto {
   @ApiPropertyOptional({
     type: String,
     nullable: true,
-    description: 'Human-readable chat name when known (contact pushName, group subject).',
+    description:
+      'Push name of the message sender as the engine reported it; in a group this is the member who posted, not the group subject. Null when no contact name was known.',
     example: 'Alice',
   })
   chatName?: string | null;
@@ -65,7 +66,8 @@ export class MessageListItemDto {
   @ApiPropertyOptional({
     type: String,
     nullable: true,
-    description: 'Sender of a group, status or broadcast-list message (`from` is the group or `@broadcast` id there).',
+    description:
+      'Sender of a group, status or broadcast-list message (`from` is the group, `status@broadcast` or list id there). On Baileys a list message the account received is filed under the sender, so `from` is the sender too.',
     example: '628123456789@c.us',
   })
   author?: string | null;
@@ -298,7 +300,8 @@ export class ChatHistoryMessageDto {
   ephemeralDuration?: number;
 
   @ApiPropertyOptional({
-    description: 'Sender of a group, status or broadcast-list message (`from` is the group or `@broadcast` id there).',
+    description:
+      'Sender of a group, status or broadcast-list message (`from` is the group, `status@broadcast` or list id there). On Baileys a list message the account received is filed under the sender, so `from` is the sender too.',
     example: '628123456789@c.us',
   })
   author?: string;
@@ -315,7 +318,8 @@ export class ChatHistoryMessageDto {
   @ApiPropertyOptional({
     type: String,
     nullable: true,
-    description: 'Best-effort phone digits of a privacy-id sender, when resolved.',
+    description:
+      'Never set on this route: live history does no privacy-id resolution. Resolve an @lid sender with GET /api/sessions/{sessionId}/contacts/{contactId}/phone.',
     example: null,
   })
   senderPhone?: string | null;

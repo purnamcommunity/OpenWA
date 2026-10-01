@@ -19,7 +19,8 @@
  * and optionality only, so the literal sets themselves are ungated on the TS clients. Everywhere
  * else the vocabulary IS compared member by member: Python Literals, Go const blocks and Java
  * enum constants (by their `@SerializedName`, or the constant's own name when it has none, which
- * is what Gson emits), whether the field carries one member or a list of them.
+ * is what Gson emits; a bare `UNKNOWN` is the decode-only sentinel and is skipped), whether the
+ * field carries one member or a list of them.
  *
  * One exception, in Java only: Gson serializes an enum constant by name, i.e. as a JSON string, so
  * a NUMERIC enum cannot be modelled as a Java enum without a custom adapter: the wire would carry
@@ -29,7 +30,8 @@
  *
  * What one comparison covers, per mapped pair: field-name sets in both directions, required vs
  * optional (hand `?` vs the schema's `required` array), and — for fields whose both sides reduce
- * to a simple token (primitive, enum literal set, array of those, null union) — the token itself,
+ * to a simple token (primitive, enum literal set, array of those, null union; on the hand side, any
+ * union too) — the token itself,
  * which is what catches `string` widened to `string | number` or a re-ordered enum growing a
  * member. Complex/nested fields are compared by presence and optionality only; that limit is
  * deliberate (the hand parser stays regular), and the exclusions below record what is known to be
@@ -43,8 +45,7 @@
  * under-describes reality, fix the backend DTO decorator, regenerate, and un-exclude).
  */
 
-import { readFileSync, readdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 // Resolve from the script's own location, not process.cwd() — same reason check-sdk-coverage.mjs
@@ -85,6 +86,7 @@ const MAPPINGS = {
     GroupParticipant: 'GroupParticipantDto',
     GroupSubjectRequest: 'GroupSubjectDto',
     GroupSummary: 'GroupSummaryDto',
+    HealthReadyResponse: 'ReadinessResponseDto',
     JoinGroupRequest: 'JoinGroupDto',
     MarkChatReadRequest: 'MarkChatReadDto',
     MarkChatRequest: 'MarkChatUnreadDto',
@@ -167,16 +169,16 @@ const MAPPINGS = {
 
 /**
  * Floor on the mapping SIZE per client. The per-file compared-pairs guard above cannot see a
- * rewrite that silently DROPS entries (protection shrinks while everything stays green — observed
- * in review: a from-memory rewrite lost four conforming pairs and the run still passed). Raising
- * these floors as pairs are added makes the shrink loud.
+ * rewrite that silently DROPS entries (protection shrinks while everything stays green: a rewrite
+ * once lost four conforming pairs and the run still passed). Raising these floors as pairs are
+ * added makes the shrink loud.
  */
 const MINIMUM_MAPPED = {
-  'sdk/javascript/src/types.ts': 83,
+  'sdk/javascript/src/types.ts': 84,
   'dashboard/src/services/api.ts': 21,
   'sdk/python/openwa/types.py': 79,
   'sdk/go': 79,
-  'sdk/java': 83,
+  'sdk/java': 84,
 };
 
 /** Known drift, deliberately not gated yet — each line is a to-adjudicate follow-up. */
@@ -410,6 +412,7 @@ const JAVA_MAPPING = {
   GroupParticipant: 'GroupParticipantDto',
   GroupSubjectRequest: 'GroupSubjectDto',
   GroupSummary: 'GroupSummaryDto',
+  HealthReadyResponse: 'ReadinessResponseDto',
   JoinGroupRequest: 'JoinGroupDto',
   MarkChatReadRequest: 'MarkChatReadDto',
   MarkChatRequest: 'MarkChatUnreadDto',
@@ -691,7 +694,8 @@ export function comparePair(handName, handMembers, schemaName, schema, schemas, 
         }
       }
       const absorbs = handInfo.absorbsNull && contract === `${hand}|null`;
-      if (hand !== contract && !absorbs && isSimpleToken(hand)) {
+      // A union never equals a simple contract token, so it is drift, not a shape too complex to read.
+      if (hand !== contract && !absorbs && (isSimpleToken(hand) || hand.startsWith('union('))) {
         diffs.push(`"${field}": hand ${hand}, contract ${contract}`);
       }
     }
@@ -1014,7 +1018,9 @@ export function parseJavaTypes(sources) {
           continue;
         }
         const bare = part.replace(/@\w+\([^)]*\)/g, '').trim().match(/^([A-Z][A-Z0-9_]*)$/);
-        if (bare) members.push(bare[1]);
+        // A bare UNKNOWN is the client-side sentinel the SDK decodes an unrecognised token to, not
+        // a wire member. An annotated @SerializedName("unknown") is a real member and counts above.
+        if (bare && bare[1] !== 'UNKNOWN') members.push(bare[1]);
       }
       if (members.length) enums[m[1]] = `enum(${sortEnumMembers([...new Set(members)]).join(',')})`;
     }
@@ -1080,9 +1086,9 @@ export function parseJavaTypes(sources) {
 
 // Resolved-path comparison, not a basename match: splitting on `/` finds no separator in a Windows
 // path so the whole native path became the "basename" and never matched, and a bare `endsWith` on a
-// basename would also fire for any other script sharing this file's name. Same comparison as
-// check-sdk-docs.mjs and check-upstream-surface.mjs.
-const isDirectRun = Boolean(process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url));
+// basename would also fire for any other script sharing this file's name. argv[1] is realpathed
+// because Node realpaths the main module's URL, so an unresolved path through a symlink never matched.
+const isDirectRun = Boolean(process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url));
 if (isDirectRun) {
   const openapi = JSON.parse(readFileSync(`${REPO_ROOT}openapi.json`, 'utf8'));
   const schemas = openapi.components.schemas;

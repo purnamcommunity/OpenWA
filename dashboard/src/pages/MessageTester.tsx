@@ -226,8 +226,16 @@ export function MessageTester() {
         if (batchPollRef.current !== timer) return;
         setBatchStatus(status);
         if (TERMINAL_BATCH_STATUSES.includes(status.status)) stopBatchPolling();
-      } catch {
-        // A transient poll failure (network blip, backend restart) must not kill progress tracking.
+      } catch (err) {
+        if (batchPollRef.current !== timer) return;
+        // A 404 (the batch or its session was deleted) or 403 (the key lost access) is permanent: stop
+        // and say so. A transient failure (network blip, backend restart, 5xx, 408, 429) must not kill
+        // progress tracking.
+        const status = (err as { status?: number }).status;
+        if (status === 404 || status === 403) {
+          stopBatchPolling();
+          setBatchError(err instanceof Error ? err.message : t('messageTester.sendFailed'));
+        }
       }
     }, 2000);
     batchPollRef.current = timer;
@@ -358,9 +366,12 @@ export function MessageTester() {
       (delayMs === undefined || (!Number.isNaN(delayMs) && delayMs >= 1000 && delayMs <= 60000));
   }
 
+  // A new send replaces the batch on screen, so it waits for an in-flight cancel: the cancel's answer
+  // would otherwise be merged into the newer batch and stop its progress polling.
   const isSendDisabled =
     !canWrite ||
     isLoading ||
+    batchCancelling ||
     !session ||
     !formValid ||
     (messageType !== 'bulk' && (recipientType === 'group' ? selectedGroups.length === 0 : !recipient));

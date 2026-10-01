@@ -18,8 +18,9 @@ import { EngineNotSupportedError } from '../../common/errors/engine-not-supporte
 import { GroupNotFoundError } from '../../common/errors/group-not-found.error';
 import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.error';
 import { toMessageMedia } from './wwebjs-messaging';
-import { type WwebjsEngineHost, withPage } from './wwebjs-host';
+import { type WwebjsEngineHost, withPage, reportPageDeath } from './wwebjs-host';
 import { isProtocolTimeout } from './wwebjs-lifecycle';
+import { listChats } from './wwebjs-chats';
 
 /**
  * Extracts the JID of the parent community a group is linked to, if any.
@@ -325,30 +326,28 @@ export class WwebjsGroups {
 
   async getGroups(): Promise<Group[]> {
     this.host.ensureReady();
-    return withPage(this.host, 'getGroups', async () => {
-      const client = this.client();
-      const chats = await client.getChats();
+    const client = this.client();
+    const chats = await listChats(this.host, 'getGroups');
 
-      // Filter only group chats
-      const groups = chats.filter(chat => chat.isGroup);
+    // Filter only group chats
+    const groups = chats.filter(chat => chat.isGroup);
 
-      // List path: read linkedParentJID synchronously from whatever metadata getChats()
-      // already loaded. We deliberately do NOT fall back to getChatById per group here —
-      // that would be an N+1 round-trip across every group on every list call. Groups
-      // whose metadata isn't loaded report null; the single-group endpoint (getGroupInfo,
-      // which loads full metadata via getChatById) is the authoritative source.
-      return groups.map(g => {
-        const groupChat = g as unknown as GroupChat;
-        return {
-          id: g.id._serialized,
-          name: g.name,
-          participantsCount: groupChat.participants?.length,
-          isAdmin: groupChat.participants?.some(
-            p => p.isAdmin && readWid(p.id) !== undefined && readWid(p.id) === readWid(client.info?.wid),
-          ),
-          linkedParentJID: extractLinkedParentJID(groupChat.groupMetadata),
-        };
-      });
+    // List path: read linkedParentJID synchronously from whatever metadata the chat list
+    // already loaded. We deliberately do NOT fall back to getChatById per group here:
+    // that would be an N+1 round-trip across every group on every list call. Groups
+    // whose metadata isn't loaded report null; the single-group endpoint (getGroupInfo,
+    // which loads full metadata via getChatById) is the authoritative source.
+    return groups.map(g => {
+      const groupChat = g as unknown as GroupChat;
+      return {
+        id: g.id._serialized,
+        name: g.name,
+        participantsCount: groupChat.participants?.length,
+        isAdmin: groupChat.participants?.some(
+          p => p.isAdmin && readWid(p.id) !== undefined && readWid(p.id) === readWid(client.info?.wid),
+        ),
+        linkedParentJID: extractLinkedParentJID(groupChat.groupMetadata),
+      };
     });
   }
 
@@ -372,15 +371,25 @@ export class WwebjsGroups {
           isSuperAdmin: Boolean(p.isSuperAdmin),
         }));
 
+      // GroupChat.createdAt is a getter returning a Date (GroupChat.js:36), which serialises as an
+      // ISO string; the contract is Unix seconds, so read the raw metadata field instead.
+      const creation = (groupChat.groupMetadata as { creation?: unknown } | undefined)?.creation;
+      // GroupChat has no isAnnounce, and WA Web overwrites isReadOnly with the announce SETTING
+      // (Injected/Utils.js:1005), which tells an admin of an announce-only group they cannot post.
+      // Derive both from the metadata, as the Baileys mapper does.
+      const announce = Boolean(groupChat.groupMetadata?.announce);
+      const selfWid = readWid(this.client().info?.wid);
+      const selfIsAdmin = participants.some(p => p.isAdmin && selfWid !== undefined && p.id === selfWid);
+
       return {
         id: chat.id._serialized,
         name: chat.name,
         description: groupChat.description ? String(groupChat.description) : undefined,
         owner: readWid(groupChat.owner),
-        createdAt: groupChat.createdAt,
+        createdAt: typeof creation === 'number' ? creation : undefined,
         participants,
-        isReadOnly: Boolean(groupChat.isReadOnly),
-        isAnnounce: Boolean(groupChat.isAnnounce),
+        isReadOnly: announce && !selfIsAdmin,
+        isAnnounce: announce,
         announce: groupChat.groupMetadata?.announce,
         locked: groupChat.groupMetadata?.restrict,
         ephemeralSeconds: groupChat.groupMetadata?.ephemeralDuration,
@@ -502,9 +511,9 @@ export class WwebjsGroups {
   }
 
   async addParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
-    const chat = await this.requireGroupChat(groupId);
+    const chat = await this.requireGroupChat(groupId, 'addParticipants');
     const participantIds = participants.map(toParticipantWid);
-    const raw = await chat.addParticipants(participantIds);
+    const raw = await reportPageDeath(this.host, 'addParticipants', () => chat.addParticipants(participantIds));
     // whatsapp-web.js reports a batch-level refusal (no admin rights, empty group) by RESOLVING a
     // plain reason string (GroupChat.js:106-107,128-130) instead of throwing — surface it as a
     // refusal, not a success.
@@ -609,7 +618,7 @@ export class WwebjsGroups {
     groupId: string,
     participants: string[],
   ): Promise<ParticipantOperationResult[]> {
-    const chat = await this.requireGroupChat(groupId);
+    const chat = await this.requireGroupChat(groupId, op);
     const participantIds = participants.map(toParticipantWid);
     const res = await this.runParticipantBatch(op, groupId, chat, participantIds);
     if (res?.status !== 200) {
@@ -643,7 +652,7 @@ export class WwebjsGroups {
     participantIds: string[],
   ): Promise<{ status?: number; matched?: unknown }> {
     try {
-      return await chat[op](participantIds);
+      return await reportPageDeath(this.host, op, () => chat[op](participantIds));
     } catch (error) {
       if (/expected at least 1 children/.test((error as Error)?.message ?? '')) {
         throw new EngineRefusedError(`${op}: none of the requested participants is a member of group ${groupId}`);
@@ -678,49 +687,49 @@ export class WwebjsGroups {
   }
 
   async leaveGroup(groupId: string): Promise<void> {
-    const chat = await this.requireGroupChat(groupId);
-    await chat.leave();
+    const chat = await this.requireGroupChat(groupId, 'leaveGroup');
+    await reportPageDeath(this.host, 'leaveGroup', () => chat.leave());
   }
 
   async setGroupSubject(groupId: string, subject: string): Promise<void> {
-    const chat = await this.requireGroupChat(groupId);
+    const chat = await this.requireGroupChat(groupId, 'setGroupSubject');
     // GroupChat.setSubject resolves false when WA Web rejects the change (e.g. the account lacks
     // admin rights; index.d.ts:1982) instead of throwing — surface the refusal, not a false success.
-    const ok = await chat.setSubject(subject);
+    const ok = await withPage(this.host, 'setGroupSubject', () => chat.setSubject(subject));
     if (!ok) {
       throw new EngineRefusedError(`Failed to set the subject for group ${groupId} — admin rights required`);
     }
   }
 
   async setGroupDescription(groupId: string, description: string): Promise<void> {
-    const chat = await this.requireGroupChat(groupId);
+    const chat = await this.requireGroupChat(groupId, 'setGroupDescription');
     // Same discarded-boolean contract as setSubject (index.d.ts:1984).
-    const ok = await chat.setDescription(description);
+    const ok = await withPage(this.host, 'setGroupDescription', () => chat.setDescription(description));
     if (!ok) {
       throw new EngineRefusedError(`Failed to set the description for group ${groupId} — admin rights required`);
     }
   }
 
   async getGroupInviteCode(groupId: string): Promise<string> {
-    const chat = await this.requireGroupChat(groupId);
+    const chat = await this.requireGroupChat(groupId, 'getGroupInviteCode');
     // Typed Promise<string>, but WA Web yields nothing when the account is not an admin of the
     // group — and String(undefined) is the literal 'undefined', which the caller renders as the
     // link "https://chat.whatsapp.com/undefined". Same refusal contract as setDescription.
-    const inviteCode = await chat.getInviteCode();
+    const inviteCode = await withPage(this.host, 'getGroupInviteCode', () => chat.getInviteCode());
     if (!inviteCode) {
       throw new EngineRefusedError(`Failed to get the invite code for group ${groupId} — admin rights required`);
     }
-    this.host.logger.log(`Got invite code for group ${groupId}`);
+    this.host.logger.debug('Got group invite code', { groupId });
     return inviteCode;
   }
 
   async revokeGroupInviteCode(groupId: string): Promise<string> {
-    const chat = await this.requireGroupChat(groupId);
-    const newCode = await chat.revokeInvite();
+    const chat = await this.requireGroupChat(groupId, 'revokeGroupInviteCode');
+    const newCode = await reportPageDeath(this.host, 'revokeGroupInviteCode', () => chat.revokeInvite());
     if (!newCode) {
       throw new EngineRefusedError(`Failed to revoke the invite code for group ${groupId} — admin rights required`);
     }
-    this.host.logger.log(`Revoked invite code for group ${groupId}, new code generated`);
+    this.host.logger.debug('Revoked group invite code, new code generated', { groupId });
     return newCode;
   }
 
@@ -816,14 +825,18 @@ export class WwebjsGroups {
     if (!groupId) {
       throw new InvalidInviteCodeError();
     }
-    this.host.logger.log(`Joined group ${groupId} via invite code`);
+    this.host.logger.debug('Joined group via invite code', { groupId });
     return groupId;
   }
 
-  /** Resolve a group chat or throw — the shared preamble of the group settings writes. */
-  private async requireGroupChat(groupId: string): Promise<GroupChat> {
+  /**
+   * Resolve a group chat or throw: the shared preamble of the group settings writes. The lookup is a
+   * read that runs before any write, so a dead page answers 503 with the death signal even for the
+   * non-idempotent callers: nothing has been applied yet. `context` names the caller's operation.
+   */
+  private async requireGroupChat(groupId: string, context: string): Promise<GroupChat> {
     this.host.ensureReady();
-    const chat = await this.client().getChatById(groupId);
+    const chat = await withPage(this.host, context, () => this.client().getChatById(groupId));
     // getChatById RESOLVES undefined for an unknown id (wwebjs does not throw): unknown id and a
     // non-group id are the same client-facing outcome — there is no such group (404, not a 500).
     if (!chat?.isGroup) {
@@ -834,10 +847,12 @@ export class WwebjsGroups {
 
   // Set "only admins can send messages" (announce)
   async setGroupMessagesAdminsOnly(groupId: string, adminsOnly: boolean): Promise<void> {
-    const groupChat = await this.requireGroupChat(groupId);
+    const groupChat = await this.requireGroupChat(groupId, 'setGroupMessagesAdminsOnly');
     // Resolves false instead of throwing when the account lacks admin rights (GroupChat.js:503) —
     // surface that as an error rather than a silent no-op.
-    const ok = await groupChat.setMessagesAdminsOnly(adminsOnly);
+    const ok = await withPage(this.host, 'setGroupMessagesAdminsOnly', () =>
+      groupChat.setMessagesAdminsOnly(adminsOnly),
+    );
     if (!ok) {
       throw new EngineRefusedError(
         `Failed to update the messages-admins-only setting for group ${groupId} — admin rights required`,
@@ -846,17 +861,19 @@ export class WwebjsGroups {
   }
 
   async setGroupPicture(groupId: string, media: MediaInput): Promise<void> {
-    const groupChat = await this.requireGroupChat(groupId);
+    const groupChat = await this.requireGroupChat(groupId, 'setGroupPicture');
+    // Loaded outside the page guard: a media fetch failing with "connection closed" is not a dead page.
+    const picture = await toMessageMedia(media, this.host.config.proxy?.url);
     // GroupChat.setPicture, NOT Client.setProfilePicture — the latter targets the own account.
-    const ok = await groupChat.setPicture(await toMessageMedia(media, this.host.config.proxy?.url));
+    const ok = await withPage(this.host, 'setGroupPicture', () => groupChat.setPicture(picture));
     if (!ok) {
       throw new EngineRefusedError(`Failed to set the picture for group ${groupId} — admin rights required`);
     }
   }
 
   async deleteGroupPicture(groupId: string): Promise<void> {
-    const groupChat = await this.requireGroupChat(groupId);
-    const ok = await groupChat.deletePicture();
+    const groupChat = await this.requireGroupChat(groupId, 'deleteGroupPicture');
+    const ok = await withPage(this.host, 'deleteGroupPicture', () => groupChat.deletePicture());
     if (!ok) {
       throw new EngineRefusedError(`Failed to delete the picture for group ${groupId} — admin rights required`);
     }
@@ -866,8 +883,10 @@ export class WwebjsGroups {
   // own GroupChat setter, and it is inverted relative to our neutral vocabulary: adminsOnly=true
   // means mode 'admins'.
   async setGroupMemberAddMode(groupId: string, mode: GroupMemberAddMode): Promise<void> {
-    const groupChat = await this.requireGroupChat(groupId);
-    const ok = await groupChat.setAddMembersAdminsOnly(mode === 'admins');
+    const groupChat = await this.requireGroupChat(groupId, 'setGroupMemberAddMode');
+    const ok = await withPage(this.host, 'setGroupMemberAddMode', () =>
+      groupChat.setAddMembersAdminsOnly(mode === 'admins'),
+    );
     if (!ok) {
       throw new EngineRefusedError(
         `Failed to update the member-add-mode setting for group ${groupId} — admin rights required`,
@@ -877,8 +896,8 @@ export class WwebjsGroups {
 
   // Set "only admins can edit group info" (locked/restrict)
   async setGroupInfoAdminsOnly(groupId: string, adminsOnly: boolean): Promise<void> {
-    const groupChat = await this.requireGroupChat(groupId);
-    const ok = await groupChat.setInfoAdminsOnly(adminsOnly);
+    const groupChat = await this.requireGroupChat(groupId, 'setGroupInfoAdminsOnly');
+    const ok = await withPage(this.host, 'setGroupInfoAdminsOnly', () => groupChat.setInfoAdminsOnly(adminsOnly));
     if (!ok) {
       throw new EngineRefusedError(
         `Failed to update the info-admins-only setting for group ${groupId} — admin rights required`,
@@ -898,7 +917,7 @@ export class WwebjsGroups {
     // Resolved first, like every other group operation in this file. Without it an unknown id or a
     // non-group jid answered 200 with an empty list, which reads as "this group has no pending
     // requests" rather than "there is no such group"; Baileys answers the refusal.
-    await this.requireGroupChat(groupId);
+    await this.requireGroupChat(groupId, 'getGroupMembershipRequests');
     return withPage(this.host, 'getGroupMembershipRequests', async () => {
       const raw = await this.client().getGroupMembershipRequests(groupId);
       // Raw page-context store objects: wids can arrive as {_serialized} OR {$1} (the #747
@@ -950,7 +969,7 @@ export class WwebjsGroups {
     participants?: string[],
   ): Promise<ParticipantOperationResult[]> {
     this.host.ensureReady();
-    const raw = await this.client()[op](groupId, {
+    const options = {
       // Qualified like every other participant write in this file: the service blesses a bare phone
       // number, and the page maps requesterIds straight through `createWid` (Injected/Utils.js) —
       // which upstream itself never hands a bare number, appending '@c.us' first. Unqualified it
@@ -958,7 +977,8 @@ export class WwebjsGroups {
       // input succeeded on Baileys. `null` still means every pending request.
       requesterIds: participants?.map(toParticipantWid) ?? null,
       sleep: [250, 500],
-    });
+    };
+    const raw = await reportPageDeath(this.host, op, () => this.client()[op](groupId, options));
     // {requesterId, error?, message} per requester; requesterId is a page-context value that can
     // arrive as a string or a wid object (both #747 spellings), so it goes through readWid too.
     // "No error field" is NOT sufficient for success: the page util's non-success RPC branch pushes

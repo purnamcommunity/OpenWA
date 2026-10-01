@@ -70,7 +70,7 @@ export interface SaveOutgoingMessageData {
  *
  * Backpressure is applied at the edges instead: bulk sends self-throttle via
  * `delayBetweenMessages` (default 3s) and a per-process concurrent-batch cap (see
- * `BulkMessageService`), and the global throttler enforces per-key rate limits.
+ * `BulkMessageService`), and the global throttler enforces per-route, per-client-IP rate limits.
  */
 @Injectable()
 export class MessageSendService {
@@ -120,7 +120,8 @@ export class MessageSendService {
       quotedMessageId: finalDto.quotedMessageId,
     });
 
-    // Opt-in humanising "typing…" pause before the actual send (anti-automation signal).
+    // Humanising "typing…" pause before the actual send (anti-automation signal). On by default;
+    // SIMULATE_TYPING=false disables it.
     await this.simulateTypingIfEnabled(engine, finalDto.chatId, finalDto.text);
 
     let result: MessageResult;
@@ -206,6 +207,8 @@ export class MessageSendService {
         chatId: message.chatId,
         messageId: message.id,
         error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+        // An EnginePageError keeps the full in-page summary (stack, own properties) here only.
+        ...(error instanceof Error && error.cause instanceof Error ? { cause: error.cause.message } : {}),
       });
     }
     await this.saveFailedMessage(message);

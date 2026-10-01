@@ -4,6 +4,7 @@ import { createAdapter } from '@socket.io/redis-adapter';
 import Redis, { type RedisOptions } from 'ioredis';
 import type { Server, ServerOptions } from 'socket.io';
 import { createLogger } from '../../common/services/logger.service';
+import { redisConnectionOptions } from '../../config/redis-options';
 
 const logger = createLogger('RedisIoAdapter');
 
@@ -22,11 +23,7 @@ export function isWsRedisEnabled(): boolean {
 /** ioredis options for the pub/sub pair, mirroring the throttler/cache connection env exactly. */
 export function wsRedisOptions(): RedisOptions {
   return {
-    host: process.env.REDIS_HOST || 'localhost',
-    port: parseInt(process.env.REDIS_PORT || '6379', 10),
-    username: process.env.REDIS_USERNAME,
-    password: process.env.REDIS_PASSWORD,
-    connectTimeout: parseInt(process.env.REDIS_CONNECT_TIMEOUT_MS || '5000', 10),
+    ...redisConnectionOptions(),
     // The adapter's SUBSCRIBE connection cannot issue ordinary commands, so a bounded retry that
     // gives up (returning null) would strand fan-out permanently after one blip. Reconnect forever
     // with capped backoff, matching the cache client.
@@ -74,6 +71,16 @@ export class RedisIoAdapter extends IoAdapter {
       ] as const) {
         client.on('error', err => logger.warn(`Redis ${name} client error: ${err.message}`));
       }
+      // The adapter fires publish() on every broadcast and drops the promise. During an outage ioredis
+      // queues those commands and, each time its retries run out, rejects the whole queue, so every
+      // event emitted meanwhile surfaced as an unhandled rejection. The 'error' listener above already
+      // reports the outage once; a lost fan-out frame is only worth a debug line.
+      const publish = pubClient.publish.bind(pubClient);
+      pubClient.publish = (channel: string, message: string | Buffer) =>
+        publish(channel, message).catch((err: Error) => {
+          logger.debug(`Redis publish dropped: ${err.message}`);
+          return 0;
+        });
       this.pubClient = pubClient;
       this.subClient = subClient;
       server.adapter(createAdapter(pubClient, subClient));

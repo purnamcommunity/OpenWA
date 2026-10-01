@@ -88,8 +88,9 @@ text (escape-then-highlight), never as HTML. Do not inject HTML.
 
 ## 27.3 Indexing via the `message:persisted` hook
 
-The core fires `message:persisted` for every live message (outbound on send, inbound on receive) — never
-for history backfill. Register a handler to keep your index in sync:
+The core fires `message:persisted` for every live message (outbound on send, inbound on receive, and again
+when a stored message is revoked) — never for history backfill. Register a handler to keep your index in
+sync:
 
 ```ts
 ctx.registerHook('message:persisted', async hookCtx => {
@@ -104,6 +105,12 @@ as `PENDING` (usually with `waMessageId` still null), then emits it **again** wi
 reaches its terminal state (`SENT` with the engine id, or `FAILED`). Key your documents by the row `id`
 and treat every emission as an upsert, and your index always converges to the finalized state.
 
+**A revoke re-emits the row too.** When a message of either direction is revoked (an engine
+`message.revoked`, or `POST /messages/delete`, whether or not `forEveryone` is set), the core clears the
+stored row and emits `message:persisted` again with the same `id`, an empty `body`, `type: 'revoked'` and
+null `metadata`. An upsert keyed by `id` therefore drops the deleted content from your index; do not count
+the emission as a new message.
+
 One race remains visible by design: when the engine's own-send echo wins, the redundant PENDING row is
 merged into the echo's row and then dropped. The core emits `message:persisted` for the surviving row
 (upsert it) followed by `message:deleted` for the dropped one — delete that document by its `id`:
@@ -115,9 +122,35 @@ ctx.registerHook('message:deleted', async hookCtx => {
 });
 ```
 
+Clearing a chat's messages (`DELETE /api/sessions/:sessionId/chats/:chatId/messages`) or deleting a chat
+(`POST /api/sessions/:sessionId/chats/delete`) also emits `message:deleted` for every stored row it removes, so
+the same handler keeps your index in step.
+Rows removed in bulk emit no `message:deleted`: deleting a session and message retention (`MESSAGE_RETENTION_DAYS`) leave the plugin's copies in its index until the plugin removes them itself.
+
 **Backfill is the plugin's responsibility.** The hook fires only for live traffic. A plugin installed on
-a deployment with existing message history must perform its own one-time backfill (read the `messages`
-table via `ctx.engine.getChatHistory` or a direct query, and index) at `onEnable`. The built-in DB-FTS
+a deployment with existing message history must perform its own one-time backfill. The only sanctioned
+path is `ctx.engine.getChats(sessionId)` followed by `ctx.engine.getChatHistory(sessionId, chatId, limit)`,
+which needs the `engine:read` permission and a session in the plugin's scope. It reads live from WhatsApp,
+not from the core `messages` table, and returns at most the 100 most recent messages per chat.
+
+`getChatHistory` exists only on the whatsapp-web.js engine. On Baileys it rejects with
+`EngineNotSupportedError` (see [29 - Engine Capability Matrix](./29-engine-capability-matrix.md)), so a
+Baileys deployment has no backfill path and a provider there indexes live `message:persisted` traffic
+only. A sandboxed plugin receives that rejection as a plain `Error` (its class and name do not cross the
+worker boundary) whose message starts with `Operation not supported by the active engine`. Match on that
+prefix on the first chat and skip the backfill rather than retrying it chat after chat.
+
+There is no capability that reads the `messages` table. Reading the database directly bypasses the
+capability model and is unsupported; see [30 - Plugin Sandboxing](./30-plugin-sandboxing.md) for what a
+loaded plugin can still reach.
+
+Backfilled items carry only the WhatsApp id (`id` there is the WhatsApp message id), not the core row PK.
+Keep a `waMessageId` lookup too, and when a later `message:persisted` arrives for a message you already
+backfilled, upsert onto that document instead of adding a second one.
+
+Start the backfill from `onEnable` without awaiting it: a sandboxed lifecycle call is cut off after 30 s,
+and walking every chat's history takes longer on a real deployment. Record a marker in `ctx.storage` (which
+needs the `storage:use` permission) when it finishes so a restart does not repeat it. The built-in DB-FTS
 provider is unaffected (its index is DB-synced via triggers on every insert, including backfill).
 
 ## 27.4 Host-side guarantees (the plugin author doesn't handle these)
@@ -132,10 +165,13 @@ The host enforces these before/after the RPC, so the plugin doesn't have to:
   key never sees an out-of-scope hit even if the plugin leaks one.
 - **Timeout.** The plugin's `search()` handler must answer within **10 seconds** (`SANDBOX_SEARCH_TIMEOUT_MS`).
   A slow/wedged handler resolves `ok:false` → the caller sees `503 Service Unavailable`. Fail fast.
-- **Health.** The host reuses the plugin's general `healthCheck()` (the `health` lifecycle method) for
-  the `/search` health check. Implement `healthCheck()` to report your backend's reachability.
+- **Health.** The search provider's health reuses the plugin's general `healthCheck()` (the `health`
+  lifecycle method), but search-provider health is not yet exposed on any route. `healthCheck()` still
+  feeds the plugin health check (`GET /api/plugins/:id/health`); implement it to report your backend's
+  reachability.
 - **Selection.** When `SEARCH_PROVIDER=auto` (the default), the plugin supersedes the built-in
-  `builtin-fts` on enable. Set `SEARCH_PROVIDER=builtin-fts` to keep the built-in active.
+  `builtin-fts` on enable. Set `SEARCH_PROVIDER=builtin-fts` to keep the built-in active. Selection is
+  not health-gated: the plugin stays active while its `healthCheck()` reports unhealthy.
 
 ## 27.5 A minimal full example
 
@@ -153,7 +189,8 @@ plugins/my-search/
   "name": "My Search Backend",
   "version": "1.0.0",
   "type": "extension",
-  "main": "index.js"
+  "main": "index.js",
+  "permissions": ["search:provide"]
 }
 ```
 
@@ -162,7 +199,7 @@ plugins/my-search/
 ```js
 module.exports = class MySearchPlugin {
   async onEnable(ctx) {
-    // 1. Index every persisted message (live traffic only — backfill separately at onEnable).
+    // 1. Index every persisted message (live traffic only — backfill separately, see 27.3).
     ctx.registerHook('message:persisted', async hookCtx => {
       const { message } = hookCtx.data;
       await this._index(ctx, message);
@@ -201,10 +238,15 @@ module.exports = class MySearchPlugin {
     /* run your backend's query, honoring query.q + filters + limit/offset */ return { rows: [], total: 0 };
   }
   _highlight(body, term) {
-    return body.replace(new RegExp(term, 'gi'), '<mark>$&</mark>');
+    // Escape the query so `c++` or `(` matches literally instead of throwing a SyntaxError.
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return body.replace(new RegExp(escaped, 'gi'), '<mark>$&</mark>');
+  }
+  async _pingBackend() {
+    /* ping your backend */ return true;
   }
 
-  // Optional: report backend health to the /search health check.
+  // Optional: report backend health to the plugin health check.
   async healthCheck() {
     const ok = await this._pingBackend();
     return { healthy: ok, message: ok ? undefined : 'backend unreachable' };

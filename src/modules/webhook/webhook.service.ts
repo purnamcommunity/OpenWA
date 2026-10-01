@@ -10,6 +10,7 @@ import { createLogger } from '../../common/services/logger.service';
 import { resolveSessionScope } from '../../common/security/session-scope';
 import { ListOptions, resolveListWindow } from '../../common/utils/paginate';
 import { generateDeliveryId } from './utils/idempotency.util';
+import { buildDeliveryHeaders } from './utils/deliver-once';
 import {
   assertSafeFetchUrl,
   withSafeFetch,
@@ -55,9 +56,9 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Periodically prune webhook_delivery_failures older than WEBHOOK_FAILURE_RETENTION_DAYS
-   * (default 90; set <= 0 to disable). Runs once at startup, then daily. The table is an append-only
-   * log written on every terminally-failed delivery, so without this it grows without bound under a
-   * receiver outage. (Mirrors AuditService's audit-log retention.)
+   * (default 90; set <= 0 to disable). Runs once at startup, then daily. The table records every
+   * failed or unsent delivery (a later successful delivery removes its row), so without this it grows
+   * without bound under a receiver outage. (Mirrors AuditService's audit-log retention.)
    */
   onModuleInit(): void {
     const parsed = Number.parseInt(process.env.WEBHOOK_FAILURE_RETENTION_DAYS ?? '', 10);
@@ -220,7 +221,10 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
   async update(sessionId: string, id: string, dto: UpdateWebhookDto): Promise<Webhook> {
     const webhook = await this.findOne(sessionId, id);
 
-    if (dto.url !== undefined) {
+    // An unchanged URL is not re-validated: every edit re-sends it, so a webhook whose host stopped
+    // resolving or became SSRF-blocked could not otherwise be deactivated or re-filtered. Delivery
+    // still checks the URL on every send.
+    if (dto.url !== undefined && dto.url !== webhook.url) {
       await this.validateWebhookUrl(dto.url);
       webhook.url = dto.url;
     }
@@ -261,20 +265,8 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
     };
 
     const body = JSON.stringify(testPayload);
-    const headers: Record<string, string> = {
-      // Custom headers FIRST so the system headers below always win.
-      ...this.delivery.sanitizeCustomHeaders(webhook.headers),
-      'Content-Type': 'application/json',
-      'User-Agent': 'OpenWA-Webhook/1.0.0',
-      'X-OpenWA-Event': 'test',
-      'X-OpenWA-Idempotency-Key': testPayload.idempotencyKey,
-      'X-OpenWA-Delivery-Id': testPayload.deliveryId,
-      'X-OpenWA-Retry-Count': '0',
-    };
-
-    if (webhook.secret) {
-      headers['X-OpenWA-Signature'] = this.delivery.generateSignature(body, webhook.secret);
-    }
+    // The same header builder as a real delivery, so the probe tests what the receiver will get.
+    const headers = buildDeliveryHeaders(webhook, 'test', testPayload.idempotencyKey, deliveryId, body);
 
     try {
       return await withSafeFetch(

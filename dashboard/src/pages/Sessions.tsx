@@ -70,7 +70,7 @@ export function Sessions() {
   const { t } = useTranslation();
   useDocumentTitle(t('sessions.title'));
   const toast = useToast();
-  const { canWrite } = useRole();
+  const { canWrite, isAdmin } = useRole();
   const queryClient = useQueryClient();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
@@ -429,8 +429,11 @@ export function Sessions() {
   };
 
   // Load the config when the detail modal opens and drop it when it closes, so a value fetched for
-  // one session can never render against another.
+  // one session can never render against another. A toggle's answer checks `configSessionId` for the
+  // same reason: Close stays enabled while it saves, so another session's modal may be open by then.
+  const configSessionId = useRef<string | null>(null);
   useEffect(() => {
+    configSessionId.current = selectedSessionId;
     setSessionConfig(null);
     if (!selectedSessionId) return;
     let cancelled = false;
@@ -450,15 +453,17 @@ export function Sessions() {
 
   const handleAutoRejectToggle = async (next: boolean) => {
     if (!selectedSessionId || !sessionConfig) return;
+    const id = selectedSessionId;
     const previous = sessionConfig;
     setSessionConfig({ ...sessionConfig, autoRejectCalls: next });
     setSavingConfig(true);
     try {
-      setSessionConfig(await sessionApi.updateConfig(selectedSessionId, { autoRejectCalls: next }));
+      const saved = await sessionApi.updateConfig(id, { autoRejectCalls: next });
+      if (configSessionId.current === id) setSessionConfig(saved);
     } catch (err) {
       // Revert: an optimistic toggle left flipped would tell the operator calls are being rejected
       // when the gateway never accepted the change.
-      setSessionConfig(previous);
+      if (configSessionId.current === id) setSessionConfig(previous);
       toast.error(t('sessions.details.autoRejectCalls'), err instanceof Error ? err.message : t('common.unknownError'));
     } finally {
       setSavingConfig(false);
@@ -466,7 +471,12 @@ export function Sessions() {
   };
 
   const proxySessionId = proxySession?.id ?? null;
+  // Cancel stays enabled while a save runs, so a save that answers after its modal closed must neither
+  // close nor unlock whichever proxy modal is open by then.
+  const proxyOpenId = useRef<string | null>(null);
   useEffect(() => {
+    proxyOpenId.current = proxySessionId;
+    setProxySaving(false);
     setProxyInfo(null);
     setProxyEnabled(false);
     setProxyUrl('');
@@ -514,12 +524,13 @@ export function Sessions() {
       }
     }
     setProxyUrlError(null);
+    const id = proxySession.id;
     setProxySaving(true);
     try {
       if (!proxyEnabled) {
-        await sessionApi.updateProxy(proxySession.id, { proxyUrl: null });
+        await sessionApi.updateProxy(id, { proxyUrl: null });
       } else if (proxyUrl.trim()) {
-        await sessionApi.updateProxy(proxySession.id, { proxyUrl: proxyUrl.trim() });
+        await sessionApi.updateProxy(id, { proxyUrl: proxyUrl.trim() });
       } else if (proxyInfo?.enabled) {
         setProxySession(null);
         return;
@@ -527,11 +538,11 @@ export function Sessions() {
         return;
       }
       toast.success(t('sessions.proxy.saveSuccessTitle'), t('sessions.proxy.saveSuccess'));
-      setProxySession(null);
+      if (proxyOpenId.current === id) setProxySession(null);
     } catch (err) {
       toast.error(t('sessions.proxy.saveError'), err instanceof Error ? err.message : t('common.unknownError'));
     } finally {
-      setProxySaving(false);
+      if (proxyOpenId.current === id) setProxySaving(false);
     }
   };
 
@@ -555,7 +566,14 @@ export function Sessions() {
       toast.success(t('sessions.forceKill.successTitle'), t('sessions.forceKill.success'));
     } catch (err) {
       console.error('Failed to force-kill:', err);
-      toast.error(t('sessions.forceKill.failedTitle'), t('sessions.forceKill.failed'));
+      // 502 + SESSION_FORCE_KILL_INCOMPLETE: the session is stopped, but the engine process may still
+      // run. Show the gateway's guidance (restart the node). Any other error, a reverse-proxy 502
+      // without that code included, stays generic.
+      const incomplete = (err as { code?: string } | null)?.code === 'SESSION_FORCE_KILL_INCOMPLETE';
+      toast.error(
+        t('sessions.forceKill.failedTitle'),
+        incomplete && err instanceof Error && err.message ? err.message : t('sessions.forceKill.failed'),
+      );
       await fetchSessions();
     } finally {
       setKillConfirmId(null);
@@ -730,33 +748,36 @@ export function Sessions() {
             <p className="input-error">{t('sessions.create.tooLong', { length: newSessionName.length })}</p>
           )}
           {nameIssues.includes('duplicate') && <p className="input-error">{t('sessions.create.duplicate')}</p>}
-          <div className="proxy-form-section">
-            <label className="detail-toggle-row" htmlFor="create-use-proxy">
-              <span>{t('sessions.proxy.enabled')}</span>
-              <input
-                id="create-use-proxy"
-                type="checkbox"
-                checked={useProxy}
-                onChange={e => setUseProxy(e.target.checked)}
-              />
-            </label>
-            {useProxy && (
-              <>
-                <label htmlFor="create-proxy-url">{t('sessions.proxy.url')}</label>
+          {/* The API refuses proxyUrl from a key below ADMIN, so the section is not offered. */}
+          {isAdmin && (
+            <div className="proxy-form-section">
+              <label className="detail-toggle-row" htmlFor="create-use-proxy">
+                <span>{t('sessions.proxy.enabled')}</span>
                 <input
-                  id="create-proxy-url"
-                  type="text"
-                  placeholder={t('sessions.proxy.urlPlaceholder')}
-                  value={createProxyUrl}
-                  onChange={e => setCreateProxyUrl(e.target.value)}
+                  id="create-use-proxy"
+                  type="checkbox"
+                  checked={useProxy}
+                  onChange={e => setUseProxy(e.target.checked)}
                 />
-                {createProxyInvalid && createProxyUrl.trim() && (
-                  <p className="input-error">{t('sessions.proxy.invalidUrl')}</p>
-                )}
-                <p className="input-hint">{t('sessions.proxy.createHint')}</p>
-              </>
-            )}
-          </div>
+              </label>
+              {useProxy && (
+                <>
+                  <label htmlFor="create-proxy-url">{t('sessions.proxy.url')}</label>
+                  <input
+                    id="create-proxy-url"
+                    type="text"
+                    placeholder={t('sessions.proxy.urlPlaceholder')}
+                    value={createProxyUrl}
+                    onChange={e => setCreateProxyUrl(e.target.value)}
+                  />
+                  {createProxyInvalid && createProxyUrl.trim() && (
+                    <p className="input-error">{t('sessions.proxy.invalidUrl')}</p>
+                  )}
+                  <p className="input-hint">{t('sessions.proxy.createHint')}</p>
+                </>
+              )}
+            </div>
+          )}
         </Modal>
       )}
 
@@ -987,7 +1008,7 @@ export function Sessions() {
               <button className="btn-secondary" onClick={() => setProxySession(null)}>
                 {t('common.cancel')}
               </button>
-              {canWrite && !proxyLoadFailed && (
+              {isAdmin && !proxyLoadFailed && (
                 <button
                   className="btn-primary"
                   onClick={() => void handleProxySave()}
@@ -1037,7 +1058,7 @@ export function Sessions() {
                       type="checkbox"
                       aria-labelledby="proxy-enabled-label"
                       checked={proxyEnabled}
-                      disabled={!canWrite || proxySaving}
+                      disabled={!isAdmin || proxySaving}
                       onChange={e => setProxyEnabled(e.target.checked)}
                     />
                     <span className="toggle-slider"></span>
@@ -1059,7 +1080,7 @@ export function Sessions() {
                           : t('sessions.proxy.urlPlaceholder')
                       }
                       value={proxyUrl}
-                      disabled={!canWrite || proxySaving}
+                      disabled={!isAdmin || proxySaving}
                       onChange={e => {
                         setProxyUrl(e.target.value);
                         setProxyUrlError(null);

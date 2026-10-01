@@ -58,6 +58,12 @@ export interface ReconnectState extends ReconnectAttemptState {
   parkedFailure?: { run: () => void; terminal: boolean };
   /** When the session last reached READY; consumed by the next scheduleReconnect (see STABLE_READY_MS). */
   readyAt?: number;
+  /**
+   * When that READY stretch ended inside the engine (it reported a non-READY state without a drop the
+   * gateway sees, e.g. a Baileys in-engine reconnect). The stretch is measured to here, not to the next
+   * READY or drop, so time spent reconnecting inside the engine never counts as READY time.
+   */
+  readyEndedAt?: number;
 }
 
 // Reconnect-backoff bounds. An OPERATOR-supplied session.config feeds this math, so the values
@@ -343,6 +349,7 @@ export class SessionEngineLifecycle {
       handleEngineDisconnected: (id, engine, reason) => this.handleEngineDisconnected(id, engine, reason),
       updateStatus: (id, status) => this.updateStatus(id, status),
       cancelReconnect: id => this.cancelReconnect(id),
+      endReadyStretch: id => this.endReadyStretch(id),
       parkReconnectInitFailure: (id, run, reason) => this.parkReconnectInitFailure(id, run, reason),
       evictAndForceDestroy: (id, engine) => this.evictAndForceDestroy(id, engine),
       trackPendingCredentialTeardown: (sessionName, raw) => this.trackPendingCredentialTeardown(sessionName, raw),
@@ -413,8 +420,8 @@ export class SessionEngineLifecycle {
   // settlement profile the inline methods had (the Task-1 delegate rule above).
 
   /** Delegate: SessionEngineControls.start. */
-  start(id: string): Promise<Session> {
-    return this.controls.start(id);
+  start(id: string, options?: { explicit?: boolean }): Promise<Session> {
+    return this.controls.start(id, options);
   }
 
   /** Delegate: SessionEngineControls.stop. */
@@ -486,7 +493,7 @@ export class SessionEngineLifecycle {
    * Set the tearing-down mark synchronously, before any awaited work a retiring control performs.
    *
    * The pre-initialize retirement race turns on this mark being visible to initializeEngine's
-   * post-INITIALIZING check (line ~507) by the time that awaited DB write settles. stop()/delete()
+   * post-INITIALIZING stop-mark check by the time that awaited DB write settles. stop()/delete()
    * both add the mark internally, but only AFTER their own first await (requireSession /
    * awaitPendingTeardown), and the ownership fence added another await ahead of them — so the mark
    * could land after the window it guards. Exposing it lets SessionService set it at true entry,
@@ -529,6 +536,21 @@ export class SessionEngineLifecycle {
     return (
       reconnect != null && (reconnect.timer !== null || (reconnect.attempts > 0 && reconnect.readyAt === undefined))
     );
+  }
+
+  /** Whether the last READY stretch lasted STABLE_READY_MS, measured to where it ended (or to now). */
+  private readyStretchHeld(state: ReconnectState): boolean {
+    return state.readyAt !== undefined && (state.readyEndedAt ?? Date.now()) - state.readyAt >= STABLE_READY_MS;
+  }
+
+  /**
+   * The live engine left READY without a drop the gateway handles (it reports the new state itself,
+   * e.g. a Baileys in-engine reconnect). Records when the READY stretch ended; readyAt stays set, so
+   * isEngineActive does not read the session as a pending gateway reconnect.
+   */
+  endReadyStretch(id: string): void {
+    const state = this.reconnectStates.get(id);
+    if (state?.readyAt !== undefined && state.readyEndedAt === undefined) state.readyEndedAt = Date.now();
   }
 
   // --- Leaf-event delegates (SessionEngineLeafEvents) ------------------------------------------
@@ -583,6 +605,11 @@ export class SessionEngineLifecycle {
   }
 
   private async initializeEngine(id: string, session: Session): Promise<void> {
+    // A stop that landed before this engine exists had nothing to tear down and already wrote its
+    // DISCONNECTED; registering now would overwrite it with INITIALIZING and then retire. start()
+    // clears its own mark and executeReconnect checks it on entry, so a mark seen here always came
+    // from a later stop, force-kill, logout or delete.
+    if (this.stoppingSessions.has(id)) return;
     this.logger.log(`Initializing engine for session: ${session.name}`, {
       sessionId: id,
       action: 'engine_init',
@@ -691,23 +718,26 @@ export class SessionEngineLifecycle {
           sessionId: id,
           action: 'engine_init_timeout',
         });
-        this.sessionErrors.set(id, err.message);
         // Evict from the map BEFORE tearing down. forceDestroy() → beginClientTeardown → setStatus
         // fires onStateChanged SYNCHRONOUSLY while the engine is still live, so isLiveEngine would
         // pass and the callback would run a redundant DISCONNECTED write against this path; removing
         // the engine first makes isLiveEngine return false. Unlike delete()/stop()/forceKill(), this
-        // path has no stoppingSessions + cancelReconnect wrap to fall back on. Matches the canonical
-        // delete-before-teardown at evictAndForceDestroy() and start()'s catch.
+        // path has no stoppingSessions + cancelReconnect wrap to fall back on. Like
+        // evictAndForceDestroy() and start()'s catch, the eviction is identity-checked (deleteIfLive):
+        // a stop() + start() during a hung reconnect init may already have registered a new engine,
+        // and this stale deadline must neither evict it nor overwrite its error and status. The
+        // stale engine is force-destroyed either way, and the caller still gets the 504.
         //
         // Do NOT port this reorder to delete()/stop()/forceKill(): there, engines.has(id) staying
         // TRUE for the duration of the teardown await is the sole deterministic block on a concurrent
         // start() (start() clears stoppingSessions rather than rejecting on it), so delete-first would
         // open a start()-during-teardown orphan-engine window. Verified in the teardown-ordering audit.
-        this.engines.delete(id);
+        const wasLive = this.engines.deleteIfLive(id, engine);
+        if (wasLive) this.sessionErrors.set(id, err.message);
         // Force-kill whatever got launched so a retry doesn't collide with an orphaned browser.
         // teardownEngineSafely is itself time-bound, so this can't wedge a second time.
         await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
-        await this.updateStatus(id, SessionStatus.DISCONNECTED);
+        if (wasLive) await this.updateStatus(id, SessionStatus.DISCONNECTED);
         // Map to a diagnostic 504 like the auth-timeout branch below, so a wedged init doesn't escape as a
         // bare 500 (#733 follow-up). This deadline covers EVERY cause and cannot tell them apart: the
         // auth-timeout below only fires once the page has LOADED (whatsapp-web.js navigates with
@@ -803,7 +833,7 @@ export class SessionEngineLifecycle {
   /** Engine callback body, lifted out of initializeEngine so the wiring table stays readable. */
   private handleEngineReady(id: string, engine: IWhatsAppEngine, phone: string, pushName: string): void {
     if (!this.isLiveEngine(id, engine)) return;
-    this.logger.log(`Session ready: ${phone}`, {
+    this.logger.log('Session ready', {
       sessionId: id,
       phone,
       pushName,
@@ -830,12 +860,13 @@ export class SessionEngineLifecycle {
     // only if this READY held for STABLE_READY_MS, so a session that flaps keeps backing off.
     // Baileys fires READY again on every internal socket reopen, with no drop reported in between:
     // a previous READY that already held the window ends the streak here, before it is overwritten.
+    // The stretch is measured to where it ended (readyEndedAt), so an in-engine reconnect in between
+    // is not counted as READY time.
     const reconnectState = this.reconnectStates.get(id);
     if (reconnectState) {
-      if (reconnectState.readyAt !== undefined && Date.now() - reconnectState.readyAt >= STABLE_READY_MS) {
-        reconnectState.attempts = 0;
-      }
+      if (this.readyStretchHeld(reconnectState)) reconnectState.attempts = 0;
       reconnectState.readyAt = Date.now();
+      reconnectState.readyEndedAt = undefined;
       if (reconnectState.timer) {
         clearTimeout(reconnectState.timer);
         reconnectState.timer = null;
@@ -1063,8 +1094,9 @@ export class SessionEngineLifecycle {
     // this drop starts a fresh streak; a shorter one is the same flap and keeps the streak growing.
     // Cleared either way, so a later re-init failure inside this episode never resets it.
     if (state.readyAt !== undefined) {
-      if (Date.now() - state.readyAt >= STABLE_READY_MS) state.attempts = 0;
+      if (this.readyStretchHeld(state)) state.attempts = 0;
       state.readyAt = undefined;
+      state.readyEndedAt = undefined;
     }
 
     // All the backoff rules (budget, exponential delay, loop cadence) live in the
@@ -1193,6 +1225,9 @@ export class SessionEngineLifecycle {
       if (this.reconnectStates.get(id) === state) this.cancelReconnect(id);
       return;
     }
+    // The engine this attempt registers, captured like start() does: the catch must reap this one, not
+    // whatever a later attempt has registered by the time the init rejects.
+    let mine: IWhatsAppEngine | undefined;
     try {
       // Clean up old engine. Time-bound the teardown: a wedged Chromium (the common reconnect
       // trigger) makes destroy() hang, and a raw await here would stall the reconnect forever —
@@ -1200,14 +1235,11 @@ export class SessionEngineLifecycle {
       // (after 10s on a hang), so reconnection proceeds either way.
       const oldEngine = this.engines.get(id);
       if (oldEngine) {
-        const destroyed = await this.teardownEngineSafely(id, oldEngine, e => e.destroy(), 'destroy');
-        if (!destroyed) {
-          // A timed-out destroy() leaves the wedged Chromium process alive (the raced promise never
-          // kills it — see start()'s catch), and this path relaunches on the SAME profile dir in the
-          // same tick. Escalate to a SIGKILL so the replacement browser can't collide with the
-          // orphan (#1081); bounded again by teardownEngineSafely, so it can't wedge a second time.
-          await this.teardownEngineSafely(id, oldEngine, e => e.forceDestroy(), 'force-destroy');
-        }
+        // A timed-out destroy() leaves the wedged Chromium process alive (the raced promise never
+        // kills it; see start()'s catch), and this path relaunches on the SAME profile dir in the
+        // same tick. destroyWithEscalation escalates to a SIGKILL so the replacement browser can't
+        // collide with the orphan (#1081); each step is bounded, so it can't wedge a second time.
+        await this.fences.destroyWithEscalation(id, oldEngine);
         this.engines.deleteIfLive(id, oldEngine);
       }
 
@@ -1219,11 +1251,24 @@ export class SessionEngineLifecycle {
       // engine was created, so there is nothing to evict and no dir to purge).
       await this.awaitPendingTeardown(session.name);
 
+      // A stop, force-kill, logout, delete or shutdown during the awaits above dropped or replaced this
+      // state, and a start after it may already run its own engine: registering one now would overwrite
+      // that engine in the registry and leave it running beyond any control's reach. Nothing is awaited
+      // between this check and the registration inside initializeEngine.
+      if (this.reconnectStates.get(id) !== state || this.stoppingSessions.has(id)) {
+        if (this.reconnectStates.get(id) === state) this.cancelReconnect(id);
+        return;
+      }
+
       // Re-initialize. An engine failure reported inside this window is parked (see
       // parkReconnectInitFailure): a failed launch must retry, not land FAILED and strand the session.
       state.initInFlight = true;
       try {
-        await this.initializeEngine(id, session);
+        const before = this.engines.get(id);
+        const init = this.initializeEngine(id, session);
+        const registered = this.engines.get(id);
+        mine = registered !== before ? registered : undefined;
+        await init;
       } finally {
         state.initInFlight = false;
       }
@@ -1249,7 +1294,7 @@ export class SessionEngineLifecycle {
       if (retired) {
         const resurrected = this.engines.get(id);
         if (resurrected) {
-          await this.teardownEngineSafely(id, resurrected, e => e.destroy(), 'destroy');
+          await this.fences.destroyWithEscalation(id, resurrected);
           this.engines.deleteIfLive(id, resurrected);
         }
         // Same start/delete window as start()'s post-init guard: this re-init re-created auth dirs
@@ -1277,11 +1322,13 @@ export class SessionEngineLifecycle {
       // initializeEngine registers the engine in the map BEFORE engine.initialize() runs, so a rejected
       // re-init leaves a half-built engine behind. Evict + reap it: otherwise a reconnect that later
       // exhausts its attempts strands an orphaned Chromium holding a concurrency slot, and the next
-      // start() sees the session as "already started".
-      const halfBuilt = this.engines.get(id);
-      if (halfBuilt) {
-        this.evictAndForceDestroy(id, halfBuilt);
-      }
+      // start() sees the session as "already started". Only while it is still registered: otherwise the
+      // init deadline has reaped it already, or a later attempt destroyed it as its old engine.
+      if (mine && this.engines.isLive(id, mine)) this.evictAndForceDestroy(id, mine);
+      // A disconnect of this attempt's engine mid-init re-armed the same state, and a later attempt
+      // registered a replacement before this init rejected. That attempt owns the episode: arming
+      // another would destroy its engine as the old one, or kill it on the exhausted branch.
+      if (this.engines.has(id)) return;
       if (this.stoppingSessions.has(id)) {
         this.cancelReconnect(id);
         return;
