@@ -1,5 +1,5 @@
 import type { Client } from 'whatsapp-web.js';
-import { WwebjsGroups } from './wwebjs-groups';
+import { WwebjsGroups, changeAdminStatusInPage } from './wwebjs-groups';
 import { createLogger } from '../../common/services/logger.service';
 import { type WwebjsEngineHost } from './wwebjs-host';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
@@ -70,6 +70,10 @@ describe('group reads distinguish a dead page from an ordinary failure', () => {
  * dead page answered an opaque 500 and never fed the liveness path, while their routes document 503.
  * The lookup and the converging writes now answer 503 with the death signal; the writes that do not
  * converge report the death and keep their status, so a retrying client cannot apply them twice.
+ *
+ * Promote and demote converge: they run changeAdminStatusInPage, which skips every member already in
+ * the requested state, so a replay can only arrive at the same admins. They answer 503 like the other
+ * converging writes, and their page call is page.evaluate rather than a chat method.
  */
 describe('group writes classify a dead page', () => {
   const transportError = new Error('Protocol error (Runtime.callFunctionOn): Target closed');
@@ -78,7 +82,7 @@ describe('group writes classify a dead page', () => {
 
   type ChatMethods = Record<string, jest.Mock>;
 
-  function makeGroups(chat: ChatMethods | Promise<never>, clientMethods: ChatMethods = {}) {
+  function makeGroups(chat: ChatMethods | Promise<never>, clientMethods: Record<string, unknown> = {}) {
     const client = {
       info: {},
       getChatById:
@@ -113,15 +117,18 @@ describe('group writes classify a dead page', () => {
     ['revokeGroupInviteCode', 'revokeInvite', g => g.revokeGroupInviteCode(GROUP)],
     ['addParticipants', 'addParticipants', g => g.addParticipants(GROUP, ['628111@c.us'])],
     ['removeParticipants', 'removeParticipants', g => g.removeParticipants(GROUP, ['628111@c.us'])],
-    ['promoteParticipants', 'promoteParticipants', g => g.promoteParticipants(GROUP, ['628111@c.us'])],
-    ['demoteParticipants', 'demoteParticipants', g => g.demoteParticipants(GROUP, ['628111@c.us'])],
+  ];
+  // [public op, page function it evaluates, invocation]
+  const ADMIN_CHANGE: [string, string, (g: WwebjsGroups) => Promise<unknown>][] = [
+    ['promoteParticipants', 'changeAdminStatusInPage', g => g.promoteParticipants(GROUP, ['628111@c.us'])],
+    ['demoteParticipants', 'changeAdminStatusInPage', g => g.demoteParticipants(GROUP, ['628111@c.us'])],
   ];
   const MEMBERSHIP: [string, (g: WwebjsGroups) => Promise<unknown>][] = [
     ['approveGroupMembershipRequests', g => g.approveGroupMembershipRequests(GROUP, ['628111@c.us'])],
     ['rejectGroupMembershipRequests', g => g.rejectGroupMembershipRequests(GROUP, ['628111@c.us'])],
   ];
 
-  it.each([...CONVERGING, ...NON_CONVERGING_CHAT])(
+  it.each([...CONVERGING, ...NON_CONVERGING_CHAT, ...ADMIN_CHANGE])(
     '%s answers a dead page during the group lookup with 503 before calling %s',
     async (op, _method, run) => {
       const lookup = Promise.reject(transportError);
@@ -141,6 +148,21 @@ describe('group writes classify a dead page', () => {
     });
 
     await expect(run(groups)).rejects.toThrow(EngineTransportError);
+    expect(reportIfPageTransportError).toHaveBeenCalledTimes(1);
+    expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, op);
+  });
+
+  it.each(ADMIN_CHANGE)('%s answers a dead page in %s with 503 and reports it', async (op, _fn, run) => {
+    const evaluate = jest.fn().mockRejectedValue(transportError);
+    const { groups, reportIfPageTransportError } = makeGroups({}, { pupPage: { evaluate } });
+
+    await expect(run(groups)).rejects.toThrow(EngineTransportError);
+    expect(evaluate).toHaveBeenCalledWith(
+      changeAdminStatusInPage,
+      GROUP,
+      ['628111@c.us'],
+      op === 'promoteParticipants',
+    );
     expect(reportIfPageTransportError).toHaveBeenCalledTimes(1);
     expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, op);
   });
@@ -168,6 +190,17 @@ describe('group writes classify a dead page', () => {
   it.each(CONVERGING)('%s leaves an ordinary failure in %s untouched and unreported', async (_op, method, run) => {
     const failure = new Error('Evaluation failed: x');
     const { groups, reportIfPageTransportError } = makeGroups({ [method]: jest.fn().mockRejectedValue(failure) });
+
+    await expect(run(groups)).rejects.toBe(failure);
+    expect(reportIfPageTransportError).not.toHaveBeenCalled();
+  });
+
+  it.each(ADMIN_CHANGE)('%s leaves an ordinary failure in %s untouched and unreported', async (_op, _fn, run) => {
+    const failure = new Error('Evaluation failed: x');
+    const { groups, reportIfPageTransportError } = makeGroups(
+      {},
+      { pupPage: { evaluate: jest.fn().mockRejectedValue(failure) } },
+    );
 
     await expect(run(groups)).rejects.toBe(failure);
     expect(reportIfPageTransportError).not.toHaveBeenCalled();

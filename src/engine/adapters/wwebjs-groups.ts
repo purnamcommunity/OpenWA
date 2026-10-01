@@ -563,6 +563,10 @@ export class WwebjsGroups {
    * community's admins, so WhatsApp Web makes someone its admin only by promoting them to community
    * admin on the parent community — its own "Make community admin" flow. The page function does
    * exactly that, and each result says the person became (or stopped being) a community admin.
+   *
+   * A dead page here answers 503 (withPage), not the raw error the other participant writes keep:
+   * the page function skips every member already in the requested state, so a client that replays
+   * the request arrives at the same admins.
    */
   private async changeAdminStatus(
     promote: boolean,
