@@ -570,7 +570,7 @@ export class WwebjsGroups {
     participants: string[],
   ): Promise<ParticipantOperationResult[]> {
     const op = promote ? 'promoteParticipants' : 'demoteParticipants';
-    await this.requireGroupChat(groupId);
+    await this.requireGroupChat(groupId, op);
     const participantIds = participants.map(toParticipantWid);
     const page = (this.client() as unknown as { pupPage?: AdminChangePage }).pupPage;
     if (!page) {
