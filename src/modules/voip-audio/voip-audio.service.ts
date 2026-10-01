@@ -1,6 +1,7 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { spawn, type ChildProcessByStdio } from 'child_process';
 import type { Readable, Writable } from 'stream';
+import { createLogger } from '../../common/services/logger.service';
 import {
   FRAME_BYTES,
   MAX_MIC_BACKLOG_BYTES,
@@ -57,7 +58,7 @@ function msOf(bytes: number): number {
 
 @Injectable()
 export class VoipAudioService implements OnModuleDestroy {
-  private readonly logger = new Logger(VoipAudioService.name);
+  private readonly logger = createLogger(VoipAudioService.name);
   private readonly bridges = new Map<string, Bridge>();
 
   /**

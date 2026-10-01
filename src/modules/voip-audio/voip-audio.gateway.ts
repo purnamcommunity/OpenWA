@@ -6,10 +6,10 @@ import {
   MessageBody,
   ConnectedSocket,
 } from '@nestjs/websockets';
-import { Logger } from '@nestjs/common';
 import { Socket } from 'socket.io';
 import { AuthService } from '../auth/auth.service';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { createLogger } from '../../common/services/logger.service';
 import { resolveCorsPolicy } from '../../config/bootstrap-security';
 import { VoipAudioService } from './voip-audio.service';
 import { VoipAudioTokenService } from './voip-audio-token.service';
@@ -37,7 +37,7 @@ const MAX_FRAME_BYTES = FRAME_BYTES * 10;
  */
 @WebSocketGateway({ namespace: '/voip-audio', cors: { origin: corsOrigin(), credentials: true } })
 export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnect {
-  private readonly logger = new Logger(VoipAudioGateway.name);
+  private readonly logger = createLogger(VoipAudioGateway.name);
   /** Which session each socket is carrying, so a disconnect closes the right bridge. */
   private readonly sessionOf = new Map<string, string>();
   /** Sockets authenticated by a minted token are BOUND to that token's session — a token buys
