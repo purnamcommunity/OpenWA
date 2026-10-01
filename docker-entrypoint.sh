@@ -84,14 +84,17 @@ if [ "${VOIP_AUDIO_ENABLED:-false}" = "true" ]; then
   # captures and what the bridge sends. PulseAudio otherwise defaults these to 44.1 kHz STEREO,
   # so a call's audio is resampled and channel-converted on the way in and again on the way out —
   # for no gain, since nothing in the path is stereo or 44.1 kHz.
-  PA_FORMAT="rate=48000 channels=1 format=s16le"
+  # Written out in one place, as separate words: each is its own module argument.
+  pa_load_module() {
+    $PA pactl load-module "$@" rate=48000 channels=1 format=s16le >/dev/null 2>&1
+  }
   if mkdir -p "$PULSE_DIR" && chown openwa:openwa "$PULSE_DIR"; then
     # --exit-idle-time=-1 keeps the daemon up while no client holds a stream; without it PulseAudio
     # exits between calls and the devices disappear from Chromium's enumeration.
     if $PA pulseaudio --start --exit-idle-time=-1 --disallow-exit --realtime=no 2>/dev/null &&
-       $PA pactl load-module module-null-sink sink_name="$MIC_SINK" $PA_FORMAT >/dev/null 2>&1 &&
-       $PA pactl load-module module-null-sink sink_name="$OUT_SINK" $PA_FORMAT >/dev/null 2>&1 &&
-       $PA pactl load-module module-remap-source source_name="$SOURCE" master="$MIC_SINK.monitor" $PA_FORMAT >/dev/null 2>&1; then
+       pa_load_module module-null-sink sink_name="$MIC_SINK" &&
+       pa_load_module module-null-sink sink_name="$OUT_SINK" &&
+       pa_load_module module-remap-source source_name="$SOURCE" master="$MIC_SINK.monitor"; then
       # Chromium picks the DEFAULTS; pinning them is what makes it record the operator rather than
       # an arbitrary monitor, and play to the sink the bridge is recording.
       $PA pactl set-default-source "$SOURCE" >/dev/null 2>&1 || true
