@@ -35,7 +35,15 @@ def quote_segment(segment: Any) -> str:
 
 
 def build_url(base_url: str, path: str, query: Mapping[str, Any] | None = None) -> str:
-    """Build a URL, serializing query params and skipping ``None`` values."""
+    """Build a URL, serializing query params and skipping ``None`` values.
+
+    Raises :class:`ValueError` for a path that does not begin with ``/``, as the
+    JavaScript, Go and Java clients do: an absolute URL such as
+    ``https://example.net/x`` would replace the client's base host and carry the
+    API key there.
+    """
+    if not path.startswith("/"):
+        raise ValueError(f"OpenWA: path must begin with '/': {path!r}")
     url = f"{base_url.rstrip('/')}{path}"
     if not query:
         return url
@@ -101,9 +109,12 @@ class HttpExecutor:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
-    def request(self, method: HttpMethod, path: str, *, query: Mapping[str, Any] | None = None, body: Any = None) -> Any:
+    def request(
+        self, method: HttpMethod, path: str, *, query: Mapping[str, Any] | None = None,
+        body: Any = None, idempotency_key: str | None = None
+    ) -> Any:
         """Perform one request and return the parsed JSON (or ``None`` for 204)."""
-        res = self._send(method, path, query=query, body=body)
+        res = self._send(method, path, query=query, body=body, idempotency_key=idempotency_key)
         if res.status_code == 204 or not res.content:
             return None
         try:
@@ -125,12 +136,24 @@ class HttpExecutor:
             return b"", None
         return res.content, res.headers.get("content-type")
 
-    def _send(self, method: HttpMethod, path: str, *, query: Mapping[str, Any] | None, body: Any) -> httpx.Response:
+    def _send(
+        self, method: HttpMethod, path: str, *, query: Mapping[str, Any] | None,
+        body: Any, idempotency_key: str | None = None
+    ) -> httpx.Response:
         """Shared transport for :meth:`request` and :meth:`request_bytes`: builds
         the URL, performs the request, and translates a non-2xx into a typed error."""
+        headers = None
+        if idempotency_key is not None:
+            if (
+                not isinstance(idempotency_key, str)
+                or not 1 <= len(idempotency_key) <= 255
+                or any(not "!" <= char <= "~" for char in idempotency_key)
+            ):
+                raise ValueError("Idempotency-Key must contain 1-255 visible ASCII characters")
+            headers = {"Idempotency-Key": idempotency_key}
         url = build_url("", path, query)
         try:
-            res = self._client.request(method, url, json=body if body is not None else None)
+            res = self._client.request(method, url, json=body if body is not None else None, headers=headers)
         except httpx.TimeoutException as e:
             raise OpenWATimeoutError(self._timeout) from e
         # Treat any non-2xx as an error, including 3xx: redirects are deliberately not followed

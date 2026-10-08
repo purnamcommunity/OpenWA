@@ -4,7 +4,7 @@ import { FindOperator, In, Repository } from 'typeorm';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { MessageService, spendInlineMediaBudget } from './message.service';
 import { MessageSendService } from './message-send.service';
-import { Message, MessageDirection } from './entities/message.entity';
+import { Message } from './entities/message.entity';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { MessageProjector } from '../session/message-projector.service';
 import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
@@ -80,6 +80,7 @@ describe('MessageService', () => {
     findPhoneForLid: jest.Mock;
   };
   let mockEngine: ReturnType<typeof createMockEngine>;
+  let pacing: { assertSendAllowed: jest.Mock };
 
   beforeEach(async () => {
     repository = {
@@ -140,6 +141,7 @@ describe('MessageService', () => {
     }).compile();
 
     service = module.get<MessageService>(MessageService);
+    pacing = module.get(SendPacingService);
   });
 
   // ── outbound send delegation ──────────────────────────────────────
@@ -708,26 +710,6 @@ describe('MessageService', () => {
     });
   });
 
-  // ── saveIncomingMessage ───────────────────────────────────────────
-
-  describe('saveIncomingMessage', () => {
-    it('should save with INCOMING direction', async () => {
-      await service.saveIncomingMessage('sess-1', {
-        waMessageId: 'wa-in-1',
-        chatId: 'sender@c.us',
-        body: 'Hi there',
-        type: 'text',
-      });
-
-      expect(repository.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sessionId: 'sess-1',
-          direction: MessageDirection.INCOMING,
-        }),
-      );
-    });
-  });
-
   // ── reactToMessage / deleteMessage ────────────────────────────────
 
   describe('reactToMessage', () => {
@@ -882,6 +864,14 @@ describe('MessageService', () => {
         expect.objectContaining({ type: 'edit' }),
         expect.any(Object),
       );
+    });
+
+    // An edit only UPDATEs the existing row, so it is judged against the caps but never held in the
+    // admission window: holding it would charge the day's allowance for a message that is not sent.
+    it('checks an edit against the pacing caps without holding it', async () => {
+      await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(pacing.assertSendAllowed).toHaveBeenCalledWith('sess-1', 'test@c.us', { hold: false });
     });
 
     it('lets a plugin block an edit before the engine is called', async () => {

@@ -17,6 +17,7 @@ import {
   LocationInput,
   MediaInput,
   MessageResult,
+  MessageType,
   PollInput,
   Product,
   Quotable,
@@ -24,7 +25,14 @@ import {
 import { toEngineParticipants } from './baileys-groups';
 import { findSelfParticipant } from './baileys-group-mapper';
 import { buildVCard } from './vcard';
-import { baileysChatJid, resolveBaileysButtonClick, setBaileysText, storedKeyInChat } from './baileys-message-mapper';
+import {
+  baileysChatJid,
+  isBaileysCatalogShare,
+  mapBaileysMessageType,
+  resolveBaileysButtonClick,
+  setBaileysText,
+  storedKeyInChat,
+} from './baileys-message-mapper';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import { BadRequestException, InternalServerErrorException } from '@nestjs/common';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
@@ -32,6 +40,8 @@ import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
 import { type createLogger } from '../../common/services/logger.service';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { EngineNotSentError } from '../../common/errors/engine-not-sent.error';
+import { parseWaId, userPart } from '../identity/wa-id';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
 
 /**
@@ -45,6 +55,8 @@ export interface BaileysMessagingHost {
   ensureReady(): void;
   /** Post-ensureReady socket handle — call host.ensureReady() first. */
   getSocket(): WASocket;
+  /** The live socket, or null once a stop or logout has torn it down. */
+  getSocketOrNull(): WASocket | null;
   readonly logger: ReturnType<typeof createLogger>;
   toNeutralJid(jid: string): string;
   toEngineJid(jid: string): string;
@@ -58,9 +70,9 @@ export interface BaileysMessagingHost {
   /** Persist a just-sent message to the store; undefined when no store is configured. */
   putStoredMessage(msg: WAMessage): Promise<void> | undefined;
   /** Make a just-sent message the chat's last-message preview and sort time (its echo is skipped). */
-  recordMessage(msg: WAMessage): void;
+  recordMessage(msg: WAMessage, type?: MessageType): void;
   /** Replace the chat preview's text when the message is still the chat's last one (edit, or '' once deleted). */
-  recordMessageEdit(chatId: string, messageId: string, text: string): void;
+  recordMessageEdit(chatId: string, messageId: string, text: string, type?: MessageType): void;
   /** Record the id of a message this session just sent, so its library echo is recognised as ours. */
   rememberOwnSend(id: string | null | undefined): void;
   /** Look up a previously-seen message from the store (the reply/forward/react/delete handle). */
@@ -261,7 +273,7 @@ export class BaileysMessaging {
           error: err instanceof Error ? err.message : String(err),
         }),
       );
-      this.host.recordMessage(sent);
+      this.host.recordMessage(sent, 'text');
       // Parity with the wwjs engine's message_create → message.sent (see emitOwnSendEcho).
       void this.emitOwnSendEcho(sent);
     }
@@ -277,7 +289,11 @@ export class BaileysMessaging {
 
   async getNumberId(number: string): Promise<string | null> {
     this.host.ensureReady();
-    const results = await this.sock().onWhatsApp(number);
+    const results = await withQueryDeadline(
+      this.sock().onWhatsApp(number),
+      this.queryBudgetMs,
+      'WhatsApp did not answer the number-check query in time',
+    );
     // onWhatsApp has no else branch after `if (results)`, so it resolves undefined when the usync
     // query goes unanswered — and Baileys' query() swallows its own timeout rather than throwing.
     // An empty ARRAY is a real answer; undefined is the absence of one, and coalescing the two
@@ -433,13 +449,19 @@ export class BaileysMessaging {
     // link is that token behind one of the library's two exported prefixes. Note the audio prefix
     // WhatsApp itself uses is `/voice/`, which is also what whatsapp-web.js calls the same thing.
     //
-    // timeoutMs is passed so the library can retire its own pending query, and the call is ALSO
-    // wrapped: baileys' query() swallows its timeout, so an unanswered request would otherwise
-    // resolve to nothing and be indistinguishable from a refusal.
-    const token = await this.confirmed(
-      this.sock().createCallLink(type, { startTime: Math.floor(startTime / 1000) }, this.queryBudgetMs),
-      'the call link',
-    );
+    // No timeoutMs is passed: without it the library's wait resolves nothing after its own 60 s, which
+    // would read as "no link". The wrap below is the deadline, but its 503 is rethrown as a 500:
+    // minting is non-idempotent and the deadline does not cancel the query, so a client replaying a
+    // 503 could create a second link. Same rule as createGroup and the whatsapp-web.js call link.
+    let token: string | undefined;
+    try {
+      token = await this.confirmed(
+        this.sock().createCallLink(type, { startTime: Math.floor(startTime / 1000) }),
+        'the call link',
+      );
+    } catch (err) {
+      throw err instanceof EngineTransportError ? new Error(err.message) : err;
+    }
     if (!token) {
       // A prefix with nothing after it is a dead link that looks like a real one — the caller would
       // hand it to a user and only find out then.
@@ -579,18 +601,15 @@ export class BaileysMessaging {
     // revoke, yet the send resolves, so it would report a deletion that never happened. WhatsApp Web
     // deletes such a message for the account alone instead, and so does this. A group whose member
     // list shows no row for the account proves nothing either way, so the revoke still goes out there.
-    // Whichever branch runs, the text leaves this account's view, so it must not stay the chat
-    // preview. The echo of an own revoke is skipped as an own send, so the inbound path never clears it.
+    // Whichever branch runs, the text leaves this account's view, so clear the preview immediately.
     const chatJid = target.key.remoteJid ?? chatId;
     // The preview of a received broadcast-list message is kept in its sender's chat.
     const previewJid = baileysChatJid(chatJid, target.key.participant, target.key.fromMe === true);
     if (forEveryone && (target.key.fromMe === true || (await this.selfIsGroupAdmin(target.key.remoteJid)) !== false)) {
       await this.send(await this.toDeliverableJid(chatId), { delete: target.key });
-      this.host.recordMessageEdit(previewJid, messageId, '');
-      // The echo of this delete is skipped as an own send, so the stored copy is emptied here, as
-      // processInboundMessage does for a delete made from the phone or by the other side. Recorded
-      // first, so the message stays deleted even if the store write fails or a repeat delivery of the
-      // original is stored after it.
+      this.host.recordMessageEdit(previewJid, messageId, '', 'revoked');
+      // Clear the stored copy before the buffered echo arrives. Record the deletion first so it
+      // survives a failed store write or a repeat delivery of the original.
       this.host.markDeletedForEveryone(messageId);
       await this.changeStored(messageId, stored => ({ ...stored, message: null }));
       return;
@@ -612,7 +631,7 @@ export class BaileysMessaging {
       ),
       'the delete-for-me',
     );
-    this.host.recordMessageEdit(previewJid, messageId, '');
+    this.host.recordMessageEdit(previewJid, messageId, '', 'revoked');
   }
 
   /**
@@ -656,10 +675,9 @@ export class BaileysMessaging {
     const editContent = { text: body, ...this.withMentions(mentions), edit: target.key };
     const b = await this.host.loadLib();
     await this.send(jid, this.previewSafe(editContent), this.previewSafeOptions(editContent));
-    // The edit's echo is skipped as an own send, so the chat preview follows it from here.
+    // Update the preview and raw copy immediately, ahead of the buffered echo.
     this.host.recordMessageEdit(target.key.remoteJid ?? chatId, messageId, body);
-    // Same reason as deleteMessage: the stored copy is what a later quote carries, and this edit's
-    // echo never reaches processInboundMessage.
+    // A later quote must carry the updated text even before the edit's echo arrives.
     await this.changeStored(messageId, stored => {
       const content = b.normalizeMessageContent(stored.message ?? undefined);
       return content && setBaileysText(content, body) ? stored : null;
@@ -686,24 +704,32 @@ export class BaileysMessaging {
    * Resolve a 1:1 phone-dialect chat id (`@c.us` / `@s.whatsapp.net`) to the contact's `@lid` when the
    * mapping is known. WhatsApp rejects PN-addressed 1:1 sends to LID-migrated accounts with ack error
    * 463 ("missing tctoken" — the privacy token is stored and honored under the LID), while the very
-   * same send addressed to the LID delivers (verified live). Groups, broadcast, already-lid and
-   * unmapped ids pass through unchanged, reproducing the previous behavior.
+   * same send addressed to the LID delivers (verified live). Unmapped phone ids still need the
+   * canonical Baileys domain; the library does not rewrite a neutral @c.us destination.
    */
   private async toDeliverableJid(chatId: string): Promise<string> {
-    if (!chatId.endsWith('@c.us') && !chatId.endsWith('@s.whatsapp.net')) {
-      return chatId;
-    }
+    const { kind, userPart: user } = parseWaId(chatId);
+    if (kind === 'lid') return `${user}@lid`;
+    if (kind !== 'user') return chatId;
+    const pn = this.host.toEngineJid(chatId);
+    const sock = this.sock();
     try {
-      const pn = this.host.toEngineJid(chatId);
-      const lid = await this.sock().signalRepository?.lidMapping?.getLIDForPN(pn);
+      const lid = await withQueryDeadline(
+        Promise.resolve(sock.signalRepository?.lidMapping?.getLIDForPN(pn)),
+        this.queryBudgetMs,
+        'WhatsApp did not answer the recipient LID lookup in time',
+      );
+      if (this.host.getSocketOrNull() !== sock) throw new EngineNotReadyError();
       // Record what the socket just told us. This resolution is the one place a cold contact's lid
       // becomes known before any message arrives, and without writing it back the session store
       // still believes the two ids are unrelated — which makes an ownership check comparing the
       // stored key's lid against a phone-dialect chatId reject a message that IS in that chat.
-      if (lid) this.host.recordLidMapping(lid, pn);
-      return lid ?? chatId;
-    } catch {
-      return chatId; // resolution is best-effort; an unmapped contact sends to the PN as before
+      if (lid) this.host.recordLidMapping(`${userPart(lid)}@lid`, pn);
+      return lid ? `${userPart(lid)}@lid` : pn;
+    } catch (error) {
+      if (this.host.getSocketOrNull() !== sock || error instanceof EngineNotReadyError) throw new EngineNotReadyError();
+      if (error instanceof EngineTransportError) throw new EngineNotSentError(error.message);
+      return pn; // LID resolution is best-effort; the phone destination must still be canonical.
     }
   }
 
@@ -762,6 +788,7 @@ export class BaileysMessaging {
     content: AnyMessageContent,
     options?: MiscMessageGenerationOptions,
   ): Promise<MessageResult> {
+    const b = await this.host.loadLib();
     const jid = await this.toDeliverableJid(chatId);
     const safe = this.previewSafe(content);
     const merged = this.previewSafeOptions(safe, this.withEphemeral(jid, options));
@@ -772,7 +799,21 @@ export class BaileysMessaging {
           error: err instanceof Error ? err.message : String(err),
         }),
       );
-      this.host.recordMessage(sent);
+      // Preview metadata must not turn a completed send into a retryable failure.
+      let type: MessageType | undefined;
+      try {
+        if (sent.message) {
+          const normalized = b.normalizeMessageContent(sent.message) ?? sent.message;
+          type = mapBaileysMessageType(
+            b.getContentType(normalized),
+            normalized.audioMessage?.ptt === true,
+            isBaileysCatalogShare(normalized),
+          );
+        }
+      } catch (error) {
+        this.host.logger.warn('Failed to classify sent message preview', { error: String(error) });
+      }
+      this.host.recordMessage(sent, type);
       // wwjs fires `message_create` for its own API sends, which SessionService turns into `message.sent`.
       // Baileys' own socket-sends echo back only as a `type:'append'` upsert, which handleMessagesUpsert
       // skips by the id send() recorded, so that event never fired for API sends. Emit the outbound
@@ -785,21 +826,44 @@ export class BaileysMessaging {
   }
 
   /**
-   * Every message this delegate sends goes through here so its id is recorded before the library
-   * echoes it back. Baileys re-emits each own send through `messages.upsert` tagged `append`, the
+   * Every send goes through here. Content message ids are recorded before the library echoes
+   * them back. Baileys re-emits each own send through `messages.upsert` tagged `append`, the
    * same tag WhatsApp uses to replay what the account typed on its phone while the gateway was
    * down, and the id is the only thing that tells the two apart (see handleMessagesUpsert). The
    * record is synchronous on the send's own continuation, ahead of the library's buffered echo.
+   *
+   * A send that fails after a stop or logout has torn its socket down is not ready (409), the same as
+   * one interrupted before it reached the socket; a failure on a socket still in place propagates.
    */
   private async send(
     jid: string,
     content: Parameters<WASocket['sendMessage']>[1],
     options?: Parameters<WASocket['sendMessage']>[2],
   ): Promise<WAMessage | undefined> {
-    const sent = options
-      ? await this.sock().sendMessage(jid, content, options)
-      : await this.sock().sendMessage(jid, content);
-    this.host.rememberOwnSend(sent?.key?.id);
+    const sock = this.sock();
+    if (parseWaId(jid).kind === 'user') {
+      let numberId: string | null;
+      try {
+        numberId = await this.getNumberId(jid);
+      } catch (error) {
+        if (this.host.getSocketOrNull() !== sock) throw new EngineNotReadyError();
+        throw new EngineNotSentError(`WhatsApp could not check the recipient before send: ${String(error)}`);
+      }
+      if (this.host.getSocketOrNull() !== sock) throw new EngineNotReadyError();
+      if (!numberId) throw new BadRequestException(`WhatsApp reports recipient ${jid} is not registered`);
+      const canonical = this.host.toEngineJid(numberId);
+      if (canonical !== jid) jid = await this.toDeliverableJid(numberId);
+    }
+    if (this.host.getSocketOrNull() !== sock) throw new EngineNotReadyError();
+    let sent: WAMessage | undefined;
+    try {
+      sent = options ? await sock.sendMessage(jid, content, options) : await sock.sendMessage(jid, content);
+    } catch (error) {
+      if (this.host.getSocketOrNull() !== sock) throw new EngineNotReadyError();
+      throw error;
+    }
+    // Mutations are announced by their library echo; no local callback replaces it.
+    if (!('react' in content || 'delete' in content || 'edit' in content)) this.host.rememberOwnSend(sent?.key?.id);
     return sent;
   }
 

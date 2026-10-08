@@ -70,6 +70,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'CHAT_MEDIA_ARCHIVE_OUTBOUND',
   'CHAT_MEDIA_ARCHIVE_MAX_BYTES',
   'CHAT_MEDIA_ARCHIVE_TTL_DAYS',
+  'MESSAGE_INLINE_MEDIA',
   'CHAT_MEDIA_ORPHAN_SWEEP_INTERVAL_MS',
   'CHAT_MEDIA_ORPHAN_GRACE_MS',
   // Send pacing. Blank-forwarded by compose like the chat-media keys, so an operator who sets
@@ -178,6 +179,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'WEBHOOK_MAX_PAYLOAD_BYTES',
   'WEBHOOK_MAX_PER_SESSION',
   'WEBHOOK_FAILURE_RETENTION_DAYS',
+  'WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS',
   'WEBHOOK_WORKER_CONCURRENCY',
   'WEBHOOK_DEGRADED_SESSION_CONCURRENCY',
   'INGRESS_INSTANCE_LIMIT',
@@ -297,10 +299,10 @@ export function isOsProvidedEnv(key: string): boolean {
  * OR by the project `.env`, both of which load with `override: false` and therefore win over the
  * dashboard-saved file for good.
  *
- * Distinct from `osEnvKeys` on purpose. That snapshot answers "may this value win over the file being
- * WRITTEN?" for the save-config guard, where only a host value counts. This one answers "can the
- * dashboard change this setting at all?", and there a project `.env` pins exactly as hard as an
- * orchestrator variable does.
+ * Distinct from `osEnvKeys` on purpose. That snapshot records what the host supplied; the save-config
+ * guard now reads both snapshots, since the host and the project .env both outrank the file being
+ * WRITTEN. This one answers "can the dashboard change this setting at all?", and there a project
+ * `.env` pins exactly as hard as an orchestrator variable does.
  */
 let pinnedEnvKeys: Set<string> | null = null;
 

@@ -1,6 +1,7 @@
 import { DelayedError, Job } from 'bullmq';
 import { FindOperator, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
+import { WebhookOutboxService } from '../../webhook/webhook-outbox.service';
 import { WebhookProcessor } from './webhook.processor';
 import { Webhook } from '../../webhook/entities/webhook.entity';
 import { WebhookDeliveryFailure } from '../../webhook/entities/webhook-delivery-failure.entity';
@@ -24,7 +25,8 @@ jest.mock('undici', () => {
 describe('WebhookProcessor', () => {
   let processor: WebhookProcessor;
   let repo: { update: jest.Mock; findOne: jest.Mock };
-  let failureRepo: { insert: jest.Mock; count: jest.Mock; delete: jest.Mock };
+  let failureRepo: { insert: jest.Mock; count: jest.Mock; delete: jest.Mock; update: jest.Mock };
+  let outbox: { close: jest.Mock };
   let failureRows: Array<{ webhookId?: string; idempotencyKey?: string | null; attempts?: number }>;
   let hookManager: { execute: jest.Mock };
   let configService: { get: jest.Mock };
@@ -35,6 +37,8 @@ describe('WebhookProcessor', () => {
     ({
       id: 'job-1',
       attemptsMade,
+      // BullMQ counts the activation running the job, so a job in process() has started one more.
+      attemptsStarted: attemptsMade + 1,
       data: {
         webhookId: 'wh-1',
         url: 'https://8.8.8.8/hook', // IP literal → SSRF guard needs no DNS lookup
@@ -57,13 +61,21 @@ describe('WebhookProcessor', () => {
     repo = {
       update: jest.fn().mockResolvedValue({ affected: 1 }),
       // The live row matches makeJob()'s snapshot unless a test says otherwise.
-      findOne: jest.fn().mockResolvedValue({ id: 'wh-1', active: true, url: 'https://8.8.8.8/hook', events: ['*'] }),
+      findOne: jest.fn().mockResolvedValue({
+        id: 'wh-1',
+        active: true,
+        sessionId: 'sess-1',
+        url: 'https://8.8.8.8/hook',
+        events: ['*'],
+      }),
     };
     // Stateful like the real table: the recorder counts existing rows for the delivery before it
     // inserts, so a constant would leave that guard unexercised here and let a duplicated row pass.
     failureRows = [];
     const insertedFailures = failureRows;
+    outbox = { close: jest.fn().mockResolvedValue(undefined) };
     failureRepo = {
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
       insert: jest.fn().mockImplementation((rowToInsert: { webhookId?: string; idempotencyKey?: string | null }) => {
         insertedFailures.push(rowToInsert);
         return Promise.resolve({});
@@ -104,6 +116,7 @@ describe('WebhookProcessor', () => {
       failureRepo as unknown as Repository<WebhookDeliveryFailure>,
       hookManager as unknown as HookManager,
       configService as unknown as ConfigService,
+      outbox as unknown as WebhookOutboxService,
     );
     // The merged delivery path uses withSafeFetch (undici), so mock undici's fetch, not global.fetch.
     mockFetch = undiciFetch as jest.Mock;
@@ -166,7 +179,13 @@ describe('WebhookProcessor', () => {
 
   it('persists a durable delivery-failure record on the final attempt (with parsed HTTP status)', async () => {
     mockFetch.mockResolvedValue({ ok: false, status: 503, statusText: 'Service Unavailable' });
-    repo.findOne.mockResolvedValue({ id: 'wh-x', active: true, url: 'https://8.8.8.8/h', events: ['*'] });
+    repo.findOne.mockResolvedValue({
+      id: 'wh-x',
+      active: true,
+      sessionId: 'sess-1',
+      url: 'https://8.8.8.8/h',
+      events: ['*'],
+    });
 
     await expect(
       processor.process(makeJob({ maxRetries: 3, webhookId: 'wh-x', url: 'https://8.8.8.8/h' }, 2)),
@@ -183,6 +202,45 @@ describe('WebhookProcessor', () => {
         lastError: 'HTTP 503: Service Unavailable',
       }),
     );
+  });
+
+  it('keeps queue ownership in the outbox when the terminal database write fails', async () => {
+    failureRepo.insert.mockRejectedValue(new Error('disk unavailable'));
+    mockFetch.mockResolvedValue({ ok: false, status: 503, statusText: 'Unavailable' });
+    await expect(processor.process(makeJob({}, 2))).rejects.toThrow('HTTP 503');
+    expect(outbox.close).not.toHaveBeenCalled();
+  });
+
+  it('keeps the job replay copy (pre-hook data) on the final-attempt row, never the sent body', async () => {
+    configService.get.mockImplementation((key: string, def?: unknown) =>
+      key === 'webhook.failurePayloadRetentionHours' ? 24 : def,
+    );
+    mockFetch.mockResolvedValue({ ok: false, status: 503, statusText: 'Service Unavailable' });
+    const job = makeJob({ maxRetries: 3, replayData: { from: 'x@c.us', body: 'hi' } }, 2);
+    job.data.payload.data = { redacted: true };
+
+    await expect(processor.process(job)).rejects.toThrow();
+
+    expect(failureRepo.insert).toHaveBeenCalledWith(
+      expect.objectContaining({ attempts: 3, payload: { from: 'x@c.us', body: 'hi' } }),
+    );
+  });
+
+  it.each(['terminal', 'stalled'])('drops an old queued replay copy after retention is disabled (%s)', async mode => {
+    const job = makeJob({ replayData: { body: 'private' } }, 2);
+    mockFetch.mockResolvedValue({ ok: false, status: 503, statusText: 'Unavailable' });
+    if (mode === 'terminal') await expect(processor.process(job)).rejects.toThrow();
+    else await processor.onWorkerFailed(job, new Error('job stalled more than allowable limit'));
+    expect(failureRepo.insert).toHaveBeenCalledTimes(1);
+    expect((failureRepo.insert.mock.calls as unknown[][])[0][0]).not.toHaveProperty('payload');
+  });
+
+  it('writes no payload for a job enqueued with payload retention off', async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 503, statusText: 'Service Unavailable' });
+
+    await expect(processor.process(makeJob({ maxRetries: 3 }, 2))).rejects.toThrow();
+
+    expect((failureRepo.insert.mock.calls as unknown[][])[0][0]).not.toHaveProperty('payload');
   });
 
   it("replaces a replayed delivery's attempts-0 shed row with its own final-attempt row", async () => {
@@ -254,7 +312,13 @@ describe('WebhookProcessor', () => {
   // message — the resolved internal IP is a recon oracle. The server-side logger.error keeps full detail.
   it('redacts the resolved internal IP from the webhook:error payload and DLQ row on an SSRF block', async () => {
     process.env.WEBHOOK_SSRF_PROTECT = 'true';
-    repo.findOne.mockResolvedValue({ id: 'wh-1', active: true, url: 'https://169.254.169.254/h', events: ['*'] });
+    repo.findOne.mockResolvedValue({
+      id: 'wh-1',
+      active: true,
+      sessionId: 'sess-1',
+      url: 'https://169.254.169.254/h',
+      events: ['*'],
+    });
     // final attempt (attemptsMade=0, maxRetries=1 → 1 >= 1) so the hook + DLQ fire
     await expect(processor.process(makeJob({ url: 'https://169.254.169.254/h', maxRetries: 1 }, 0))).rejects.toThrow();
 
@@ -316,12 +380,13 @@ describe('WebhookProcessor', () => {
 
   // The job is a snapshot from enqueue time; the operator may have changed the webhook since.
   describe('stale snapshot', () => {
-    const live = { id: 'wh-1', active: true, url: 'https://8.8.8.8/hook', events: ['*'] };
+    const live = { id: 'wh-1', active: true, sessionId: 'sess-1', url: 'https://8.8.8.8/hook', events: ['*'] };
 
     it.each([
       ['deleted', null],
       ['disabled', { ...live, active: false }],
       ['unsubscribed', { ...live, events: ['message.sent'] }],
+      ['reassigned', { ...live, sessionId: 'sess-2' }],
     ])('does not POST, retry or dead-letter a job for a %s webhook', async (_label, row) => {
       repo.findOne.mockResolvedValue(row);
       mockFetch.mockResolvedValue({ ok: true, status: 200 });
@@ -387,7 +452,13 @@ describe('WebhookProcessor', () => {
     it('records a dead-letter row, metric, and webhook:error for a job failed by a double stall', async () => {
       const failuresBefore = getWebhookDeliveryFailuresTotal();
       // Re-pointed since enqueue: the row names the URL a retry would have used, not the snapshot's.
-      repo.findOne.mockResolvedValue({ id: 'wh-stall', active: true, url: 'https://8.8.8.8/s', events: ['*'] });
+      repo.findOne.mockResolvedValue({
+        id: 'wh-stall',
+        active: true,
+        sessionId: 'sess-1',
+        url: 'https://8.8.8.8/s',
+        events: ['*'],
+      });
 
       await processor.onWorkerFailed(
         makeJob({ webhookId: 'wh-stall', url: 'https://8.8.8.8/old' }, 1),
@@ -416,6 +487,7 @@ describe('WebhookProcessor', () => {
     it.each([
       ['deleted', null],
       ['disabled', { id: 'wh-1', active: false, url: 'https://8.8.8.8/hook', events: ['*'] }],
+      ['reassigned', { id: 'wh-1', active: true, sessionId: 'sess-2', url: 'https://8.8.8.8/hook', events: ['*'] }],
     ])('files nothing for a job whose webhook was %s', async (_label, row) => {
       repo.findOne.mockResolvedValue(row);
 
@@ -483,6 +555,7 @@ describe('WebhookProcessor', () => {
         failureRepo as unknown as Repository<WebhookDeliveryFailure>,
         hookManager as unknown as HookManager,
         configService as unknown as ConfigService,
+        outbox as unknown as WebhookOutboxService,
       );
     };
     const withMoveToDelayed = (job: Job<WebhookJobData>): jest.Mock => {
@@ -540,6 +613,40 @@ describe('WebhookProcessor', () => {
       await expect(gp.process(job, 'tok-2')).rejects.toBeInstanceOf(DelayedError);
 
       expect((move.mock.calls[0] as [number])[0]).toBeGreaterThanOrEqual(before + 1000);
+      first.release();
+      await inFlight;
+    });
+
+    // Every backlogged job of a dead receiver is otherwise promoted and bounced again each 1-2x the
+    // retry delay, so the churn grows with the backlog. Each bounce doubles the job's wait, up to 64x.
+    it('backs a repeatedly bounced job off exponentially, up to 64 times the retry delay', async () => {
+      const gp = gatedProcessor(1000);
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 500, statusText: 'Server Error' });
+      await expect(gp.process(makeJob())).rejects.toThrow('HTTP 500');
+      const first = hang();
+      const inFlight = gp.process(makeJob(), 'tok-1');
+      await new Promise(resolve => setImmediate(resolve));
+
+      // attemptsStarted counts every activation, attemptsMade only real attempts: the gap, less the
+      // current activation, is how many times the job has already been bounced.
+      const waitAfter = async (bounces: number): Promise<number> => {
+        const job = makeJob({}, 1);
+        (job as unknown as { attemptsStarted: number }).attemptsStarted = 1 + bounces + 1;
+        const move = withMoveToDelayed(job);
+        const before = Date.now();
+        await expect(gp.process(job, 'tok-2')).rejects.toBeInstanceOf(DelayedError);
+        return (move.mock.calls[0] as [number])[0] - before;
+      };
+      const fresh = await waitAfter(0);
+      expect(fresh).toBeGreaterThanOrEqual(1000);
+      expect(fresh).toBeLessThan(2000 + 50);
+      const third = await waitAfter(3);
+      expect(third).toBeGreaterThanOrEqual(8000);
+      expect(third).toBeLessThan(16000 + 50);
+      const capped = await waitAfter(40);
+      expect(capped).toBeGreaterThanOrEqual(64000);
+      expect(capped).toBeLessThan(128000 + 50);
+
       first.release();
       await inFlight;
     });

@@ -58,7 +58,7 @@ export class MessageListItemDto {
     type: String,
     nullable: true,
     description:
-      'Push name of the message sender as the engine reported it; in a group this is the member who posted, not the group subject. Null when no contact name was known.',
+      "Sender's push name, or their saved contact name when the engine reported no push name; in a group this is the member who posted, not the group subject. Null when neither was known.",
     example: 'Alice',
   })
   chatName?: string | null;
@@ -120,6 +120,11 @@ export class MessageListItemDto {
 }
 
 export class MessageListResponseDto {
+  @ApiPropertyOptional({
+    description:
+      'Rows matching the non-time filters with unknown message time, before time bounds. Present only for time selections; excluded from their messages and total. Stored history is not proof of complete remote history.',
+  })
+  unknownTimestampTotal?: number;
   @ApiProperty({ type: [MessageListItemDto], description: 'Newest first.' })
   messages!: MessageListItemDto[];
 
@@ -222,18 +227,6 @@ export class ChatHistoryCallDto {
   missed!: boolean;
 }
 
-/** OpenAPI mirror of the engine `PollDetails` carried by a poll-creation message. */
-export class ChatHistoryPollDto {
-  @ApiProperty({ description: 'The poll question (also carried in `body`).', example: 'Where should we meet?' })
-  name!: string;
-
-  @ApiProperty({ type: [String], description: 'Option texts, in display order.', example: ['Park', 'Beach'] })
-  options!: string[];
-
-  @ApiProperty({ description: 'Whether a voter may select more than one option.', example: false })
-  allowMultipleAnswers!: boolean;
-}
-
 export class ChatHistoryOrderDto {
   @ApiProperty({
     description: 'Id of the cart the customer placed from the business catalog.',
@@ -259,6 +252,17 @@ export class ChatHistoryProductDto {
 
   @ApiPropertyOptional({ description: "JID of the catalog's owner.", example: '628123456789@c.us' })
   businessOwnerJid?: string;
+}
+
+export class ChatHistoryPollDto {
+  @ApiProperty({ example: 'Where?' })
+  name!: string;
+
+  @ApiProperty({ type: [String], example: ['Park', 'Beach'] })
+  options!: string[];
+
+  @ApiProperty({ example: false })
+  allowMultipleAnswers!: boolean;
 }
 
 /** OpenAPI mirror of the engine `IncomingMessage` served by the live chat-history route. */
@@ -339,11 +343,11 @@ export class ChatHistoryMessageDto {
   @ApiPropertyOptional({ type: ChatHistoryQuotedMessageDto })
   quotedMessage?: ChatHistoryQuotedMessageDto;
 
+  @ApiPropertyOptional({ type: ChatHistoryPollDto, description: 'Poll choices and selection mode, when available.' })
+  poll?: ChatHistoryPollDto;
+
   @ApiPropertyOptional({ type: ChatHistoryLocationDto })
   location?: ChatHistoryLocationDto;
-
-  @ApiPropertyOptional({ type: ChatHistoryPollDto, description: 'Set for `poll` messages.' })
-  poll?: ChatHistoryPollDto;
 
   @ApiPropertyOptional({ type: ChatHistoryOrderDto, description: 'Set for `order` messages.' })
   order?: ChatHistoryOrderDto;

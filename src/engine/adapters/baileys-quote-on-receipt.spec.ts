@@ -77,6 +77,7 @@ describe('quoting a Baileys message the moment it is announced', () => {
     on: { edited?: () => void; revoked?: () => void } = {},
   ): { events: BaileysEvents; messaging: BaileysMessaging; sock: { sendMessage: jest.Mock } } => {
     const sock = {
+      onWhatsApp: jest.fn((jid: string) => Promise.resolve([{ jid, exists: true }])),
       sendMessage: jest
         .fn()
         .mockResolvedValue({ key: { id: 'R1', remoteJid: CHAT, fromMe: true }, messageTimestamp: 1 }),
@@ -91,6 +92,7 @@ describe('quoting a Baileys message the moment it is announced', () => {
       loadLib: () =>
         Promise.resolve({
           normalizeMessageContent: (c: unknown) => c,
+          extractMessageContent: (c: unknown) => c,
           getContentType: (c: Record<string, unknown> | undefined) => Object.keys(c ?? {})[0],
           proto: { Message: { ProtocolMessage: { Type: { REVOKE: 0, MESSAGE_EDIT: 14 } } } },
           BufferJSON: { replacer: (_k: string, v: unknown) => v, reviver: (_k: string, v: unknown) => v },

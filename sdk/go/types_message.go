@@ -3,6 +3,7 @@ package openwa
 import (
 	"encoding/json"
 	"net/url"
+	"strconv"
 )
 
 // MessageResponse is the acknowledgement for a sent message.
@@ -173,10 +174,17 @@ type EditMessageRequest struct {
 
 // ListMessagesQuery filters GET /sessions/:id/messages.
 type ListMessagesQuery struct {
-	ChatID *string
-	From   *string
-	Limit  *int
-	Offset *int
+	// Inclusive lower/exclusive upper message-time bounds, Unix epoch milliseconds.
+	Since     *float64
+	Until     *float64
+	Direction *string
+	MessageID *string
+	OrderBy   *string
+	Type      *string
+	ChatID    *string
+	From      *string
+	Limit     *int
+	Offset    *int
 	// After is a keyset cursor: the id of the last message of the previous page. Takes
 	// precedence over Offset.
 	After *string
@@ -187,6 +195,16 @@ type ListMessagesQuery struct {
 
 func (q *ListMessagesQuery) values() url.Values {
 	v := url.Values{}
+	if q.Since != nil {
+		v.Set("since", strconv.FormatFloat(*q.Since, 'f', -1, 64))
+	}
+	if q.Until != nil {
+		v.Set("until", strconv.FormatFloat(*q.Until, 'f', -1, 64))
+	}
+	setStr(v, "direction", q.Direction)
+	setStr(v, "orderBy", q.OrderBy)
+	setStr(v, "messageId", q.MessageID)
+	setStr(v, "type", q.Type)
 	setStr(v, "chatId", q.ChatID)
 	setStr(v, "from", q.From)
 	setInt(v, "limit", q.Limit)
@@ -245,8 +263,9 @@ type MessageRecord struct {
 
 // MessageListResponse is the paginated message list payload.
 type MessageListResponse struct {
-	Messages []MessageRecord `json:"messages"`
-	Total    int             `json:"total"`
+	UnknownTimestampTotal *int            `json:"unknownTimestampTotal,omitempty"`
+	Messages              []MessageRecord `json:"messages"`
+	Total                 int             `json:"total"`
 }
 
 // ChatHistoryMedia is the media block on a live history message.
@@ -301,14 +320,13 @@ type ChatHistoryMessage struct {
 	Media         *ChatHistoryMedia `json:"media,omitempty"`
 	QuotedMessage *QuotedMessage    `json:"quotedMessage,omitempty"`
 	Location      *MessageLocation  `json:"location,omitempty"`
-	// Poll is set on poll messages only: the choices, which Body (the question) does not carry.
-	Poll    *MessagePoll    `json:"poll,omitempty"`
-	Order   *MessageOrder   `json:"order,omitempty"`
-	Product *MessageProduct `json:"product,omitempty"`
+	Order         *MessageOrder     `json:"order,omitempty"`
+	Product       *MessageProduct   `json:"product,omitempty"`
+	Poll          *ChatHistoryPoll  `json:"poll,omitempty"`
 }
 
-// MessagePoll is the poll block on a poll-creation message.
-type MessagePoll struct {
+// ChatHistoryPoll contains the poll question, choices, and selection mode.
+type ChatHistoryPoll struct {
 	Name                 string   `json:"name"`
 	Options              []string `json:"options"`
 	AllowMultipleAnswers bool     `json:"allowMultipleAnswers"`
@@ -565,7 +583,7 @@ type BatchProgress struct {
 	Cancelled int `json:"cancelled"`
 }
 
-// BatchStatusResponse is the response from the batch status / cancel endpoints.
+// BatchStatusResponse is the response from the batch status endpoint.
 type BatchStatusResponse struct {
 	BatchID     string               `json:"batchId"`
 	Status      BatchLifecycleStatus `json:"status"`
@@ -573,6 +591,14 @@ type BatchStatusResponse struct {
 	Results     []BatchMessageResult `json:"results"`
 	StartedAt   *string              `json:"startedAt,omitempty"`
 	CompletedAt *string              `json:"completedAt,omitempty"`
+}
+
+// BatchCancelResponse is the response from the batch cancel endpoint: the batch
+// state without the per-recipient results.
+type BatchCancelResponse struct {
+	BatchID  string               `json:"batchId"`
+	Status   BatchLifecycleStatus `json:"status"`
+	Progress BatchProgress        `json:"progress"`
 }
 
 // MessageMedia is a message's stored media: the raw bytes plus the served

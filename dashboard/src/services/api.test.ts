@@ -69,6 +69,36 @@ test('a role 403 keeps the key and rejects with the status', async () => {
   assert.deepEqual(navigations, []);
 });
 
+test('archived media forwards cancellation through fetch and the response body', async () => {
+  const controller = new AbortController();
+  let requested: string | undefined;
+  let options: RequestInit | undefined;
+  let reading = false;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    requested = String(input);
+    options = init;
+    return Promise.resolve({
+      ok: true,
+      blob: () => {
+        reading = true;
+        return new Promise<Blob>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+            once: true,
+          });
+        });
+      },
+    } as Response);
+  }) as typeof fetch;
+  const bytes = sessionApi.getMessageMediaBlob('s1', '100@c.us', 'WA1', controller.signal);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(reading);
+  assert.ok(requested?.endsWith('/sessions/s1/messages/100%40c.us/WA1/media'));
+  assert.equal((options?.headers as Record<string, string>)['X-API-Key'], 'stored-key');
+  assert.equal(options?.signal, controller.signal);
+  controller.abort();
+  await assert.rejects(bytes, { name: 'AbortError' });
+});
+
 test('the contact list walks past the 1000 contacts one response carries', async () => {
   const { contactApi } = await import('./api.ts');
   const requested: string[] = [];
@@ -88,4 +118,41 @@ test('the contact list walks past the 1000 contacts one response carries', async
     '/sessions/s1/contacts?limit=1000&offset=0',
     '/sessions/s1/contacts?limit=1000&offset=1000',
   ]);
+});
+
+test('the contact list is not cut off at 10,000 contacts', async () => {
+  const { contactApi } = await import('./api.ts');
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    const offset = Number(new URL(String(input), 'http://x').searchParams.get('offset'));
+    const count = offset < 11_000 ? 1000 : 5;
+    const contacts = Array.from({ length: count }, (_, i) => ({ id: `${offset + i}@c.us`, name: null }));
+    return Promise.resolve(
+      new Response(JSON.stringify(contacts), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+  }) as typeof fetch;
+
+  assert.equal((await contactApi.list('s1')).length, 11_005);
+});
+
+test('the contact list rejects instead of returning a partial list when a later page stays throttled', async () => {
+  const { contactApi } = await import('./api.ts');
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    if (!String(input).includes('offset=0')) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ statusCode: 429, message: 'Too Many Requests' }), {
+          status: 429,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+    }
+    const contacts = Array.from({ length: 1000 }, (_, i) => ({ id: `${i}@c.us`, name: null }));
+    return Promise.resolve(
+      new Response(JSON.stringify(contacts), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+  }) as typeof fetch;
+
+  await assert.rejects(
+    contactApi.list('s1'),
+    (err: Error & { status?: number }) => err.status === 429 && err.message === 'Too Many Requests',
+  );
 });

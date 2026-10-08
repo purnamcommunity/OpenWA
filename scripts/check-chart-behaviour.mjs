@@ -195,6 +195,8 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
   const problems = [
     podContext(byDefault) && 'the default render sets a pod securityContext',
     !addsCaps(byDefault) && 'the default render lost the capabilities the root entrypoint needs',
+    !/^ {14}- KILL$/m.test(byKind(byDefault, 'StatefulSet')[0] ?? '') &&
+      'the root init cannot forward shutdown signals after the privilege drop',
     !/runAsNonRoot: true/.test(pod) && 'podSecurityContext.runAsNonRoot does not reach the pod spec',
     !/fsGroup: 997/.test(pod) && 'podSecurityContext.fsGroup does not reach the pod spec',
     // Without it the kubelet re-owns every file on the volume on every mount before the pod starts.
@@ -257,6 +259,53 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
     wrong.length
       ? `values-file entries rendered differently from how they were written: ${wrong.map(k => `${k}=${JSON.stringify(got[k])}`).join(', ')}`
       : 'unquoted numbers in a values file reach the ConfigMap and Secret as written',
+  );
+}
+
+// The kubelet injects Docker-link variables for every Service in the namespace unless the pod opts
+// out, so a Service named `redis` or `database` sets REDIS_PORT or DATABASE_PORT to tcp://<ip>:<port>
+// and boot validation refuses it. The app reads no service-link variable.
+{
+  const sts = byKind(render(), 'StatefulSet')[0] ?? '';
+  const links = /^\s*enableServiceLinks:\s*(\S+)/m.exec(sts)?.[1];
+  check(
+    'no-service-link-env',
+    links === 'false',
+    links === 'false'
+      ? 'enableServiceLinks: false, so no Service in the namespace can set REDIS_PORT or DATABASE_PORT'
+      : `${nameOf(sts) ?? 'StatefulSet'}: enableServiceLinks is ${links ?? 'unset (defaults to true)'}, so a Service named redis or database injects REDIS_PORT or DATABASE_PORT`,
+  );
+}
+
+// With NODE_ENV=production the app sends upgrade-insecure-requests, so a dashboard opened over a
+// TLS-less ingress fetches its scripts over https and renders blank. NOTES must warn on exactly that
+// combination: ingress.tls or an explicit CSP_UPGRADE_INSECURE_REQUESTS=false silences it. `helm
+// template` does not render NOTES, so this one goes through a client-side dry-run install.
+{
+  const notes = (...setArgs) =>
+    execFileSync('docker', ['run', '--rm', '-v', `${CHARTS}:/charts:ro`, HELM_IMAGE, 'install', 'ci', '/charts/openwa', '--dry-run=client', ...setArgs], {
+      encoding: 'utf8',
+      maxBuffer: 1 << 24,
+    }).split('\nNOTES:\n')[1] ?? '';
+  const warns = out => out.includes('this ingress has no TLS');
+  const tls = ['--set', 'ingress.tls[0].secretName=openwa-tls', '--set', 'ingress.tls[0].hosts[0]=openwa.example.com'];
+  const cases = [
+    ['ingress without TLS', true, ['--set', 'ingress.enabled=true']],
+    ['CSP upgrade off', false, ['--set', 'ingress.enabled=true', '--set-string', 'env.CSP_UPGRADE_INSECURE_REQUESTS=false']],
+    // `--set` parses this one as a YAML boolean rather than a string.
+    ['CSP upgrade off as a boolean', false, ['--set', 'ingress.enabled=true', '--set', 'env.CSP_UPGRADE_INSECURE_REQUESTS=false']],
+    ['ingress with TLS', false, ['--set', 'ingress.enabled=true', ...tls]],
+    // A null drops the key from the ConfigMap, so the image's NODE_ENV=production applies.
+    ['NODE_ENV removed', true, ['--set', 'ingress.enabled=true', '--set', 'env.NODE_ENV=null']],
+    // An empty value reaches the container and overrides the image default.
+    ['NODE_ENV empty', false, ['--set', 'ingress.enabled=true', '--set-string', 'env.NODE_ENV=']],
+    ['no ingress', false, []],
+  ];
+  const wrong = cases.filter(([, want, args]) => warns(notes(...args)) !== want).map(([name, want]) => `${name} (expected ${want ? 'a' : 'no'} warning)`);
+  check(
+    'notes-warn-on-tls-less-ingress',
+    wrong.length === 0,
+    wrong.length ? `NOTES got the plain-http ingress warning wrong for: ${wrong.join(', ')}` : 'NOTES warns only when the ingress has no TLS and the CSP upgrade is on',
   );
 }
 

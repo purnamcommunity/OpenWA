@@ -85,6 +85,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
   return [
     defineTool({
       name: 'MessageList',
+      chatScope: ['chatId'],
       description:
         'List persisted messages for a session, optionally filtered by chatId or sender. Reads from the local DB.',
       tier: 'read',
@@ -106,6 +107,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageHistory',
+      chatScope: ['chatId'],
       description:
         'Fetch live chat history from WhatsApp for a specific chat. Bypasses the local DB — useful for messages that arrived before the gateway started.',
       tier: 'read',
@@ -128,6 +130,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageGetReactions',
+      chatScope: ['chatId'],
       description: 'Get reactions for a specific message, including which contacts sent which emoji.',
       tier: 'read',
       sessionScoped: true,
@@ -140,6 +143,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageSendText',
+      chatScope: ['chatId'],
       description: 'Send a plain text message to a chat or group. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -171,6 +175,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageSendImage',
+      chatScope: ['chatId'],
       description: 'Send an image message via URL or base64. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -200,6 +205,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageSendVideo',
+      chatScope: ['chatId'],
       description: 'Send a video message via URL or base64. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -229,6 +235,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageSendAudio',
+      chatScope: ['chatId'],
       description: 'Send an audio/voice message via URL or base64. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -260,6 +267,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageSendDocument',
+      chatScope: ['chatId'],
       description: 'Send a document/file message via URL or base64. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -289,6 +297,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageSendLocation',
+      chatScope: ['chatId'],
       description: 'Send a location pin message. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -314,6 +323,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageSendContact',
+      chatScope: ['chatId'],
       description: 'Send a contact card message. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -339,6 +349,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageSendSticker',
+      chatScope: ['chatId'],
       description: 'Send a sticker message via URL or base64. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -368,6 +379,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageSendTemplate',
+      chatScope: ['chatId'],
       description:
         'Render a stored text template and send it as a text message. Provide either templateId or templateName. Requires OPERATOR role.',
       tier: 'write',
@@ -395,6 +407,8 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageReply',
+      chatQuotedAllowed: true,
+      chatScope: ['chatId'],
       description: 'Reply to a specific message (quoted reply). Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -416,6 +430,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageForward',
+      chatScope: ['fromChatId', 'toChatId'],
       description: 'Forward a message from one chat to another. Requires OPERATOR role.',
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
@@ -435,6 +450,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'MessageReact',
+      chatScope: ['chatId'],
       description:
         'Add or remove a reaction emoji on a message. Send empty string emoji to remove. Requires OPERATOR role.',
       tier: 'write',

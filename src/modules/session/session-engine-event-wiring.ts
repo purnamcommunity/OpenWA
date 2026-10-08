@@ -165,7 +165,13 @@ export class SessionEngineEventWiring {
         });
         return;
       }
-      void host.updateStatus(id, status);
+      void host.updateStatus(id, status).catch(err =>
+        this.logger.warn('Failed to persist an engine status', {
+          sessionId: id,
+          status,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
     };
 
     return {
@@ -228,15 +234,16 @@ export class SessionEngineEventWiring {
         host.handleEngineReady(id, engine, phone, pushName);
       },
       onMessage: (message): void => host.messages.handleInboundMessage(id, engine, message),
-      onHistoryMessages: (messages): void => {
+      onHistoryMessages: messages => {
         if (!host.isLiveEngine(id, engine)) return;
         // Persist for the chat view only; no dispatch (these predate the live session).
-        void host.messages
+        return host.messages
           .persistHistoryMessages(id, engine, messages)
           .catch(err => this.logger.error(`Failed to persist history messages for ${id}`, String(err)));
       },
       onMessageCreate: (message): void => host.messages.handleOwnSendEcho(id, engine, message),
-      onMessageAck: (messageId, status): void => host.messages.handleMessageAck(id, engine, messageId, status),
+      onMessageAck: (messageId, status, chatId): void =>
+        host.messages.handleMessageAck(id, engine, messageId, status, chatId),
       onMessageRevoked: (message): void => host.messages.handleMessageRevoked(id, engine, message),
       onMessageReaction: (event): void => {
         if (!host.isLiveEngine(id, engine)) return;

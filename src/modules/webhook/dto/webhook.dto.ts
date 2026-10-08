@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
+  ArrayMaxSize,
   ArrayMinSize,
   IsArray,
   IsBoolean,
@@ -9,6 +10,7 @@ import {
   IsString,
   IsUrl,
   Max,
+  MaxLength,
   Min,
   MinLength,
   ValidateIf,
@@ -363,8 +365,10 @@ export class WebhookResponseDto {
 }
 
 /**
- * A webhook delivery that exhausted its retries, or one not sent (attempts 0) that the outbox replays; the
- * shape `GET /webhooks/delivery-failures` serves. A later successful delivery removes the row.
+ * A webhook delivery that exhausted its retries, or one not sent (attempts 0); the shape
+ * `GET /webhooks/delivery-failures` serves. A shed or shutdown-refused delivery is replayed by the outbox
+ * sweep; one rejected before sending (an over-cap or unserializable payload) is recorded once and not
+ * replayed. A later successful delivery removes the row.
  */
 export class WebhookDeliveryFailureDto {
   @ApiProperty({ example: '0a941dac-a965-45e7-b318-74ae8be134f0' })
@@ -393,7 +397,10 @@ export class WebhookDeliveryFailureDto {
   deliveryId?: string | null;
 
   @ApiProperty({
-    description: 'Attempts recorded for the delivery; 0 when it was shed, refused or failed before sending.',
+    description:
+      'Attempts recorded for the delivery; 0 when it was shed, refused or failed before sending. With the ' +
+      'queue disabled, a delivery that shutdown caught in a retry backoff also records 0, although earlier ' +
+      'attempts were sent.',
     example: 5,
   })
   attempts!: number;
@@ -406,11 +413,84 @@ export class WebhookDeliveryFailureDto {
   })
   lastStatusCode?: number | null;
 
-  @ApiProperty({ example: 'connect ECONNREFUSED 10.0.0.1:443' })
+  @ApiProperty({ example: 'fetch failed' })
   lastError!: string;
 
   @ApiProperty({ type: String, format: 'date-time', description: 'When the failure was first recorded.' })
   createdAt!: Date;
+
+  @ApiProperty({
+    description:
+      'True when the row still holds the event data and can be replayed with ' +
+      '`POST /webhooks/delivery-failures/redrive`. Only terminal rows (attempts > 0) recorded while ' +
+      '`WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` > 0 are, until that window passes.',
+    example: false,
+  })
+  replayable!: boolean;
+}
+
+/** Body of `POST /webhooks/delivery-failures/redrive`. Every field narrows; an empty body takes eligible rows with the fewest attempts. */
+export class RedriveWebhookDeliveriesDto {
+  @ApiPropertyOptional({
+    description: "Only rows of this session. Narrows within the calling key's allowedSessions, never past it.",
+    example: 'my-session',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  sessionId?: string;
+
+  @ApiPropertyOptional({ description: 'Only rows of this webhook.', example: '0a941dac-a965-45e7-b318-74ae8be134f0' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  webhookId?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description: 'Only these failure rows (ids from `GET /webhooks/delivery-failures`).',
+    example: ['0a941dac-a965-45e7-b318-74ae8be134f0'],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(500)
+  @IsString({ each: true })
+  @MaxLength(128, { each: true })
+  ids?: string[];
+
+  @ApiPropertyOptional({ description: 'Max rows replayed by this call (1-500, default 100).', example: 100 })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(500)
+  limit?: number;
+}
+
+/** Outcome of `POST /webhooks/delivery-failures/redrive`. */
+export class WebhookRedriveResultDto {
+  @ApiProperty({ description: 'Rows replayed by this call; equals delivered.', example: 2 })
+  redriven!: number;
+
+  @ApiProperty({ description: 'Delivered by a direct POST; their failure rows were removed.', example: 2 })
+  delivered!: number;
+
+  @ApiProperty({
+    description: 'Reserved for response compatibility; operator redrive uses direct POST and returns zero.',
+    example: 0,
+  })
+  enqueued!: number;
+
+  @ApiProperty({ description: 'Replays that failed again; their rows stay, with attempts raised by one.', example: 0 })
+  failed!: number;
+
+  @ApiProperty({
+    description: 'Rows not replayed: the webhook was removed, disabled or unsubscribed, or a plugin cancelled it.',
+    example: 0,
+  })
+  skipped!: number;
+
+  @ApiProperty({ description: 'Replayable rows still in scope after this call.', example: 0 })
+  remaining!: number;
 }
 
 /** Outcome of `POST /sessions/:sessionId/webhooks/:id/test`. */

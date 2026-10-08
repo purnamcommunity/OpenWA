@@ -66,9 +66,9 @@ export interface SessionResponse {
   createdAt: string;
   updatedAt: string;
   /**
-   * Human-readable reason while `status` is `'failed'` or `'action_required'`, or `'initializing'` during
-   * a prolonged automatic reconnect (fifth attempt onward, or while a failed relaunch waits to retry);
-   * `null` otherwise.
+   * Human-readable reason while `status` is `'failed'` or `'action_required'`, or `'initializing'` from the
+   * fifth attempt of a reconnect the engine runs itself (Baileys), or while a reconnect waits to retry after a
+   * failed relaunch (either engine); `null` otherwise.
    */
   lastError?: string | null;
   /**
@@ -230,6 +230,7 @@ export interface CreateSessionRequest {
   name: string;
   config?: Record<string, unknown>;
   proxyUrl?: string;
+  /** @deprecated Ignored by the gateway; the `proxyUrl` scheme selects the protocol. */
   proxyType?: 'http' | 'https' | 'socks4' | 'socks5';
 }
 
@@ -301,7 +302,10 @@ export interface SendMediaRequest {
   /** Requires `mimetype`. */
   base64?: string;
   mimetype?: string;
-  /** Required for documents; max 255 chars. */
+  /**
+   * Shown only on document sends; defaults to `file` when omitted (whatsapp-web.js first tries the URL basename).
+   * Max 255 chars.
+   */
   filename?: string;
   /** Max 4096 chars. */
   caption?: string;
@@ -507,6 +511,16 @@ export interface SendPollRequest {
 }
 
 export interface ListMessagesQuery {
+  type?: MessageType;
+  /** Inclusive message-time lower bound, Unix epoch milliseconds. */
+  since?: number;
+  /** Exclusive message-time upper bound, Unix epoch milliseconds. */
+  until?: number;
+  direction?: MessageDirection;
+  /** Newest first; timestamp excludes rows without known message time. Default createdAt. */
+  orderBy?: 'createdAt' | 'timestamp';
+  /** Exact WhatsApp message reference within the selection. */
+  messageId?: string;
   chatId?: Jid;
   from?: Jid;
   limit?: number;
@@ -541,9 +555,16 @@ export interface MessageRecord {
   body?: string | null;
   type: string;
   direction: MessageDirection;
-  /** Chat display name, when the session resolves one for the chat. */
+  /**
+   * Push name of the sender as the engine reported it (their saved contact name when it reported no push
+   * name); in a group this is the member who posted, not the group subject. Null when no name was known.
+   */
   chatName?: string | null;
-  /** Author display name for an inbound group message. */
+  /**
+   * JID of the sender of a group, status or broadcast-list message (`from` is the group, `status@broadcast`
+   * or the list id there; on Baileys a received list message is filed under the sender, so `from` is the
+   * sender too). Null on 1:1 messages and outgoing echoes.
+   */
   author?: string | null;
   /** Storage key of the archived media copy, when chat-media archiving wrote one. */
   mediaPath?: string | null;
@@ -637,9 +658,8 @@ export interface ChatHistoryMessage {
     sizeBytes?: number;
   };
   quotedMessage?: { id: string; body: string };
-  location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
-  /** Present on `poll` messages only: the choices, which `body` (the question) does not carry. */
   poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
+  location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
   /** Present on `order` messages only: the placed cart, plus the single-order token for its items. */
   order?: { orderId: string; token?: string };
   /** Present on `product` messages only: the catalog product shared into the chat. */
@@ -648,6 +668,8 @@ export interface ChatHistoryMessage {
 
 /** Paginated payload returned by `GET /sessions/:id/messages`. */
 export interface MessageListResponse {
+  /** Unknown message-time rows in the selected scope; present for time selections only. */
+  unknownTimestampTotal?: number;
   messages: MessageRecord[];
   total: number;
 }
@@ -768,9 +790,8 @@ export interface BatchMessageResult {
 export type BatchMessageStatus = 'pending' | 'sent' | 'failed' | 'cancelled';
 
 /**
- * Response from `GET /messages/batch/:batchId` (batch status polling) and
- * `POST /messages/batch/:batchId/cancel`. Distinct from
- * {@link BulkMessageResponse} (the send-bulk acknowledgement).
+ * Response from `GET /messages/batch/:batchId` (batch status polling). Distinct from
+ * {@link BulkMessageResponse} (the send-bulk acknowledgement) and {@link BatchCancelResponse}.
  */
 export interface BatchStatusResponse {
   batchId: string;
@@ -779,6 +800,13 @@ export interface BatchStatusResponse {
   results: BatchMessageResult[];
   startedAt?: string | null;
   completedAt?: string | null;
+}
+
+/** Response from `POST /messages/batch/:batchId/cancel`: the batch state without per-recipient `results`. */
+export interface BatchCancelResponse {
+  batchId: string;
+  status: BatchLifecycleStatus;
+  progress: BatchProgress;
 }
 
 /** Lifecycle of a whole batch — the `status` of {@link BatchStatusResponse}. */
@@ -839,11 +867,13 @@ export interface GroupParticipant {
   isSuperAdmin: boolean;
 }
 
-/** Item returned by `GET /sessions/:id/groups` (the slim list shape). */
+/** Item returned by `GET /sessions/:id/groups` (the slim list shape), and the `groups.create` response. */
 export interface GroupSummary {
   id: Jid;
   name: string;
+  /** Only in a `groups.create` response, never in `groups.list`; `groups.get` carries the participants. */
   participantsCount?: number;
+  /** Only in a `groups.create` response, never in `groups.list`; `groups.get` carries each participant's role. */
   isAdmin?: boolean;
   /** JID of the parent community, or null if standalone. */
   linkedParentJID?: string | null;
@@ -1032,7 +1062,10 @@ export interface CreateWebhookRequest {
   secret?: string;
   headers?: Record<string, string>;
   filters?: WebhookFilters | null;
-  /** 0–5; default 3. Server DTO field is `retryCount`. */
+  /**
+   * Total delivery attempts per event including the first, 0 to 5 (0 and 1 both mean one attempt); default 3 on
+   * create, while an update that omits it keeps the current value. Server DTO field is `retryCount`.
+   */
   retryCount?: number;
 }
 
@@ -1080,6 +1113,40 @@ export interface WebhookDeliveryFailure {
   lastError: string;
   /** ISO timestamp of when the row was recorded. */
   createdAt: string;
+  /**
+   * True when the row still holds the event data and can be replayed with
+   * {@link WebhooksResource.redriveDeliveryFailures}: a terminal row (`attempts > 0`) recorded while the
+   * gateway's `WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` is above 0, until that window passes.
+   */
+  replayable: boolean;
+}
+
+/** Body of {@link WebhooksResource.redriveDeliveryFailures}. An empty body takes the least-retried eligible rows. */
+export interface RedriveWebhookDeliveriesRequest {
+  /** Only rows of this session (within the key's allowedSessions). */
+  sessionId?: string;
+  /** Only rows of this webhook. */
+  webhookId?: string;
+  /** Only these failure rows (ids from `deliveryFailures`), at most 500. */
+  ids?: string[];
+  /** Max rows replayed by this call (1-500, default 100). */
+  limit?: number;
+}
+
+/** Outcome of {@link WebhooksResource.redriveDeliveryFailures}. */
+export interface WebhookRedriveResult {
+  /** Rows replayed by this call: delivered plus enqueued. */
+  redriven: number;
+  /** Delivered by a direct POST; their failure rows were removed. */
+  delivered: number;
+  /** Reserved for compatibility; operator redrive always returns zero. */
+  enqueued: number;
+  /** Replays that failed again; their rows stay, with attempts raised by one. */
+  failed: number;
+  /** Rows not replayed: the webhook was removed, disabled or unsubscribed, or a plugin cancelled it. */
+  skipped: number;
+  /** Replayable rows still in scope after this call. */
+  remaining: number;
 }
 
 // ── Chat (session-scoped chat operations) ─────────────────────────
@@ -1110,6 +1177,7 @@ export interface ChatSummary {
   lastMessage?: string;
   /** Set when the chat's newest activity is an add-on rather than a message. */
   lastActivity?: ChatActivityPreview;
+  lastMessageType?: MessageType;
   /** Unix seconds of the last activity. */
   timestamp: number;
   kind: ChatKind;
@@ -1244,7 +1312,11 @@ export interface SendTextStatusRequest {
 export interface StatusMediaInput {
   url?: string;
   base64?: string;
-  /** Optional explicit mimetype (inferred from URL/bytes when omitted). */
+  /**
+   * MIME type of the media. When omitted the server uses the route's default (`image/jpeg`, `video/mp4` or
+   * `audio/ogg; codecs=opus`), which also overrides a URL's Content-Type; the bytes are never inspected. Set
+   * it for base64 and for any media of another type.
+   */
   mimetype?: string;
 }
 
@@ -1306,6 +1378,7 @@ export interface AuthValidateResponse {
   valid: boolean;
   role?: string;
   engineType?: string;
+  scoped?: boolean;
 }
 
 // ── Template ──────────────────────────────────────────────────────

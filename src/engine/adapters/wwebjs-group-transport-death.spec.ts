@@ -114,7 +114,6 @@ describe('group writes classify a dead page', () => {
   ];
   const NON_CONVERGING_CHAT: [string, string, (g: WwebjsGroups) => Promise<unknown>][] = [
     ['leaveGroup', 'leave', g => g.leaveGroup(GROUP)],
-    ['revokeGroupInviteCode', 'revokeInvite', g => g.revokeGroupInviteCode(GROUP)],
     ['addParticipants', 'addParticipants', g => g.addParticipants(GROUP, ['628111@c.us'])],
     ['removeParticipants', 'removeParticipants', g => g.removeParticipants(GROUP, ['628111@c.us'])],
   ];
@@ -128,7 +127,14 @@ describe('group writes classify a dead page', () => {
     ['rejectGroupMembershipRequests', g => g.rejectGroupMembershipRequests(GROUP, ['628111@c.us'])],
   ];
 
-  it.each([...CONVERGING, ...NON_CONVERGING_CHAT, ...ADMIN_CHANGE])(
+  // revokeGroupInviteCode runs its write in-page through pupPage.evaluate, not a chat method.
+  const REVOKE: [string, string, (g: WwebjsGroups) => Promise<unknown>] = [
+    'revokeGroupInviteCode',
+    'pupPage.evaluate',
+    g => g.revokeGroupInviteCode(GROUP),
+  ];
+
+  it.each([...CONVERGING, ...NON_CONVERGING_CHAT, ...ADMIN_CHANGE, REVOKE])(
     '%s answers a dead page during the group lookup with 503 before calling %s',
     async (op, _method, run) => {
       const lookup = Promise.reject(transportError);
@@ -175,6 +181,23 @@ describe('group writes classify a dead page', () => {
     await expect(run(groups)).rejects.toBe(transportError);
     expect(reportIfPageTransportError).toHaveBeenCalledTimes(1);
     expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, op);
+  });
+
+  it('revokeGroupInviteCode reports a dead page in its write but keeps the raw error', async () => {
+    const { groups, reportIfPageTransportError } = makeGroups(
+      {},
+      { pupPage: { evaluate: jest.fn().mockRejectedValue(transportError) } },
+    );
+
+    await expect(groups.revokeGroupInviteCode(GROUP)).rejects.toBe(transportError);
+    expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, 'revokeGroupInviteCode');
+  });
+
+  it('revokeGroupInviteCode leaves an ordinary failure untouched', async () => {
+    const failure = new Error('Evaluation failed: x');
+    const { groups } = makeGroups({}, { pupPage: { evaluate: jest.fn().mockRejectedValue(failure) } });
+
+    await expect(groups.revokeGroupInviteCode(GROUP)).rejects.toBe(failure);
   });
 
   it.each(MEMBERSHIP)('%s reports a dead page but keeps the raw error', async (op, run) => {

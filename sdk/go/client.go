@@ -1,4 +1,5 @@
-// Package openwa is the official Go client for the OpenWA WhatsApp API Gateway.
+// Package openwa is the official Go client for OpenWA, the open-source WhatsApp API Gateway (not
+// affiliated with WhatsApp or Meta).
 //
 // The single entry point is New, which returns a *Client whose exported fields
 // are the domain services:
@@ -17,6 +18,8 @@
 //	if _, err := client.Sessions.Start(ctx, session.ID); err != nil {
 //	    log.Fatal(err)
 //	}
+//	// Link the account before sending: scan Sessions.QRCode or use Sessions.RequestPairingCode,
+//	// then wait for status "ready". An unlinked session answers the send with 409.
 //	res, err := client.Messages.SendText(ctx, session.ID, openwa.SendTextRequest{
 //	    ChatID: "628123456789@c.us",
 //	    Text:   "Hello from the OpenWA Go SDK!",
@@ -234,6 +237,15 @@ func (c *Client) call(ctx context.Context, method, path string, query url.Values
 	return nil
 }
 
+type idempotencyContextKey struct{}
+
+// WithIdempotencyKey supplies a caller-owned key for one logical send. Reuse
+// this context for its retries and choose another key for an unrelated send.
+// Only the gateway's documented idempotent send routes interpret the header.
+func WithIdempotencyKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, idempotencyContextKey{}, key)
+}
+
 // doRaw performs the request and returns the response body and Content-Type.
 // Any non-2xx status (including an unfollowed 3xx) is an error.
 //
@@ -258,12 +270,25 @@ func (c *Client) doRaw(ctx context.Context, method, path string, query url.Value
 
 	rawURL := c.baseURL + path
 	if len(query) > 0 {
-		rawURL += "?" + query.Encode()
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		rawURL += sep + query.Encode()
 	}
 
+	key, hasKey := ctx.Value(idempotencyContextKey{}).(string)
+	if hasKey {
+		if len(key) < 1 || len(key) > 255 || strings.IndexFunc(key, func(r rune) bool { return r < 0x21 || r > 0x7e }) >= 0 {
+			return nil, "", errors.New("openwa: idempotency key must contain 1-255 visible ASCII characters")
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
 	if err != nil {
 		return nil, "", fmt.Errorf("openwa: building request: %w", err)
+	}
+	if hasKey {
+		req.Header.Set("Idempotency-Key", key)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

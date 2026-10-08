@@ -132,9 +132,9 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Mirrors ci.yml's test job. The queue-on e2e suite needs this service: under GitHub Actions it
-    # fails rather than skipping when Redis is unreachable, so the tag is never verified less than the
-    # branch it came from.
+    # Mirrors ci.yml's test job. The queue-on and throttler-redis e2e suites need this service: under
+    # GitHub Actions they fail rather than skipping when Redis is unreachable, so the tag is never
+    # verified less than the branch it came from.
     services:
       redis:
         image: redis:7-alpine
@@ -229,17 +229,17 @@ jobs:
       # database), that a paged message list has a total order, that the data entities can build
       # their own schema (raw SQL the ORM passes through verbatim, such as a partial index predicate,
       # only case-folds on a real server), and that the UTC pin holds across a backup round trip, a
-      # retention window and a local-midnight count. All five self-skip unless DATABASE_TYPE=postgres,
+      # retention window and a local-midnight count. All six self-skip unless DATABASE_TYPE=postgres,
       # so they are a no-op in the default test job and only execute here against the postgres:16
       # service. TZ is deliberately not UTC, for the reason ci.yml states.
-      - name: Postgres specs (FTS provider + boot-migration lock + list ordering + entity synchronize + UTC pin)
+      - name: Postgres specs (FTS + migrations + ordering + schema + UTC + recovery)
         # --runInBand: same reason the CI job passes it — both specs issue DDL against the one
         # shared service database, and jest's default file-parallelism races their catalog writes
         # (the first v0.19.0 tag failed this step on `relation "messages" already exists` over a
         # tree CI had passed minutes earlier). The lock spec's own two-migrator race is in-file
         # (Promise.all) and unaffected by runInBand. The synchronize spec additionally CREATEs and
         # DROPs a scratch database of its own, which is only safe serialized.
-        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts src/database/postgres-utc.pg.spec.ts
+        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts src/database/postgres-utc.pg.spec.ts src/modules/webhook/webhook-recovery.pg.spec.ts
         env:
           TZ: Asia/Jakarta
           DATABASE_TYPE: postgres
@@ -807,7 +807,7 @@ jobs:
             grep -q "$want" /tmp/inspect.txt || { echo "MISSING PLATFORM: $want"; exit 1; }
           done
 
-  # ──── Staging tag cleanup (happy path AND failure path) ───────────
+  # ──── Staging tag cleanup (only when promote never ran) ───────────
   # Best-effort tidy-up of the staging tag, and it MUST refuse to act unless that tag is the only
   # one on its version.
   #
@@ -821,8 +821,11 @@ jobs:
   # This lives in its own `if: always()` job — not inside promote — because the failure path is
   # exactly when cleanup matters most: when boot-smoke or image-scan fails, promote is skipped and
   # the staging tag would otherwise leak. On the happy path the release tags share the staging
-  # version, so the step below keeps it (the deliberate retention documented above); on a failed
-  # run the staging tag is alone and gets removed.
+  # version, so the step below does not run at all (the deliberate retention documented above): the
+  # package-versions API is eventually consistent, and a read that does not list the new release
+  # tags yet would count the staging tag alone and delete the version just published. The same
+  # holds for a promote that failed after re-pointing some tags, so the step runs only when promote
+  # never ran, which is the one case where the staging tag is alone and gets removed.
   cleanup-staging:
     name: Clean up the staging tag
     runs-on: ubuntu-latest
@@ -833,6 +836,10 @@ jobs:
     needs: [docker, boot-smoke, image-scan, promote]
     steps:
       - name: Remove the staging tag (only when it is alone on its version)
+        # Only when promote never ran: once it has started re-pointing tags, the version can carry
+        # release tags that a stale read does not list yet. A failed or cancelled promote leaves the
+        # stray staging tag behind, the same retention as the happy path.
+        if: needs.promote.result == 'skipped'
         # Best-effort: a failed tidy-up must not turn an otherwise successful release red.
         continue-on-error: true
         env:
@@ -875,10 +882,9 @@ jobs:
     name: Verify published tags (anonymous)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # After cleanup-staging, not beside it: GHCR's package-versions API is eventually consistent, so
-    # that job can read a version whose release tags are not listed yet and delete the version the
-    # release just published. This check is the net for exactly that, so it has to run last. It is a
-    # best-effort job, so gate on promote rather than on its result.
+    # After cleanup-staging, not beside it: that job deletes registry versions, so this check has to
+    # see the registry after it, and run last. It is a best-effort job, so gate on promote rather
+    # than on its result.
     needs: [docker, promote, cleanup-staging]
     if: always() && needs.promote.result == 'success'
     # attestations: read for `gh attestation verify` below. GH_TOKEN is an API credential for the

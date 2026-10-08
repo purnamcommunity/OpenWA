@@ -54,6 +54,7 @@ OpenWA v0.2+ implements a **dual-database architecture** that separates boot con
 │                             │ • status_updates                  │
 │                             │ • webhook_delivery_failures       │
 │                             │ • webhook_outbox_events           │
+│                             │ • send_idempotency_keys           │
 │                             │ • plugin_instances                │
 │                             │ • ingress_events                  │
 │                             │ • conversation_mappings           │
@@ -127,7 +128,7 @@ POSTGRES_SCHEMA=public   # Default behavior (historical)
 
 **Validation:**
 
-- Schema name is validated at boot as a legal Postgres identifier (letters, digits, underscores, max 63 chars)
+- Schema name is validated at boot as a lower-case Postgres identifier (a lower-case letter or underscore, then lower-case letters, digits or underscores, max 63 chars)
 - Reserved `pg_` prefix is rejected to prevent conflicts with system schemas
 - Invalid values cause fast boot failure rather than migration-time errors
 
@@ -160,6 +161,9 @@ curl -X POST 'http://localhost:2785/api/infra/import-data' \
   -H 'Content-Type: application/json' \
   -d @backup.json
 ```
+
+> [!IMPORTANT]
+> The export leaves out webhook `secret` and custom `headers` and the `user:pass` of a session `proxyUrl`. Set them again after the import with `PUT /api/sessions/:sessionId/webhooks/:id` and `PATCH /api/sessions/:sessionId/proxy`, or webhooks deliver unsigned and an authenticated proxy fails the session's next start. The import is one request bounded by `BODY_SIZE_LIMIT` (`413` above it). Plugin instance secrets travel in plaintext, so treat the file as a secret. See [14 - Migration Guide: API-Based Migration](./14-migration-guide.md#api-based-migration-recommended-for-v02) for the full procedure.
 
 #### Cross-Database Date Portability
 
@@ -302,7 +306,7 @@ erDiagram
     }
 ```
 
-`messages` and `message_batches` reference `sessions.id` through a plain `sessionId` (`session_id` on `message_batches`) with no foreign key. Deleting a session through the API removes their rows explicitly; a raw `DELETE FROM sessions` leaves them behind.
+Only `webhooks`, `templates`, `automation_rules` and `baileys_stored_messages` declare an `ON DELETE CASCADE` foreign key to `sessions.id`. `messages`, `message_batches`, `chat_states`, `status_updates`, `webhook_outbox_events`, `webhook_delivery_failures` and `integration_delivery_failures` reference it through a plain `sessionId` (`session_id` on `message_batches`) with no foreign key. Deleting a session through the API removes their rows explicitly; a raw `DELETE FROM sessions` leaves them behind.
 
 ## 5.3 Table Specifications
 
@@ -704,8 +708,9 @@ The data connection also owns:
 
 - **`templates`** — reusable message templates (`src/modules/template/entities/template.entity.ts`), with a unique constraint on `(sessionId, name)` — one template name per session.
 - **`status_updates`** — inbound status/story broadcasts with a 24-hour TTL (`src/modules/status-store/entities/status-update.entity.ts`); unique on `(sessionId, waStatusId)`. Attached media is stored via `StorageService`, not in the row.
-- **`webhook_delivery_failures`** — durable record of a webhook delivery that exhausted its retries, or was not sent (attempts 0: shed, refused at shutdown, oversize or a preflight failure) and is pending replay (`src/modules/webhook/entities/webhook-delivery-failure.entity.ts`), surfaced via the ADMIN `GET /webhooks/delivery-failures`. A later successful delivery removes the row.
-- **`webhook_outbox_events`**: the outbound webhook delivery record (`src/modules/webhook/entities/webhook-outbox-event.entity.ts`): a row is written `pending` before the delivery attempt, so a delivery lost to a crash is replayed by the reconciler. It settles as `dispatched` once a durable owner (the BullMQ queue, or the inline POST in direct mode) holds it, or as `failed` when the replays run out or the reconciler finds the webhook removed, disabled or unsubscribed from the event (no failure row is written then). Settled rows drop their payload and are pruned on age (§5.7).
+- **`webhook_delivery_failures`**: durable record of a webhook delivery that exhausted its retries, or was not sent (attempts 0) (`src/modules/webhook/entities/webhook-delivery-failure.entity.ts`), surfaced via the ADMIN `GET /webhooks/delivery-failures`. A shed or shutdown-refused delivery is replayed by the outbox until its replay budget runs out; an oversize payload or a preflight failure on first dispatch is retired after its failure record is stored. A later successful delivery removes the row. While `WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` > 0 (default 0), a terminal row (attempts > 0) also keeps the pre-hook event data in `payload` (never selected by the listing, which reports `replayable` instead) so ADMIN `POST /webhooks/delivery-failures/redrive` can replay it with the stored idempotency key; the payload is cleared once that window passes and the row stays.
+- **`webhook_outbox_events`**: the outbound delivery record (`src/modules/webhook/entities/webhook-outbox-event.entity.ts`). A successfully written `pending` row holds pre-hook event data before the attempt. Enqueue changes it to `queued` without dropping the payload. Delivery success, subscription invalidation or a successfully recorded terminal failure retires the copy; failed terminal recording leaves it available for reconciliation. The reconciler checks the stored job before replaying queued work and reuses its idempotency key. Settled rows drop their payload and are pruned on age (§5.7). Message persistence and outbox insertion remain separate transactions.
+- **`send_idempotency_keys`**: one claimed `Idempotency-Key` per `(sessionId, idempotencyKey)` (unique) from the opt-in header on the message send routes (`src/modules/message/entities/send-idempotency-key.entity.ts`). The insert that wins the unique key runs the send; the row then holds `state` (`pending`, `completed` with the `responseBody` replayed to retries, or `failed` when the outcome is unknown), the `route` and a SHA-256 `requestHash` of route and body. Rows expire 24 hours after the claim (`expiresAt`) and are pruned hourly (§5.7). Not exported by `GET /infra/export-data`.
 - **`plugin_instances`** — one configured instance of an adapter plugin, keyed `${pluginId}:${instanceId}` (`src/modules/integration/entities/plugin-instance.entity.ts`); holds the host-minted ingress HMAC secret, masked on API reads.
 - **`ingress_events`** — persist-before-ack durable row and inbound dedup oracle, unique on `(pluginId, instanceId, providerDeliveryId)` (`src/modules/integration/entities/ingress-event.entity.ts`). The full payload is retired to `NULL` once dispatch is settled, leaving a slim dedup marker.
 - **`conversation_mappings`** — bidirectional WA-chat ↔ provider-conversation mapping plus handover state (`src/modules/integration/entities/conversation-mapping.entity.ts`).
@@ -850,10 +855,10 @@ flowchart LR
 
 OpenWA runs **two separate TypeORM connections**, each with its own migrations directory and CLI DataSource:
 
-| Connection | DataSource            | Migrations dir                  | Owns                                                                                                                                                                                                                                                                                                                              |
-| ---------- | --------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **main**   | `data-source-main.ts` | `src/database/migrations-main/` | `api_keys`, `audit_logs` — always SQLite (`./data/main.sqlite` by default)                                                                                                                                                                                                                                                        |
-| **data**   | `data-source.ts`      | `src/database/migrations/`      | `sessions`, `webhooks`, `messages`, `message_batches`, `templates`, `status_updates`, `automation_rules`, `webhook_delivery_failures`, `webhook_outbox_events`, the integration tables (`plugin_instances`, `ingress_events`, `conversation_mappings`, `integration_delivery_failures`), engine tables — SQLite **or** PostgreSQL |
+| Connection | DataSource            | Migrations dir                  | Owns                                                                                                                                                                                                                                                                                                                                                      |
+| ---------- | --------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **main**   | `data-source-main.ts` | `src/database/migrations-main/` | `api_keys`, `audit_logs`, always SQLite (`./data/main.sqlite` by default)                                                                                                                                                                                                                                                                                 |
+| **data**   | `data-source.ts`      | `src/database/migrations/`      | `sessions`, `webhooks`, `messages`, `message_batches`, `templates`, `status_updates`, `automation_rules`, `webhook_delivery_failures`, `webhook_outbox_events`, `send_idempotency_keys`, the integration tables (`plugin_instances`, `ingress_events`, `conversation_mappings`, `integration_delivery_failures`), engine tables, SQLite **or** PostgreSQL |
 
 Migrations are hand-authored and idempotent (`IF NOT EXISTS`) so they are safe to adopt on a database originally created by `synchronize`. The two connections differ in how schema is managed:
 
@@ -895,7 +900,7 @@ src/database/migrations/           # data connection (pluggable)
 ├── 1785600000000-SlimIngressEventPayload.ts
 ├── 1785700000000-AddMessageMediaArchive.ts
 ├── 1785800000000-AddSessionOwnership.ts
-├── 1785900000000-AddAutomationRules.ts            # 14th migration table; FKs sessions ON DELETE CASCADE
+├── 1785900000000-AddAutomationRules.ts            # FKs sessions ON DELETE CASCADE
 ├── 1786000000000-AddSessionNodeUrl.ts
 ├── 1786100000000-AddMessageMediaPathIndex.ts   # partial index on messages.mediaPath (orphan sweep)
 ├── 1786200000000-AddWebhookOutboxEvents.ts   # webhook_outbox_events (durable outbound delivery record)
@@ -907,7 +912,11 @@ src/database/migrations/           # data connection (pluggable)
 ├── 1786700000000-AddMessagesSessionChatCreatedAtIndex.ts   # (sessionId, chatId, createdAt): chat thread pages
 ├── 1786800000000-AddBaileysStoredMessagesSessionCreatedIdIndex.ts   # (sessionId, createdAt, id) index for the Baileys store cap trim
 ├── 1786900000000-ScrubRevokedMessageContent.ts   # clears content kept on rows revoked by earlier releases
-└── 1786950000000-ScrubNonPhoneLidMappings.ts   # drops lid_mappings rows where earlier releases stored a broadcast id as the phone
+├── 1786950000000-ScrubNonPhoneLidMappings.ts   # drops lid_mappings rows where earlier releases stored a broadcast id as the phone
+├── 1787000000000-AddWebhookDeliveryFailurePayload.ts   # webhook_delivery_failures.payload (optional replay copy)
+├── 1787100000000-AddSendIdempotencyKeys.ts   # send_idempotency_keys (opt-in send retry guard)
+├── 1787200000000-DeduplicateTerminalWebhookFailures.ts   # one terminal record per webhook and idempotency key
+└── 1790812800000-AddMessageWindowIndexes.ts   # compound timestamp indexes for message-time pagination
 ```
 
 > [!NOTE]
@@ -942,7 +951,7 @@ export class AddMessagesWaMessageIdUnique1781300000000 implements MigrationInter
 
 ### Retention Policies
 
-Six tables have an automated _time-based_ retention job, across five services: **`audit_logs`**, **`status_updates`**, **`webhook_delivery_failures`**, **`webhook_outbox_events`** (settled rows only), **`ingress_events`** and **`integration_delivery_failures`**. Separately, **`baileys_stored_messages`** is capped per session rather than by age: each write keeps the newest `BAILEYS_MESSAGE_STORE_LIMIT` rows (default 5000) for that session and deletes the rest. Everything else is kept indefinitely (api keys, sessions, webhooks, pending and processing batches, templates, conversation mappings, plugin instances, lid mappings, chat states, automation rules) and is removed only by user action (e.g. deleting a session) or operational backup/restore. Two more, `messages` and finished `message_batches`, have an opt-in time-based job (`MESSAGE_RETENTION_DAYS`, off by default); until it is set they are kept indefinitely too.
+Seven tables have an automated _time-based_ retention job, across six services: **`audit_logs`**, **`status_updates`**, **`webhook_delivery_failures`**, **`webhook_outbox_events`** (settled rows only), **`ingress_events`**, **`integration_delivery_failures`** and **`send_idempotency_keys`**. Separately, **`baileys_stored_messages`** is capped per session rather than by age: each write keeps the newest `BAILEYS_MESSAGE_STORE_LIMIT` rows (default 5000) for that session and deletes the rest. Everything else is kept indefinitely (api keys, sessions, webhooks, pending and processing batches, templates, conversation mappings, plugin instances, lid mappings, chat states, automation rules) and is removed only by user action (e.g. deleting a session) or operational backup/restore. Two more, `messages` and finished `message_batches`, have an opt-in time-based job (`MESSAGE_RETENTION_DAYS`, off by default); until it is set they are kept indefinitely too.
 
 | Data Type                     | Default Retention | Configurable                                                    |
 | ----------------------------- | ----------------- | --------------------------------------------------------------- |
@@ -954,6 +963,7 @@ Six tables have an automated _time-based_ retention job, across five services: *
 | Webhook outbox (settled rows) | 7 days            | Yes, `WEBHOOK_OUTBOX_RETENTION_DAYS` (≤ 0 does **not** disable) |
 | Ingress events (dedup rows)   | 7 days            | Yes — `INGRESS_DEDUP_RETENTION_DAYS` (≤ 0 does **not** disable) |
 | Integration delivery failures | 90 days           | Yes — `INGRESS_RETENTION_DAYS` (≤ 0 disables this prune only)   |
+| Send idempotency keys         | 24 hours          | No (fixed: the window a key guards a retry)                     |
 
 ### Audit-Log Cleanup Job
 
@@ -984,10 +994,11 @@ async cleanup(olderThanDays = 30): Promise<number> {
 
 The other interval-based prunes are the same shape: one prune at startup, then a 24-hour `setInterval`, `unref`'d, never a `@Cron`:
 
-- **`webhook_delivery_failures`** — `WebhookService.onModuleInit()` (`src/modules/webhook/webhook.service.ts`), window `WEBHOOK_FAILURE_RETENTION_DAYS` (default 90; ≤ 0 disables the prune and logs that it is off).
-- **`webhook_outbox_events`**: `WebhookOutboxService.onModuleInit()` (`src/modules/webhook/webhook-outbox.service.ts`), window `WEBHOOK_OUTBOX_RETENTION_DAYS` (default 7). Only settled rows are deleted; a `pending` row is a delivery that can still be replayed and is never pruned on age. A non-positive value does **not** disable the prune: a settled row carries no payload, so the service warns and falls back to 7 days.
+- **`webhook_delivery_failures`**: `WebhookService.onModuleInit()` (`src/modules/webhook/webhook.service.ts`), window `WEBHOOK_FAILURE_RETENTION_DAYS` (default 90; ≤ 0 disables the prune and logs that it is off). The replay `payload` has its own, shorter window: `WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` (default 0, store none) clears expired payloads at startup and hourly; at 0 one startup pass clears any payload an earlier setting left.
+- **`webhook_outbox_events`**: `WebhookOutboxService.onModuleInit()` (`src/modules/webhook/webhook-outbox.service.ts`), window `WEBHOOK_OUTBOX_RETENTION_DAYS` (default 7). Only settled rows are deleted; `pending` and `queued` rows can still be replayed and are never pruned on age. A non-positive value does **not** disable the prune: a settled row carries no payload, so the service warns and falls back to 7 days.
 - **`ingress_events`** and **`integration_delivery_failures`** — `IntegrationRetentionService` (`src/modules/integration/integration-retention.service.ts`) prunes both in one timer on two independent windows. `INGRESS_DEDUP_RETENTION_DAYS` (default 7) bounds the dedup rows; a non-positive value does **not** disable it — an unpruned dedup table grows without bound for no functional gain, so the service warns and falls back to the 7-day default. `INGRESS_RETENTION_DAYS` (default 90) bounds the DLQ rows, where long retention can be a deliberate operator choice, so ≤ 0 disables that prune (and only that prune).
 - **`messages`** and finished **`message_batches`**: `MessageRetentionService` (`src/modules/message/message-retention.service.ts`), window `MESSAGE_RETENTION_DAYS` (default 0, which keeps everything; boot rejects a value above 36500). Messages are deleted by `createdAt` in batches of 500 ids, at most 200 batches per run, so a run deletes at most 100,000 messages; a run that hits that limit logs a warning and is followed by another a minute later until the backlog is cleared. Pending and processing batches are never pruned. Once enabled, send pacing treats a contact silent for longer than the window as a new (cold) contact again, stats totals and search results shrink, archived media files are reclaimed by the chat-media orphan sweep, and a history sync does not write back messages older than the window. Search plugins get no `message:deleted` for pruned rows, so an external index keeps its copies.
+- **`send_idempotency_keys`**: `SendIdempotencyService` (`src/modules/message/idempotency/send-idempotency.service.ts`) deletes rows past `expiresAt` (24 hours after the claim) on an hourly `setInterval`, with no startup run: a claim that collides with an expired row deletes it and claims the key itself, so a late prune never blocks a send.
 
 ### Status-Update TTL Sweep
 

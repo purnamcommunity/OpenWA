@@ -1,5 +1,7 @@
 # @rmyndharis/openwa
 
+This document describes `main`. Send idempotency, webhook failure redrive, message-window filters, poll choices, and last-message types are unreleased additions after SDK 0.5.1 and require the corresponding server changes after OpenWA 0.24.0.
+
 Official JavaScript/TypeScript SDK for [OpenWA](https://github.com/rmyndharis/OpenWA), the open-source WhatsApp API Gateway. OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or Meta.
 
 Ships dual CJS + ESM builds with bundled type declarations.
@@ -11,13 +13,6 @@ npm install @rmyndharis/openwa
 ```
 
 Requires Node.js >= 18 (relies on the global `fetch`).
-
-This README describes `main`. The 0.5.0 release lacks `sessions.getProxy`,
-`sessions.updateProxy`, `messages.clickButton`, the `name` filter on
-`sessions.list`, `verifyWebhookSignature`, the `WebhookDelivery` types, the
-`code`, `retryAfterSeconds` and `headers` error fields and the refusal of an
-empty, `.` or `..` id or path segment; they ship with the next SDK release. See
-[the SDK overview](../README.md#coverage).
 
 ## Usage
 
@@ -34,6 +29,8 @@ const client = new OpenWAClient({
 const session = await client.sessions.create({ name: 'my-session' });
 await client.sessions.start(session.id);
 
+// Link the account before sending: scan sessions.getQrCode or use sessions.requestPairingCode,
+// then wait for status 'ready'. An unlinked session answers the send with 409.
 const result = await client.messages.sendText(session.id, {
   chatId: '628123456789@c.us',
   text: 'Hello from the OpenWA SDK!',
@@ -59,10 +56,13 @@ catalog 503 can persist because WhatsApp may never answer that query, so bound
 any retry. A 429 from the global rate limiter lifts when its window expires
 (seconds for the per-second tier, up to an hour for the hourly tier by
 default), and `.retryAfterSeconds` carries its `Retry-After` header. A 429 whose
-`.code` is `"SEND_PACING_LIMITED"` is not transient: do not retry it before
-`.retryAfterSeconds`, which then comes from the body and can be hours. Every API
-error also exposes the response `.headers`. A 503 does not prove a write was
-never carried out: the engine answers it when WhatsApp did not confirm in time,
+`.code` is `"SEND_PACING_LIMITED"` is usually not transient: do not retry it
+before `.retryAfterSeconds`, which then comes from the body: a few seconds when
+only sends still in flight caused it, the rest of the failure breaker's cooldown
+(`SEND_PACING_BREAKER_COOLDOWN_MS`, 15 minutes by default) after a run of send
+failures, otherwise up to the next UTC day. Every API error also exposes the
+response `.headers`. A 503 does not prove a write was never carried out: the
+engine answers it when WhatsApp did not confirm in time,
 and the change may still have been applied, so re-read the state before
 repeating it. In a routed deployment a forward that fails before reaching the
 owner node answers 503, one that fails after the request reached it answers 502
@@ -117,7 +117,7 @@ rejects the publish, so configure it first.
 Cutting a release:
 
 1. Bump `version` in `package.json` and land it on `main`.
-2. Tag that commit `js-sdk-v<version>` (e.g. `js-sdk-v0.5.0`) and push the tag.
+2. Tag that commit `js-sdk-v<version>` (e.g. `js-sdk-v0.5.1`) and push the tag.
    The SDK has its own version line — the monorepo's `v*` tags are the app
    version and never trigger an SDK publish.
 3. The workflow re-runs the SDK's tests, typecheck, build and dual CJS/ESM
@@ -127,3 +127,15 @@ Cutting a release:
 ## License
 
 MIT
+
+## Send idempotency
+
+The example below requires the unreleased SDK changes on `main`; SDK 0.5.1 does not expose this per-send key argument. The server must also include the send idempotency changes after OpenWA 0.24.0.
+
+Supply a unique caller-owned key for one logical send and reuse it when retrying that same call. Keys contain 1-255 visible ASCII characters; unrelated calls must use different keys. The SDK forwards the key without changing its retry policy or generating one automatically.
+
+```javascript
+await client.messages.sendText(sessionId, { chatId: '628123@c.us', text: 'Hello' }, 'order-123');
+```
+
+The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply and forward sends. Completed calls replay their response; pending or uncertain outcomes return 409, and a changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk, product and button operations have no such guarantee. Omit the key to preserve existing behavior.

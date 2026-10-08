@@ -26,6 +26,7 @@ describe('WwebjsChats.setOnlinePresence', () => {
     const host = {
       ensureReady: jest.fn(),
       getClient: () => client as unknown as Client,
+      isPageTransportError: () => false,
       logger,
     } as unknown as WwebjsEngineHost;
     return { chats: new WwebjsChats(host, {} as unknown as WwebjsMessaging), client };
@@ -88,6 +89,7 @@ describe('BaileysMessaging.setOnlinePresence', () => {
     const host = {
       ensureReady: jest.fn(),
       getSocket: () => sock as unknown as WASocket,
+      getSocketOrNull: () => sock as unknown as WASocket,
       toEngineJid: (jid: string) => jid,
       recordLidMapping: jest.fn(),
       logger,

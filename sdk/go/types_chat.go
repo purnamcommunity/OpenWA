@@ -4,18 +4,19 @@ import "net/url"
 
 // ChatSummary is a chat-list entry.
 type ChatSummary struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	IsGroup     bool     `json:"isGroup"`
-	UnreadCount int      `json:"unreadCount"`
-	LastMessage string   `json:"lastMessage,omitempty"`
+	ID              string      `json:"id"`
+	Name            string      `json:"name"`
+	IsGroup         bool        `json:"isGroup"`
+	UnreadCount     int         `json:"unreadCount"`
+	LastMessage     string      `json:"lastMessage,omitempty"`
+	LastMessageType MessageType `json:"lastMessageType,omitempty"`
 	// LastActivity is set when the chat's newest activity is an add-on rather than a
 	// message — a reply on an announcement, a reaction, a vote.
 	LastActivity *ChatActivityPreview `json:"lastActivity,omitempty"`
-	Timestamp   int64    `json:"timestamp"`
-	Kind        ChatKind `json:"kind"`
-	Archived    bool     `json:"archived"`
-	Pinned      bool     `json:"pinned"`
+	Timestamp       int64       `json:"timestamp"`
+	Kind            ChatKind    `json:"kind"`
+	Archived        bool        `json:"archived"`
+	Pinned          bool        `json:"pinned"`
 	// Muted reports whether the chat is muted right now, not the expiry behind it.
 	Muted bool `json:"muted"`
 	// MuteExpiration is the epoch milliseconds the mute ends, present only when muted; 0 means

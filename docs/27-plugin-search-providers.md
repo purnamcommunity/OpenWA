@@ -48,7 +48,7 @@ returns a `SearchResults`:
 
 ```ts
 ctx.registerSearchProvider(async (query) => {
-  // query: SearchQuery — { q, sessionIds?, sessionId?, chatId?, direction?, type?, from?, dateFrom?, dateTo?, limit?, offset? }
+  // query: SearchQuery, { q, sessionIds?, sessionId?, chatId?, direction?, type?, from?, dateFrom?, dateTo?, limit?, offset? }
   // Run your backend's query here (e.g. a Meilisearch /search call).
   return {
     hits: [...],   // SearchHit[] — see below
@@ -148,10 +148,20 @@ Backfilled items carry only the WhatsApp id (`id` there is the WhatsApp message 
 Keep a `waMessageId` lookup too, and when a later `message:persisted` arrives for a message you already
 backfilled, upsert onto that document instead of adding a second one.
 
-Start the backfill from `onEnable` without awaiting it: a sandboxed lifecycle call is cut off after 30 s,
-and walking every chat's history takes longer on a real deployment. Record a marker in `ctx.storage` (which
-needs the `storage:use` permission) when it finishes so a restart does not repeat it. The built-in DB-FTS
-provider is unaffected (its index is DB-synced via triggers on every insert, including backfill).
+Start the backfill per session from a `ctx.registerHook('session:ready', ...)` handler (the session is
+`hookCtx.sessionId`), without awaiting it: a sandboxed hook is cut off after 5 s and a lifecycle call
+after 30 s, and walking every chat's history takes longer on a real deployment. Do not rely on `onEnable`
+alone: it also runs at boot, when the host re-enables the plugin before any session engine is up, so an
+engine read there fails (no active engine, or one still initializing) and a session linked later is never
+covered. No `ctx` capability lists sessions or reports their status, so in `onEnable` try only the
+session ids the plugin already knows (its `manifest.sessions` list or its own config) and leave any whose
+engine read fails (no active engine, or one not yet ready) to its `session:ready` hook.
+Record a per-session marker in `ctx.storage` (which needs the `storage:use` permission) when that
+session's backfill finishes, and skip a session whose marker is set, so a restart resumes an interrupted
+backfill and does not repeat a finished one. Keep an in-memory set of sessions whose backfill is running
+too, so a repeated `session:ready` (a reconnect) does not start a second walk alongside the first. The
+built-in DB-FTS provider is unaffected (its index is DB-synced via triggers on every insert, including
+backfill).
 
 ## 27.4 Host-side guarantees (the plugin author doesn't handle these)
 
@@ -282,6 +292,10 @@ ctx interface is planned; for now the search contract types above are the stable
   `query.sessionIds` — the plugin should honor it (filter by `sessionIds` in the backend query) for
   correct results + performance. The host re-filters as defense-in-depth, but a plugin that ignores
   `sessionIds` returns more rows than needed (wasteful) and relies on the host to strip them.
+- **Chat-restricted keys require the built-in provider.** Plugin search returns `403` before invoking
+  the worker for these keys. Filtering a plugin's returned page cannot enforce scoped offsets or
+  counts. Use `SEARCH_PROVIDER=builtin-fts` to enable search for chat-restricted keys. A compiled
+  chat scope with no valid ids returns no hits and a zero total without invoking the worker.
 - **`message:persisted` is fire-and-forget.** An error in the indexing handler is swallowed (it must not
   break the send/receive pipeline). Log errors via `ctx.logger` and retry/mirror in your backend's own
   retry queue if you need stronger delivery guarantees.

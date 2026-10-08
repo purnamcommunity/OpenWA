@@ -12,9 +12,9 @@ import { SEARCH_OFFSET_MAX } from '../search.constants';
  * from the global ValidationPipe, never reaching the provider as a NaN SQL param. The epoch-ms
  * bounds `dateFrom`/`dateTo` use `@IsNumber()`; `limit`/`offset` use `@IsInt()`, because they are
  * bound straight into `LIMIT ?`/`OFFSET ?` where better-sqlite3 rejects a fractional value with
- * SQLITE_MISMATCH: a fraction has to be a 400 here rather than a driver-level 500. `sessionIds` is
- * intentionally absent: scope is injected by SearchService from the caller's API-key
- * allowedSessions (never user-supplied).
+ * SQLITE_MISMATCH: a fraction has to be a 400 here rather than a driver-level 500. `sessionIds` and
+ * `chatIds` are intentionally absent: both scopes are injected by SearchService from the caller's
+ * API-key allowedSessions/allowedChats (never user-supplied).
  */
 export class SearchQueryDto {
   @ApiProperty({ description: 'Search term (required, non-empty)' })
@@ -63,14 +63,19 @@ export class SearchQueryDto {
   @IsNumber()
   dateTo?: number;
 
-  @ApiPropertyOptional({ description: 'Max hits to return', type: Number })
+  @ApiPropertyOptional({ description: 'Max hits to return', type: 'integer', minimum: 1 })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
   limit?: number;
 
-  @ApiPropertyOptional({ description: `Pagination offset, at most ${SEARCH_OFFSET_MAX}`, type: Number })
+  @ApiPropertyOptional({
+    description: `Pagination offset, at most ${SEARCH_OFFSET_MAX}`,
+    type: 'integer',
+    minimum: 0,
+    maximum: SEARCH_OFFSET_MAX,
+  })
   @IsOptional()
   @ToStrictNumber()
   @Type(() => Number)

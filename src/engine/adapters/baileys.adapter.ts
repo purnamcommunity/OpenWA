@@ -52,7 +52,10 @@ import {
   StatusPostOptions,
 } from '../interfaces/whatsapp-engine.interface';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
-import { NotFoundException } from '@nestjs/common';
+import { EngineRefusedError } from '../../common/errors/engine-refused.error';
+import { EngineNotSentError } from '../../common/errors/engine-not-sent.error';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { createLogger } from '../../common/services/logger.service';
 import { BaileysAdapterConfig } from '../types/baileys.types';
 import { baileysAuthDir } from '../auth-dir-paths';
@@ -140,13 +143,15 @@ export class BaileysAdapter implements IWhatsAppEngine {
       toUnixSeconds,
       inboundLimiter: this.inboundLimiter,
       recordKeyLidMappings: key => this.sessionStore.recordKeyLidMappings(key),
-      recordMessage: msg => this.sessionStore.recordMessage(msg),
-      recordMessageEdit: (chatId, messageId, text) => this.sessionStore.recordMessageEdit(chatId, messageId, text),
+      recordMessage: (msg, type) => this.sessionStore.recordMessage(msg, type),
+      recordMessageEdit: (chatId, messageId, text, type) =>
+        this.sessionStore.recordMessageEdit(chatId, messageId, text, type),
       putStoredMessage: msg => this.config.messageStore?.put(this.config.dbSessionId, msg),
       updateStoredMessage: (messageId, change) =>
         this.config.messageStore?.update(this.config.dbSessionId, messageId, change),
       wasDeletedForEveryone: messageId => this.events.wasDeletedForEveryone(messageId),
       markDeletedForEveryone: messageId => this.events.markDeletedForEveryone(messageId),
+      applyHistoryRevoke: (target, envelope) => this.events.applyHistoryRevoke(target, envelope),
       pendingEditOf: (messageId, target) => this.events.pendingEditOf(messageId, target),
       rememberOwnSend: id => this.ownSends.remember(id),
       consumeOwnSend: id => this.ownSends.consume(id),
@@ -203,6 +208,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
       handleGroupJoinRequest: event => this.events.handleGroupJoinRequest(event),
       handleCallEvents: calls => this.events.handleCallEvents(calls),
       handlePresenceUpdate: update => this.events.handlePresenceUpdate(update),
+      fenceStoredWrites: () => this.events.fenceStoredWrites(),
       captureHistoryMessages: messages => this.history.captureHistoryMessages(messages),
       hydrateNames: () => this.history.hydrateNames(),
       restoreAddressbookSnapshot: () => this.history.restoreAddressbookSnapshot(),
@@ -779,7 +785,14 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.catalog.getProduct(productId);
   }
   async sendProduct(chatId: string, productId: string, body?: string): Promise<MessageResult> {
-    const product = await this.catalog.getProduct(productId);
+    const product = await this.catalog.getProduct(productId).catch((error: unknown) => {
+      // Still 403, but no longer an EngineRefusedError: the send breaker counts WhatsApp refusing a
+      // send, and a catalog read it refused says nothing about the account's send standing.
+      if (error instanceof EngineRefusedError) throw new ForbiddenException(error.message);
+      // A lookup that timed out or was throttled failed before the message was handed to WhatsApp.
+      if (error instanceof EngineTransportError) throw new EngineNotSentError(error.message);
+      throw error;
+    });
     if (!product) {
       throw new NotFoundException(`Product ${productId} not found in the session catalog`);
     }

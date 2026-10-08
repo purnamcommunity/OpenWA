@@ -1,7 +1,7 @@
 /**
  * Post-install hook (npm `postinstall`).
  *
- * Nineteen conditional steps, each skipped when its target is absent so the hook is a no-op where the
+ * Twenty conditional steps, each skipped when its target is absent so the hook is a no-op where the
  * piece is missing (the Docker builder stage copies package*.json long before any source):
  *
  *   1. `npm ci` inside dashboard/ when dashboard/ exists — the dashboard carries its own lockfile and
@@ -50,9 +50,12 @@
  *  18. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
  *      bound, gated the same way.
  *  19. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
- *      newsletter-create parse fix. Steps 18-19 are the Baileys patches. Every patcher runs whenever
- *      its script is present, whatever ENGINE_TYPE is set to. This list is the order `planSteps`
- *      plans, which `scripts/postinstall.spec.js` pins against the patchers on disk.
+ *      newsletter-create parse fix.
+ *  20. `node scripts/patch-baileys-pairing.js --best-effort` when present, preserving pre-login
+ *      notification ACKs and refreshing pairing credentials. A partial patch remains fatal.
+ *      Steps 18-20 are the Baileys patches. Every patcher runs whenever its script is present,
+ *      whatever ENGINE_TYPE is set to. This list is the order `planSteps` plans, which
+ *      `scripts/postinstall.spec.js` pins against the patchers on disk.
  *
  * Structured like scripts/patch-wwebjs-201832.js: pure planning + injectable spawn, so the spec
  * (scripts/postinstall.spec.js, node:test) exercises every branch without a real npm run.
@@ -258,6 +261,15 @@ function planSteps(root, env = process.env) {
       name: 'Baileys newsletter-create parse fix (scripts/patch-baileys-newsletter-create.js --best-effort)',
       command: process.execPath,
       args: [baileysNewsletterPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const baileysPairingPatcher = path.join(root, 'scripts', 'patch-baileys-pairing.js');
+  if (fs.existsSync(baileysPairingPatcher)) {
+    steps.push({
+      name: 'Baileys pairing refresh (scripts/patch-baileys-pairing.js --best-effort)',
+      command: process.execPath,
+      args: [baileysPairingPatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }

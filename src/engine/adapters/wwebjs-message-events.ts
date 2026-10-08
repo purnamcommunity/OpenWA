@@ -144,13 +144,15 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       return;
     }
     // Map the whatsapp-web.js MessageAck integer to the neutral DeliveryStatus here, at the
-    // adapter boundary, so no downstream consumer ever sees engine-specific ack codes.
-    host.getCallbacks().onMessageAck?.(ackId, wwebjsAckToDeliveryStatus(ack));
+    // adapter boundary, so no downstream consumer ever sees engine-specific ack codes. The chat is
+    // derived as Message._getChatId derives it (the same direction flag the revoked handler uses),
+    // so the ack's chatId matches the chatId of the message it belongs to.
+    const ackChatId = msg.fromMe ? msg.to : msg.from;
+    host.getCallbacks().onMessageAck?.(ackId, wwebjsAckToDeliveryStatus(ack), ackChatId || undefined);
   });
 
   client.on('message_revoke_everyone', (after, before) => {
     try {
-      const selfWid = host.getSelfWid();
       // Emit structured data only; the engine layer never produces a localized
       // display string. The dashboard renders the localized "message deleted" text.
       //
@@ -169,7 +171,9 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       const payload: RevokedMessage = {
         id: afterId?._serialized ?? afterId?.$1 ?? '',
         revokedId: beforeId?._serialized ?? beforeId?.$1,
-        chatId: after.from === selfWid ? after.to : after.from,
+        // Direction flag, as Message._getChatId: an own message in a LID chat carries the own LID as
+        // `from`, which never equals the phone-dialect account wid.
+        chatId: after.fromMe ? after.to : after.from,
         from: after.from,
         to: after.to,
         type: 'revoked',

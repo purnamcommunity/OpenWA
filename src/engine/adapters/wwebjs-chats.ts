@@ -8,6 +8,7 @@ import { indexChatActivity, probeChatActivity } from './wwebjs-chat-activity';
 import { WwebjsMessaging } from './wwebjs-messaging';
 import { type WwebjsEngineHost } from './wwebjs-host';
 import { isProtocolTimeout } from './wwebjs-lifecycle';
+import { mapWwebjsMessageType } from './message-mapper';
 
 /**
  * Build the chat list IN-PAGE with the same `window.WWebJS.getChatModel` whatsapp-web.js's own
@@ -133,6 +134,7 @@ export class WwebjsChats {
         timestamp: chat.timestamp || 0,
         // A location message's body is the base64 map thumbnail; don't surface it as the chat preview.
         lastMessage: chat.lastMessage?.type === MessageTypes.LOCATION ? '📍' : chat.lastMessage?.body || undefined,
+        lastMessageType: chat.lastMessage ? mapWwebjsMessageType(chat.lastMessage.type) : undefined,
         archived: Boolean(chat.archived),
         pinned: Boolean(chat.pinned),
         // Chat.isMuted is the current verdict; muteExpiration is wwjs epoch SECONDS with -1 = forever.
@@ -301,16 +303,37 @@ export class WwebjsChats {
     if (!chat) throw new BadRequestException(`Chat ${chatId} does not exist on this session`);
   }
 
+  /**
+   * The write leg of mute, pin and the account's own presence. A dead page or an expired protocol
+   * timeout is a 503 (mute, unmute, pin, unpin and a presence change all converge when repeated) and
+   * a dead page is reported as the early death signal. Any other rejection is rethrown untouched,
+   * for the reason above.
+   */
+  private async chatWrite<T>(context: string, op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (error) {
+      if (this.host.isPageTransportError(error)) {
+        this.host.reportIfPageTransportError(error, context);
+        throw new EngineTransportError(`Transport died during ${context}`);
+      }
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError(`WhatsApp Web did not answer in time during ${context}`);
+      }
+      throw error;
+    }
+  }
+
   async muteChat(chatId: string, muteUntil: number | null): Promise<void> {
     this.host.ensureReady();
     await this.requireResolvableChat(chatId);
     if (muteUntil === null) {
-      await this.client().unmuteChat(chatId);
+      await this.chatWrite('muteChat', () => this.client().unmuteChat(chatId));
       return;
     }
     // muteUntil is epoch milliseconds, which is what Date wants; Client.muteChat floors it to the
     // seconds its page-side call expects. The Baileys side takes the same milliseconds unmodified.
-    await this.client().muteChat(chatId, new Date(muteUntil));
+    await this.chatWrite('muteChat', () => this.client().muteChat(chatId, new Date(muteUntil)));
   }
 
   async pinChat(chatId: string, pin: boolean): Promise<boolean> {
@@ -324,13 +347,13 @@ export class WwebjsChats {
       // both on its early-out for an already-unpinned chat and after actually unpinning
       // (Client.js:2073-2084). Forwarding it would report every success as a refusal, the same trap
       // archiveChat documents. Discard it: an unpin that did not throw succeeded.
-      await this.client().unpinChat(chatId);
+      await this.chatWrite('pinChat', () => this.client().unpinChat(chatId));
       return true;
     }
     // In this direction the return value IS information. WhatsApp caps pinned chats at three
     // (MAX_PIN_COUNT, Client.js:2054-2063) and the page returns false without pinning once that is
     // met, so a false here is a real refusal the caller needs to see.
-    return await this.client().pinChat(chatId);
+    return await this.chatWrite('pinChat', () => this.client().pinChat(chatId));
   }
 
   async markUnread(chatId: string): Promise<boolean> {
@@ -395,11 +418,9 @@ export class WwebjsChats {
    */
   async setOnlinePresence(available: boolean): Promise<void> {
     this.host.ensureReady();
-    if (available) {
-      await this.client().sendPresenceAvailable();
-    } else {
-      await this.client().sendPresenceUnavailable();
-    }
+    await this.chatWrite('setOnlinePresence', () =>
+      available ? this.client().sendPresenceAvailable() : this.client().sendPresenceUnavailable(),
+    );
   }
 
   async sendChatState(chatId: string, state: ChatState): Promise<void> {

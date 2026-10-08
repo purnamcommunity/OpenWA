@@ -14,7 +14,7 @@ import { createHmac } from 'crypto';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { getQueueToken } from '@nestjs/bullmq';
-import { In, Repository } from 'typeorm';
+import { FindOperator, In, Repository } from 'typeorm';
 import { NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { fetch as undiciFetch } from 'undici';
@@ -75,6 +75,7 @@ describe('WebhookService', () => {
       insert: jest.fn().mockResolvedValue({}),
       find: jest.fn().mockResolvedValue([]),
       delete: jest.fn().mockResolvedValue({ affected: 0 }),
+      update: jest.fn().mockResolvedValue({ affected: 0 }),
     };
 
     sessionRepository = {
@@ -377,12 +378,38 @@ describe('WebhookService', () => {
     it('should update only provided fields', async () => {
       const webhook = createMockWebhook();
       (repository.findOne as jest.Mock).mockResolvedValue(webhook);
-      (repository.save as jest.Mock).mockImplementation(w => Promise.resolve(w));
+      (repository.update as jest.Mock).mockImplementation((_where, patch: Partial<Webhook>) => {
+        Object.assign(webhook, patch);
+        return Promise.resolve({ affected: 1 });
+      });
 
       const result = await service.update('sess-1', 'wh-uuid-1', { url: 'https://new-url.com/hook' });
 
       expect(result.url).toBe('https://new-url.com/hook');
       expect(result.events).toEqual(['message.received']); // unchanged
+    });
+
+    it('writes only the fields the request carries, scoped to the row as it exists now', async () => {
+      const webhook = createMockWebhook();
+      (repository.findOne as jest.Mock).mockResolvedValue(webhook);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.update('sess-1', 'wh-uuid-1', { active: false, secret: '' });
+
+      expect(repository.update).toHaveBeenCalledWith(
+        { id: 'wh-uuid-1', sessionId: 'sess-1' },
+        { active: false, secret: null },
+      );
+      expect(repository.save).not.toHaveBeenCalled();
+    });
+
+    it('answers 404 instead of re-creating a webhook deleted while the update was in flight', async () => {
+      const webhook = createMockWebhook();
+      (repository.findOne as jest.Mock).mockResolvedValue(webhook);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 0 });
+
+      await expect(service.update('sess-1', 'wh-uuid-1', { active: false })).rejects.toThrow(NotFoundException);
+      expect(repository.save).not.toHaveBeenCalled();
     });
 
     it('rejects a URL carrying userinfo on update and leaves the stored URL unchanged', async () => {
@@ -393,7 +420,7 @@ describe('WebhookService', () => {
         service.update('sess-1', 'wh-uuid-1', { url: 'https://user:pass@evil.example/hook' }),
       ).rejects.toMatchObject({ status: 400 });
       expect(webhook.url).toBe('https://example.com/webhook');
-      expect(repository.save).not.toHaveBeenCalled();
+      expect(repository.update).not.toHaveBeenCalled();
     });
 
     describe('with the SSRF guard on', () => {
@@ -407,15 +434,14 @@ describe('WebhookService', () => {
       it('saves an edit that re-sends an unchanged URL the guard would now refuse', async () => {
         const webhook = createMockWebhook({ url: 'https://169.254.169.254/hook' });
         (repository.findOne as jest.Mock).mockResolvedValue(webhook);
-        (repository.save as jest.Mock).mockImplementation(w => Promise.resolve(w));
+        (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
 
-        const result = await service.update('sess-1', 'wh-uuid-1', {
+        await service.update('sess-1', 'wh-uuid-1', {
           url: 'https://169.254.169.254/hook',
           active: false,
         });
 
-        expect(result.active).toBe(false);
-        expect(repository.save).toHaveBeenCalledWith(expect.objectContaining({ active: false }));
+        expect(repository.update).toHaveBeenCalledWith({ id: 'wh-uuid-1', sessionId: 'sess-1' }, { active: false });
       });
 
       it('still refuses a changed URL the guard blocks', async () => {
@@ -426,7 +452,7 @@ describe('WebhookService', () => {
           service.update('sess-1', 'wh-uuid-1', { url: 'https://169.254.169.254/hook', active: false }),
         ).rejects.toMatchObject({ status: 400 });
         expect(webhook.url).toBe('https://example.com/webhook');
-        expect(repository.save).not.toHaveBeenCalled();
+        expect(repository.update).not.toHaveBeenCalled();
       });
     });
   });
@@ -477,6 +503,54 @@ describe('WebhookService', () => {
       } finally {
         if (prev === undefined) delete process.env.WEBHOOK_FAILURE_RETENTION_DAYS;
         else process.env.WEBHOOK_FAILURE_RETENTION_DAYS = prev;
+      }
+    });
+
+    it('pruneDeliveryFailurePayloads clears expired payloads and keeps the rows', async () => {
+      (failureRepository.update as jest.Mock).mockResolvedValue({ affected: 2 });
+      const before = Date.now();
+
+      await expect(service.pruneDeliveryFailurePayloads(72)).resolves.toBe(2);
+
+      const [where, patch] = (failureRepository.update as jest.Mock).mock.calls[0] as [
+        { payload: FindOperator<unknown>; createdAt: FindOperator<Date> },
+        Record<string, unknown>,
+      ];
+      expect(patch).toEqual({ payload: null });
+      expect(where.payload.type).toBe('not');
+      expect(where.createdAt.type).toBe('lessThan');
+      const cutoff = where.createdAt.value.getTime();
+      expect(cutoff).toBeLessThanOrEqual(before - 72 * 3600_000 + 1000);
+      expect(cutoff).toBeGreaterThanOrEqual(before - 72 * 3600_000 - 1000);
+      expect(failureRepository.delete).not.toHaveBeenCalled();
+    });
+
+    it('with payload retention off, startup clears leftover payloads once and schedules nothing', () => {
+      jest.useFakeTimers();
+      try {
+        service.onModuleInit();
+        expect(failureRepository.update).toHaveBeenCalledTimes(1);
+        jest.advanceTimersByTime(2 * 60 * 60 * 1000);
+        expect(failureRepository.update).toHaveBeenCalledTimes(1);
+      } finally {
+        service.onModuleDestroy();
+        jest.useRealTimers();
+      }
+    });
+
+    it('with payload retention on, expired payloads are cleared at startup and then hourly', () => {
+      (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T) =>
+        key === 'webhook.failurePayloadRetentionHours' ? 24 : def,
+      );
+      jest.useFakeTimers();
+      try {
+        service.onModuleInit();
+        expect(failureRepository.update).toHaveBeenCalledTimes(1);
+        jest.advanceTimersByTime(60 * 60 * 1000);
+        expect(failureRepository.update).toHaveBeenCalledTimes(2);
+      } finally {
+        service.onModuleDestroy();
+        jest.useRealTimers();
       }
     });
   });
@@ -602,6 +676,41 @@ describe('WebhookService', () => {
       expect(failureRepository.find).toHaveBeenCalledWith(
         expect.objectContaining({ where: { sessionId: In(['s1']) }, order: { createdAt: 'DESC', id: 'DESC' } }),
       );
+    });
+
+    it('flags the rows that still hold a replay payload, without reading any payload', async () => {
+      (configService.get as jest.Mock).mockImplementation((key: string, def?: unknown) =>
+        key === 'webhook.failurePayloadRetentionHours' ? 24 : def,
+      );
+      (failureRepository.find as jest.Mock)
+        .mockResolvedValueOnce([{ id: 'f1' }, { id: 'f2' }])
+        .mockResolvedValueOnce([{ id: 'f2' }]);
+
+      const out = await service.listDeliveryFailures({});
+
+      expect(out).toEqual([
+        { id: 'f1', replayable: false },
+        { id: 'f2', replayable: true },
+      ]);
+      const second = ((failureRepository.find as jest.Mock).mock.calls as unknown[][])[1][0] as {
+        select: Record<string, boolean>;
+        where: Record<string, unknown>;
+      };
+      expect(second.select).toEqual({ id: true });
+      expect(second.where.id).toEqual(In(['f1', 'f2']));
+      expect(second.where.createdAt).toEqual(expect.any(FindOperator));
+    });
+
+    it('reports retained payloads as unavailable when retention is disabled', async () => {
+      (failureRepository.find as jest.Mock).mockResolvedValue([{ id: 'f1' }]);
+      await expect(service.listDeliveryFailures({})).resolves.toEqual([{ id: 'f1', replayable: false }]);
+      expect(failureRepository.find).toHaveBeenCalledTimes(1);
+    });
+
+    it('skips the replayable lookup for an empty page', async () => {
+      (failureRepository.find as jest.Mock).mockResolvedValue([]);
+      await expect(service.listDeliveryFailures({})).resolves.toEqual([]);
+      expect(failureRepository.find).toHaveBeenCalledTimes(1);
     });
   });
 });

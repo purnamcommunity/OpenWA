@@ -145,9 +145,9 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Real Redis for the queue-on e2e suite (test/queue-on.e2e-spec.ts); the rest of the e2e family
-    # boots QUEUE_ENABLED=false and never connects. Mirrors the test-postgres job's service pattern;
-    # the image pin matches docker-compose.yml.
+    # Real Redis for the queue-on and throttler-redis e2e suites (test/queue-on.e2e-spec.ts,
+    # test/throttler-redis.e2e-spec.ts); the rest of the e2e family boots QUEUE_ENABLED=false and never
+    # connects. Mirrors the test-postgres job's service pattern; the image pin matches docker-compose.yml.
     services:
       redis:
         image: redis:7-alpine
@@ -189,9 +189,9 @@ jobs:
 
       - name: Run e2e smoke tests
         run: npm run test:e2e
-        # Point the queue-on suite at the service container (under GitHub Actions the suite fails
-        # without one; a local run without Redis skips). Every other suite keeps QUEUE_ENABLED=false
-        # via setup-e2e.ts and never touches Redis.
+        # Point the queue-on and throttler-redis suites at the service container (under GitHub Actions
+        # they fail without one; a local run without Redis skips). Every other suite keeps
+        # QUEUE_ENABLED=false via setup-e2e.ts and never touches Redis.
         env:
           REDIS_HOST: localhost
           REDIS_PORT: '6379'
@@ -250,20 +250,20 @@ jobs:
       # differently between two statements, so an unstable order drops rows from a page walk), and
       # that the data entities can build their own schema (raw SQL the ORM passes through verbatim,
       # such as a partial index predicate, only case-folds on a real server), and that the UTC pin
-      # holds across a backup round trip, a retention window and a local-midnight count. All five
+      # holds across a backup round trip, a retention window and a local-midnight count. All six
       # self-skip unless DATABASE_TYPE=postgres, so they are a no-op in the default test job and only
       # execute here against the postgres:16 service.
       #
       # TZ is deliberately NOT UTC: the pin's whole job is to make a `timestamp` column mean the same
       # instant on a host that runs in another zone, and on a UTC runner every assertion about it
       # would pass for the wrong reason (the UTC-pin spec fails outright rather than pass vacuously).
-      - name: Postgres specs (FTS provider + boot-migration lock + list ordering + entity synchronize + UTC pin)
+      - name: Postgres specs (FTS + migrations + ordering + schema + UTC + recovery)
         # --runInBand: the specs issue DDL against the one shared service database, and jest's
         # default file-parallelism races their catalog writes (pg_type duplicate-key). The lock
         # spec's own two-migrator race is in-file (Promise.all) and unaffected by runInBand. The
         # synchronize spec additionally CREATEs and DROPs a scratch database of its own, which is
         # only safe serialized.
-        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts src/database/postgres-utc.pg.spec.ts
+        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts src/database/postgres-utc.pg.spec.ts src/modules/webhook/webhook-recovery.pg.spec.ts
         env:
           TZ: Asia/Jakarta
           DATABASE_TYPE: postgres

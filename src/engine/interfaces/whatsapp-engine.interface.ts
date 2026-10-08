@@ -193,6 +193,7 @@ export interface IncomingMessage {
   backgroundColor?: string;
   /** Styling of a text status/story: the WhatsApp font index. Only set by engines that expose it. */
   font?: number;
+  poll?: PollDetails;
   media?: {
     mimetype: string;
     filename?: string;
@@ -432,6 +433,13 @@ export interface LocationInput extends Quotable {
   address?: string;
 }
 
+/** Poll choices as received from the engine, without vote counts. */
+export interface PollDetails {
+  name: string;
+  options: string[];
+  allowMultipleAnswers: boolean;
+}
+
 export interface PollInput extends Quotable {
   /** Poll question / title. */
   name: string;
@@ -653,6 +661,8 @@ export interface ChatSummary {
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
+  /** Engine-neutral type of the last message, when available. */
+  lastMessageType?: MessageType;
   /** Archived state, as set via `POST /sessions/{sessionId}/chats/archive`. */
   archived: boolean;
   /** Pinned state, as set via `POST /sessions/{sessionId}/chats/pin`. */
@@ -931,8 +941,11 @@ export interface EngineEventCallbacks {
   /**
    * Fired when the delivery status of an outgoing message advances. The adapter maps its native
    * delivery signal to the neutral `DeliveryStatus`, so consumers never see engine-specific codes.
+   * `chatId` is the conversation the acked message belongs to, canonicalized the same way the
+   * inbound mappers canonicalize `IncomingMessage.chatId`; undefined when the engine's update
+   * carries no chat, and the emitted payload then omits the field rather than guess.
    */
-  onMessageAck?: (messageId: string, status: DeliveryStatus) => void;
+  onMessageAck?: (messageId: string, status: DeliveryStatus, chatId?: string) => void;
   onMessageRevoked?: (message: RevokedMessage) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
   /**
@@ -957,8 +970,9 @@ export interface EngineEventCallbacks {
   /**
    * Bulk historical messages from an engine's initial sync (e.g. Baileys `messaging-history.set`).
    * They predate the live session, so consumers persist them for the chat view but must not dispatch.
+   * An async consumer may return stored revocations to keep previews cleared across resyncs.
    */
-  onHistoryMessages?: (messages: IncomingMessage[]) => void;
+  onHistoryMessages?: (messages: IncomingMessage[]) => void | Promise<IncomingMessage[] | void>;
   onDisconnected?: (reason: string) => void;
   /**
    * Fired each time the engine schedules an INTERNAL reconnect attempt: a drop it retries on its own

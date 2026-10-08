@@ -8,8 +8,9 @@ import { Message, MessageDirection, MessageStatus } from '../message/entities/me
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { KeyedMutationQueue } from '../../common/utils/keyed-mutation-queue';
 import { SessionLidResolver } from './session-lid-resolver.service';
-import { buildMessageMetadata, storableWaMessageId } from './message-row.mapper';
+import { buildMessageMetadata, REVOKED_ROW_PATCH, storableWaMessageId } from './message-row.mapper';
 import { MessageMutationProjector } from './message-mutation-projector';
+import { updateMessageMetadata } from '../message/message-metadata';
 import { persistHistoryMessages } from './message-history-projector';
 import { isTransientDbError, isUniqueViolation } from '../../common/utils/db-errors';
 import { resolveFeatureFlags } from '../../config/feature-flags';
@@ -57,20 +58,6 @@ import { isMessagePayload } from '../../core/hooks/hook-results';
  * retry after this delay closes that race; the forward-only transition guard keeps it idempotent.
  */
 export const ACK_RECONCILE_DELAY_MS = 750;
-
-/**
- * What a revoke leaves of a stored message: the placeholder WhatsApp itself shows. Body, archived-media
- * pointers and metadata (inline media, quote, reactions, buttons) are all cleared, so the row carries
- * nothing of what the sender took back. The archived file, now unreferenced, is reaped by the chat-media
- * orphan sweep.
- */
-const REVOKED_ROW_PATCH = {
-  body: '',
-  type: 'revoked',
-  metadata: null,
-  mediaPath: null,
-  mediaMimetype: null,
-} as unknown as QueryDeepPartialEntity<Message>;
 
 /**
  * Delay before the single retry of a message insert that failed transiently (lock contention, a
@@ -515,16 +502,14 @@ export class MessageProjector {
 
   /** Merge reactions into the row's metadata, withdrawing a sender's on ''. Must run on the mutation chain. */
   private async storeReactions(id: string, waMessageId: string, changes: Record<string, string>): Promise<void> {
-    const row = await this.messageRepository.findOne({ where: { sessionId: id, waMessageId } });
-    if (!row) return;
-    const metadata = row.metadata ?? {};
-    const reactions = { ...(metadata.reactions as Record<string, string> | undefined) };
-    for (const [sender, reaction] of Object.entries(changes)) {
-      if (reaction) reactions[sender] = reaction;
-      else delete reactions[sender];
-    }
-    // Only the metadata column, so a concurrent ack UPDATE is not overwritten.
-    await this.messageRepository.update({ sessionId: id, waMessageId }, { metadata: { ...metadata, reactions } });
+    await updateMessageMetadata(this.messageRepository, { sessionId: id, waMessageId }, metadata => {
+      const reactions = { ...(metadata.reactions as Record<string, string> | undefined) };
+      for (const [sender, reaction] of Object.entries(changes)) {
+        if (reaction) reactions[sender] = reaction;
+        else delete reactions[sender];
+      }
+      return { ...metadata, reactions };
+    });
   }
 
   /**
@@ -616,7 +601,8 @@ export class MessageProjector {
     if (pending?.revoked) {
       // Nothing of the content survives, as in REVOKED_ROW_PATCH.
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { media, quotedMessage, call, buttons, button, location, order, product, mentionedIds, ...kept } = message;
+      const { media, quotedMessage, call, buttons, button, location, order, product, poll, mentionedIds, ...kept } =
+        message;
       return { ...kept, body: '', type: 'revoked' };
     }
     return pending?.editedBody === undefined ? message : { ...message, body: pending.editedBody };
@@ -733,8 +719,8 @@ export class MessageProjector {
       // one transient retry) fails open, so a real send is never dropped on a DB fault.
       const outcome = await this.insertWithRetry(id, engine, dbMessage, 'outgoing');
       if (outcome.landed === 'stale') return;
-      // The first attempt may have committed before its error: that row still takes what arrived.
-      if (outcome.landed === 'dup' && outcome.retried) this.applyChangesMadeInFlight(id, outgoing.id);
+      // The REST writer may have won either attempt; its row still takes the echo's pending changes.
+      if (outcome.landed === 'dup') this.applyChangesMadeInFlight(id, outgoing.id);
       if (outcome.landed === 'yes') {
         this.applyChangesMadeInFlight(id, outgoing.id);
         // Fire-and-forget, mirroring onMessage: plugin providers (search etc.) see phone-
@@ -750,7 +736,8 @@ export class MessageProjector {
         // Archive this send's media, mirroring onMessage. This is the ONLY path a phone-composed
         // send takes, so the REST-side chokepoint would never see it. Opt-in twice over
         // (CHAT_MEDIA_ARCHIVE_ENABLED + _OUTBOUND) and a no-op otherwise; archive() itself
-        // refuses a row that is already archived, so the REST writer racing us costs nothing.
+        // refuses a row that is already archived, so the REST writer racing us costs at most one
+        // duplicate file write, which archive() deletes because the first pointer wins.
         if (this.configService?.get<boolean>('chatMedia.archiveOutbound', false) === true) {
           void this.chatMediaArchive?.archive(dbMessage).catch(() => undefined);
         }
@@ -765,7 +752,13 @@ export class MessageProjector {
   }
 
   /** Engine callback body, lifted out of initializeEngine so the wiring table stays readable. */
-  handleMessageAck(id: string, engine: IWhatsAppEngine, messageId: string, status: DeliveryStatus): void {
+  handleMessageAck(
+    id: string,
+    engine: IWhatsAppEngine,
+    messageId: string,
+    status: DeliveryStatus,
+    chatId?: string,
+  ): void {
     if (!this.engines.isLive(id, engine)) return;
     this.logger.debug(`Message ack: ${messageId} -> ${status}`, {
       sessionId: id,
@@ -821,8 +814,16 @@ export class MessageProjector {
     // One ack payload, emitted identically over the socket and the webhook so a client coded
     // against either channel sees the same shape. `id` mirrors the field every other message.*
     // event carries (and the idempotency-key resolver reads). `ack` is a deprecated legacy field
-    // kept for backward compatibility — new consumers should read the neutral `status`.
-    const ackPayload = { id: messageId, messageId, status, ack: deliveryStatusToAck(status) };
+    // kept for backward compatibility — new consumers should read the neutral `status`. `chatId`
+    // rides along when the engine's update names the chat, so a webhook `chatId` condition scopes
+    // ack and failure events to that chat instead of suppressing them outright.
+    const ackPayload = {
+      id: messageId,
+      messageId,
+      status,
+      ack: deliveryStatusToAck(status),
+      ...(chatId ? { chatId } : {}),
+    };
 
     // Push the live delivery/read tick to the dashboard over the websocket.
     this.eventsGateway.emitMessageAck(id, ackPayload);
@@ -894,9 +895,20 @@ export class MessageProjector {
   }
 
   /** History backfill persist, extracted to message-history-projector.ts (stateless function). */
-  persistHistoryMessages(id: string, engine: IWhatsAppEngine, messages: IncomingMessage[]): Promise<void> {
-    return persistHistoryMessages(this.messageRepository, this.configService, id, messages, this.logger, () =>
-      this.engines.isLive(id, engine),
+  persistHistoryMessages(id: string, engine: IWhatsAppEngine, messages: IncomingMessage[]): Promise<IncomingMessage[]> {
+    return persistHistoryMessages(
+      this.messageRepository,
+      this.configService,
+      id,
+      messages,
+      this.logger,
+      () => this.engines.isLive(id, engine),
+      row => {
+        if (!this.engines.isLive(id, engine)) return;
+        void this.hookManager
+          .execute('message:persisted', { sessionId: id, message: row }, { sessionId: id, source: 'SessionService' })
+          .catch(() => undefined);
+      },
     );
   }
 

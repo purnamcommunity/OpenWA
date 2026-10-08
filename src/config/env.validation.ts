@@ -1,5 +1,7 @@
 import { resolve } from 'path';
 import { normalizeS3KeyPrefix } from '../common/storage/s3-key-prefix';
+import { resolveBodyLimit } from './bootstrap-security';
+import { parseBodyLimitBytes } from './inflight-body-budget';
 
 type EnvConfig = Record<string, unknown>;
 
@@ -98,6 +100,13 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   };
   checkEnum('ENGINE_TYPE', ['whatsapp-web.js', 'baileys']);
   checkEnum('STORAGE_TYPE', ['local', 's3']);
+  checkEnum('MESSAGE_INLINE_MEDIA', ['inline', 'archive']);
+  // 'archive' drops the inline copy only after the archiver stored the file; with the archiver off
+  // nothing is ever stored, so the mode would silently do nothing. Refuse that rather than let an
+  // operator believe the inline copies are being reclaimed.
+  if (rawEnum('MESSAGE_INLINE_MEDIA') === 'archive' && config.CHAT_MEDIA_ARCHIVE_ENABLED !== 'true') {
+    errors.push('MESSAGE_INLINE_MEDIA=archive needs CHAT_MEDIA_ARCHIVE_ENABLED=true');
+  }
   // The S3 key root. A prefix that is absolute, traverses, or is only slashes would put this
   // deployment's objects (and its orphan sweeps' deletes) at the bucket root or outside its own root;
   // one with an empty or '.' segment builds keys an S3-compatible store refuses on every write.
@@ -223,6 +232,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'WEBHOOK_MAX_PER_SESSION', // 0 = unlimited
     'AUTOMATION_MAX_PER_SESSION', // 0 = unlimited
     'WEBHOOK_MEDIA_INLINE_MAX_BYTES', // 0 = never inline media
+    'WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS', // 0 = failure rows keep no payload (no redrive)
     'EXPORT_INLINE_MEDIA_BUDGET_BYTES', // 0 = a data export carries no inline media at all
     'MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES', // 0 = a message list carries no inline media at all
     'SESSION_WATCHDOG_WARMUP_MS', // 0 = no post-ready warm-up for the liveness watchdog
@@ -231,6 +241,14 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'REDIS_CACHE_DB',
     'INBOUND_MEDIA_GLOBAL_CONCURRENCY', // 0 = no process-wide ceiling, only the per-session one
     'SHUTDOWN_DELAY_MS', // 0 = no drain; parseInt read `3s` as a 3 ms drain
+    // 0 = disabled. A negative value failed the digits-only read and silently kept the default sweep.
+    'MESSAGE_REAPER_INTERVAL_MS',
+    'WEBHOOK_RECONCILE_INTERVAL_MS',
+    'INGRESS_RECONCILE_INTERVAL_MS',
+    // 0 = act on a row as soon as it is seen; the cap below keeps the cutoff inside the safe range.
+    'MESSAGE_REAPER_GRACE_MS',
+    'WEBHOOK_RECONCILE_GRACE_MS',
+    'INGRESS_RECONCILE_GRACE_MS',
   ]) {
     checkNonNegativeInt(key);
   }
@@ -280,6 +298,20 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     const days = str(key);
     if (days !== undefined && Number(days) > 36500) {
       errors.push(`${key} must be at most 36500 (got "${days}")`);
+    }
+  }
+  // The same cutoff bound, expressed in hours.
+  {
+    const hours = str('WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS');
+    if (hours !== undefined && Number(hours) > 36500 * 24) {
+      errors.push(`WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS must be at most ${36500 * 24} (got "${hours}")`);
+    }
+  }
+  // The grace windows build the same kind of cutoff (now minus the grace), so they share the cap.
+  for (const key of ['MESSAGE_REAPER_GRACE_MS', 'WEBHOOK_RECONCILE_GRACE_MS', 'INGRESS_RECONCILE_GRACE_MS']) {
+    const raw = str(key);
+    if (raw !== undefined && DECIMAL_INTEGER.test(raw) && Number(raw) > 36500 * 86_400_000) {
+      errors.push(`${key} must be at most ${36500 * 86_400_000} ms, 36500 days (got "${raw}")`);
     }
   }
 
@@ -356,6 +388,8 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     // Positive-only is the POINT here, not a convention: 0 arms no Puppeteer timer at all, so a
     // wedged renderer holds the request forever (see wwebjs-lifecycle.ts).
     'PUPPETEER_PROTOCOL_TIMEOUT_MS',
+    // The read fell back to its default on garbage, so `10s` silently meant 10000.
+    'SSRF_DNS_TIMEOUT_MS',
     // The media knobs take RAW numbers while their neighbours in .env.example and docs/12 take unit
     // strings (`BODY_SIZE_LIMIT=25mb`), and their read sites parse with `Number.parseInt`. That
     // accepts the leading digits of a unit-suffixed value and discards the unit, so
@@ -399,6 +433,16 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     checkPositiveInt(key);
   }
 
+  // The body cap takes a unit string. A spelling the parser does not know (`50M`, `50MiB`) silently
+  // becomes the 25mb default, and a value that parses to 0 bytes refuses every request carrying a
+  // body, the same self-DoS INFLIGHT_BODY_BUDGET_BYTES is refused for above.
+  const bodyLimit = str('BODY_SIZE_LIMIT');
+  if (bodyLimit !== undefined && (resolveBodyLimit(bodyLimit) !== bodyLimit || parseBodyLimitBytes(bodyLimit) < 1)) {
+    errors.push(
+      `BODY_SIZE_LIMIT must be a positive size such as 25mb or 1048576 (units b, kb, mb, gb, tb, pb; got "${bodyLimit}")`,
+    );
+  }
+
   // The ceiling matters for the same reason from the other side: the docs forbid 0, so an operator
   // who wants an effectively unlimited budget reaches for a row of nines. Rejected at boot rather
   // than clamped, so they learn the value they wrote is not the value they would have got.
@@ -419,10 +463,14 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     ['RATE_LIMIT_MEDIUM_TTL', 'each hit expires after 1 ms and that rate-limit tier never blocks'],
     ['RATE_LIMIT_LONG_TTL', 'each hit expires after 1 ms and that rate-limit tier never blocks'],
     ['INGRESS_INSTANCE_TTL', 'each hit expires after 1 ms and the ingress rate limits never block'],
+    ['SSRF_DNS_TIMEOUT_MS', 'every guarded DNS lookup times out, failing webhook deliveries and URL downloads'],
     // 0 still disables these three, so they carry only the ceiling, not the positive-only check.
     ['MESSAGE_REAPER_INTERVAL_MS', 'the pending message reaper reruns every millisecond'],
     ['WEBHOOK_RECONCILE_INTERVAL_MS', 'the webhook reconciler reruns every millisecond'],
     ['INGRESS_RECONCILE_INTERVAL_MS', 'the ingress reconciler reruns every millisecond'],
+    // 0 disables these two as well; pg arms both with a plain setTimeout.
+    ['DATABASE_CONNECTION_TIMEOUT_MS', 'every pool connect times out'],
+    ['DATABASE_IDLE_TIMEOUT_MS', 'each idle pool connection is closed 1 ms after release'],
   ]) {
     const raw = str(key);
     const n = raw !== undefined && DECIMAL_INTEGER.test(raw) ? Number(raw) : NaN;
@@ -432,6 +480,19 @@ export function validateEnv(config: EnvConfig): EnvConfig {
           `timers overflow above that and fire after 1 ms, so ${consequence}`,
       );
     }
+  }
+  // Not a Node timer, but the same ceiling: PostgreSQL's statement_timeout is an int capped at
+  // 2147483647, and a larger startup value is refused on every runtime connection. 0 still disables.
+  const statementTimeout = str('DATABASE_STATEMENT_TIMEOUT_MS');
+  if (
+    statementTimeout !== undefined &&
+    DECIMAL_INTEGER.test(statementTimeout) &&
+    Number(statementTimeout) > MAX_TIMER_MS
+  ) {
+    errors.push(
+      `DATABASE_STATEMENT_TIMEOUT_MS must not exceed ${MAX_TIMER_MS} ms (got "${statementTimeout}"): ` +
+        'PostgreSQL refuses a larger statement_timeout, so every runtime connection fails',
+    );
   }
   // Knobs armed at a multiple of their value get that fraction of the timer's ceiling. Send verbs arm
   // four times PLUGIN_CAP_TIMEOUT_MS (SEND_CAP_TIMEOUT_FACTOR in plugin-worker-host.ts); a direct

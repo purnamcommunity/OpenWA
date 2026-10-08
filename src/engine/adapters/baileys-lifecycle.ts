@@ -155,6 +155,8 @@ export interface BaileysLifecycleHost {
   handleGroupJoinRequest: BaileysEvents['handleGroupJoinRequest'];
   handleCallEvents: BaileysEvents['handleCallEvents'];
   handlePresenceUpdate: BaileysEvents['handlePresenceUpdate'];
+  /** Drop the store writes of messages still being processed; called before an unlink wipes the store. */
+  fenceStoredWrites: BaileysEvents['fenceStoredWrites'];
   captureHistoryMessages: BaileysHistory['captureHistoryMessages'];
   /** Backfill names the initial sync skipped (runs on connection 'open'). */
   hydrateNames: BaileysHistory['hydrateNames'];
@@ -192,6 +194,7 @@ export class BaileysLifecycle {
   private qrCode: string | null = null;
   /** Issue and expiry of the latest QR; kept past a cleared qrCode so the next one can tell a new round. */
   private qrTiming: QrTiming | null = null;
+  private qrRenderSequence = 0;
   private phoneNumber: string | null = null;
   private pushName: string | null = null;
   private intentionalClose = false;
@@ -510,7 +513,9 @@ export class BaileysLifecycle {
       );
       this.host.upsertChats(history.chats);
       this.host.addLidMappings(history.lidPnMappings ?? []);
-      void this.host.captureHistoryMessages(history.messages ?? []);
+      void this.host
+        .captureHistoryMessages(history.messages ?? [])
+        .catch(error => this.host.logger.warn('Failed to capture history messages', { error: String(error) }));
       this.host.logger.debug('History sync received', {
         action: 'baileys_history_set',
         sessionId: this.host.config.sessionId,
@@ -817,12 +822,22 @@ export class BaileysLifecycle {
   /** Render the raw Baileys QR ref to a PNG data URL, then publish it (mirrors the whatsapp-web.js engine). */
   private async handleQrCode(qr: string): Promise<void> {
     const sock = this.sock;
+    const sequence = ++this.qrRenderSequence;
+    // A registration refresh retires the previous secret before PNG rendering finishes.
+    this.qrCode = null;
     try {
       const rendered = await qrcode.toDataURL(qr);
       // The socket can drop, or the link be accepted, while the QR renders. The handler has already
       // moved the status on, and publishing now would stamp QR_READY on a dead socket until the
       // backoff reconnect, or reopen the pairing guard on a socket that is committed to a restart.
-      if (this.sock !== sock || !sock?.ws.isOpen || this.status === EngineStatus.AUTHENTICATING) {
+      if (
+        sequence !== this.qrRenderSequence ||
+        this.sock !== sock ||
+        !sock?.ws.isOpen ||
+        this.status === EngineStatus.AUTHENTICATING ||
+        this.status === EngineStatus.READY ||
+        sock.user?.id
+      ) {
         return;
       }
       this.qrCode = rendered;
@@ -894,6 +909,7 @@ export class BaileysLifecycle {
       // Acknowledged. End/null the captured socket, clear live call handles, and drop to
       // DISCONNECTED before the awaited cleanup so no send/path observes a half-torn-down socket.
       this.localSocketShutdown(sourceSock);
+      this.host.fenceStoredWrites();
       await this.host.config.messageStore?.clearSession(this.host.config.dbSessionId).catch(() => undefined);
       await this.host.config.chatStateStore?.clearSession(this.host.config.sessionId).catch(() => undefined);
       // Wipe the multi-file auth dir so a fresh link starts clean — stale creds would otherwise be
@@ -959,6 +975,8 @@ export class BaileysLifecycle {
     // Cached call handles die with the connection — drop them so a later rejectCall() reports
     // not-found (404) instead of acting on a dead socket (mirrors disconnect/logout/destroy).
     this.host.liveCalls.clear();
+    // A message still being processed must not recreate a row of the unlinked account after the wipe below.
+    this.host.fenceStoredWrites();
     void dead?.end(undefined);
 
     const cleanup = (async (): Promise<void> => {

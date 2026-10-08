@@ -1320,7 +1320,7 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
     expect(await ds.getRepository(Session).findOneBy({ id: 's2' })).toBeNull();
   });
 
-  it('refuses an empty/garbage backup — does not wipe existing data (#488 review must-fix)', async () => {
+  it('refuses an empty/garbage backup — does not wipe existing data (#488)', async () => {
     await seedSession('s1');
     await ds.getRepository(Message).save(
       ds.getRepository(Message).create({
@@ -1343,6 +1343,51 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
     expect(res.warnings.length).toBeGreaterThan(0);
     expect(await ds.getRepository(Session).count()).toBe(1);
     expect(await ds.getRepository(Message).count()).toBe(1);
+  });
+
+  it('refuses a backup whose template names of one session differ only by NUL, before any teardown', async () => {
+    await seedSession('s1');
+
+    // The restore drops NUL from a template name and (sessionId, name) is unique: importing both rows
+    // would fail the second insert and roll everything back, so the pre-flight refuses the backup.
+    const res = await controller.importData({
+      tables: {
+        sessions: [
+          {
+            id: 's1',
+            name: 'restored',
+            status: 'ready',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+        ] as never,
+        templates: [
+          {
+            id: 't1',
+            sessionId: 's1',
+            name: 'promo',
+            body: 'a',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+          {
+            id: 't2',
+            sessionId: 's1',
+            name: 'promo\u0000',
+            body: 'b',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+        ] as never,
+      },
+    });
+
+    expect(res.imported).toBe(false);
+    expect(res.warnings).toEqual([
+      'Skipped template t2: name "promo" without NUL characters collides with template t1 of session s1',
+    ]);
+    expect(await ds.getRepository(Session).count()).toBe(1);
+    expect(await ds.getRepository(Template).count()).toBe(0);
   });
 
   it('propagates a genuine clear-table failure (lock/IO) instead of committing a merged restore', async () => {
@@ -1399,7 +1444,10 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
       });
     });
 
-    await expect(controller.importData({ tables: { messages: [] } })).rejects.toThrow(/database is locked/);
+    // One row, so the archive is not refused as empty before the transaction opens.
+    await expect(controller.importData({ tables: { messages: [{ id: 'm2' }] } as never })).rejects.toThrow(
+      /database is locked/,
+    );
     expect(rolledBack).toBe(true);
 
     jest.restoreAllMocks();
@@ -1514,6 +1562,99 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     expect(res.imported).toBe(true);
     expect(await outboxRepo.count()).toBe(1);
     expect((await outboxRepo.findOneByOrFail({ idempotencyKey: 'key-1' })).state).toBe('pending');
+  });
+
+  it('restores legacy terminal failures using a deterministic keeper without losing independent records', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+    const base = {
+      webhookId: 'wh-1',
+      sessionId: 's1',
+      event: 'message.received',
+      url: 'https://receiver.example',
+      idempotencyKey: 'key-1',
+      deliveryId: null,
+      attempts: 3,
+      lastStatusCode: 503,
+      lastError: 'HTTP 503',
+      createdAt: '2026-10-05T00:00:00.000Z',
+    };
+    dump.tables.webhookDeliveryFailures = [
+      { ...base, id: 'a', attempts: 8 },
+      { ...base, id: 'b', payload: '{"body":"retained"}' },
+      { ...base, id: 'c', attempts: 0 },
+      { ...base, id: 'd', idempotencyKey: null },
+      { ...base, id: 'e', idempotencyKey: null },
+      { ...base, id: 'f', idempotencyKey: 'key-2', attempts: 5 },
+      { ...base, id: 'g', idempotencyKey: 'key-2', attempts: 5 },
+    ];
+    const result = await controller.importData({ tables: dump.tables });
+    expect(result.imported).toBe(true);
+    expect(result.warnings).toEqual([]);
+    const repository = ds.getRepository(WebhookDeliveryFailure);
+    expect((await repository.find({ order: { id: 'ASC' } })).map(row => row.id)).toEqual(['b', 'c', 'd', 'e', 'g']);
+    expect(result.counts.webhookDeliveryFailures).toBe(5);
+    expect(await repository.createQueryBuilder('failure').addSelect('failure.payload').getMany()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'b', payload: null })]),
+    );
+  });
+
+  it.each(['primary-key', 'missing-url'] as const)(
+    'preserves restore rollback for a %s error in terminal failures',
+    async problem => {
+      await seedSession('s1');
+      const dump = await controller.exportData();
+      const base = {
+        id: 'same-id',
+        webhookId: 'wh-1',
+        sessionId: 's1',
+        event: 'message.received',
+        url: 'https://receiver.example',
+        deliveryId: null,
+        attempts: 3,
+        lastStatusCode: 503,
+        lastError: 'HTTP 503',
+        createdAt: '2026-10-05T00:00:00.000Z',
+      };
+      dump.tables.webhookDeliveryFailures =
+        problem === 'primary-key'
+          ? [
+              { ...base, idempotencyKey: 'key-1' },
+              { ...base, idempotencyKey: 'key-2' },
+            ]
+          : [
+              { ...base, id: 'a', idempotencyKey: 'key-1', attempts: 1, url: null as unknown as string },
+              { ...base, id: 'b', idempotencyKey: 'key-1' },
+            ];
+      const result = await controller.importData({ tables: dump.tables });
+      expect(result.imported).toBe(false);
+      expect(result.warnings.join(' ')).toMatch(/UNIQUE constraint failed|NOT NULL constraint failed/);
+      expect(await ds.getRepository(Session).count()).toBe(1);
+    },
+  );
+
+  it('projects failure audit columns before reading retained payloads and supports the pre-payload schema', async () => {
+    await seedSession('s1');
+    const repository = ds.getRepository(WebhookDeliveryFailure);
+    await repository.save({
+      webhookId: 'wh-1',
+      sessionId: 's1',
+      event: 'message.received',
+      url: 'https://receiver.example',
+      idempotencyKey: 'key-1',
+      attempts: 3,
+      lastError: 'HTTP 503',
+      payload: { body: 'x'.repeat(2 * 1024 * 1024) },
+    });
+    const query = jest.spyOn(ds, 'query');
+    const dump = await controller.exportData();
+    expect(dump.tables.webhookDeliveryFailures).toHaveLength(1);
+    expect(dump.tables.webhookDeliveryFailures[0]).not.toHaveProperty('payload');
+    const reads = query.mock.calls.filter(([sql]) => /^SELECT .*FROM webhook_delivery_failures$/i.test(sql));
+    expect(reads).toHaveLength(1);
+    expect(reads[0][0]).not.toMatch(/\*|payload/);
+    await ds.query('ALTER TABLE webhook_delivery_failures DROP COLUMN payload');
+    expect((await controller.exportData()).tables.webhookDeliveryFailures).toEqual(dump.tables.webhookDeliveryFailures);
   });
 
   // A PostgreSQL export serializes CreateDateColumn/UpdateDateColumn values as ISO `...T...Z`, while
@@ -1712,7 +1853,7 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
         headers: {},
         active: true,
         retryCount: 3,
-        filters: { conditions: [{ field: 'sender', operator: 'equals', value: '123@c.us' }] },
+        filters: { conditions: [{ field: 'sender', operator: 'is', value: ['123@c.us'] }] },
       }),
     );
 
@@ -1721,7 +1862,7 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
 
     expect(res.imported).toBe(true);
     expect((await ds.getRepository(Webhook).findOneByOrFail({ id: 'w1' })).filters).toEqual({
-      conditions: [{ field: 'sender', operator: 'equals', value: '123@c.us' }],
+      conditions: [{ field: 'sender', operator: 'is', value: ['123@c.us'] }],
     });
     // The active flag (exported as integer 1 from SQLite) must round-trip as a real boolean.
     expect((await ds.getRepository(Webhook).findOneByOrFail({ id: 'w1' })).active).toBe(true);
@@ -2258,7 +2399,7 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
         sessionId: 's1',
         name: 'office hours',
         enabled: true,
-        conditions: { bodyContains: ['hello'] } as never,
+        conditions: { conditions: [{ field: 'body', operator: 'contains', value: 'hello' }] },
         replyText: 'We are closed',
         cooldownSeconds: 120,
       }),
@@ -2277,7 +2418,7 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
     expect(restored.replyText).toBe('We are closed');
     expect(restored.cooldownSeconds).toBe(120);
     expect(restored.enabled).toBe(true);
-    expect(restored.conditions).toEqual({ bodyContains: ['hello'] });
+    expect(restored.conditions).toEqual({ conditions: [{ field: 'body', operator: 'contains', value: 'hello' }] });
   });
 
   it('exports and restores status_updates (the table the docs promise is covered)', async () => {
@@ -2444,6 +2585,50 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
     expect(res.stoppedOrphanEngines).toEqual(['ghost']);
     expect(res.failedOrphanEngines).toEqual([]);
     expect(res.orphanedEngines).toEqual(['ghost']);
+  });
+
+  it('refuses an archive with no rows before stopOrphans tears down any engine', async () => {
+    // With no sessions in the archive every running engine looks orphaned, and the teardown cannot be
+    // undone, yet a backup without rows is always refused. Nothing may be stopped for it.
+    await seedSession('s1');
+    const stopOrphanEngines = jest.fn().mockResolvedValue({ stopped: ['s1'], notRunning: [], failed: [] });
+    const controller = build({ sessionService: { getActiveSessionIds: () => ['s1'], stopOrphanEngines } });
+
+    const res = await controller.importData({ tables: { sessions: [], messages: [] }, stopOrphans: true });
+
+    expect(res.imported).toBe(false);
+    expect(res.warnings).toEqual([
+      'Backup contained no rows to restore; refused to replace existing data. Check the file.',
+    ]);
+    expect(stopOrphanEngines).not.toHaveBeenCalled();
+    expect(res.stoppedOrphanEngines).toEqual([]);
+    expect(await ds.getRepository(Session).count()).toBe(1);
+  });
+
+  it('refuses an archive holding a row the import would skip before stopOrphans tears down any engine', async () => {
+    // A skipped row always rolls the restore back, and the teardown cannot be undone with it.
+    await seedSession('s1');
+    const stopOrphanEngines = jest.fn().mockResolvedValue({ stopped: ['ghost'], notRunning: [], failed: [] });
+    const controller = build({
+      sessionService: { getActiveSessionIds: () => ['ghost'], stopOrphanEngines },
+    });
+    const dump = await controller.exportData();
+    const filters = { conditions: [{ field: 'type', operator: 'is', value: ['text'], negate: true }] };
+
+    const res = await controller.importData({
+      tables: {
+        ...dump.tables,
+        webhooks: [{ id: 'wh1', sessionId: 's1', url: 'https://example.com/hook', events: [], filters }] as never,
+      },
+      stopOrphans: true,
+    });
+
+    expect(res.imported).toBe(false);
+    expect(res.warnings).toEqual([expect.stringContaining('Skipped webhook wh1')]);
+    expect(stopOrphanEngines).not.toHaveBeenCalled();
+    expect(res.stoppedOrphanEngines).toEqual([]);
+    expect(res.orphanedEngines).toEqual([]);
+    expect(await ds.getRepository(Session).count()).toBe(1);
   });
 
   it('still reports the engines it already stopped when the import rolls back', async () => {
@@ -2742,8 +2927,8 @@ describe('InfraDataController.importData rejects a malformed table value', () =>
   // the guard hardening into refusing shapes the endpoint supports: an absent table (a partial
   // archive) and an empty one (a table that legitimately has no rows).
   it.each([
-    ['omits a table', { sessions: [{ id: 's1' }] }],
-    ['carries an empty table', { sessions: [], messages: [] }],
+    ['omits a table', { sessions: [{ id: 's1', name: 's1' }] }],
+    ['carries an empty table', { sessions: [{ id: 's1', name: 's1' }], messages: [] }],
   ])('does not reject an archive that %s', async (_label, tables) => {
     await expect(controller().importData({ tables } as never)).rejects.not.toThrow(/must be an array/);
   });
