@@ -193,7 +193,6 @@ export interface IncomingMessage {
   backgroundColor?: string;
   /** Styling of a text status/story: the WhatsApp font index. Only set by engines that expose it. */
   font?: number;
-  poll?: PollDetails;
   media?: {
     mimetype: string;
     filename?: string;
@@ -431,13 +430,6 @@ export interface LocationInput extends Quotable {
   longitude: number;
   description?: string;
   address?: string;
-}
-
-/** Poll choices as received from the engine, without vote counts. */
-export interface PollDetails {
-  name: string;
-  options: string[];
-  allowMultipleAnswers: boolean;
 }
 
 export interface PollInput extends Quotable {
