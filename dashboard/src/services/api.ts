@@ -407,8 +407,6 @@ export interface EngineHistoryMessage {
   poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   quotedMessage?: { id: string; body: string };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
-  /** Present on `poll` messages only: the choices, which `body` (the question) does not carry. */
-  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   /** Present on `order` messages only: the placed cart, plus the single-order token for its items. */
   order?: { orderId: string; token?: string };
   /** Present on `product` messages only: the catalog product shared into the chat. */
