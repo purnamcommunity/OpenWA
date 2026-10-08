@@ -50,8 +50,8 @@ describe('SendBulkMessageDto content length + variables validation', () => {
     const captionItem = (caption: string) => ({
       messages: [{ chatId: 'c@c.us', type: 'image', content: { image: { base64: 'AAAA' }, caption } }],
     });
-    expect(await validateBulk(captionItem('a'.repeat(4096)))).toHaveLength(0);
-    expect((await validateBulk(captionItem('a'.repeat(4097)))).length).toBeGreaterThan(0);
+    await accepts(captionItem('a'.repeat(4096)));
+    await rejects(captionItem('a'.repeat(4097)));
   });
 
   it('accepts an object variables map and rejects a non-object', async () => {
