@@ -21855,37 +21855,6 @@
           "longitude"
         ]
       },
-      "ChatHistoryPollDto": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "The poll question (also carried in `body`).",
-            "example": "Where should we meet?"
-          },
-          "options": {
-            "description": "Option texts, in display order.",
-            "example": [
-              "Park",
-              "Beach"
-            ],
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "allowMultipleAnswers": {
-            "type": "boolean",
-            "description": "Whether a voter may select more than one option.",
-            "example": false
-          }
-        },
-        "required": [
-          "name",
-          "options",
-          "allowMultipleAnswers"
-        ]
-      },
       "ChatHistoryOrderDto": {
         "type": "object",
         "properties": {
@@ -22075,14 +22044,6 @@
           },
           "location": {
             "$ref": "#/components/schemas/ChatHistoryLocationDto"
-          },
-          "poll": {
-            "description": "Set for `poll` messages.",
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ChatHistoryPollDto"
-              }
-            ]
           },
           "order": {
             "description": "Set for `order` messages.",
