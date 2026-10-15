@@ -18,6 +18,7 @@ export const availableEventNames = [
   'session.reconnect_loop',
   'session.restriction',
   'presence.update',
+  'event.response',
   'group.join',
   'group.leave',
   'group.update',

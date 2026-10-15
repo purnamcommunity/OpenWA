@@ -28,12 +28,13 @@ import {
 import { differentWaIds, type BaileysEvents } from './baileys-events';
 import type { BaileysHistory } from './baileys-history';
 import type { BaileysSessionStore } from './baileys-session-store';
-import { userPart } from '../identity/wa-id';
+import { chatKind, userPart } from '../identity/wa-id';
 
-/** Linked-device identity shown in WhatsApp (Settings → Linked Devices). The display name is
- * operator-brandable via BAILEYS_BROWSER_NAME; it only applies to pairings made after the change. */
+/** Linked-device identity shown in WhatsApp (Settings → Linked Devices). The OS platform is
+ * operator-configurable via BAILEYS_BROWSER_NAME; defaults to 'Ubuntu' because some accounts reject a
+ * non-standard name on phone-number (pairing-code) linking. Only new pairings carry the name. */
 const BAILEYS_BROWSER: [string, string, string] = [
-  process.env.BAILEYS_BROWSER_NAME?.trim() || 'OpenWA',
+  process.env.BAILEYS_BROWSER_NAME?.trim() || 'Ubuntu',
   'Chrome',
   '120.0.0',
 ];
@@ -197,7 +198,11 @@ export class BaileysLifecycle {
   private qrRenderSequence = 0;
   private phoneNumber: string | null = null;
   private pushName: string | null = null;
-  private intentionalClose = false;
+  /** Aborted by disconnect()/logout()/destroy(); the adapter is single-use from then on. */
+  private readonly teardown = new AbortController();
+  private get intentionalClose(): boolean {
+    return this.teardown.signal.aborted;
+  }
   private readonly versionResolver: BaileysVersionResolver;
   private connecting = false;
   private reconnectAttempts = 0;
@@ -210,7 +215,7 @@ export class BaileysLifecycle {
   private lastConnectionCloseAt = 0;
   /** Lazily loaded @whiskeysockets/baileys module (ESM-only; loaded on first connect, not at boot). */
   private lib?: typeof BaileysLib;
-  /** The session proxy's fetch dispatcher, built once: the proxy URL is fixed for the adapter's life. */
+  /** The session proxy's fetch dispatcher, built on first use and closed at teardown. */
   private dispatcher?: Dispatcher;
 
   constructor(private readonly host: BaileysLifecycleHost) {
@@ -219,6 +224,11 @@ export class BaileysLifecycle {
       sessionId: this.host.config.sessionId,
       logger: this.host.logger,
     });
+  }
+
+  /** The module once {@link loadLib} has loaded it, which happens before any socket exists. */
+  get loadedLib(): typeof BaileysLib | undefined {
+    return this.lib;
   }
 
   /** Lazily loaded @whiskeysockets/baileys module (ESM-only; loaded on first connect, not at boot). */
@@ -233,6 +243,16 @@ export class BaileysLifecycle {
       return undefined;
     }
     return (this.dispatcher ??= createProxyDispatcher(proxyUrl));
+  }
+
+  /**
+   * Drop the proxy's pooled tunnels at teardown instead of leaving them to idle out. close(), not
+   * destroy(): a request already in progress finishes. A later fetch builds a fresh dispatcher.
+   */
+  private closeFetchDispatcher(): void {
+    const dispatcher = this.dispatcher;
+    this.dispatcher = undefined;
+    void dispatcher?.close().catch(() => undefined);
   }
 
   async initialize(): Promise<void> {
@@ -304,7 +324,16 @@ export class BaileysLifecycle {
     }
     const b = await this.loadLib();
     const { state, saveCreds } = await useAtomicMultiFileAuthState(this.host.authPath, b, this.host.logger);
-    const version = await this.versionResolver.resolve(b, { dispatcher: this.fetchDispatcher() });
+    // A teardown during those loads already closed the dispatcher: the lookup would build a new one
+    // that nothing closes and send the stopped session's requests through its proxy. One during the
+    // lookup aborts it, and the latch check below bails.
+    if (this.intentionalClose) {
+      return;
+    }
+    const version = await this.versionResolver.resolve(b, {
+      dispatcher: this.fetchDispatcher(),
+      signal: this.teardown.signal,
+    });
     // BaileysLogger matches ILogger exactly; cast needed because the module resolves the type
     // through a deep import path that TypeScript does not auto-unify here. Shared by the key
     // store wrapper below and the socket itself, rather than constructing two instances.
@@ -403,6 +432,20 @@ export class BaileysLifecycle {
         const stored = await this.host.config.messageStore?.getMessage(this.host.config.dbSessionId, key.id);
         if (!stored) {
           return undefined;
+        }
+        // An RSVP to an event this account posted in a 1:1 chat names the event by its key as the guest
+        // sees it, so its remoteJid is this account. Baileys rewrites reaction and poll keys to our side
+        // but not event keys, so our own 1:1 message asked for under our own jid is that same chat.
+        const bare = (jid: string): string => `${userPart(jid)}@${jid.split('@')[1]}`;
+        const asked = key.remoteJid ? bare(key.remoteJid) : undefined;
+        const me = this.sock?.user;
+        const askedByGuest =
+          !!asked &&
+          stored.key.fromMe === true &&
+          chatKind(stored.key.remoteJid ?? '') === 'individual' &&
+          [me?.id, me?.lid].some(own => !!own && bare(own) === asked);
+        if (askedByGuest) {
+          return stored.message ?? undefined;
         }
         const neutral = (jid: string): string => this.host.toNeutralJid(jid);
         const chat = [stored.key.remoteJid, stored.key.remoteJidAlt];
@@ -850,7 +893,7 @@ export class BaileysLifecycle {
   }
 
   disconnect(): Promise<void> {
-    this.intentionalClose = true;
+    this.teardown.abort();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
@@ -859,6 +902,7 @@ export class BaileysLifecycle {
     this.cancelAddressbookRestore();
     void this.sock?.end(undefined);
     this.sock = null;
+    this.closeFetchDispatcher();
     // Cached call handles die with the socket — drop them so a later rejectCall() reports
     // not-found instead of acting on a closed connection.
     this.host.liveCalls.clear();
@@ -867,7 +911,7 @@ export class BaileysLifecycle {
   }
 
   async logout(): Promise<void> {
-    this.intentionalClose = true;
+    this.teardown.abort();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
@@ -946,6 +990,7 @@ export class BaileysLifecycle {
     } catch {
       // end() may already have run from Baileys' own close handler — a safe no-op.
     }
+    this.closeFetchDispatcher();
     // Cached call handles die with the connection — drop them so a later rejectCall() reports
     // not-found (404) instead of acting on a dead socket (mirrors disconnect/destroy).
     this.host.liveCalls.clear();
@@ -978,6 +1023,7 @@ export class BaileysLifecycle {
     // A message still being processed must not recreate a row of the unlinked account after the wipe below.
     this.host.fenceStoredWrites();
     void dead?.end(undefined);
+    this.closeFetchDispatcher();
 
     const cleanup = (async (): Promise<void> => {
       try {
@@ -1026,7 +1072,7 @@ export class BaileysLifecycle {
   }
 
   destroy(): Promise<void> {
-    this.intentionalClose = true;
+    this.teardown.abort();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
@@ -1035,6 +1081,7 @@ export class BaileysLifecycle {
     this.cancelAddressbookRestore();
     void this.sock?.end(undefined);
     this.sock = null;
+    this.closeFetchDispatcher();
     this.host.liveCalls.clear();
     this.setStatus(EngineStatus.DISCONNECTED);
     return Promise.resolve();

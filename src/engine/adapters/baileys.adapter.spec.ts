@@ -344,6 +344,31 @@ describe('BaileysAdapter lifecycle & status', () => {
     }
   });
 
+  it("answers an RSVP's lookup of the account's own 1:1 event under the account's own jid", async () => {
+    await newAdapter().initialize(noopCallbacks({}));
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const makeWASocket = jest.requireMock('@whiskeysockets/baileys').default as jest.Mock;
+    const [[{ getMessage }]] = makeWASocket.mock.calls as Array<
+      [{ getMessage: (key: { remoteJid?: string; id?: string }) => Promise<unknown> }]
+    >;
+    const content = { eventMessage: { name: 'Game night' } };
+    const own = { key: { remoteJid: '628111@s.whatsapp.net', fromMe: true, id: 'EVT1' }, message: content };
+    fakeSock.user = { id: '628999:12@s.whatsapp.net', lid: '99887766:12@lid', name: 'Me' };
+    try {
+      // The guest names the event's chat as they see it: this account, by phone number or by lid.
+      fakeStore.getMessage.mockResolvedValue(own);
+      await expect(getMessage({ remoteJid: '628999@s.whatsapp.net', id: 'EVT1' })).resolves.toBe(content);
+      await expect(getMessage({ remoteJid: '99887766@lid', id: 'EVT1' })).resolves.toBe(content);
+      // Only the account's own 1:1 messages: a received one or a group one still needs its own chat.
+      fakeStore.getMessage.mockResolvedValue({ ...own, key: { ...own.key, fromMe: false } });
+      await expect(getMessage({ remoteJid: '628999@s.whatsapp.net', id: 'EVT1' })).resolves.toBeUndefined();
+      fakeStore.getMessage.mockResolvedValue({ ...own, key: { ...own.key, remoteJid: '120363000@g.us' } });
+      await expect(getMessage({ remoteJid: '628999@s.whatsapp.net', id: 'EVT1' })).resolves.toBeUndefined();
+    } finally {
+      fakeSock.user = undefined;
+    }
+  });
+
   it('on a logged-out close: DISCONNECTED, onDisconnected, and NO reconnect', async () => {
     const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
     try {

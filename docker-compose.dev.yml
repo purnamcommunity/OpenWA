@@ -308,6 +308,7 @@ services:
       - STORAGE_LIST_MAX_FILES=${STORAGE_LIST_MAX_FILES:-}
       - STORAGE_IMPORT_MAX_BYTES=${STORAGE_IMPORT_MAX_BYTES:-}
       - STORAGE_IMPORT_MAX_ENTRIES=${STORAGE_IMPORT_MAX_ENTRIES:-}
+      - STORAGE_IMPORT_MAX_TOTAL_BYTES=${STORAGE_IMPORT_MAX_TOTAL_BYTES:-}
       - STORAGE_EXPORT_TTL_MS=${STORAGE_EXPORT_TTL_MS:-}
       - STORAGE_EXPORT_SWEEP_MAX_AGE_MS=${STORAGE_EXPORT_SWEEP_MAX_AGE_MS:-}
       - S3_REPROBE_INTERVAL_MS=${S3_REPROBE_INTERVAL_MS:-}
@@ -355,6 +356,9 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    # Same teardown budget as docker-compose.yml, which has the arithmetic: Docker's 10s default would
+    # SIGKILL the container while an engine is still stopping.
+    stop_grace_period: 75s
     healthcheck:
       test: ['CMD', 'curl', '-f', 'http://localhost:2785/api/health/ready']
       interval: 30s
