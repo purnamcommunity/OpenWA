@@ -29,8 +29,10 @@ services:
     # engine per session, and a SIGKILL that lands while one is writing its profile destroys the
     # WhatsApp login — recoverable only by scanning a fresh QR with the physical phone. Baked into a
     # container at creation, so a container recreated from an older file silently keeps the 10s
-    # default; check with `docker inspect openwa-api --format '{{.Config.StopTimeout}}'`.
-    stop_grace_period: 45s
+    # default; check with `docker inspect openwa-api --format '{{.Config.StopTimeout}}'`. The value is
+    # the same teardown budget as docker-compose.yml, which has the arithmetic: the app force-exits 5s
+    # before it, so a shorter grace period SIGKILLs the container before that exit can run.
+    stop_grace_period: 75s
     # Container hardening — same posture as production (same Dockerfile/entrypoint).
     security_opt:
       - 'no-new-privileges:true'
@@ -356,9 +358,6 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
-    # Same teardown budget as docker-compose.yml, which has the arithmetic: Docker's 10s default would
-    # SIGKILL the container while an engine is still stopping.
-    stop_grace_period: 75s
     healthcheck:
       test: ['CMD', 'curl', '-f', 'http://localhost:2785/api/health/ready']
       interval: 30s
