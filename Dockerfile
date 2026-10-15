@@ -234,7 +234,6 @@ RUN npm ci --omit=dev --ignore-scripts \
     && node scripts/patch-wwebjs-media-id.js \
     && node scripts/patch-wwebjs-group-invite.js \
     && node scripts/patch-wwebjs-send-error.js \
-    && node \
     && node scripts/patch-wwebjs-forward-bundle.js \
     && node scripts/patch-baileys-appstate.js \
     && node scripts/patch-baileys-newsletter-create.js \
