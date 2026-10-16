@@ -9902,6 +9902,101 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/contacts/{contactId}/common-groups": {
+      "get": {
+        "description": "WhatsApp's \"groups in common\". A member listed in a group under their privacy id (@lid) is found from their phone-based id and the reverse, as far as the engine knows the pairing. A community's parent group is left out: nobody chats in it, and its roster is the community's admins.",
+        "operationId": "ContactController_getCommonGroups",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "contactId",
+            "required": true,
+            "in": "path",
+            "description": "Contact ID (e.g., 628xxx@c.us or an @lid)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Groups in common",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CommonGroupDto"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started, or a contact id that does not name an individual",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The API key is missing, unknown, revoked, or expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "WhatsApp did not answer the group lookup — retry shortly",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "summary": "List the groups this account shares with a contact",
+        "tags": [
+          "contacts"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/contacts/{contactId}/block": {
       "post": {
         "operationId": "ContactController_blockContact",
@@ -24353,6 +24448,26 @@
         "required": [
           "contactId",
           "phone"
+        ]
+      },
+      "CommonGroupDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Group id.",
+            "example": "120363012345678901@g.us"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "description": "The group's subject, or null when the engine has none for it yet.",
+            "example": "Weekend volunteers"
+          }
+        },
+        "required": [
+          "id",
+          "name"
         ]
       },
       "UpsertContactDto": {

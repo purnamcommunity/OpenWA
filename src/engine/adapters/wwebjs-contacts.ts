@@ -1,6 +1,6 @@
 import { type Client } from 'whatsapp-web.js';
 import { InternalServerErrorException } from '@nestjs/common';
-import { Contact } from '../interfaces/whatsapp-engine.interface';
+import { CommonGroup, Contact } from '../interfaces/whatsapp-engine.interface';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { userPart } from '../identity/wa-id';
 import { readVerifiedName, readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
@@ -252,6 +252,41 @@ export class WwebjsContacts {
     const [result] = await this.client().getContactLidAndPhone([contactId]);
     const pn = result?.pn;
     return pn ? pn.replace(/@c\.us$/i, '').replace(/\D/g, '') || null : null;
+  }
+
+  /**
+   * whatsapp-web.js's own `getCommonGroups` does the lookup: WhatsApp Web's `findCommonGroups` asks
+   * with the contact's id AND its alternate (phone ↔ lid), and drops community parents and locked
+   * groups. It answers ids only, so the names are read in one more page call from the chat
+   * collection the lookup has just filled — never `getChatById` per group, which is a page round
+   * trip for each of what can be well over a hundred groups.
+   */
+  async getCommonGroups(contactId: string): Promise<CommonGroup[]> {
+    this.host.ensureReady();
+    return withPage(this.host, 'getCommonGroups', async () => {
+      const client = this.client();
+      const raw = (await client.getCommonGroups(contactId)) as unknown as (SerializedWid | string)[];
+      const ids = raw.map(id => readWid(id)).filter((id): id is string => Boolean(id));
+      if (ids.length === 0) return [];
+      const page = (client as unknown as { pupPage?: { evaluate<T, A>(fn: (arg: A) => T, arg: A): Promise<T> } })
+        .pupPage;
+      const names = page
+        ? await page.evaluate((groupIds: string[]) => {
+            const chats = (
+              window as unknown as {
+                require(name: string): {
+                  Chat?: { get(id: string): { name?: string; formattedTitle?: string } | undefined };
+                };
+              }
+            ).require('WAWebCollections').Chat;
+            return groupIds.map(id => {
+              const chat = chats?.get(id);
+              return chat?.name || chat?.formattedTitle || null;
+            });
+          }, ids)
+        : [];
+      return ids.map((id, i) => ({ id, name: names[i] ?? null }));
+    });
   }
 
   async upsertContact(contactId: string, firstName: string, lastName = ''): Promise<void> {

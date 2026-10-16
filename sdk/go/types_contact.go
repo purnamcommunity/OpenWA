@@ -45,6 +45,13 @@ type ContactPhoneResponse struct {
 	Phone     *string `json:"phone,omitempty"`
 }
 
+// CommonGroup is a group the account shares with one contact. Name is nil when the engine has none
+// for it yet.
+type CommonGroup struct {
+	ID   string  `json:"id"`
+	Name *string `json:"name"`
+}
+
 // ListContactsQuery paginates the contact list.
 type ListContactsQuery struct {
 	Limit  *int

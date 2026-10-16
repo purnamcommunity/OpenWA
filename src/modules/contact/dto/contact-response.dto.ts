@@ -96,6 +96,19 @@ export class NumberCheckResponseDto {
   whatsappId!: string | null;
 }
 
+export class CommonGroupDto {
+  @ApiProperty({ description: 'Group id.', example: '120363012345678901@g.us' })
+  id!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: "The group's subject, or null when the engine has none for it yet.",
+    example: 'Weekend volunteers',
+  })
+  name!: string | null;
+}
+
 export class ResolvedPhoneResponseDto {
   @ApiProperty({ description: 'The contact id exactly as supplied in the path.', example: '12345678901234@lid' })
   contactId!: string;

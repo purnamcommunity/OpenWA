@@ -10,6 +10,7 @@ import type { OpenWAClient } from '../client.js';
 import type {
   UpsertContactRequest,
   CheckNumberResponse,
+  CommonGroup,
   ContactPhoneResponse,
   ContactRecord,
   ProfilePictureResponse,
@@ -111,6 +112,18 @@ export class ContactsResource {
     return this.client.request<SuccessResult>({
       method: 'DELETE',
       path: `/api/sessions/${encodeSegment(sessionId)}/contacts/${encodeSegment(contactId)}/block`,
+    });
+  }
+
+  /**
+   * List the groups this account shares with a contact — WhatsApp's "groups in common". A member
+   * listed under their `@lid` is found from their phone-based id and the reverse. A community's
+   * parent group is left out.
+   */
+  commonGroups(sessionId: string, contactId: string): Promise<CommonGroup[]> {
+    return this.client.request<CommonGroup[]>({
+      method: 'GET',
+      path: `/api/sessions/${encodeSegment(sessionId)}/contacts/${encodeSegment(contactId)}/common-groups`,
     });
   }
 

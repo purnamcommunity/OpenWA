@@ -11,6 +11,7 @@ from .._http import quote_segment
 from ..types import (
     UpsertContactRequest,
     CheckNumberResponse,
+    CommonGroup,
     ContactPhoneResponse,
     ContactRecord,
     ProfilePictureResponse,
@@ -75,6 +76,16 @@ class ContactsResource:
     def unblock(self, session_id: str, contact_id: str) -> SuccessResult:
         """Unblock a contact (OPERATOR)."""
         return self._http.request("DELETE", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}/block")
+
+    def common_groups(self, session_id: str, contact_id: str) -> List[CommonGroup]:
+        """List the groups this account shares with a contact — WhatsApp's "groups in common".
+
+        A member listed under their ``@lid`` is found from their phone-based id and the reverse.
+        A community's parent group is left out.
+        """
+        return self._http.request(
+            "GET", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}/common-groups"
+        )
 
     def list_blocked(self, session_id: str) -> List[str]:
         """List the JIDs this account has blocked.

@@ -846,6 +846,13 @@ class ContactPhoneResponse(TypedDict):
     phone: str | None
 
 
+class CommonGroup(TypedDict):
+    """A group the account shares with one contact. ``name`` is None when the engine has none yet."""
+
+    id: Jid
+    name: str | None
+
+
 # ── Group ─────────────────────────────────────────────────────────
 
 
