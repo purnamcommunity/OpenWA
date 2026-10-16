@@ -40,6 +40,7 @@ const EXPECTED_PATCHER_ORDER = [
   'patch-wwebjs-group-invite.js',
   'patch-wwebjs-send-error.js',
   'patch-wwebjs-forward-bundle.js',
+  'patch-wwebjs-pushname-bundle.js',
   'patch-baileys-appstate.js',
   'patch-baileys-newsletter-create.js',
   'patch-baileys-pairing.js',
