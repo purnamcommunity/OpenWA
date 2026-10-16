@@ -114,6 +114,18 @@ class ContactsResource
     }
 
     /**
+     * List the groups this account shares with a contact — WhatsApp's "groups in common". A member
+     * listed under their @lid is found from their phone-based id and the reverse. A community's
+     * parent group is left out.
+     *
+     * @return list<array{id:string,name:?string}>
+     */
+    public function commonGroups(string $sessionId, string $contactId): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}/common-groups");
+    }
+
+    /**
      * List the JIDs this account has blocked.
      *
      * Session-wide, so it takes no contact id — unlike block() and unblock(), which act on one

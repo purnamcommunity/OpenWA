@@ -45,6 +45,20 @@ export class ContactService {
     return this.getEngine(sessionId).getBlockedContacts();
   }
 
+  /**
+   * Groups in common with one person. The id must name an individual: anything else reaches WhatsApp
+   * Web's page-side `createWid`, whose error the minified bundle reports without a name.
+   */
+  getCommonGroups(sessionId: string, contactId: string) {
+    const engine = this.getEngine(sessionId);
+    if (!isIndividualWid(contactId)) {
+      throw new BadRequestException(
+        `Contact ${contactId} does not name an individual; pass a phone-based (<number>@c.us) or privacy (@lid) contact id`,
+      );
+    }
+    return engine.getCommonGroups(contactId);
+  }
+
   getNumberId(sessionId: string, number: string) {
     return this.getEngine(sessionId).getNumberId(number);
   }

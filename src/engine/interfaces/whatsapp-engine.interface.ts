@@ -294,6 +294,14 @@ export interface Contact {
   isMe?: boolean;
 }
 
+/** A group the account shares with one contact — see {@link IWhatsAppEngine.getCommonGroups}. */
+export interface CommonGroup {
+  /** Neutral group id (`<id>@g.us`). */
+  id: string;
+  /** The group's subject, or null when the engine has none for it yet. */
+  name: string | null;
+}
+
 export interface Group {
   id: string;
   name: string;
@@ -1422,6 +1430,14 @@ export interface ContactCapability {
    * different things about the same account.
    */
   getBlockedContacts(): Promise<string[]>;
+
+  /**
+   * The groups this account and one contact are both members of — WhatsApp's "groups in common".
+   * `contactId` is an individual id in either dialect: a member listed under their `@lid` is found
+   * from their phone id and the reverse, as far as the engine knows the pairing. A community's
+   * parent group is not a group anyone chats in and is left out.
+   */
+  getCommonGroups(contactId: string): Promise<CommonGroup[]>;
 
   /**
    * Save a contact to the account's addressbook, or edit an existing entry. `contactId` is a

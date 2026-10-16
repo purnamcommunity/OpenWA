@@ -114,6 +114,15 @@ func (s *ContactsService) Unblock(ctx context.Context, sessionID, contactID stri
 	return &out, nil
 }
 
+// CommonGroups lists the groups this account shares with a contact — WhatsApp's "groups in
+// common". A member listed under their @lid is found from their phone-based ID and the reverse. A
+// community's parent group is left out.
+func (s *ContactsService) CommonGroups(ctx context.Context, sessionID, contactID string) ([]CommonGroup, error) {
+	var out []CommonGroup
+	err := s.client.do(ctx, "GET", s.base(sessionID)+"/"+pathEscape(contactID)+"/common-groups", nil, nil, &out)
+	return out, err
+}
+
 // ListBlocked returns the JIDs this account has blocked. Session-wide, so it takes no contact ID —
 // unlike Block and Unblock, which act on one contact — and it returns bare IDs, not contact records.
 func (s *ContactsService) ListBlocked(ctx context.Context, sessionID string) ([]string, error) {

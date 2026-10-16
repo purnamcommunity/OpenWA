@@ -50,6 +50,7 @@ import {
   StatusResult,
   ChatSummary,
   StatusPostOptions,
+  CommonGroup,
 } from '../interfaces/whatsapp-engine.interface';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
@@ -394,6 +395,10 @@ export class BaileysAdapter implements IWhatsAppEngine {
 
   async getGroups(): Promise<Group[]> {
     return this.groups.getGroups();
+  }
+
+  async getCommonGroups(contactId: string): Promise<CommonGroup[]> {
+    return this.groups.getCommonGroups(contactId);
   }
 
   async getGroupInfo(groupId: string): Promise<GroupInfo | null> {

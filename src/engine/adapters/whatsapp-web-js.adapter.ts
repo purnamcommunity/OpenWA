@@ -38,6 +38,7 @@ import {
   LabelInput,
   CustomLinkPreview,
   GroupJoinInfo,
+  CommonGroup,
 } from '../interfaces/whatsapp-engine.interface';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { resolveAuthTimeoutMs } from '../engine-init-timeout';
@@ -864,6 +865,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   getBlockedContacts(): Promise<string[]> {
     return this.contacts.getBlockedContacts();
+  }
+
+  getCommonGroups(contactId: string): Promise<CommonGroup[]> {
+    return this.contacts.getCommonGroups(contactId);
   }
 
   // ========== Profile (own account) ==========

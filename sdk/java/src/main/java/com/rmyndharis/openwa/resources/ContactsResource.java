@@ -5,6 +5,7 @@ import static com.rmyndharis.openwa.http.Http.encodeSegment;
 import com.rmyndharis.openwa.OpenWAClient;
 import com.rmyndharis.openwa.http.HttpMethod;
 import com.rmyndharis.openwa.model.CheckNumberResponse;
+import com.rmyndharis.openwa.model.CommonGroup;
 import com.rmyndharis.openwa.model.ContactPhoneResponse;
 import com.rmyndharis.openwa.model.ContactRecord;
 import com.rmyndharis.openwa.model.ListContactsQuery;
@@ -124,6 +125,20 @@ public final class ContactsResource {
             null,
             null,
             SuccessResult.class);
+    }
+
+    /**
+     * List the groups this account shares with a contact — WhatsApp's "groups in common". A member
+     * listed under their {@code @lid} is found from their phone-based id and the reverse. A
+     * community's parent group is left out.
+     */
+    public List<CommonGroup> commonGroups(String sessionId, String contactId) {
+        return client.requestList(
+            HttpMethod.GET,
+            "/api/sessions/" + encodeSegment(sessionId) + "/contacts/" + encodeSegment(contactId) + "/common-groups",
+            null,
+            null,
+            CommonGroup.class);
     }
 
     /**

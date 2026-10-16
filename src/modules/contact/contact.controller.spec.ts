@@ -16,6 +16,7 @@ describe('ContactController', () => {
     blockContact: jest.fn(),
     unblockContact: jest.fn(),
     getBlockedContacts: jest.fn(),
+    getCommonGroups: jest.fn(),
   };
   const controller = new ContactController(service as unknown as ContactService, new ChatScopeService());
 
@@ -107,6 +108,14 @@ describe('ContactController', () => {
     expect(service.getBlockedContacts).toHaveBeenCalledWith('s1');
   });
 
+  it('getCommonGroups returns the service list as a bare array', async () => {
+    service.getCommonGroups.mockResolvedValue([{ id: '120363001@g.us', name: 'Volunteers' }]);
+    await expect(controller.getCommonGroups('s1', '628111@c.us')).resolves.toEqual([
+      { id: '120363001@g.us', name: 'Volunteers' },
+    ]);
+    expect(service.getCommonGroups).toHaveBeenCalledWith('s1', '628111@c.us');
+  });
+
   it('upsertContact passes first/last name from the DTO', async () => {
     service.upsertContact.mockResolvedValue(undefined);
     await expect(controller.upsertContact('s1', 'c1', { firstName: 'A', lastName: 'B' })).resolves.toEqual({
@@ -136,7 +145,7 @@ describe('ContactController OpenAPI error responses', () => {
   );
 
   it('covers every route', () => {
-    expect(routes).toHaveLength(11);
+    expect(routes).toHaveLength(12);
   });
 
   it.each(routes)('%s declares 400', method => {

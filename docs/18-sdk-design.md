@@ -30,7 +30,7 @@ All five SDKs expose the same fluent surface:
 | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sessions`  | list, get, getConfig, updateConfig, getProxy, updateProxy, create, delete, start, stop, logout, forceKill, getQrCode, requestPairingCode, cancelPairingCode, setOnlinePresence, stats                                                                                                                    |
 | `messages`  | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, sendPoll, reply, forward, react, delete, editMessage, history, reactions, pollVotes, comments, sendComment, media, pin, unpin, star, votePoll, sendBulk, batchStatus, cancelBatch, clickButton          |
-| `contacts`  | list, get, check, profilePicture, profilePictures, phone, upsert, delete, block, unblock, listBlocked                                                                                                                                                                                                    |
+| `contacts`  | list, get, check, profilePicture, profilePictures, phone, upsert, delete, block, unblock, listBlocked, commonGroups                                                                                                                                                                                      |
 | `groups`    | list, get, create, joinInfo, joinGroup, add/remove/promote/demoteParticipants, setSubject, setDescription, getGroupSettings, updateGroupSettings, leave, getPicture, setPicture, deletePicture, inviteCode, revokeInviteCode, getMembershipRequests, approveMembershipRequests, rejectMembershipRequests |
 | `webhooks`  | list, listAll, deliveryFailures, redriveDeliveryFailures, get, create, update, delete, test                                                                                                                                                                                                              |
 | `chats`     | list, subscribePresence, getPresence, markRead, markUnread, archive, pin, mute, clearMessages, delete, sendState                                                                                                                                                                                         |
@@ -229,6 +229,7 @@ Media bodies share the `SendMediaRequest` shape: `{ chatId, url? | base64?, mime
 | `delete`          | `delete(sessionId, contactId)`         | Remove a contact from the account's addressbook. **OPERATOR**                        |
 | `unblock`         | `unblock(sessionId, contactId)`        | Unblock a contact. **OPERATOR**                                                      |
 | `listBlocked`     | `listBlocked(sessionId)`               | List the ids this account has blocked. Session-wide, so it takes no contact id.      |
+| `commonGroups`    | `commonGroups(sessionId, contactId)`   | List the groups this account shares with a contact ("groups in common").             |
 
 #### `groups`
 
@@ -611,6 +612,7 @@ Resources are accessed as properties on the client (e.g. `client.messages`). All
 | `delete`           | `delete(session_id, contact_id) -> SuccessResult`                   | Remove a contact from the account's addressbook. **OPERATOR**                        |
 | `unblock`          | `unblock(session_id, contact_id) -> SuccessResult`                  | Unblock a contact. **OPERATOR**                                                      |
 | `list_blocked`     | `list_blocked(session_id) -> list[str]`                             | List the ids this account has blocked. Session-wide, so it takes no contact id.      |
+| `common_groups`    | `common_groups(session_id, contact_id) -> list[CommonGroup]`        | List the groups this account shares with a contact ("groups in common").             |
 
 #### `client.groups`
 
@@ -996,6 +998,7 @@ All payloads are associative arrays; all listed methods are synchronous and retu
 | `delete`          | `delete(string $sessionId, string $contactId): array`              | Remove a contact from the account's addressbook. **OPERATOR**                        |
 | `unblock`         | `unblock(string $sessionId, string $contactId): array`             | Unblock a contact. **OPERATOR**                                                      |
 | `listBlocked`     | `listBlocked(string $sessionId): array`                            | List the ids this account has blocked. Session-wide, so it takes no contact id.      |
+| `commonGroups`    | `commonGroups(string $sessionId, string $contactId): array`        | List the groups this account shares with a contact ("groups in common").             |
 
 #### `groups`
 

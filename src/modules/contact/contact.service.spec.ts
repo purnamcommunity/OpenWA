@@ -26,6 +26,30 @@ describe('ContactService', () => {
     expect(() => makeService(undefined).getBlockedContacts('s1')).toThrow(BadRequestException);
   });
 
+  it('getCommonGroups passes a phone or lid id through to the engine', async () => {
+    const getCommonGroups = jest.fn().mockResolvedValue([{ id: '120363001@g.us', name: 'Volunteers' }]);
+    const svc = makeService({ getCommonGroups });
+    await expect(svc.getCommonGroups('s1', '628111@c.us')).resolves.toEqual([
+      { id: '120363001@g.us', name: 'Volunteers' },
+    ]);
+    await svc.getCommonGroups('s1', '159442138038327@lid');
+    expect(getCommonGroups).toHaveBeenNthCalledWith(1, '628111@c.us');
+    expect(getCommonGroups).toHaveBeenNthCalledWith(2, '159442138038327@lid');
+  });
+
+  it('getCommonGroups refuses an id that names no individual with a 400, before the engine', () => {
+    const getCommonGroups = jest.fn();
+    const svc = makeService({ getCommonGroups });
+    for (const id of ['120363001@g.us', 'NOT A USER@c.us', 'abc']) {
+      expect(() => svc.getCommonGroups('s1', id)).toThrow(BadRequestException);
+    }
+    expect(getCommonGroups).not.toHaveBeenCalled();
+  });
+
+  it('getCommonGroups throws 400 when the session is not started', () => {
+    expect(() => makeService(undefined).getCommonGroups('s1', '628111@c.us')).toThrow(BadRequestException);
+  });
+
   it('listContacts returns the whole set, unwindowed', async () => {
     const big = Array.from({ length: 1500 }, (_, i) => ({ id: `${i}@c.us` }));
     const getContacts = jest.fn().mockResolvedValue(big);

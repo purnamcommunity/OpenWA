@@ -2911,6 +2911,30 @@ For inbound messages the gateway can attach this automatically instead: `RESOLVE
 
 **Errors:** `400` session is not started · `401` missing/invalid API key · `409` conflict or engine not ready (retryable)
 
+#### GET /api/sessions/:sessionId/contacts/:contactId/common-groups
+
+The groups this account and one contact are both members of — WhatsApp's "groups in common".
+`contactId` is a phone-based (`<number>@c.us`) or privacy (`@lid`) id; a member listed in a group
+under their lid is found from their phone id and the reverse, as far as the engine knows the
+pairing. A community's parent group is left out: nobody chats in it, and its roster is the
+community's admins. On whatsapp-web.js this is WhatsApp Web's own lookup; on Baileys it filters the
+rosters of the account's group list.
+
+**Auth:** API key
+
+**Response** `200`
+
+```json
+[
+  { "id": "120363012345678901@g.us", "name": "Weekend volunteers" },
+  { "id": "120363098765432109@g.us", "name": null }
+]
+```
+
+`name` is null when the engine has no subject for that group yet.
+
+**Errors:** `400` session not started, or a contact id that does not name an individual · `401` missing/invalid `X-API-Key` · `409` engine not ready · `503` WhatsApp did not answer the group lookup (retry shortly)
+
 #### PUT /api/sessions/:sessionId/contacts/:contactId
 
 Save a contact to the account's addressbook, or edit an existing entry. This is the WhatsApp

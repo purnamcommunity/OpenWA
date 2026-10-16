@@ -1,5 +1,6 @@
 import type { GroupMetadata, WASocket } from '@whiskeysockets/baileys';
 import {
+  CommonGroup,
   Group,
   GroupInfo,
   GroupJoinInfo,
@@ -18,7 +19,7 @@ import { EngineThrottledError } from '../../common/errors/engine-throttled.error
 import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.error';
 import { type createLogger } from '../../common/services/logger.service';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
-import { toParticipantWid } from '../identity/wa-id';
+import { toNeutralJid, toParticipantWid } from '../identity/wa-id';
 
 /**
  * Group-domain operations extracted from BaileysAdapter. The adapter keeps the public
@@ -185,11 +186,12 @@ export class BaileysGroups {
     return toEngineParticipants(participants, jid => this.host.toEngineJid(jid));
   }
 
-  async getGroups(): Promise<Group[]> {
-    this.host.ensureReady();
-    // groupFetchAllParticipating yields {} for BOTH an unanswered query and an account with no
-    // groups, so the empty list carries no signal — only our own clock separates them, and an
-    // empty list is the shape a caller is least able to question.
+  /**
+   * Every group the account is in, with rosters. groupFetchAllParticipating yields {} for BOTH an
+   * unanswered query and an account with no groups, so the empty answer carries no signal — only
+   * our own clock separates them, and an empty list is the shape a caller is least able to question.
+   */
+  private async fetchAllParticipating(): Promise<GroupMetadata[]> {
     let all: Awaited<ReturnType<WASocket['groupFetchAllParticipating']>>;
     try {
       all = await withQueryDeadline(
@@ -206,8 +208,38 @@ export class BaileysGroups {
       }
       throw err;
     }
+    return Object.values(all);
+  }
+
+  async getGroups(): Promise<Group[]> {
+    this.host.ensureReady();
+    const all = await this.fetchAllParticipating();
     const self = this.host.normalizedSelfJid();
-    return Object.values(all).map(metadata => mapBaileysGroup(metadata, self, jid => this.host.toNeutralJid(jid)));
+    return all.map(metadata => mapBaileysGroup(metadata, self, jid => this.host.toNeutralJid(jid)));
+  }
+
+  /**
+   * Baileys has no common-groups query, but the group list already carries every roster, so this
+   * is a filter over one call. A member matches under any id the roster or the lid map gives them:
+   * their listed id, its phone or lid twin, and the phone the session's lid map resolves it to.
+   * The rosters' lid twins are fed back into that map on the way, as getGroupInfo does.
+   */
+  async getCommonGroups(contactId: string): Promise<CommonGroup[]> {
+    this.host.ensureReady();
+    const all = await this.fetchAllParticipating();
+    const wanted = new Set([toNeutralJid(contactId), this.host.toNeutralJid(contactId)]);
+    const shared: CommonGroup[] = [];
+    for (const metadata of all) {
+      this.host.addLidMappings(collectGroupLidTwins(metadata));
+      if (metadata.isCommunity) continue;
+      const member = (metadata.participants ?? []).some(p =>
+        [p.id, p.lid, p.phoneNumber].some(
+          id => id && (wanted.has(toNeutralJid(id)) || wanted.has(this.host.toNeutralJid(id))),
+        ),
+      );
+      if (member) shared.push({ id: toNeutralJid(metadata.id), name: metadata.subject || null });
+    }
+    return shared;
   }
 
   async getGroupInfo(groupId: string): Promise<GroupInfo | null> {

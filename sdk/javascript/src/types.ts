@@ -857,6 +857,13 @@ export interface ContactPhoneResponse {
   phone: string | null;
 }
 
+/** A group the account shares with one contact. */
+export interface CommonGroup {
+  id: Jid;
+  /** The group's subject, or null when the engine has none for it yet. */
+  name: string | null;
+}
+
 // ── Group ─────────────────────────────────────────────────────────
 
 export interface GroupParticipant {

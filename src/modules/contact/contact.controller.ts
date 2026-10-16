@@ -7,6 +7,7 @@ import { ChatScopeService } from '../auth/chat-scope.service';
 import { paginate } from '../../common/utils/paginate';
 import { UpsertContactDto } from './dto/upsert-contact.dto';
 import {
+  CommonGroupDto,
   ContactAckResponseDto,
   ContactDto,
   NumberCheckResponseDto,
@@ -200,6 +201,25 @@ export class ContactController {
   async resolvePhone(@Param('sessionId') sessionId: string, @Param('contactId') contactId: string) {
     const phone = await this.contactService.resolveContactPhone(sessionId, contactId);
     return { contactId, phone };
+  }
+
+  @ChatScoped('fenced')
+  @Get(':contactId/common-groups')
+  @ApiOperation({
+    summary: 'List the groups this account shares with a contact',
+    description:
+      'WhatsApp\'s "groups in common". A member listed in a group under their privacy id (@lid) is ' +
+      'found from their phone-based id and the reverse, as far as the engine knows the pairing. A ' +
+      "community's parent group is left out: nobody chats in it, and its roster is the community's admins.",
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'contactId', description: 'Contact ID (e.g., 628xxx@c.us or an @lid)' })
+  @ApiResponse({ status: 200, description: 'Groups in common', type: [CommonGroupDto] })
+  @ApiResponse({ status: 400, description: 'Session is not started, or a contact id that does not name an individual' })
+  @ApiResponse({ status: 503, description: 'WhatsApp did not answer the group lookup — retry shortly' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async getCommonGroups(@Param('sessionId') sessionId: string, @Param('contactId') contactId: string) {
+    return this.contactService.getCommonGroups(sessionId, contactId);
   }
 
   @ChatScoped('fenced')
