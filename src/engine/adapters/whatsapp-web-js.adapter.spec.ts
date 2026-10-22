@@ -3763,7 +3763,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     (adapter as unknown as { client: unknown }).client = client;
     const onMessageCreate = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageCreate };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
 
     client.emit('message_create', {
       id: { _serialized: 'true_628111@c.us_CALL9' },
@@ -7482,6 +7482,7 @@ describe('WhatsAppWebJsAdapter page transport error detection (wedged page fast-
       number: '628111',
       isMyContact: true,
       isBlocked: false,
+      isMe: false,
     });
   });
 
@@ -9920,7 +9921,7 @@ describe('WhatsAppWebJsAdapter sync progress', () => {
     });
     (adapter as unknown as { client: unknown }).client = client;
     (adapter as unknown as { callbacks: unknown }).callbacks = {};
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { adapter, client };
   };
   const syncEvaluates = (client: SyncClient): number =>
