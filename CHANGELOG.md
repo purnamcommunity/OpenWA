@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Move the arm64 image's pinned Debian chromium from major 154 to 155. A session opened under 154 can need a QR re-pair, and the previous image cannot reopen profiles 155 has written.
 - Support Guzzle 8 in the PHP SDK while retaining Guzzle 7 compatibility (#1870).
 - Reject empty PHP SDK `defaultHeaders` lists before sending requests; use `''` for an empty header value (#1870).
 - Convert legacy message types in a one-time migration instead of on every boot, which read the whole messages table before the HTTP port opened.
