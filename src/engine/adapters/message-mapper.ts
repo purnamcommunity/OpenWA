@@ -5,7 +5,7 @@ import {
   MessageType,
   PollDetails,
 } from '../interfaces/whatsapp-engine.interface';
-import type { SerializedWid } from '../types/whatsapp-web-js.types';
+import { readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
 import { chatKind } from '../identity/wa-id';
 
 /**
@@ -139,7 +139,7 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
     // backport every arriving message otherwise carries `id: undefined`. The empty sentinel means
     // "received, id unreadable" and is normalized to NULL where it is persisted — never to `''`, which
     // the non-partial (sessionId, waMessageId) unique index would collide the second such message on.
-    id: msg.id._serialized ?? msg.id.$1 ?? '',
+    id: readWid(msg.id) ?? '',
     from: msg.from,
     to: msg.to,
     chatId,

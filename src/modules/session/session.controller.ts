@@ -505,7 +505,15 @@ export class SessionController {
 
   @Post(':sessionId/pairing-code')
   @RequireRole(ApiKeyRole.OPERATOR)
-  @ApiOperation({ summary: 'Request an 8-char pairing code to link via phone number (alternative to QR)' })
+  @ApiOperation({
+    summary: 'Request an 8-char pairing code to link via phone number (alternative to QR)',
+    description:
+      'On the whatsapp-web.js engine, only request a code for a number you are prepared to re-link. A request ' +
+      'for a number that already has a linked session has been observed to end with WhatsApp revoking that ' +
+      'device: the linked session logs out, its credentials are deleted and it falls back to `qr_ready`. ' +
+      'Nothing refuses such a request, because the guards check the session state and never the number. ' +
+      'Baileys was not affected in the same tests. Link by QR when a session of that number must stay up.',
+  })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({ status: 201, description: 'Pairing code generated', type: PairingCodeResponseDto })
   @ApiResponse({ status: 400, description: 'Session not started or already authenticated' })

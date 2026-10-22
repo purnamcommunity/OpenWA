@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import get_args, get_type_hints
 
@@ -254,6 +255,98 @@ class TestClientCore:
         plain = fail(500, text="oops")
         assert plain.code is None and plain.retry_after_seconds is None
 
+    def test_an_error_with_no_body_names_the_status_text_not_none(self):
+        # A proxy in front of the gateway answers 502 and 504 with nothing.
+        transport = httpx.MockTransport(lambda _: httpx.Response(502, content=b""))
+        client = OpenWAClient(base_url="https://x", api_key="k", transport=transport)
+        with pytest.raises(OpenWAApiError) as caught:
+            client.health.live()
+        assert "Bad Gateway" in str(caught.value)
+        assert "None" not in str(caught.value)
+
+    def test_an_httpx_timeout_or_a_tuple_is_taken_as_given(self):
+        # The published 0.5.1 handed `timeout` straight to httpx, which takes both.
+        per_operation = httpx.Timeout(10.0, connect=2.0)
+        client = OpenWAClient(base_url="https://x", api_key="k", timeout=per_operation)
+        assert client._http._client.timeout == per_operation
+        client = OpenWAClient(base_url="https://x", api_key="k", timeout=(1.0, 2.0, 3.0, 4.0))
+        assert client._http._client.timeout == httpx.Timeout(connect=1.0, read=2.0, write=3.0, pool=4.0)
+        for bad in [(1.0, 2.0), (1.0, 2.0, 3.0, -1.0), (1.0, "2", 3.0, 4.0)]:
+            with pytest.raises(ValueError, match="timeout tuple"):
+                OpenWAClient(base_url="https://x", api_key="k", timeout=bad)  # type: ignore[arg-type]
+        # 0 and infinity mean no limit for that operation, as they do for the scalar: left as they are,
+        # httpx fails the first connect or read, or raises OverflowError, instead of the call.
+        client = OpenWAClient(base_url="https://x", api_key="k", timeout=(5, 0, 5, math.inf))
+        assert client._http._client.timeout == httpx.Timeout(connect=5.0, read=None, write=5.0, pool=None)
+
+    def test_the_api_key_loses_a_trailing_newline_and_an_illegal_one_is_refused_without_being_quoted(self):
+        client = OpenWAClient(base_url="https://x", api_key="owa_k1_secret\n")
+        assert client._http._client.headers["X-API-Key"] == "owa_k1_secret"
+        for bad in ["owa_k1_se\tcret", "owa_k1_se\x00cret", "owa_k1_sécret", "owa_k1_se\ncret"]:
+            with pytest.raises(ValueError, match="api_key") as raised:
+                OpenWAClient(base_url="https://x", api_key=bad)
+            assert bad not in str(raised.value)
+        with pytest.raises(ValueError, match="required"):
+            OpenWAClient(base_url="https://x", api_key="  \n")
+
+    def test_a_key_with_an_inner_space_is_accepted_as_the_gateway_and_other_clients_take_it(self):
+        client = OpenWAClient(base_url="https://x", api_key="correct horse battery staple correct horse\n")
+        assert client._http._client.headers["X-API-Key"] == "correct horse battery staple correct horse"
+
+    def test_a_default_header_the_stack_would_refuse_is_refused_without_quoting_its_value(self):
+        for name, value in [
+            ("CF-Access-Client-Secret", "s3cret-token\n"),
+            ("X-Trace", "caf\u00e9"),
+            ("X-Trace", "a\x00b"),
+        ]:
+            with pytest.raises(ValueError, match=name) as raised:
+                OpenWAClient(base_url="https://x", api_key="k", default_headers={name: value})
+            assert value.strip() not in str(raised.value)
+        with pytest.raises(ValueError, match="header name"):
+            OpenWAClient(base_url="https://x", api_key="k", default_headers={"X Bad": "v"})
+        # A tab and plain printable ASCII are fine.
+        client = OpenWAClient(base_url="https://x", api_key="k", default_headers={"X-Trace": "a\tb c"})
+        assert client._http._client.headers["X-Trace"] == "a\tb c"
+
+    def test_a_default_header_value_is_trimmed_of_the_spaces_the_stack_would_refuse_at_its_ends(self):
+        client = OpenWAClient(
+            base_url="https://x", api_key="k", default_headers={"X-Proxy-Cred": "  token \t", "X-Other": "\tv"}
+        )
+        assert client._http._client.headers["X-Proxy-Cred"] == "token"
+        assert client._http._client.headers["X-Other"] == "v"
+
+    def test_default_headers_take_every_shape_httpx_takes_and_refuse_the_rest_by_name(self):
+        pairs = OpenWAClient(
+            base_url="https://x", api_key="k", default_headers=[("X-Trace", "abc"), ("X-Two", "2")]  # type: ignore[arg-type]
+        )
+        assert pairs._http._client.headers["X-Trace"] == "abc"
+        assert pairs._http._client.headers["X-Two"] == "2"
+        raw = OpenWAClient(base_url="https://x", api_key="k", default_headers={b"X-Trace": b"abc"})  # type: ignore[dict-item]
+        assert raw._http._client.headers["X-Trace"] == "abc"
+        with pytest.raises(ValueError, match="X-Trace") as raised:
+            OpenWAClient(base_url="https://x", api_key="k", default_headers={"X-Trace": b"s3cret\n"})  # type: ignore[dict-item]
+        assert "s3cret" not in str(raised.value)
+        # An httpx.Headers keeps a repeated name as separate lines, and so does the client.
+        repeated = OpenWAClient(
+            base_url="https://x",
+            api_key="k",
+            default_headers=httpx.Headers([("Cookie", "a=1"), ("Cookie", "b=2")]),
+        )
+        assert repeated._http._client.headers.get_list("Cookie") == ["a=1", "b=2"]
+        for bad in (42, ["X-Trace"], [("X-Trace", "a", "b")]):
+            with pytest.raises(ValueError, match="default_headers"):
+                OpenWAClient(base_url="https://x", api_key="k", default_headers=bad)  # type: ignore[arg-type]
+
+    def test_timeout_zero_none_and_inf_mean_none_and_a_bad_value_raises(self):
+        for none in (0, None, float("inf")):
+            client = OpenWAClient(base_url="https://x", api_key="k", timeout=none)
+            assert client._http._client.timeout == httpx.Timeout(None)
+        client = OpenWAClient(base_url="https://x", api_key="k", timeout=2.5)
+        assert client._http._client.timeout == httpx.Timeout(2.5)
+        for bad in (-1, float("nan"), "30", True):
+            with pytest.raises(ValueError, match="timeout"):
+                OpenWAClient(base_url="https://x", api_key="k", timeout=bad)  # type: ignore[arg-type]
+
     def test_maps_503_to_service_unavailable(self):
         # The gateway answers 503 when the engine never confirmed an operation: a transport failure,
         # which is worth retrying, as a 429 is. It used to fall through to the base class while the
@@ -275,7 +368,7 @@ class TestClientCore:
 
 
 class TestMessages:
-    @pytest.mark.parametrize("key", [None, "!", "a" * 255])
+    @pytest.mark.parametrize("key", [None, "!", "~", "a", "a" * 255])
     def test_send_methods_forward_keys_without_changing_json(self, key: str | None) -> None:
         backend = MockBackend().on("POST", "/messages/", body={"messageId": "m", "timestamp": 1})
         client = make_client(backend)
@@ -343,7 +436,7 @@ class TestMessages:
         assert backend.last_call.headers["idempotency-key"] == "default-key"
         assert defaults == {"iDeMpOtEnCy-KeY": "default-key", "X-Trace": "trace"}
 
-    @pytest.mark.parametrize("key", ["", " ", "contains space", "key\n", "\u00e9", "a" * 256])
+    @pytest.mark.parametrize("key", ["", " ", "contains space", "key\n", "\u00e9", "a\x7fb", "a" * 256])
     def test_invalid_send_keys_are_refused_before_transport(self, key: str) -> None:
         backend = MockBackend()
         client = make_client(backend)
@@ -835,9 +928,18 @@ class TestWebhooks:
         client = make_client(backend)
         assert client.webhooks.redrive_delivery_failures({"sessionId": "s", "limit": 10}) == result
         assert backend.last_call.method == "POST"
+        # The mock route is a substring match, so the full URL is what pins the path suffix.
+        assert backend.last_call.url == "http://localhost:2785/api/webhooks/delivery-failures/redrive"
         assert backend.last_call.body == {"sessionId": "s", "limit": 10}
         client.webhooks.redrive_delivery_failures()
         assert backend.last_call.body == {}
+
+    def test_redrive_delivery_failures_keeps_an_explicit_empty_ids_list(self):
+        # The gateway reads ids: [] as "replay nothing" and an omitted ids as "replay up to 100 rows".
+        result = {"redriven": 0, "delivered": 0, "enqueued": 0, "failed": 0, "skipped": 0, "remaining": 3}
+        backend = MockBackend().on("POST", "/api/webhooks/delivery-failures/redrive", body=result)
+        make_client(backend).webhooks.redrive_delivery_failures({"ids": []})
+        assert backend.last_call.body == {"ids": []}
 
 
 class TestStatus:

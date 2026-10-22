@@ -11,7 +11,9 @@ const logger = createLogger('PgBootMigrations');
 // the shared migrations ledger: the lock holder applies the chain while every other process waits
 // inside pg_advisory_lock, then sees a filled ledger and applies nothing. This replaces TypeORM's
 // built-in migrationsRun for that connection only (it has no cross-process serialization); the
-// sqlite connections keep @nestjs/typeorm's default construction + initialize path unchanged.
+// sqlite connection without synchronize keeps @nestjs/typeorm's default construction + initialize
+// path; with synchronize (the dev and e2e setup) it is initialized here, the terminal-failure dedupe
+// runs, and only then does the schema sync.
 //
 // Lock key in the two-int4 form — exact in JavaScript (a single bigint key would exceed
 // Number.MAX_SAFE_INTEGER). The values are fixed so every process and version agrees:
@@ -37,8 +39,9 @@ type PostgresOptions = Extract<DataSourceOptions, { type: 'postgres' }>;
 /**
  * dataSourceFactory for the 'data' connection. Postgres boot migrations execute here, under the
  * advisory lock, BEFORE the DataSource is handed to any provider — same ordering the built-in
- * migrationsRun gave (it finished inside DataSource.initialize()). Non-postgres options take
- * @nestjs/typeorm's default path: construct only, let the wrapper initialize as before. The
+ * migrationsRun gave (it finished inside DataSource.initialize()). SQLite with synchronize is
+ * initialized here, deduplicates terminal webhook failures and then synchronizes; other non-postgres
+ * options take @nestjs/typeorm's default path: construct only, let the wrapper initialize. The
  * wrapper also skips its own initialize() for the postgres branch because the DataSource comes
  * back already initialized, and keeps applying retryAttempts/retryDelay to this whole factory.
  *

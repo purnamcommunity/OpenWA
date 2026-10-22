@@ -65,7 +65,7 @@ type CreateSandboxHostFn = (
   onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
   runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
   onSearchProviderRegister?: () => void,
-  onWorkerExit?: (code: number, intentional: boolean) => void,
+  onWorkerExit?: (code: number, intentional: boolean, reason?: string) => void,
   onUnresponsive?: () => void,
 ) => PluginWorkerHost;
 
@@ -337,7 +337,7 @@ export class PluginSandboxBridge {
 
     const onSearchProviderRegister = this.buildSearchProviderRegistrar(pluginId, plugin);
 
-    const onWorkerExit = this.buildWorkerExitHandler(pluginId, logRelayState);
+    const onWorkerExit = this.buildWorkerExitHandler(pluginId, logRelayState, () => host);
 
     // A worker whose event loop stays blocked after a dispatch timeout (a synchronous loop in plugin
     // code) would otherwise keep running and queue every later dispatch for the full budget each.
@@ -646,8 +646,9 @@ export class PluginSandboxBridge {
   private buildWorkerExitHandler(
     pluginId: string,
     logRelayState: SandboxLogRelayState,
-  ): (code: number, intentional: boolean) => void {
-    return (code: number, intentional: boolean): void => {
+    getSourceHost: () => PluginWorkerHost,
+  ): (code: number, intentional: boolean, reason?: string) => void {
+    return (code: number, intentional: boolean, reason?: string): void => {
       // Final log-relay flush: the per-window drop warn above only fires when a new line arrives in a
       // later window, so without this a plugin that goes quiet (or is disabled) before the rollover
       // silently discards its pending count. The worker is gone, so no further lines can arrive.
@@ -658,17 +659,19 @@ export class PluginSandboxBridge {
         );
         logRelayState.dropped = 0;
       }
-      // Always release the search-provider slot so the registry can fall back to builtin-fts. On a crash
-      // this is the only cleanup; on a deliberate disable/enable-failure the explicit unregister already
-      // ran, making this a harmless no-op.
+      // A replacement owns its provider, hooks and status. An absent host still needs cleanup after
+      // markWorkerFailed removed the retiring worker before its termination completed.
+      const currentHost = this.sandboxHosts.get(pluginId);
+      if (currentHost && currentHost !== getSourceHost()) return;
       unregisterPluginSearchProvider(this.hostServices.getSearchRegistryPort(), pluginId);
       if (intentional) return; // routine disable/enable-failure already logged and expected
       // Unexpected crash after a successful enable: the worker is gone. Drop the dead host +
       // unregister the hook shims (so they don't keep dispatching into the dead worker) + mark the
       // plugin ERROR so the dashboard reflects reality. The dispatchHook/dispatchWebhook dead-checks
       // fail-fast; this cleanup is the root-cause fix (it also makes the shim's !liveHost guard fire).
-      this.markWorkerFailed(pluginId, `worker exited unexpectedly (code ${code})`);
-      this.logger.warn(`Sandboxed plugin ${pluginId} worker exited unexpectedly (code ${code})`, {
+      const why = reason ? `: ${reason}` : '';
+      this.markWorkerFailed(pluginId, `worker exited unexpectedly (code ${code})${why}`);
+      this.logger.warn(`Sandboxed plugin ${pluginId} worker exited unexpectedly (code ${code})${why}`, {
         pluginId,
         code,
         action: 'sandbox_worker_exit',

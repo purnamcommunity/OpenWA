@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { Loader2 } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import MediaLightbox from './MediaLightbox';
+import { loadArchivedMedia } from '../../utils/archivedMediaLoad';
 
 export type ArchivedMediaKind = 'image' | 'video' | 'audio';
 
@@ -9,6 +11,15 @@ interface ArchivedMediaPreviewProps {
   /** Fetches the archived bytes (the per-message media route). Called at most once per mount. */
   load: (signal: AbortSignal) => Promise<Blob>;
   alt?: string;
+  /** The media's own file name. `alt` is only a caption, never a download name. */
+  filename?: string;
+  /** Names the viewer's download (image-<id>.jpg) when the media has no file name; unique per message. */
+  id?: string;
+  /**
+   * The thread's scroll container. The lazy-load observer measures against it: with the implicit viewport
+   * root the margin below is clipped to the container's own box and the lead never happens.
+   */
+  scrollRootRef?: RefObject<Element | null>;
   /** Rendered instead of the preview when the fetch fails, the download button, so the bytes stay reachable. */
   fallback: ReactNode;
   measureMedia?: (el: Element | null) => void;
@@ -28,7 +39,18 @@ type PreviewState = { phase: 'waiting' | 'loading' | 'failed' } | { phase: 'read
 // request per archived message at once. Where IntersectionObserver is unavailable (old browsers, the
 // jsdom test runtime) it loads immediately rather than never. The object URL is revoked on unmount so
 // the parent's media cap unmounts older previews as the thread grows.
-function ArchivedMediaPreview({ kind, load, alt, fallback, measureMedia, onMediaLoad }: ArchivedMediaPreviewProps) {
+function ArchivedMediaPreview({
+  kind,
+  load,
+  alt,
+  filename,
+  id,
+  scrollRootRef,
+  fallback,
+  measureMedia,
+  onMediaLoad,
+}: ArchivedMediaPreviewProps) {
+  const { t } = useTranslation();
   const [state, setState] = useState<PreviewState>({ phase: 'waiting' });
   const [imageOpen, setImageOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement | null>(null);
@@ -37,6 +59,10 @@ function ArchivedMediaPreview({ kind, load, alt, fallback, measureMedia, onMedia
   const loadRef = useRef(load);
   useEffect(() => {
     loadRef.current = load;
+  });
+  const onMediaLoadRef = useRef(onMediaLoad);
+  useEffect(() => {
+    onMediaLoadRef.current = onMediaLoad;
   });
   // The object URL the ready render points at. Revoked on unmount only, the phase never leaves
   // `ready`, so the URL stays valid for as long as the element showing it exists.
@@ -65,11 +91,11 @@ function ArchivedMediaPreview({ kind, load, alt, fallback, measureMedia, onMedia
         }
       },
       // A screen's worth of lead so the bytes are usually there by the time the bubble scrolls in.
-      { rootMargin: '600px 0px' },
+      { root: scrollRootRef?.current ?? null, rootMargin: '600px 0px' },
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [state.phase]);
+  }, [state.phase, scrollRootRef]);
 
   // Phase 2: fetch once. A response landing after unmount is dropped rather than turned into a URL
   // nothing would ever revoke.
@@ -77,8 +103,7 @@ function ArchivedMediaPreview({ kind, load, alt, fallback, measureMedia, onMedia
     if (state.phase !== 'loading') return undefined;
     let cancelled = false;
     const controller = new AbortController();
-    loadRef
-      .current(controller.signal)
+    loadArchivedMedia(controller.signal, () => loadRef.current(controller.signal))
       .then(blob => {
         if (cancelled) return;
         const url = URL.createObjectURL(blob);
@@ -94,11 +119,26 @@ function ArchivedMediaPreview({ kind, load, alt, fallback, measureMedia, onMedia
     };
   }, [state.phase]);
 
+  // An audio player has a fixed box that does not wait for decode, so the thread grows the moment the
+  // player replaces the placeholder, before any media event could say so. Report it, so a thread pinned
+  // to the bottom stays pinned (image and video report their own load).
+  useEffect(() => {
+    if (state.phase === 'ready' && kind === 'audio') onMediaLoadRef.current?.();
+  }, [state.phase, kind]);
+
   if (state.phase === 'failed') return <>{fallback}</>;
 
   if (state.phase !== 'ready') {
     return (
-      <div ref={anchorRef} className="message-media-omitted message-media-archived-loading" aria-busy="true">
+      <div
+        ref={anchorRef}
+        className={`message-media-omitted message-media-archived-loading${
+          kind === 'audio' || kind === 'video' ? ` message-media-archived-loading-${kind}` : ''
+        }`}
+        role="status"
+        aria-busy="true"
+        aria-label={t('common.loading')}
+      >
         <Loader2 size={14} className="animate-spin" />
       </div>
     );
@@ -112,10 +152,11 @@ function ArchivedMediaPreview({ kind, load, alt, fallback, measureMedia, onMedia
             <img
               src={state.url}
               alt={alt ?? ''}
-              className="chat-image-media"
+              className="chat-image-media chat-image-media-archived"
               ref={measureMedia}
               onLoad={onMediaLoad}
               role="button"
+              aria-haspopup="dialog"
               tabIndex={0}
               onClick={() => setImageOpen(true)}
               onKeyDown={event => {
@@ -127,7 +168,7 @@ function ArchivedMediaPreview({ kind, load, alt, fallback, measureMedia, onMedia
             />
           </div>
           <MediaLightbox
-            items={[{ id: 'archived-image', url: state.url, alt, filename: alt }]}
+            items={[{ id: id ?? 'archived-image', url: state.url, alt, filename }]}
             index={imageOpen ? 0 : null}
             onClose={() => setImageOpen(false)}
             onNavigate={() => {}}

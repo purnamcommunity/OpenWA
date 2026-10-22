@@ -28,7 +28,7 @@ import {
 
 const handSource = `
 export interface Sample {
-  id: string;
+  id: string; // inline comment on field
   name?: string;
   direction: string;
   count: number | null;
@@ -40,6 +40,15 @@ test('parseHandTypes reads required and optional members (a required field is no
   assert.deepEqual(Object.keys(types.Sample), ['id', 'name', 'direction', 'count']);
   assert.equal(types.Sample.id.optional, false);
   assert.equal(types.Sample.name.optional, true);
+});
+
+test('parsers handle Windows CRLF line endings identically to LF', () => {
+  const crlfHand = handSource.replace(/\n/g, '\r\n');
+  assert.deepEqual(parseHandTypes(crlfHand), parseHandTypes(handSource));
+
+  const pySource = 'class Sample(TypedDict):\n    id: str\n    name: NotRequired[str]\n';
+  const crlfPy = pySource.replace(/\n/g, '\r\n');
+  assert.deepEqual(parsePythonTypes(crlfPy), parsePythonTypes(pySource));
 });
 
 const schemas = {
@@ -280,7 +289,11 @@ test('parseJavaTypes: a bare UNKNOWN sentinel is not a wire member, an annotated
 
 test('isSimpleToken-gated diffing reaches inside an array of enum members', () => {
   const hand = { events: { optional: false, token: 'array<enum(a,b)>' } };
-  const schema = { type: 'object', required: ['events'], properties: { events: { type: 'array', items: { enum: ['a', 'c'] } } } };
+  const schema = {
+    type: 'object',
+    required: ['events'],
+    properties: { events: { type: 'array', items: { enum: ['a', 'c'] } } },
+  };
   const diffs = comparePair('Hand', hand, 'Dto', schema, {});
   assert.equal(diffs.length, 1, 'a vocabulary that travels as a list must still be compared');
   assert.match(diffs[0], /events/);

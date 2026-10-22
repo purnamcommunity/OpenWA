@@ -434,7 +434,8 @@ docker stats --no-stream
 #    copied live; stop the sessions first if a restore must not need re-pairing, and start them
 #    again in step 10
 docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-docker cp openwa-api:/app/data/backups/. ./backups/
+docker cp openwa-api:/app/data/backups/. ./backups/ \
+  && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # the copy off the volume is the backup
 
 # Verify backup (backup.sh writes $BACKUP_DIR/openwa-backup-<timestamp>.tar.gz,
 # BACKUP_DIR defaults to ./backups — it creates no dated subdirectories)
@@ -520,7 +521,8 @@ curl -H "X-API-Key: $API_KEY" \
 export BACKUP_DIR="/backups/openwa"
 mkdir -p "$BACKUP_DIR"
 docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-docker cp openwa-api:/app/data/backups/. "$BACKUP_DIR"/
+docker cp openwa-api:/app/data/backups/. "$BACKUP_DIR"/ \
+  && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # the copy off the volume is the backup
 
 # 3. Export the Data DB as JSON alongside the archive (admin key)
 curl -H "X-API-Key: $ADMIN_API_KEY" \
@@ -583,9 +585,12 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
 
 > On Kubernetes with the chart in `charts/openwa`, take the step 2 backup with the Helm lines in
 > Runbook: Database Backup and the step 3 export first, then replace steps 4-8 with checking out the
-> new release and running `helm upgrade openwa ./charts/openwa --reuse-values`. The image tag defaults
-> to the chart's `appVersion`, so the checkout moves it, unless `image.tag` was set at install:
-> `--reuse-values` keeps that value, so pass `--set image.tag=<new-version>` in that case.
+> new release and running `helm upgrade openwa ./charts/openwa --reset-then-reuse-values` (Helm 3.14
+> or later). It takes the new chart's defaults and re-applies the values you set. Plain
+> `--reuse-values` renders the new templates with the old release's defaults instead, which keeps a
+> 45 s `terminationGracePeriodSeconds` and a capability list without `KILL`, so a stop never reaches
+> the app. The image tag defaults to the chart's `appVersion`, so the checkout moves it, unless
+> `image.tag` was set at install: that value is kept, so pass `--set image.tag=<new-version>` then.
 > Run steps 9-12 through `kubectl port-forward` to the release's Service. `helm rollback` keeps the
 > volume, so read the notes on restoring `sessions/` below before relying on it.
 
@@ -778,9 +783,11 @@ OPENWA_DATA_DIR=/srv/openwa/data \
 >
 > ```bash
 > docker exec -e BACKUP_DIR=/app/data/backups -e TMPDIR=/app/data/backups openwa-api ./scripts/backup.sh
-> docker cp openwa-api:/app/data/backups/. ./backups/
+> docker cp openwa-api:/app/data/backups/. ./backups/ \
+>   && docker exec openwa-api sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'   # do not let archives pile up on the volume
 > # Helm: kubectl exec <pod> -- env BACKUP_DIR=/app/data/backups ./scripts/backup.sh
-> #       kubectl cp <pod>:/app/data/backups ./backups
+> #       kubectl cp <pod>:/app/data/backups ./backups \
+> #         && kubectl exec <pod> -- sh -c 'rm -f /app/data/backups/openwa-backup-*.tar.gz'
 > ```
 >
 > The script stages a full copy of the data in `TMPDIR` before archiving it. The compose file mounts

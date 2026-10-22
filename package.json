@@ -1,6 +1,6 @@
 {
   "name": "openwa",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API for WhatsApp",
   "author": "Yudhi Armyndharis & OpenWA Contributors",
   "private": true,
@@ -41,7 +41,7 @@
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\"",
     "lint:fix": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
     "test": "jest",
-    "test:scripts": "node --test scripts/proxy-addr.spec.js scripts/postinstall.spec.js scripts/patch-wwebjs-newsletter-preview.spec.js scripts/patch-wwebjs-status.spec.js scripts/patch-wwebjs-ready-sync.spec.js scripts/patch-wwebjs-participant-arity.spec.js scripts/patch-wwebjs-block.spec.js scripts/patch-wwebjs-group-description.spec.js scripts/patch-wwebjs-media-id.spec.js scripts/patch-wwebjs-send-error.spec.js scripts/patch-baileys-appstate.spec.js scripts/patch-baileys-newsletter-create.spec.js scripts/patch-baileys-pairing.spec.js scripts/baileys-pairing.integration.spec.mjs scripts/dockerfile-patchers.spec.js scripts/smoke-test-docker-proxy.spec.js scripts/check-upstream-surface.spec.mjs scripts/check-sdk-docs.spec.mjs scripts/check-audit.spec.mjs scripts/check-contract-shapes.spec.mjs scripts/check-sdk-coverage.spec.mjs scripts/cli-entrypoint-guard.spec.mjs scripts/backup-min-content.spec.js scripts/patch-wwebjs-call-state.spec.js scripts/patch-wwebjs-call-log-event.spec.js scripts/patch-wwebjs-contact-alt-wid.spec.js scripts/patch-wwebjs-message-secret.spec.js scripts/patch-wwebjs-group-invite.spec.js scripts/patch-wwebjs-forward-bundle.spec.js scripts/patch-wwebjs-pushname-bundle.spec.js",
+    "test:scripts": "node --test scripts/proxy-addr.spec.js scripts/music-metadata.spec.js scripts/postinstall.spec.js scripts/patch-wwebjs-newsletter-preview.spec.js scripts/patch-wwebjs-status.spec.js scripts/patch-wwebjs-ready-sync.spec.js scripts/patch-wwebjs-participant-arity.spec.js scripts/patch-wwebjs-block.spec.js scripts/patch-wwebjs-group-description.spec.js scripts/patch-wwebjs-media-id.spec.js scripts/patch-wwebjs-send-error.spec.js scripts/patch-baileys-appstate.spec.js scripts/patch-baileys-newsletter-create.spec.js scripts/patch-baileys-pairing.spec.js scripts/baileys-pairing.integration.spec.mjs scripts/dockerfile-patchers.spec.js scripts/smoke-test-docker-proxy.spec.js scripts/check-upstream-surface.spec.mjs scripts/check-sdk-docs.spec.mjs scripts/check-audit.spec.mjs scripts/check-contract-shapes.spec.mjs scripts/check-sdk-coverage.spec.mjs scripts/cli-entrypoint-guard.spec.mjs scripts/backup-min-content.spec.js scripts/patch-wwebjs-call-state.spec.js scripts/patch-wwebjs-call-log-event.spec.js scripts/patch-wwebjs-contact-alt-wid.spec.js scripts/patch-wwebjs-message-secret.spec.js scripts/patch-wwebjs-group-invite.spec.js scripts/patch-wwebjs-forward-bundle.spec.js scripts/patch-wwebjs-pushname-bundle.spec.js",
     "test:docs": "jest src/common/changelog-sections.spec.ts src/common/ci-privilege-gate.spec.ts src/common/docs-ci-jobs.spec.ts src/common/docs-coverage-policy.spec.ts src/common/docs-metrics-list.spec.ts src/common/docs-next-version.spec.ts src/common/docs-sdk-rate-limit.spec.ts src/common/openapi/docs-06-contract.spec.ts src/common/test-lane-partition.spec.ts src/config/docs-env-example.spec.ts src/config/openapi-contract.spec.ts src/config/openapi-export-pins.spec.ts src/config/wa-web-version-example-pin.spec.ts src/engine/docs-29-counts.spec.ts src/engine/docs-27-backfill-engine.spec.ts src/engine/engine-inventory-parity.spec.ts src/engine/engine-parity.spec.ts src/engine/inventory-mapping-direction.spec.ts src/engine/adapters/baileys-voice-waveform.spec.ts src/engine/adapters/wwebjs-newsletter-preview.spec.ts src/modules/audit/audit-coverage.spec.ts src/modules/auth/global-route-fence-coverage.spec.ts src/modules/auth/query-session-scope-coverage.spec.ts src/modules/docker/compose-network.spec.ts src/modules/queue/bull-board-mount-coverage.spec.ts src/common/release-gate-parity.spec.ts src/database/migrations/__tests__/migration-drift.spec.ts src/common/docs-governance.spec.ts --testPathIgnorePatterns=/node_modules/",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
@@ -87,10 +87,9 @@
     "@socket.io/redis-adapter": "^8.3.0",
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "adm-zip": "^0.6.1",
-    "archiver": "^8.0.0",
     "audio-decode": "^2.2.3",
     "better-sqlite3": "^13.0.3",
-    "bullmq": "^6.3.12",
+    "bullmq": "^6.3.13",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
     "dockerode": "^5.0.1",
@@ -119,7 +118,6 @@
     "@nestjs/cli": "^11.0.24",
     "@nestjs/schematics": "^11.0.0",
     "@nestjs/testing": "^11.2.7",
-    "@types/archiver": "^8.0.0",
     "@types/dockerode": "^4.0.2",
     "@types/express": "^5.0.0",
     "@types/jest": "^30.0.0",
@@ -135,7 +133,7 @@
     "eslint-plugin-prettier": "^5.5.6",
     "globals": "^17.13.0",
     "jest": "^30.5.2",
-    "prettier": "^3.9.9",
+    "prettier": "^3.9.10",
     "supertest": "^7.3.1",
     "ts-jest": "^29.4.14",
     "ts-node": "^10.9.2",
@@ -198,7 +196,6 @@
     "moduleNameMapper": {
       "^@whiskeysockets/baileys$": "<rootDir>/../test/__mocks__/@whiskeysockets/baileys.ts",
       "^@whiskeysockets/baileys/(.*)$": "<rootDir>/../test/__mocks__/@whiskeysockets/baileys.ts",
-      "^archiver$": "<rootDir>/../test/__mocks__/archiver.ts",
       "^https-proxy-agent$": "<rootDir>/../test/__mocks__/https-proxy-agent.ts",
       "^puppeteer$": "<rootDir>/../test/__mocks__/puppeteer.ts",
       "^socks-proxy-agent$": "<rootDir>/../test/__mocks__/socks-proxy-agent.ts"
@@ -215,10 +212,10 @@
         "statements": 61
       },
       "./src/common/cache/": {
-        "branches": 34,
-        "functions": 33,
-        "lines": 42,
-        "statements": 42
+        "branches": 70,
+        "functions": 75,
+        "lines": 95,
+        "statements": 91
       },
       "./src/common/security/": {
         "branches": 85,
@@ -455,7 +452,7 @@
         "statements": 44
       },
       "./src/modules/profile/": {
-        "branches": 78,
+        "branches": 65,
         "functions": 84,
         "lines": 88,
         "statements": 85

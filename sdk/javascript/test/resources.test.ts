@@ -291,6 +291,15 @@ describe('WebhooksResource — exact paths', () => {
     await c.webhooks.redriveDeliveryFailures();
     expect(t.lastCall!.body).toEqual({});
   });
+
+  // The gateway reads `ids: []` as "replay nothing" and an omitted `ids` as "replay up to 100 rows", so
+  // an SDK that drops the empty array would turn a deliberate empty selection into a real replay.
+  it('redriveDeliveryFailures keeps an explicit empty ids list', async () => {
+    const result = { redriven: 0, delivered: 0, enqueued: 0, failed: 0, skipped: 0, remaining: 3 };
+    const t = new MockTransport().on('POST', /\/api\/webhooks\/delivery-failures\/redrive$/, { body: result });
+    await client(t).webhooks.redriveDeliveryFailures({ ids: [] });
+    expect(t.lastCall!.body).toEqual({ ids: [] });
+  });
 });
 
 describe('StatusResource — nested media bodies', () => {

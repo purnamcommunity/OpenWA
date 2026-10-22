@@ -69,6 +69,9 @@ describe('WebhookRedriveService', () => {
         ReturnType<WebhookDeliveryService['redeliver']>,
         Parameters<WebhookDeliveryService['redeliver']>
       >(async (webhook, sessionId, event, key, data) => {
+        // A preflight refusal (a body over the payload cap after the hooks): reported as failed, with
+        // nothing recorded, so the row keeps the attempt count it had.
+        if (data.refuse === true) return 'failed';
         if (data.fail === true) {
           const recorded = await recordWebhookDeliveryFailure(
             failures,
@@ -127,6 +130,66 @@ describe('WebhookRedriveService', () => {
     );
     expect(await failures.count()).toBe(0);
     expect(await service.redrive({})).toMatchObject({ delivered: 0, remaining: 0 });
+  });
+
+  it('counts a replay the delivery path refused before sending, so that row does not head every batch', async () => {
+    const refused = await addFailure({ attempts: 1, payload: { id: 'big', refuse: true } });
+    const other = await addFailure({ attempts: 1, createdAt: new Date(Date.now() - 30_000) });
+
+    expect(await service.redrive({ limit: 1 })).toMatchObject({ failed: 1, remaining: 2 });
+    // The recorder raised nothing for a refusal, so the redrive counts the attempt itself, once.
+    expect((await failures.findOneByOrFail({ id: refused.id })).attempts).toBe(2);
+
+    await service.redrive({ limit: 1 });
+    expect(delivery.redeliver.mock.calls.map(call => call[3])).toEqual([refused.idempotencyKey, other.idempotencyKey]);
+  });
+
+  it('raises the attempts of a replay the recorder already counted by one, not two', async () => {
+    const row = await addFailure({ attempts: 3, payload: { id: 'm', fail: true } });
+    await service.redrive({});
+    expect((await failures.findOneByOrFail({ id: row.id })).attempts).toBe(4);
+  });
+
+  it('reads each retained payload only as its replay starts, never the whole batch at once', async () => {
+    for (let i = 0; i < 6; i++) await addFailure({ payload: { id: `m${i}`, body: 'x'.repeat(200) } });
+    const statements: string[] = [];
+    jest.spyOn(ds.logger, 'logQuery').mockImplementation(query => void statements.push(query));
+
+    await service.redrive({});
+
+    // A batch holds up to 500 rows but runs four replays at a time; loading the bodies with the batch
+    // held every one of them in memory for the whole call.
+    const selectList = (statement: string) => /^SELECT\s+(.*?)\s+FROM\s/is.exec(statement)?.[1] ?? '';
+    const payloadReads = statements.filter(
+      statement => /webhook_delivery_failures/i.test(statement) && /payload/i.test(selectList(statement)),
+    );
+    expect(payloadReads).toHaveLength(6);
+    expect(delivery.redeliver).toHaveBeenCalledTimes(6);
+  });
+
+  it('skips a row that lost its copy between the batch and its replay, without sending an empty event', async () => {
+    const rows: WebhookDeliveryFailure[] = [];
+    for (let i = 0; i < 5; i++) {
+      rows.push(await addFailure({ createdAt: new Date(Date.now() - 120_000 + i * 1000), payload: { id: `m${i}` } }));
+    }
+    // Four replays run at once, so the fifth row's body is read only after one of them ends. Remove it from
+    // inside the first replay, the way a second node or the payload retention sweep would.
+    delivery.redeliver.mockImplementationOnce(async (webhook, _sessionId, _event, key) => {
+      await failures.delete({ id: rows[4].id });
+      await failures.delete({ webhookId: webhook.id, idempotencyKey: key });
+      return 'delivered';
+    });
+
+    expect(await service.redrive({})).toEqual({
+      redriven: 4,
+      delivered: 4,
+      enqueued: 0,
+      failed: 0,
+      skipped: 1,
+      remaining: 0,
+    });
+    expect(delivery.redeliver).toHaveBeenCalledTimes(4);
+    expect(delivery.redeliver.mock.calls.map(call => call[3])).not.toContain(rows[4].idempotencyKey);
   });
 
   it('selects eligible subscriptions before the batch limit, past more than 100 old unavailable rows', async () => {
@@ -216,6 +279,28 @@ describe('WebhookRedriveService', () => {
 
     expect(await service.redrive({})).toMatchObject({ delivered: 1, remaining: 0 });
     expect(delivery.redeliver.mock.calls[0][2]).toBe('session.disconnected');
+  });
+
+  it('keeps opt-in events out of a wildcard subscription, so they cannot pin the head of a batch', async () => {
+    // message.receipt must be named; '*' no longer covers it. Rows left over from a time the webhook did
+    // name it would otherwise be selected, skipped without a counter change, and selected again forever.
+    await webhooks.update(primary.id, { events: ['*'] });
+    for (let i = 0; i < 3; i++) {
+      await addFailure({ event: 'message.receipt', createdAt: new Date(Date.now() - 120_000) });
+    }
+    const wanted = await addFailure({ event: 'message.received' });
+
+    expect(await service.redrive({ limit: 2 })).toMatchObject({ delivered: 1, skipped: 0, remaining: 0 });
+    expect(delivery.redeliver).toHaveBeenCalledTimes(1);
+    expect(delivery.redeliver.mock.calls[0][3]).toBe(wanted.idempotencyKey);
+  });
+
+  it('replays an opt-in event once the webhook names it', async () => {
+    await webhooks.update(primary.id, { events: ['*', 'message.receipt'] });
+    await addFailure({ event: 'message.receipt' });
+
+    expect(await service.redrive({})).toMatchObject({ delivered: 1, remaining: 0 });
+    expect(delivery.redeliver.mock.calls[0][2]).toBe('message.receipt');
   });
 
   it('matches exact event members and ignores non-array subscriptions', async () => {

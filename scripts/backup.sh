@@ -53,9 +53,11 @@
 #                     included, against the certificate, so name the host the certificate carries.
 #
 # Failure policy: a missing source database is FATAL (no silent empty backup), and the finished
-# archive must contain every configured database or it is deleted and the run fails. When the
-# sqlite3 CLI is unavailable the databases are plain-copied (possibly torn if the app is live) and
-# the archive carries a CONSISTENCY-WARNING marker that restore.sh surfaces.
+# archive must contain every configured database or it is deleted and the run fails. The archive
+# takes its final name only once complete, so a failed tar leaves no truncated
+# openwa-backup-*.tar.gz. When the sqlite3 CLI is unavailable the databases are plain-copied (possibly
+# torn if the app is live) and the archive carries a CONSISTENCY-WARNING marker that restore.sh
+# surfaces.
 #
 # Engine authentication state (sessions/, baileys/) is copied, not snapshotted: the engines rewrite
 # it while they run, so an online backup can hold a copy torn mid-write. When a whatsapp-web.js
@@ -121,7 +123,12 @@ fi
 # memory limit, so an in-container run there points TMPDIR at the data volume (docs/11); staging the
 # data in the tmpfs gets the running gateway OOM-killed once the data outgrows its headroom.
 STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
+# The archive is written under a name no restore, listing or retention glob matches and renamed once the
+# min-content check passes: a tar that fails part way (the volume fills) must not leave a truncated
+# archive that reads as the newest backup.
+ARCHIVE="$BACKUP_DIR/openwa-backup-$TIMESTAMP.tar.gz"
+ARCHIVE_PARTIAL="$ARCHIVE.partial"
+trap 'rm -rf "$STAGE" "$ARCHIVE_PARTIAL"' EXIT
 
 CONSISTENCY_WARNING="$STAGE/CONSISTENCY-WARNING"
 
@@ -238,7 +245,7 @@ if [ "$DATABASE_TYPE" = "postgres" ]; then
     else
       if [ -z "${PGSSLROOTCERT:-}" ] && command -v node >/dev/null 2>&1; then
         PG_ROOT_CERTS="$(mktemp)"
-        trap 'rm -rf "$STAGE" "$PG_ROOT_CERTS"' EXIT
+        trap 'rm -rf "$STAGE" "$ARCHIVE_PARTIAL" "$PG_ROOT_CERTS"' EXIT
         # Before Node 22.15 there is no getCACertificates, and rootCertificates holds only the bundled
         # roots, so NODE_EXTRA_CA_CERTS is added from its file. An unreadable file is skipped, as Node
         # itself skips it after the warning it prints at startup.
@@ -349,10 +356,9 @@ if [ -f "$ADMIN_KEY_FILE" ]; then
   cp -p "$ADMIN_KEY_FILE" "$STAGE/.api-key"
 fi
 
-ARCHIVE="$BACKUP_DIR/openwa-backup-$TIMESTAMP.tar.gz"
-tar -czf "$ARCHIVE" -C "$STAGE" .
+tar -czf "$ARCHIVE_PARTIAL" -C "$STAGE" .
 
-ARCHIVE_LIST="$(tar -tzf "$ARCHIVE")"
+ARCHIVE_LIST="$(tar -tzf "$ARCHIVE_PARTIAL")"
 
 # Min-content check on the finished archive: every configured database must be present. If not,
 # delete the defective archive and fail — leaving it on disk invites a restore into a fresh-empty
@@ -374,9 +380,10 @@ for member in "${REQUIRED_MEMBERS[@]}"; do
 done
 if [ -n "$MISSING_MEMBERS" ]; then
   log "ERROR: archive failed the min-content check — missing required member(s):$MISSING_MEMBERS"
-  rm -f "$ARCHIVE"
+  rm -f "$ARCHIVE_PARTIAL"
   exit 1
 fi
+mv "$ARCHIVE_PARTIAL" "$ARCHIVE"
 
 log "Backup complete: $ARCHIVE"
 log "SECURITY: this archive can contain database passwords, plugin secrets, and an admin API key; restrict and encrypt it"

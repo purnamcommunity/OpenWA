@@ -27,12 +27,52 @@ interface OrchestrationResult {
   estimatedTime: number; // Estimated restart time in seconds
 }
 
+/** How long a reachability or listing call may take before the daemon is read as unavailable. */
+const DOCKER_CALL_TIMEOUT_MS = 10_000;
+
 @Injectable()
 export class DockerService implements OnModuleInit {
   private readonly logger = createLogger(DockerService.name);
   private docker: Docker | null = null;
   private isAvailable = false;
   private reinitInFlight = false;
+  /** Visible for testing. */
+  callTimeoutMs = DOCKER_CALL_TIMEOUT_MS;
+
+  /**
+   * dockerode sets no timeout, so a daemon or socket proxy that accepts the connection and never
+   * answers (a dropped SYN, a wedged upstream) would hold the caller, boot included, until the OS or
+   * the proxy gave up. Short calls are bounded here; image pulls and container starts are not.
+   *
+   * The call is aborted when the deadline passes, not only raced: a call left running keeps its request
+   * and its socket open, and every later availability check would add one more.
+   */
+  private async answered<T>(call: (signal: AbortSignal) => Promise<T>, what: string): Promise<T> {
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`Docker did not answer ${what} within ${this.callTimeoutMs}ms`));
+        controller.abort();
+      }, this.callTimeoutMs);
+    });
+    try {
+      return await Promise.race([call(controller.signal), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * dockerode's runtime takes an options object with `abortSignal` on every call, which its typings
+   * declare only for some of them.
+   */
+  private abortable<T>(method: 'ping', abortSignal: AbortSignal): Promise<T> {
+    const call = this.docker![method].bind(this.docker) as unknown as (options: {
+      abortSignal: AbortSignal;
+    }) => Promise<T>;
+    return call({ abortSignal });
+  }
 
   async onModuleInit() {
     await this.initializeDocker();
@@ -90,7 +130,7 @@ export class DockerService implements OnModuleInit {
   private async initializeDocker(): Promise<void> {
     try {
       this.docker = new Docker(this.buildDockerOptions());
-      await this.docker.ping();
+      await this.answered(abortSignal => this.abortable<unknown>('ping', abortSignal), 'a ping');
       this.isAvailable = true;
       this.logger.log('Docker API connected successfully');
     } catch (error) {
@@ -142,7 +182,10 @@ export class DockerService implements OnModuleInit {
     }
 
     try {
-      const containers = await this.docker.listContainers({ all: true });
+      const containers = await this.answered(
+        abortSignal => this.docker!.listContainers({ all: true, abortSignal }),
+        'a container list',
+      );
       return containers
         .filter(c => {
           // Filter by OpenWA labels or name prefix
@@ -186,12 +229,17 @@ export class DockerService implements OnModuleInit {
     }
 
     try {
-      const containers = await this.docker.listContainers({
-        all: true,
-        filters: {
-          label: [`com.openwa.service=${service}`],
-        },
-      });
+      const containers = await this.answered(
+        abortSignal =>
+          this.docker!.listContainers({
+            all: true,
+            filters: {
+              label: [`com.openwa.service=${service}`],
+            },
+            abortSignal,
+          }),
+        'a container list',
+      );
 
       if (containers.length > 0) {
         return this.docker.getContainer(containers[0].Id);
@@ -200,7 +248,10 @@ export class DockerService implements OnModuleInit {
       // Fallback: try by EXACT name (never a substring — a substring, and especially the empty
       // string, would resolve an arbitrary container). OpenWA-managed containers are `openwa-<service>`.
       const target = `openwa-${service}`;
-      const allContainers = await this.docker.listContainers({ all: true });
+      const allContainers = await this.answered(
+        abortSignal => this.docker!.listContainers({ all: true, abortSignal }),
+        'a container list',
+      );
       const match = allContainers.find(c => c.Names?.some(n => n === target || n === `/${target}`));
 
       if (match) {
@@ -224,8 +275,8 @@ export class DockerService implements OnModuleInit {
    *  - Credentials: the compose services are the MANUAL operator path and deliberately ship no
    *    default secret (an empty POSTGRES_PASSWORD fails when the volume is first initialized; a
    *    MINIO_ROOT_PASSWORD left on its sub-minimum placeholder fails at every start). The specs below
-   *    are the dashboard built-in path: they provision the fixed built-in credentials
-   *    (openwa/openwa, minioadmin/minioadmin) that infra-config.controller writes to data/.env.generated
+   *    are the dashboard built-in path: they provision the built-in credentials, by default
+   *    (openwa/openwa, minioadmin/minioadmin), that infra-config.controller writes to data/.env.generated
    *    and that the production boot guard (bootstrap-security.ts) exempts only while the
    *    *_BUILTIN flag is set AND the datastore host resolves to the internal-only container.
    *  - Postgres init script: compose bind-mounts scripts/postgres-init-schema.sh from the host
@@ -282,10 +333,17 @@ export class DockerService implements OnModuleInit {
         image: 'postgres:16-alpine',
         name: 'openwa-postgres',
         alias: 'postgres',
-        // Fixed built-in credentials — the dashboard saves these same values to
-        // data/.env.generated (infra-config.controller) and the production boot guard exempts them only
-        // for the built-in, internal-host deployment (see the getContainerSpec docblock).
-        env: ['POSTGRES_USER=openwa', 'POSTGRES_PASSWORD=openwa', 'POSTGRES_DB=openwa'],
+        // The built-in credentials — the dashboard saves them to data/.env.generated
+        // (infra-config.controller) and the production boot guard exempts the default pair only for the
+        // built-in, internal-host deployment (see the getContainerSpec docblock). The password is the
+        // one the next boot dials with, like the MinIO keys below: a custom one saved with the built-in
+        // database would otherwise never match the role this container initializes, and the app would
+        // exit on its first connection.
+        env: [
+          'POSTGRES_USER=openwa',
+          `POSTGRES_PASSWORD=${nextBoot('DATABASE_PASSWORD') || 'openwa'}`,
+          'POSTGRES_DB=openwa',
+        ],
         volumes: [{ name: 'openwa_postgres-data', path: '/var/lib/postgresql/data' }],
         healthcheck: {
           test: ['CMD-SHELL', 'pg_isready -U openwa'],
@@ -501,7 +559,7 @@ export class DockerService implements OnModuleInit {
    * Stop a managed profile's container and RETAIN it for a later re-enable.
    *
    * Deliberately stop-only — no `container.remove()`. The bundled docker-socket-proxy
-   * (tecnativa/docker-socket-proxy, pinned v0.4.2) never reads its `DELETE` env flag: its
+   * (tecnativa/docker-socket-proxy, pinned v0.5.0) never reads its `DELETE` env flag: its
    * haproxy.cfg method gate is `deny unless METH_GET || env(POST)`, so container deletion is
    * admitted only as an undocumented side effect of POST being enabled — a contract any proxy
    * upgrade may withdraw. Stopping needs nothing beyond POST /containers/{id}/stop, which the
@@ -613,44 +671,6 @@ export class DockerService implements OnModuleInit {
     }
 
     return result;
-  }
-
-  /**
-   * Get Docker system info
-   */
-  async getSystemInfo(): Promise<{ available: boolean; info?: Record<string, unknown> }> {
-    if (!this.docker || !this.isAvailable) {
-      return { available: false };
-    }
-
-    try {
-      const info = (await this.docker.info()) as {
-        Containers: number;
-        ContainersRunning: number;
-        ContainersPaused: number;
-        ContainersStopped: number;
-        Images: number;
-        ServerVersion: string;
-        OperatingSystem: string;
-        Architecture: string;
-      };
-      return {
-        available: true,
-        info: {
-          containers: info.Containers,
-          containersRunning: info.ContainersRunning,
-          containersPaused: info.ContainersPaused,
-          containersStopped: info.ContainersStopped,
-          images: info.Images,
-          serverVersion: info.ServerVersion,
-          operatingSystem: info.OperatingSystem,
-          architecture: info.Architecture,
-        },
-      };
-    } catch (error) {
-      this.logger.error('Failed to get Docker info', error);
-      return { available: false };
-    }
   }
 }
 

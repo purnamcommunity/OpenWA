@@ -3,48 +3,14 @@ import { PassThrough, Readable } from 'stream';
 import * as tar from 'tar-stream';
 import { createGzip } from 'zlib';
 
-// archiver v8 is ESM-only and ts-jest cannot load it here. This stand-in keeps the parts of its
-// TarArchive contract the export relies on: a stream entry with a known size is piped straight into
-// the tar pack (without one it is collected first), 'entry' fires once the entry is written, and an
-// entry failure is emitted as 'error'. The real archiver runs in test/storage-export-streaming.e2e-spec.ts.
-jest.mock('archiver', () => {
-  /* eslint-disable @typescript-eslint/no-require-imports */
-  const { EventEmitter } = require('events') as typeof import('events');
-  const tar = require('tar-stream') as typeof import('tar-stream');
-  const { createGzip } = require('zlib') as typeof import('zlib');
-  /* eslint-enable @typescript-eslint/no-require-imports */
-  class TarArchive extends EventEmitter {
-    private readonly pack = tar.pack();
-    private readonly gzip = createGzip();
-    constructor() {
-      super();
-      this.pack.pipe(this.gzip);
-    }
-    pipe(destination: NodeJS.WritableStream): NodeJS.WritableStream {
-      return this.gzip.pipe(destination);
-    }
-    append(source: Readable, data: { name: string; stats?: { size: number } }): void {
-      const done = (err?: Error | null): void => void (err ? this.emit('error', err) : this.emit('entry', data));
-      if (data.stats) {
-        source.pipe(this.pack.entry({ name: data.name, size: data.stats.size }, done));
-        return;
-      }
-      const chunks: Buffer[] = [];
-      source.on('data', (chunk: Buffer) => chunks.push(chunk));
-      source.on('end', () => this.pack.entry({ name: data.name }, Buffer.concat(chunks), done));
-    }
-    finalize(): Promise<void> {
-      this.pack.finalize();
-      return Promise.resolve();
-    }
-    abort(): void {
-      this.pack.destroy();
-    }
-  }
-  return { TarArchive };
-});
-
-import { createExportStream, ExportFileSource, importFromStream } from './storage-transfer';
+import {
+  createExportStream,
+  DEFAULT_IMPORT_MAX_BYTES,
+  DEFAULT_IMPORT_MAX_ENTRIES,
+  DEFAULT_IMPORT_MAX_TOTAL_BYTES,
+  ExportFileSource,
+  importFromStream,
+} from './storage-transfer';
 
 const FILE_BYTES = 256 * 1024;
 const files = Array.from({ length: 12 }, (_, i) => `media/file-${String.fromCharCode(97 + i)}.bin`);
@@ -174,6 +140,28 @@ describe('createExportStream streams one file at a time', () => {
 
     expect(imported.get(files[1])?.equals(contentFor(files[1]))).toBe(true);
   });
+
+  // A key is an opaque name. A backslash, a doubled slash or a leading `word:` belongs to it, and an archive that
+  // rewrites any of them restores the file under a different key.
+  it.each([true, false])(
+    'writes every key under exactly the name it is stored by (size reported: %s)',
+    async withSize => {
+      const names = [
+        'media/back\\slash.bin',
+        'media/dir//double.bin',
+        '628123:4@s.whatsapp.net/c.jpg',
+        'status:x/y.bin',
+      ];
+      const { openFile } = trackingOpener({}, withSize);
+      const logger = makeLogger();
+      const output = await createExportStream(() => Promise.resolve(names), openFile, logger as never);
+
+      const imported = await importAll(output, logger);
+
+      expect([...imported.keys()]).toEqual(names);
+      expect(imported.get(names[0])?.equals(contentFor(names[0]))).toBe(true);
+    },
+  );
 
   it('fails the output with a read error part-way through a file and stops opening files', async () => {
     const { stats, openFile } = trackingOpener({ 'media/file-b.bin': 'read' });
@@ -362,5 +350,58 @@ describe('createExportStream and the per-entry import cap', () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('Raise STORAGE_IMPORT_MAX_BYTES'));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(`(${FILE_BYTES} bytes)`));
+  });
+});
+
+describe('the per-entry import cap boundary', () => {
+  const importOne = async (cap: string, size: number) => {
+    const prev = process.env.STORAGE_IMPORT_MAX_BYTES;
+    process.env.STORAGE_IMPORT_MAX_BYTES = cap;
+    const pack = tar.pack();
+    pack.entry({ name: 'only.bin' }, Buffer.alloc(size, 0x61));
+    pack.finalize();
+    try {
+      return await importFromStream(pack.pipe(createGzip()), () => Promise.resolve(), makeLogger() as never).catch(
+        (err: unknown) => err,
+      );
+    } finally {
+      if (prev === undefined) delete process.env.STORAGE_IMPORT_MAX_BYTES;
+      else process.env.STORAGE_IMPORT_MAX_BYTES = prev;
+    }
+  };
+
+  it('imports an entry of exactly the cap and aborts on one byte more', async () => {
+    expect(await importOne('10', 10)).toEqual({ imported: 1, failed: 0 });
+    const over = await importOne('10', 11);
+    expect(over).toBeInstanceOf(Error);
+    expect((over as Error).message).toMatch(/10-byte per-entry cap \(STORAGE_IMPORT_MAX_BYTES\)/);
+  });
+});
+
+describe('createExportStream and the entry-count limit this deployment lowered', () => {
+  it('warns above the lower limit, though the shipped default would not', async () => {
+    const prev = process.env.STORAGE_IMPORT_MAX_ENTRIES;
+    process.env.STORAGE_IMPORT_MAX_ENTRIES = '2';
+    const logger = makeLogger();
+    try {
+      const { openFile } = trackingOpener();
+      const output = await createExportStream(() => Promise.resolve(files.slice(0, 3)), openFile, logger as never);
+      await new Promise<void>(resolve => output.on('end', resolve).resume());
+    } finally {
+      if (prev === undefined) delete process.env.STORAGE_IMPORT_MAX_ENTRIES;
+      else process.env.STORAGE_IMPORT_MAX_ENTRIES = prev;
+    }
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('above the import limit of 2'));
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('Raise STORAGE_IMPORT_MAX_ENTRIES'));
+  });
+});
+
+// docs/14, .env.example and the upgrade notes state these figures, and an operator sizes an import
+// against them: a drifted default changes what an import is allowed to extract without a word.
+describe('storage import caps', () => {
+  it('ship at the documented defaults', () => {
+    expect(DEFAULT_IMPORT_MAX_BYTES).toBe(209_715_200);
+    expect(DEFAULT_IMPORT_MAX_ENTRIES).toBe(100_000);
+    expect(DEFAULT_IMPORT_MAX_TOTAL_BYTES).toBe(10_737_418_240);
   });
 });

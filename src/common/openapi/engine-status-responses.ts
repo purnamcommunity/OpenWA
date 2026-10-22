@@ -104,6 +104,17 @@ export const MESSAGE_NOT_FOUND_404 =
   "No such message: the id is outside the engine's lookup window (roughly the last hundred messages " +
   'of the chat, or absent from the Baileys store) or the message was revoked.';
 
+/**
+ * `MessageNotFoundError` (404) on the send routes that take a `quotedMessageId`. Not the react/delete
+ * wording: whatsapp-web.js looks the quote up by id in the page's message collection and then by
+ * `Msg.getMessagesById`, with no window of recent messages, and does not refuse a quote that resolves
+ * but cannot be replied to.
+ */
+export const QUOTED_MESSAGE_NOT_FOUND_404 =
+  'The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the ' +
+  'Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). ' +
+  'On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.';
+
 /** `ChannelNotFoundError` (404), on routes addressed by channel id. */
 export const CHANNEL_NOT_FOUND_404 =
   "No such channel — the id is not among the session's subscribed channels, either because it is " +

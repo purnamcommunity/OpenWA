@@ -108,9 +108,12 @@ mounted for any admin key.
 ```
 /                  → Dashboard (overview + charts)
 /sessions          → Sessions (create / start / stop / QR / delete)
-/chats             → Chats (Chats / Channels / Status tabs; chat list + message thread live via
-                     WebSocket; thread pages older history in on scroll-up; read-only channel
-                     feed on whatsapp-web.js)
+/chats             → Chats (Chats / Channels / Status tabs, quick filters and an Archived view on
+                     Chats; chat list + message thread live via WebSocket; thread pages older
+                     history in on scroll-up; per-chat menu (pin, mute, archive, mark unread,
+                     block, leave group; clear and delete on whatsapp-web.js only) [operator];
+                     group info dialog; new chat / new group [operator]; read-only channel feed
+                     on whatsapp-web.js)
 /webhooks          → Webhooks (per-session webhook endpoints)
 /templates         → Message Templates
 /message-tester    → Message Tester (ad-hoc send-* + check-number)
@@ -415,11 +418,15 @@ Chat-specific pieces live one level down in `components/chats/`: `MessageBody` (
 formatting + link detection), `ChatThread` (bubble list, including inbound Baileys prompt buttons
 that call `POST /sessions/:id/messages/click-button`), and `MediaLightbox` (the media viewer, built
 on `yet-another-react-lightbox`). The rest of the room is split the same way: `ChatSidebar`,
+`NewChatPanel` (new chat, and new group on Baileys), `ChatRowMenu` (a chat row's actions;
+`chatActionItems` lists them for the row and for the room's menu alike), `GroupInfoDialog` (a group's
+name, picture, description and participants), `ChatDialogs` (mute and save-contact dialogs),
 `ChatComposer`, `ChatAvatar`, `KindIcon`, `StatusComposeModal` and `StatusMedia`. Prompt choices
 arrive on live `message.received` as top-level `buttons` and are also stored in message
 `metadata.buttons` so a reload can re-render them. Clicking still requires the prompt to be in the
 engine store; an evicted prompt 404s. A read-only key sees the choices disabled and gets no reply,
-react or delete actions, the same as the disabled composer.
+react or delete actions, the same as the disabled composer, no New chat button, and of a chat's
+actions only a group's info.
 
 The message thread is paged. `useChatMessages` is a `useInfiniteQuery` whose cursor is the number
 of DB rows fetched so far, not the length of the rendered list — the thread also carries engine
@@ -479,8 +486,8 @@ Three pages keep a server list in local state instead of the query cache:
   it applies, it invalidates the `['sessions']` key prefix so the Dashboard and per-session views
   refetch.
 - **Chats** (`Chats.tsx`) reads the ready sessions directly on mount, and again when a search hit
-  names a session that list lacks, and keeps the chat list in local state that socket pushes, sends
-  and marking a chat read update.
+  names a session that list lacks, and keeps the chat list in local state that socket pushes, sends,
+  marking a chat read and the chat actions (pin, mute, archive, rename) update.
 - **Plugins** (`Plugins.tsx`) keeps the catalog in local state. It prefetches it silently on mount
   so installed cards can show an update chip, fetches it again when the Catalog tab opens with an
   empty list, and reloads it after any install, update or uninstall.
@@ -491,8 +498,10 @@ The client lives in `src/services/api.ts`. A single `request<T>()` helper attach
 header from `sessionStorage`, then returns **the parsed JSON body as-is** — the backend sends the
 raw handler payload, so `request<Session[]>('/sessions')` resolves to a bare `Session[]`, not
 `{ data: Session[] }`. (A `204 No Content` resolves to `undefined`; a `401`, or a `403` because the
-key's `allowedIps` refuse this client, clears the stored key and redirects to login; any other `403`
-leaves the key in place.) Endpoints are grouped into typed namespaces — `sessionApi`, `webhookApi`,
+key's `allowedIps` refuse this client, clears the stored key and redirects to login, but only when the
+stored key is the one the request carried: a late answer for a key since replaced fails like any other
+error, and a keyless request answered after sign-out stays silent. Any other `403` leaves the key in
+place.) Endpoints are grouped into typed namespaces — `sessionApi`, `webhookApi`,
 `templateApi`, `apiKeyApi`, `auditApi`, `messageApi`, `infraApi`, `pluginsApi`, `statsApi`, ...
 
 ```typescript
@@ -560,9 +569,10 @@ export function useStopSessionMutation() {
 }
 ```
 
-> **There is no `useSessionQr` polling hook.** QR codes are not fetched on a 30 s
-> `refetchInterval`. The Sessions page fetches the current QR imperatively via `sessionApi.getQR()`
-> and then receives fresh codes pushed over the WebSocket (`session.qr` events, see §17.6).
+> **There is no `useSessionQr` hook and no 30 s `refetchInterval`.** The Sessions page fetches the
+> current QR imperatively via `sessionApi.getQR()`, and `useSessionPairing` re-reads it with
+> `GET /sessions/:id/qr` every 5 s for as long as the QR modal is open; fresh codes are also pushed
+> over the WebSocket (`session.qr` events, see §17.6).
 
 ## 17.6 WebSocket Integration
 

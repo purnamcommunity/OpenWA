@@ -19,7 +19,7 @@ interface FetchAllPagesOptions {
 // route, and an hour's budget holds about 20 such walks.
 const THROTTLE_RETRIES = 2;
 
-async function retryThrottled<T>(fetchOnce: () => Promise<T>, delayMs: number): Promise<T> {
+export async function retryThrottled<T>(fetchOnce: () => Promise<T>, delayMs: number): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
       return await fetchOnce();

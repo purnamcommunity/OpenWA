@@ -28,6 +28,7 @@ import { redactSsrfError } from '../../common/security/ssrf-guard';
 import { HookManager } from '../../core/hooks';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 import { isWebhookBeforeResult } from '../../core/hooks/hook-results';
+import { WILDCARD_EXCLUDED_EVENTS, subscriptionCoversEvent } from '../../common/utils/wildcard-events';
 
 export interface WebhookPayload {
   event: string;
@@ -74,6 +75,13 @@ const DEFAULT_WEBHOOK_MAX_PAYLOAD_BYTES = 1024 * 1024;
 export { DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS };
 
 /**
+ * How long a session's answer to "which opt-in events does an active webhook name" is reused. Writes
+ * through WebhookService drop the answer at once on this node; a write on another instance (Redis
+ * deployment), or one that bypasses WebhookService, is picked up when it expires.
+ */
+const OPT_IN_SUBSCRIPTIONS_TTL_MS = 5000;
+
+/**
  * The result of one delivery attempt. Reported, not thrown: every delivery failure below is already
  * handled in place, so a try/catch cannot tell a delivered event from a dead-lettered one. Two
  * exceptions escape, both from shutdown, and both keep the outbox row pending: 'ConcurrencyLimiter
@@ -98,6 +106,13 @@ interface DispatchEventContext {
    * which runs inside an HTTP request: the in-process backoff schedule would hold it for minutes.
    */
   singleAttempt?: boolean;
+  /**
+   * Like `singleAttempt` for the direct path (the queue off, or the fallback for a failed enqueue), but
+   * an enabled queue is still used. Set by the reconciler, which replays its backlog one row after
+   * another: a retry schedule per row would hold every row behind an unreachable receiver for
+   * minutes, and the next sweep is the retry.
+   */
+  oneDirectAttempt?: boolean;
   /**
    * Ends a replay's retry backoff early and gives no further attempt. A replay holds no dispatch
    * slot, so the shutdown drain's limiter close cannot stop it; its owner aborts this instead.
@@ -174,6 +189,11 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
    * not replayed alongside itself.
    */
   private readonly locallyPending = new Map<string, number>();
+  /**
+   * Per session, the opt-in events (WILDCARD_EXCLUDED_EVENTS) that at least one active webhook names.
+   * The promise is cached, not its result, so a burst of receipts on a cold entry shares one lookup.
+   */
+  private readonly optInSubscriptions = new Map<string, { events: Promise<ReadonlySet<string>>; expiresAt: number }>();
 
   constructor(
     @InjectRepository(Webhook, 'data')
@@ -265,6 +285,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
   }
 
   async dispatch(sessionId: string, event: string, data: Record<string, unknown>): Promise<void> {
+    // An opt-in event fires per recipient (about 2,000 per message to a 1,000-member group): skip it
+    // before the per-dispatch webhook read when no active webhook of the session names it.
+    if (WILDCARD_EXCLUDED_EVENTS.includes(event) && !(await this.sessionNamesOptInEvent(sessionId, event))) return;
     const webhooks = await this.loadActiveWebhooks(sessionId, event);
     const matchingWebhooks = this.filterMatchingWebhooks(webhooks, event, data);
 
@@ -296,6 +319,50 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Drop the session's cached opt-in subscriptions. WebhookService calls this after every webhook
+   * create, update and delete, so a change made on this node applies to the next event.
+   */
+  invalidateOptInSubscriptions(sessionId: string): void {
+    this.optInSubscriptions.delete(sessionId);
+  }
+
+  /**
+   * Whether an active webhook of the session names `event`, read at most once per
+   * OPT_IN_SUBSCRIPTIONS_TTL_MS. A failed lookup is not cached and lets the event through, so
+   * dispatch's own lookup reports the failure as before.
+   */
+  private async sessionNamesOptInEvent(sessionId: string, event: string): Promise<boolean> {
+    const now = Date.now();
+    let entry = this.optInSubscriptions.get(sessionId);
+    if (!entry || entry.expiresAt <= now) {
+      const created = {
+        events: this.webhookRepository
+          .find({ select: { id: true, events: true }, where: { sessionId, active: true } })
+          .then(rows => {
+            const named = new Set<string>();
+            for (const row of rows) {
+              if (!Array.isArray(row.events)) continue;
+              for (const e of row.events) if (WILDCARD_EXCLUDED_EVENTS.includes(e)) named.add(e);
+            }
+            return named;
+          }),
+        expiresAt: now + OPT_IN_SUBSCRIPTIONS_TTL_MS,
+      };
+      // Identity check: an invalidation (or a newer entry) since this lookup started must not be undone.
+      created.events.catch(() => {
+        if (this.optInSubscriptions.get(sessionId) === created) this.optInSubscriptions.delete(sessionId);
+      });
+      this.optInSubscriptions.set(sessionId, created);
+      entry = created;
+    }
+    try {
+      return (await entry.events).has(event);
+    } catch {
+      return true;
+    }
+  }
+
+  /**
    * Callers fire-and-forget this (`void dispatch(...)`), so a failure looking up webhooks must be
    * logged and swallowed here — otherwise it surfaces as an unhandled promise rejection.
    */
@@ -322,9 +389,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     // other webhook of the session. A `filters` that is not a plain object, or a non-array `conditions`,
     // is refused explicitly: evaluateFilters reads either as "no filter", which would deliver every
     // subscribed event unfiltered.
-    const subscribed = webhooks.filter(
-      w => Array.isArray(w.events) && (w.events.includes(event) || w.events.includes('*')),
-    );
+    const subscribed = webhooks.filter(w => Array.isArray(w.events) && subscriptionCoversEvent(w.events, event));
     const matching = subscribed.filter(w => {
       try {
         const filters: unknown = w.filters;
@@ -949,7 +1014,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     event: string,
     idempotencyKey: string,
     data: Record<string, unknown>,
-    options: { singleAttempt?: boolean; signal?: AbortSignal } = {},
+    options: { singleAttempt?: boolean; oneDirectAttempt?: boolean; signal?: AbortSignal } = {},
   ): Promise<WebhookDeliveryOutcome> {
     const deliveryId = generateDeliveryId();
     const outcome = await this.deliverOne(webhook, deliveryId, idempotencyKey, {
@@ -957,6 +1022,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
       event,
       baseData: data,
       singleAttempt: options.singleAttempt,
+      oneDirectAttempt: options.oneDirectAttempt,
       signal: options.signal,
     });
     // The receiver has the event. An operator redrive of a failure row can find the same delivery
@@ -979,12 +1045,35 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * A finished job: its worker settled the delivery, so an outbox row still queued for it is a leftover and
+   * not a stranded send. Anything unreadable answers false here; isQueueJobPending already holds the
+   * conservative answer for that case.
+   */
+  async hasQueueJobCompleted(deliveryId: string): Promise<boolean> {
+    if (!this.webhookQueue) return false;
+    try {
+      await producerReady(this.webhookQueue);
+      const job = await this.webhookQueue.getJob(deliveryId);
+      return job ? (await job.getState()) === 'completed' : false;
+    } catch (error) {
+      this.logger.warn('Could not inspect queued webhook delivery', { deliveryId, error: String(error) });
+      return false;
+    }
+  }
+
   /** Finish a spent outbox replay budget only after its failure record is durable. */
   async recordReplayExhaustion(row: ReplayableDelivery, url: string): Promise<boolean> {
     const existing = await this.failureRepository.count({
       where: { webhookId: row.webhookId, idempotencyKey: row.idempotencyKey, attempts: MoreThan(0) },
     });
     if (existing > 0) return true;
+    // A delivery that was shed or refused before sending was recorded with its reason as an attempts-0 row,
+    // which the terminal row below replaces; keep that reason on it.
+    const unsent = await this.failureRepository.findOne({
+      where: { webhookId: row.webhookId, idempotencyKey: row.idempotencyKey, attempts: 0 },
+      select: { id: true, lastError: true },
+    });
     const recorded = await recordWebhookDeliveryFailure(this.failureRepository, this.logger, {
       webhookId: row.webhookId,
       sessionId: row.sessionId,
@@ -992,7 +1081,9 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
       url,
       idempotencyKey: row.idempotencyKey,
       attempts: Math.max(1, row.attempts),
-      lastError: 'Webhook replay budget exhausted',
+      lastError: unsent?.lastError
+        ? `Webhook replay budget exhausted; last error: ${unsent.lastError}`
+        : 'Webhook replay budget exhausted',
       ...(this.keepsFailurePayload() ? { payload: row.payload } : {}),
     });
     if (recorded === true) incrementWebhookDeliveryFailures();
@@ -1012,7 +1103,7 @@ export class WebhookDeliveryService implements OnModuleInit, OnModuleDestroy {
     return {
       yieldSlot: ctx.yieldSlot,
       replayData: this.keepsFailurePayload() ? ctx.baseData : undefined,
-      singleAttempt: ctx.singleAttempt,
+      singleAttempt: ctx.singleAttempt || ctx.oneDirectAttempt,
       signal: ctx.signal,
     };
   }

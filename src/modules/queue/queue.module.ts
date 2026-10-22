@@ -7,19 +7,15 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { WebhookProcessor } from './processors/webhook.processor';
 import { IngressProcessor } from './processors/ingress.processor';
 import { QUEUE_NAMES } from './queue-names';
-import { queueConnectionOptions } from './redis-connection';
+import { queueRootOptions } from './redis-connection';
 import { ShutdownSafeQueue } from './shutdown-safe-queue';
 import { Webhook } from '../webhook/entities/webhook.entity';
-import { WebhookOutboxService } from '../webhook/webhook-outbox.service';
-import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.entity';
+import { WebhookOutboxModule } from '../webhook/webhook-outbox.module';
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 import { IngressEvent } from '../integration/entities/ingress-event.entity';
 import { HooksModule } from '../../core/hooks/hooks.module';
 import { PluginsModule } from '../../core/plugins/plugins.module';
-
-// Re-export for backward compatibility
-export { QUEUE_NAMES } from './queue-names';
 
 /**
  * Bounded retention for finished webhook-queue jobs. Failed webhook jobs carry their full payload in
@@ -40,17 +36,16 @@ BullModule.queueClass = ShutdownSafeQueue;
     // Required for WebhookProcessor to inject Repository<Webhook> + Repository<WebhookDeliveryFailure>;
     // IngressProcessor to inject Repository<IntegrationDeliveryFailure> + Repository<IngressEvent> (all on
     // the 'data' connection).
-    TypeOrmModule.forFeature(
-      [Webhook, WebhookDeliveryFailure, WebhookOutboxEvent, IntegrationDeliveryFailure, IngressEvent],
-      'data',
-    ),
+    TypeOrmModule.forFeature([Webhook, WebhookDeliveryFailure, IntegrationDeliveryFailure, IngressEvent], 'data'),
+    // Required for WebhookProcessor to inject the one WebhookOutboxService the webhook module also uses.
+    WebhookOutboxModule,
     // Required for WebhookProcessor/IngressProcessor to inject HookManager
     HooksModule,
     // Required for IngressProcessor to inject PluginLoaderService (already @Global(), imported
     // explicitly for clarity, matching HooksModule above).
     PluginsModule,
     BullModule.forRootAsync({
-      useFactory: () => ({ connection: queueConnectionOptions() }),
+      useFactory: queueRootOptions,
     }),
     BullModule.registerQueue({
       name: QUEUE_NAMES.WEBHOOK,
@@ -78,7 +73,7 @@ BullModule.queueClass = ShutdownSafeQueue;
       adapter: BullMQAdapter,
     }),
   ],
-  providers: [WebhookProcessor, IngressProcessor, WebhookOutboxService],
+  providers: [WebhookProcessor, IngressProcessor],
   exports: [BullModule],
 })
 export class QueueModule {}

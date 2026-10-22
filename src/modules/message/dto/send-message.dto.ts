@@ -41,6 +41,15 @@ export const CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH = 1024;
 // (src/core/agent-tools/tools/message.tools.ts) so MCP and REST enforce the same limit.
 export const MESSAGE_TEXT_MAX_LENGTH = 4096;
 
+/**
+ * Caps for the ids a caller chooses: a chat id and a bulk batch id. Both end up in a btree index
+ * (the message chat indexes, UNIQUE(sessionId, batchId)), and PostgreSQL refuses an index entry past
+ * about 2.7 KB with an error the client sees as a 500, where SQLite takes any length. A WhatsApp JID is
+ * well under 100 characters, so 255 leaves room for every real id and matches the idempotency key cap.
+ */
+export const CHAT_ID_MAX_LENGTH = 255;
+export const BATCH_ID_MAX_LENGTH = 255;
+
 // The cap on a prompt choice's id. It must equal BUTTON_TEXT_MAX_LENGTH in the Baileys message
 // mapper, which refuses to offer any inbound choice whose id is longer, so an id past this bound
 // can never name a choice that exists. Validating it against the text cap instead accepted such a
@@ -108,9 +117,11 @@ export class SendTextMessageDto {
   @ApiProperty({
     description: 'WhatsApp chat ID (phone@c.us for individual, groupId@g.us for groups)',
     example: '628123456789@c.us',
+    maxLength: CHAT_ID_MAX_LENGTH,
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({
@@ -207,9 +218,11 @@ export class SendMediaMessageDto {
   @ApiProperty({
     description: 'WhatsApp chat ID',
     example: '628123456789@c.us',
+    maxLength: CHAT_ID_MAX_LENGTH,
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiPropertyOptional({

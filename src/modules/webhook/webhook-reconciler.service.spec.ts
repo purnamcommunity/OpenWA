@@ -44,6 +44,7 @@ describe('WebhookReconcilerService', () => {
     isLocallyPending: jest.Mock;
     recordReplayExhaustion: jest.Mock;
     isQueueJobPending: jest.Mock;
+    hasQueueJobCompleted: jest.Mock;
   };
   let webhooks: { findOne: jest.Mock };
   let service: WebhookReconcilerService;
@@ -58,6 +59,7 @@ describe('WebhookReconcilerService', () => {
       redeliver: jest.fn().mockResolvedValue('delivered'),
       recordReplayExhaustion: jest.fn().mockResolvedValue(true),
       isQueueJobPending: jest.fn().mockResolvedValue(false),
+      hasQueueJobCompleted: jest.fn().mockResolvedValue(false),
       isLocallyPending: jest.fn().mockReturnValue(false),
     };
     webhooks = {
@@ -79,7 +81,7 @@ describe('WebhookReconcilerService', () => {
       'message.received',
       'stored-key_wh-1',
       { from: '628123456789@c.us' },
-      { signal: expect.any(AbortSignal) as AbortSignal },
+      { signal: expect.any(AbortSignal) as AbortSignal, oneDirectAttempt: false },
     );
     // redeliver retires a delivered event's row itself; a second close here only repeats the write.
     expect(outbox.close).not.toHaveBeenCalled();
@@ -103,6 +105,68 @@ describe('WebhookReconcilerService', () => {
     // Left pending on purpose: the next sweep picks it up again until the budget runs out.
     expect(outbox.close).not.toHaveBeenCalled();
     expect(stats).toMatchObject({ replayed: 0, failed: 1 });
+  });
+
+  // Direct mode replays one row at a time with the full retry schedule. A receiver that never answers
+  // would cost that schedule per stranded row and hold every webhook queued behind it.
+  describe('a receiver that already failed in this pass', () => {
+    const replayedWith = (): Array<[string, boolean]> =>
+      delivery.redeliver.mock.calls.map(
+        ([wh, , , key, , options]: [
+          { id: string },
+          string,
+          string,
+          string,
+          unknown,
+          { oneDirectAttempt: boolean },
+        ]) => [`${wh.id}/${key}`, options.oneDirectAttempt],
+      );
+
+    beforeEach(() => {
+      webhooks.findOne.mockImplementation(({ where }: { where: { id: string } }) =>
+        Promise.resolve({ id: where.id, sessionId: 'sess-1', active: true, events: ['*'] }),
+      );
+      outbox.findStale.mockResolvedValue([
+        row({ id: 'r1', webhookId: 'wh-down', idempotencyKey: 'k1' }),
+        row({ id: 'r2', webhookId: 'wh-down', idempotencyKey: 'k2' }),
+        row({ id: 'r3', webhookId: 'wh-up', idempotencyKey: 'k3' }),
+        row({ id: 'r4', webhookId: 'wh-down', idempotencyKey: 'k4' }),
+      ]);
+    });
+
+    it('gets one attempt per further row, while other webhooks keep the full schedule', async () => {
+      delivery.redeliver.mockImplementation((wh: { id: string }) =>
+        Promise.resolve(wh.id === 'wh-down' ? 'failed' : 'delivered'),
+      );
+
+      const stats = await service.sweep(OPTS);
+
+      expect(replayedWith()).toEqual([
+        ['wh-down/k1', false],
+        ['wh-down/k2', true],
+        ['wh-up/k3', false],
+        ['wh-down/k4', true],
+      ]);
+      expect(stats).toMatchObject({ replayed: 1, failed: 3 });
+    });
+
+    it('is forgotten by the next sweep, which gives the receiver its full schedule again', async () => {
+      delivery.redeliver.mockResolvedValue('failed');
+      await service.sweep(OPTS);
+      delivery.redeliver.mockClear();
+
+      await service.sweep(OPTS);
+
+      expect(replayedWith()[0]).toEqual(['wh-down/k1', false]);
+    });
+
+    it('does not count an unexpected fault as the receiver being down', async () => {
+      delivery.redeliver.mockRejectedValue(new Error('boom'));
+
+      await service.sweep(OPTS);
+
+      expect(replayedWith().every(([, once]) => !once)).toBe(true);
+    });
   });
 
   it('leaves retirement of an enqueued replay to the worker', async () => {
@@ -165,6 +229,22 @@ describe('WebhookReconcilerService', () => {
     expect(outbox.close).not.toHaveBeenCalled();
   });
 
+  it('closes a queued row whose job already completed instead of replaying it', async () => {
+    // A worker settled the job but its outbox row was left behind (a worker that never closes the outbox, or a
+    // failed close). A replay would POST an event the receiver already has, up to the budget, and then record
+    // a failure for a delivery that succeeded.
+    outbox.findStale.mockResolvedValue([row({ state: 'queued', deliveryId: 'job' })]);
+    delivery.hasQueueJobCompleted.mockResolvedValue(true);
+
+    const stats = await service.sweep(OPTS);
+
+    expect(outbox.close).toHaveBeenCalledWith('wh-1', 'stored-key_wh-1', 'dispatched');
+    expect(delivery.redeliver).not.toHaveBeenCalled();
+    expect(outbox.countAttempt).not.toHaveBeenCalled();
+    expect(delivery.recordReplayExhaustion).not.toHaveBeenCalled();
+    expect(stats).toMatchObject({ skipped: 1, replayed: 0, failed: 0 });
+  });
+
   it('does not replay to a subscription that is gone or switched off', async () => {
     outbox.findStale.mockResolvedValue([row()]);
     webhooks.findOne.mockResolvedValue({ id: 'wh-1', active: false });
@@ -213,6 +293,20 @@ describe('WebhookReconcilerService', () => {
     expect(delivery.redeliver).not.toHaveBeenCalled();
     expect(outbox.close).not.toHaveBeenCalled();
     expect(stats).toMatchObject({ scanned: 1, skipped: 1, replayed: 0, failed: 0 });
+  });
+
+  it('moves its cursor past rows a page read could not return, instead of reading them again', async () => {
+    // A page made only of rows whose stored payload is unreadable returns nothing, but it was scanned.
+    outbox.findStale.mockImplementationOnce((_cutoff, _limit, _after, onScanned?: (lastId: string) => void) => {
+      onScanned?.('row-9');
+      return Promise.resolve([]);
+    });
+
+    await service.sweep(OPTS);
+    expect(outbox.findStale).toHaveBeenCalledTimes(1);
+
+    await service.sweep(OPTS);
+    expect((outbox.findStale.mock.calls as unknown[][])[1][2]).toBe('row-9');
   });
 
   it('never stacks a second pass on top of a slow one', async () => {

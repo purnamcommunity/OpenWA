@@ -7,8 +7,11 @@ import type { AnyToolDescriptor } from './tool-descriptor';
 
 /**
  * Run one tool call with REST-equivalent guarantees, reusing core's own auth:
- * auth (role + allowedSessions + IP fail-closed) → validate input → handler.
- * Mirrors the REST guard-then-pipe order (auth before validation).
+ * auth (role + allowedSessions + IP fail-closed) → chat gate (a chat-restricted key may run only a
+ * tool that carries a `chatScope` mark) → validate input → NUL check → chat arguments and
+ * `quotedMessageId` → handler.
+ * Mirrors the REST guard-then-pipe order (auth before validation). The chat arguments are checked
+ * on the parsed values, so schema normalization cannot change the authorized target.
  * `clientIp` is undefined over MCP — a key with allowedIps therefore fails closed
  * inside validateApiKey (documented limitation).
  *
@@ -18,8 +21,9 @@ import type { AnyToolDescriptor } from './tool-descriptor';
  * string, preventing pre-auth bucket allocation by anonymous callers.
  * @param onAuthFailure Optional callback invoked with the error when the AUTH
  * phase rejects (missing/invalid/revoked/expired key, wrong role, IP/session not
- * allowed). Chat argument checks run after parsing so normalized values remain
- * authorized. Handler errors do not reach this callback. Re-thrown after it.
+ * allowed, a tool the chat-restricted key may not run, or a chat argument outside
+ * its allowlist). Schema validation errors and handler errors do not reach this
+ * callback. Re-thrown after it.
  */
 export async function invokeTool(
   tool: AnyToolDescriptor,

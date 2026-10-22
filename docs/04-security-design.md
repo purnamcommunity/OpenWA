@@ -83,15 +83,17 @@ three scoping dimensions enforced by `ApiKeyGuard`.
 A route declares its minimum level with `@RequireRole(...)`; a key passes when its role ranks at or
 above that level (`AuthService.hasPermission`). A key below it is rejected with `403 Forbidden`.
 
-| Scope     | Field             | Effect                                                                                                                                                             |
-| --------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Source IP | `allowedIps`      | Empty/absent = unrestricted; non-empty = fail-closed IP whitelist (see §4.3)                                                                                       |
-| Sessions  | `allowedSessions` | Empty/absent = every session; non-empty = a request carrying any other session id is rejected with `403`                                                           |
-| Chats     | `allowedChats`    | Empty/absent = every chat; non-empty = default-deny: only chat-scoped routes, and only for a listed chat, else `403`; `/events`, MCP and Bull Board refuse the key |
+| Scope     | Field             | Effect                                                                                                                                                                                                              |
+| --------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source IP | `allowedIps`      | Empty/absent = unrestricted; non-empty = fail-closed IP whitelist (see §4.3)                                                                                                                                        |
+| Sessions  | `allowedSessions` | Empty/absent = every session; non-empty = a session named in the route path outside the list is rejected with `403`, and a `sessionId` filter in the query or body is narrowed to the list (an empty result, `200`) |
+| Chats     | `allowedChats`    | Empty/absent = every chat; non-empty = default-deny: only chat-scoped routes, MCP tools and events, only for a listed chat, else `403` (an event outside the list is never delivered); Bull Board refuses it        |
 
 The key-lifecycle routes (`/api/auth/api-keys`) are additionally fenced with `@RequireUnscopedKey()`:
 a session-scoped key is refused there whatever its role, so it cannot mint or widen credentials
-beyond its own confinement.
+beyond its own confinement. The same fence covers the other routes that act on the whole deployment:
+every `/api/infra` route, the plugin routes (except the per-session config override), `GET /api/settings`,
+`GET /api/stats/overview` and `/messages`, `POST /api/sessions` and the proxy setter. `SECURITY.md` lists them.
 
 A session's egress proxy (`proxyUrl` on `POST /api/sessions`, `PATCH /api/sessions/:sessionId/proxy`)
 is set only by an unscoped `admin` key; any other key gets `403`. The proxy is trusted egress chosen by
@@ -112,7 +114,8 @@ found where it was saved, or replaced. Try these in order. If every key stopped 
    key is no longer active (revoked, expired or deleted). While the file holds a live key, the
    startup banner ends with `(full key in <path>)`. Read it with `cat data/.api-key`, with
    `docker compose exec openwa-api cat /app/data/.api-key` on the compose deployment, or with
-   `kubectl exec openwa-0 -- cat /app/data/.api-key` on the Helm chart (release `openwa`). The key
+   `kubectl exec openwa-0 -- cat /app/data/.api-key` on the Helm chart (release `openwa`). The file has no
+   trailing newline, so the shell prompt follows the key on the same line: copy only the key. The key
    manages keys only while it still meets step 2's conditions. Once it is demoted from `admin`,
    given any `allowedSessions` or `allowedChats`, or given `allowedIps` that exclude your address,
    the file and the banner line remain but key management is refused; go on to step 2 or 3.
@@ -282,13 +285,13 @@ flowchart TB
 
 ### Validation Examples
 
-| Field                        | Rules                                                                                                                                            |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `chatId`                     | Non-empty string — **no format pattern**; the engine resolves the id, so `@c.us`, `@g.us`, `@lid`, `@newsletter` and `status@broadcast` all pass |
-| `phoneNumber` (pairing code) | Pattern: `^[0-9]{6,15}$` — digits only, international format                                                                                     |
-| `url`                        | Valid URL (`require_tld: false`, so single-label hosts like `http://localhost:3000` pass); HTTPS is a recommendation, not enforced               |
-| `text`                       | Max 4096 chars (`send-text`)                                                                                                                     |
-| `sessionName`                | Alphanumeric + hyphen, 3-50 chars                                                                                                                |
+| Field                        | Rules                                                                                                                                                                      |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chatId`                     | Non-empty string of at most 255 characters — **no format pattern**; the engine resolves the id, so `@c.us`, `@g.us`, `@lid`, `@newsletter` and `status@broadcast` all pass |
+| `phoneNumber` (pairing code) | Pattern: `^[0-9]{6,15}$` — digits only, international format                                                                                                               |
+| `url`                        | Valid URL (`require_tld: false`, so single-label hosts like `http://localhost:3000` pass); HTTPS is a recommendation, not enforced                                         |
+| `text`                       | Max 4096 chars (`send-text`)                                                                                                                                               |
+| `sessionName`                | Alphanumeric + hyphen, 3-50 chars                                                                                                                                          |
 
 ### DTO Validation
 
@@ -297,6 +300,7 @@ flowchart TB
 export class SendTextMessageDto {
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH) // 255
   chatId: string;
 
   @IsString()
@@ -421,10 +425,10 @@ app.enableCors({
   },
   credentials: corsPolicy.credentials, // false whenever the allowlist is a wildcard
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization', 'X-Request-ID'],
+  allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization', 'X-Request-ID', 'Idempotency-Key'],
   // Throttlers are named, so rate-limit headers carry a per-window suffix
   // (see "Response on limit" above); there are no unsuffixed variants.
-  exposedHeaders: ['X-RateLimit-Limit-short', 'X-RateLimit-Remaining-short', '...'],
+  exposedHeaders: ['X-RateLimit-Limit-short', 'X-RateLimit-Remaining-short', '...', 'Idempotent-Replayed'],
   maxAge: 86400, // 24 hours
 });
 ```
@@ -552,7 +556,8 @@ app.use(helmet({
 > (updates carry before/after authorization state), rejected authentication, session lifecycle
 > (including disconnects caused by WhatsApp unlinking the device, account restrictions and their
 > lifting, and refused rebinds), integration-instance creation, update, secret rotation, deletion,
-> redrive, and scope-binding bridge failures, send-pacing refusals (sampled) and breaker trips, the
+> redrive, and scope-binding bridge failures, plugin install, update, uninstall, enable, disable, configuration and session
+> activation, webhook delivery-failure redrive batches, send-pacing refusals (sampled) and breaker trips, the
 > infra operations (config save, restart request, data export/import, storage export/import),
 > WebSocket rate-limit violations (sampled — see §4.6), and Bull Board queue mutations. Enum
 > members for API-key use, session connected, message sends, and webhook lifecycle are explicitly
@@ -652,7 +657,7 @@ flowchart TB
 | Plugin instance secrets (`plugin_instances.secret`, `verifyToken`, `config`) | Database: **plaintext**; `secret`, `verifyToken` and secret-marked config are masked on API reads, but `GET /api/infra/export-data` includes them verbatim        | Per instance (regenerate-secret)                                   |
 | Session auth state                                                           | File system (data volume) — **not encrypted**                                                                                                                     | Never (tied to the WA session)                                     |
 
-> `API_MASTER_KEY` only seeds the first ADMIN key, and is read only while the key table is empty. Changing it later has no effect: the new value never authenticates and the seeded key stays valid. Rotate by minting a new ADMIN key with `POST /api/auth/api-keys` and revoking the seeded `Default Admin Key`.
+> `API_MASTER_KEY` only seeds the first ADMIN key, and is read only while the key table is empty. Changing it later has no effect: the new value never authenticates and the seeded key stays valid. A value that is set must still be at least 32 characters and not a known default on every production boot, or the boot refuses to start; unset it after rotating. Rotate by minting a new ADMIN key with `POST /api/auth/api-keys` and revoking the seeded `Default Admin Key`.
 
 > There is no application `ENCRYPTION_KEY` — OpenWA does not encrypt data at rest (see §4.4). The rotation cadences above are operational recommendations, not enforced by the app.
 
@@ -775,7 +780,7 @@ npm audit --json > audit-report.json
 
 ```yaml
 # .github/dependabot.yml, root npm ecosystem only (the file also covers /dashboard,
-# /sdk/javascript, github-actions, docker and docker-compose). The comment above each
+# /sdk/javascript, /sdk/python, /sdk/java, /sdk/php, /sdk/go, github-actions, docker and docker-compose). The comment above each
 # ignore is omitted here.
 version: 2
 updates:

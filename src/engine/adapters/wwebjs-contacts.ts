@@ -2,7 +2,7 @@ import { type Client } from 'whatsapp-web.js';
 import { InternalServerErrorException } from '@nestjs/common';
 import { Contact } from '../interfaces/whatsapp-engine.interface';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
-import { userPart } from '../identity/wa-id';
+import { parseWaId, userPart } from '../identity/wa-id';
 import { readVerifiedName, readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
 import { type WwebjsEngineHost, withPage } from './wwebjs-host';
 import { isProtocolTimeout } from './wwebjs-lifecycle';
@@ -125,10 +125,39 @@ export class WwebjsContacts {
       // one, so a consumer that sees only those two fields has nothing to call a contact WhatsApp's
       // own UI names on screen, and falls back to rendering the phone number.
       verifiedName: readVerifiedName(c),
-      number: c.number,
+      // whatsapp-web.js answers a contact migrated to privacy-id addressing under its phone id (the
+      // model's `phoneNumber`) but leaves `number` at the LID's digits, so a user id's number is read
+      // from the id. A LID with no known phone keeps the engine's number.
+      number: parseWaId(id).kind === 'user' ? userPart(id) : c.number,
       isMyContact: c.isMyContact,
       isBlocked: c.isBlocked,
     };
+  }
+
+  /**
+   * WhatsApp Web holds a contact migrated to privacy-id addressing twice, as its LID record and its
+   * phone record, and {@link toContact} reads the first under the phone id, so one id comes back twice.
+   * The copies are folded into the first one's place, which keeps the paging order stable, and a name or
+   * a flag only the other copy holds survives (a block is never dropped).
+   */
+  private static mergeById(contacts: Contact[]): Contact[] {
+    const byId = new Map<string, Contact>();
+    for (const c of contacts) {
+      const first = byId.get(c.id);
+      byId.set(
+        c.id,
+        first
+          ? {
+              ...first,
+              name: first.name ?? c.name,
+              pushName: first.pushName ?? c.pushName,
+              isMyContact: first.isMyContact || c.isMyContact,
+              isBlocked: first.isBlocked || c.isBlocked,
+            }
+          : c,
+      );
+    }
+    return [...byId.values()];
   }
 
   async getContacts(): Promise<Contact[]> {
@@ -195,7 +224,7 @@ export class WwebjsContacts {
     if (unreadable > 0) {
       this.host.logger.warn(`Skipped ${unreadable} contact(s) WhatsApp Web could not read`, { error: firstError });
     }
-    return contacts;
+    return WwebjsContacts.mergeById(contacts);
   }
 
   async getContactById(contactId: string): Promise<Contact | null> {
@@ -228,7 +257,12 @@ export class WwebjsContacts {
     }
   }
 
-  async getNumberId(number: string): Promise<string | null> {
+  /**
+   * The lookup as WhatsApp Web answers it: `<lid>@lid` for a contact migrated to privacy-id addressing,
+   * else `<phone>@c.us`, or null when the number is not registered. The send path needs the `@lid`
+   * (see WwebjsMessaging.resolveSendId); {@link getNumberId} is the answer that crosses the engine boundary.
+   */
+  async lookupNumberId(number: string): Promise<string | null> {
     this.host.ensureReady();
     const numberId = await withPage(this.host, 'getNumberId', () => this.client().getNumberId(number));
     // Read both property names: a WA Web build that renamed `_serialized` would otherwise make
@@ -236,8 +270,16 @@ export class WwebjsContacts {
     return readWid(numberId) ?? null;
   }
 
+  async getNumberId(number: string): Promise<string | null> {
+    const wid = await this.lookupNumberId(number);
+    // The contract is the neutral `<phone>@c.us`, which is what the Baileys engine answers. A migrated
+    // contact's lookup names its `@lid`, the engine's own scheme; the phone the caller supplied is the
+    // stable neutral id, and a send to it re-resolves to the lid.
+    return wid?.endsWith('@lid') ? `${userPart(number).replace(/\D/g, '')}@c.us` : wid;
+  }
+
   async checkNumberExists(number: string): Promise<boolean> {
-    return (await this.getNumberId(number)) !== null;
+    return (await this.lookupNumberId(number)) !== null;
   }
 
   async resolveContactPhone(contactId: string): Promise<string | null> {
@@ -285,12 +327,14 @@ export class WwebjsContacts {
   /**
    * The read half of block/unblockContact. Ids only — the neutral common subset with Baileys,
    * whose blocklist query answers bare jids. An entry whose wid is unreadable (#747 rename
-   * hazard) is dropped rather than reported as the literal "undefined".
+   * hazard) is dropped rather than reported as the literal "undefined". A contact blocked under both
+   * its LID and its phone is two entries that read as one id, which is listed once.
    */
   async getBlockedContacts(): Promise<string[]> {
     this.host.ensureReady();
     const contacts = await withPage(this.host, 'getBlockedContacts', () => this.client().getBlockedContacts());
-    return contacts.map(c => readWid(c.id as unknown as SerializedWid)).filter((id): id is string => Boolean(id));
+    const ids = contacts.map(c => readWid(c.id as unknown as SerializedWid)).filter((id): id is string => Boolean(id));
+    return [...new Set(ids)];
   }
 
   async unblockContact(contactId: string): Promise<void> {

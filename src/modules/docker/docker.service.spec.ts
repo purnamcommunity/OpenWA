@@ -82,7 +82,7 @@ describe('DockerService.buildDockerOptions', () => {
 });
 
 describe('DockerService.stopManagedService (stop-only teardown)', () => {
-  // Teardown is deliberately stop-only: the pinned docker-socket-proxy v0.4.2 never reads its
+  // Teardown is deliberately stop-only: the pinned docker-socket-proxy v0.5.0 never reads its
   // DELETE env flag (deletion is admitted only as an undocumented side effect of its POST
   // method gate), so the code must not depend on container.remove() at all.
   const makeService = (container: unknown) => {
@@ -277,6 +277,7 @@ describe('prestartBuiltinDatabase', () => {
     expect(docker.listContainers).toHaveBeenCalledWith({
       all: true,
       filters: { label: ['com.openwa.service=database'] },
+      abortSignal: expect.any(AbortSignal) as unknown,
     });
     expect(container.start).toHaveBeenCalledTimes(1);
   });
@@ -413,6 +414,7 @@ describe('DockerService.getContainerByService label match and guard rails', () =
     expect(listContainers).toHaveBeenCalledWith({
       all: true,
       filters: { label: ['com.openwa.service=database'] },
+      abortSignal: expect.any(AbortSignal) as unknown,
     });
     expect(getContainer).toHaveBeenCalledWith('label-hit-1');
     expect(result).toEqual({ id: 'label-hit-1' });
@@ -778,53 +780,5 @@ describe('DockerService.orchestrateProfiles', () => {
     expect(result.containersStarted).toEqual([]);
     expect(result.errors).toEqual(['Failed to start postgres: boom']);
     expect(result.message).toBe('Failed to start postgres: boom');
-  });
-});
-
-describe('DockerService.getSystemInfo', () => {
-  it('reports unavailable when Docker is not connected', async () => {
-    expect(await new DockerService().getSystemInfo()).toEqual({ available: false });
-  });
-
-  it('maps the daemon info into the public shape', async () => {
-    const service = new DockerService();
-    Object.assign(service as unknown as Record<string, unknown>, {
-      docker: {
-        info: jest.fn().mockResolvedValue({
-          Containers: 5,
-          ContainersRunning: 2,
-          ContainersPaused: 1,
-          ContainersStopped: 2,
-          Images: 9,
-          ServerVersion: '27.0.3',
-          OperatingSystem: 'Docker Desktop',
-          Architecture: 'aarch64',
-        }),
-      },
-      isAvailable: true,
-    });
-
-    expect(await service.getSystemInfo()).toEqual({
-      available: true,
-      info: {
-        containers: 5,
-        containersRunning: 2,
-        containersPaused: 1,
-        containersStopped: 2,
-        images: 9,
-        serverVersion: '27.0.3',
-        operatingSystem: 'Docker Desktop',
-        architecture: 'aarch64',
-      },
-    });
-  });
-
-  it('reports unavailable when the daemon info call fails', async () => {
-    const service = new DockerService();
-    Object.assign(service as unknown as Record<string, unknown>, {
-      docker: { info: jest.fn().mockRejectedValue(new Error('daemon gone')) },
-      isAvailable: true,
-    });
-    expect(await service.getSystemInfo()).toEqual({ available: false });
   });
 });

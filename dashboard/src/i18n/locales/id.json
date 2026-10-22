@@ -62,6 +62,7 @@
     "dashboard": "Dasbor",
     "sessions": "Sesi",
     "chats": "Obrolan",
+    "numberChecker": "Pemeriksa Nomor",
     "webhooks": "Webhook",
     "templates": "Templat",
     "apiKeys": "Kunci API",
@@ -71,6 +72,7 @@
     "logs": "Log"
   },
   "chats": {
+    "edited": "Diedit",
     "media": {
       "location": "Lokasi",
       "call": "Panggilan",
@@ -95,6 +97,7 @@
     "loadingMessages": "Memuat pesan...",
     "loadingOlderMessages": "Memuat pesan lama...",
     "loadOlderMessagesError": "Gagal memuat pesan lama. Gulir ke atas untuk mencoba lagi.",
+    "loadOlderMessagesRetryHint": "Gulir ke atas untuk mencoba lagi.",
     "noMessagesInChat": "Belum ada pesan. Kirim pesan pertama untuk memulai!",
     "downloadDocument": "Unduh dokumen",
     "actions": {
@@ -199,6 +202,133 @@
       "delivered": "Diterima",
       "read": "Dibaca",
       "failed": "Gagal"
+    },
+    "clearSearch": "Hapus pencarian",
+    "filters": {
+      "label": "Filter obrolan",
+      "all": "Semua",
+      "unread": "Belum dibaca",
+      "direct": "Obrolan 1:1",
+      "groups": "Grup",
+      "unknown": "Tidak dikenal"
+    },
+    "noFilterResults": "Tidak ada obrolan yang cocok dengan filter ini",
+    "moreActions": "Tindakan lainnya",
+    "copyChatId": "Salin ID obrolan",
+    "chatIdCopied": "ID obrolan disalin",
+    "copyFailed": "Tidak dapat menyalin ke papan klip",
+    "closeChat": "Tutup obrolan",
+    "chatId": "ID obrolan",
+    "newChat": {
+      "title": "Obrolan baru",
+      "searchPlaceholder": "Cari nama atau nomor dengan kode negara",
+      "startWithNumber": "Mulai obrolan dengan {{number}}",
+      "contacts": "Kontak",
+      "noContacts": "Tidak ada kontak ditemukan",
+      "loadingContacts": "Memuat kontak...",
+      "contactsError": "Tidak dapat memuat kontak",
+      "checking": "Memeriksa nomor...",
+      "notOnWhatsApp": "{{number}} tidak terdaftar di WhatsApp",
+      "checkFailed": "Tidak dapat memeriksa nomor",
+      "numberHint": "Masukkan nomor dengan kode negara, mis. +62 812 3456 7890"
+    },
+    "newGroup": {
+      "title": "Grup baru",
+      "namePlaceholder": "Nama grup",
+      "participantsPlaceholder": "Cari peserta atau masukkan nomor",
+      "addNumber": "Tambahkan {{number}}",
+      "selected": "{{count}} dipilih",
+      "create": "Buat grup",
+      "created": "Grup \"{{name}}\" dibuat",
+      "createFailed": "Tidak dapat membuat grup",
+      "removeParticipant": "Hapus {{name}}"
+    },
+    "group": {
+      "info": "Info grup",
+      "leave": "Keluar dari grup",
+      "leaveConfirm": "Keluar dari grup \"{{name}}\"?",
+      "left": "Keluar dari \"{{name}}\"",
+      "leaveFailed": "Tidak dapat keluar dari grup",
+      "editTitle": "Edit grup",
+      "tabInfo": "Info",
+      "tabParticipants": "Peserta",
+      "managedBy": "Dikelola melalui {{session}}",
+      "notAdmin": "Bukan admin melalui {{session}}",
+      "name": "Nama grup",
+      "picture": "Foto grup",
+      "pictureHint": "Klik kolom ini untuk memilih foto grup baru.",
+      "readOnlyHint": "Hanya admin grup yang dapat mengubah grup ini.",
+      "description": "Deskripsi",
+      "descriptionPlaceholder": "Deskripsi grup (opsional)",
+      "save": "Simpan perubahan",
+      "saved": "Grup diperbarui",
+      "saveFailed": "Tidak dapat menyimpan grup",
+      "loadFailed": "Tidak dapat memuat info grup",
+      "participantCount": "Peserta: {{count}}",
+      "admin": "Admin",
+      "owner": "Pembuat",
+      "makeAdmin": "Jadikan admin",
+      "removeAdmin": "Hapus admin",
+      "remove": "Hapus",
+      "removeConfirm": "Hapus {{name}} dari grup?",
+      "add": "Tambah",
+      "addPlaceholder": "Tambahkan nomor dengan kode negara",
+      "memberActionFailed": "Tindakan gagal",
+      "leaveWarning": "Anda tidak akan menerima pesannya lagi, dan hanya admin grup yang dapat menambahkan Anda kembali."
+    },
+    "rowActions": {
+      "actionsFor": "Tindakan untuk {{name}}",
+      "markUnread": "Tandai belum dibaca",
+      "markUnreadFailed": "Tidak dapat menandai obrolan belum dibaca",
+      "clear": "Kosongkan obrolan",
+      "clearConfirm": "Hapus semua pesan dalam obrolan dengan {{name}}?",
+      "clearWarning": "Obrolan tetap ada di daftar. Gateway juga menghapus salinan pesan yang disimpannya, termasuk media; ekspor riwayat dulu jika Anda membutuhkannya.",
+      "cleared": "Obrolan dengan {{name}} dikosongkan",
+      "clearFailed": "Tidak dapat mengosongkan obrolan",
+      "delete": "Hapus obrolan",
+      "deleteConfirm": "Hapus obrolan dengan {{name}}?",
+      "deleteWarning": "Obrolan hilang dari daftar, dan gateway menghapus salinan pesan yang disimpannya, termasuk media.",
+      "deleted": "Obrolan dengan {{name}} dihapus",
+      "deleteFailed": "Tidak dapat menghapus obrolan",
+      "saveContact": "Simpan kontak",
+      "renameContact": "Ganti nama kontak",
+      "firstName": "Nama depan",
+      "lastName": "Nama belakang (opsional)",
+      "contactSaved": "Kontak disimpan",
+      "contactSaveFailed": "Tidak dapat menyimpan kontak",
+      "pin": "Sematkan obrolan",
+      "unpin": "Lepas sematan obrolan",
+      "pinFailed": "Tidak dapat menyematkan obrolan. WhatsApp mengizinkan paling banyak tiga obrolan disematkan.",
+      "unpinFailed": "Tidak dapat melepas sematan obrolan",
+      "pinnedLabel": "Disematkan",
+      "mute": "Bisukan notifikasi",
+      "unmute": "Bunyikan notifikasi",
+      "mutedLabel": "Dibisukan",
+      "muteTitle": "Bisukan \"{{name}}\"",
+      "muteHint": "Peserta lain tidak diberi tahu bahwa Anda membisukan obrolan. Anda tetap diberi tahu saat disebut.",
+      "muteFailed": "Tidak dapat mengubah notifikasi",
+      "archive": "Arsipkan obrolan",
+      "unarchive": "Batal arsipkan obrolan",
+      "archived": "Obrolan diarsipkan",
+      "unarchived": "Obrolan dikeluarkan dari arsip",
+      "archiveFailed": "Tidak dapat mengubah arsip",
+      "archivedEntry": "Diarsipkan",
+      "archivedTitle": "Obrolan diarsipkan",
+      "archiveEmpty": "Tidak ada obrolan diarsipkan",
+      "declined": "WhatsApp menolak perubahan.",
+      "block": "Blokir kontak",
+      "unblock": "Buka blokir kontak",
+      "blockConfirm": "Blokir {{name}}?",
+      "blockWarning": "Kontak yang diblokir tidak dapat lagi menelepon atau mengirim pesan kepada Anda.",
+      "blocked": "{{name}} diblokir",
+      "unblocked": "Blokir {{name}} dibuka",
+      "blockFailed": "Tidak dapat mengubah blokir",
+      "muteFor": {
+        "8h": "8 jam",
+        "1w": "1 minggu",
+        "always": "Selalu"
+      },
+      "saveContactUnavailable": "Memerlukan nomor telepon yang diketahui: obrolan ini hanya memiliki ID privasi (@lid)."
     }
   },
   "errorBoundary": {
@@ -518,6 +648,7 @@
       "message.received": "Saat pesan diterima",
       "message.sent": "Saat pesan dikirim",
       "message.ack": "Saat status pengiriman atau status baca pesan berubah",
+      "message.receipt": "Setiap penerima yang menerima, membaca, atau memutar pesan grup atau status yang Anda kirim (hanya Baileys; tidak termasuk dalam *)",
       "message.failed": "Saat pesan keluar gagal terkirim",
       "message.revoked": "Saat pesan dihapus untuk semua orang",
       "message.reaction": "Saat reaksi ditambahkan, diubah atau dihapus",
@@ -703,8 +834,9 @@
     },
     "chats": {
       "label": "Akses obrolan (opsional)",
-      "hint": "Satu obrolan per baris: ID grup yang diakhiri @g.us, ID kontak yang diakhiri @c.us atau @lid, atau nomor telepon. Kosongkan untuk semua obrolan. Kunci yang dibatasi obrolan hanya dapat menggunakan rute yang terbuka untuk kunci dengan cakupan obrolan; WebSocket kejadian dan MCP menolaknya.",
-      "invalid": "Bukan ID obrolan atau nomor telepon: {{value}}"
+      "hint": "Satu obrolan per baris: ID grup yang diakhiri @g.us, ID kontak yang diakhiri @c.us atau @lid, atau nomor telepon. Kosongkan untuk semua obrolan. Kunci yang dibatasi obrolan hanya dapat menggunakan rute yang terbuka untuk kunci dengan cakupan obrolan; akses lewat WebSocket kejadian dan MCP tetap terbatas pada obrolan tersebut.",
+      "invalid": "Bukan ID obrolan atau nomor telepon: {{value}}",
+      "tooMany": "Terlalu banyak obrolan ({{count}}): satu kunci paling banyak memuat {{max}}."
     },
     "expiry": {
       "label": "Kedaluwarsa pada (opsional)",
@@ -861,6 +993,119 @@
       "progress": "Terkirim {{sent}} dari {{total}} · {{failed}} gagal · {{pending}} menunggu",
       "cancel": "Batalkan Batch",
       "cancelling": "Membatalkan..."
+    }
+  },
+  "numberChecker": {
+    "subtitle": "Periksa apakah nomor telepon memiliki akun WhatsApp aktif secara senyap, tanpa mengirim pesan",
+    "zeroMessages": "Nol Pesan Terkirim",
+    "noSession": {
+      "title": "Tidak ada sesi WhatsApp aktif yang terhubung.",
+      "desc": "Untuk memeriksa nomor telepon, OpenWA memerlukan setidaknya satu sesi yang sudah terautentikasi.",
+      "goToSessions": "Buka Sesi"
+    },
+    "tabs": {
+      "single": "Pemeriksaan Tunggal",
+      "bulk": "Pemeriksa Nomor Massal"
+    },
+    "session": {
+      "label": "Sesi WhatsApp",
+      "none": "Tidak ada sesi siap",
+      "hint": "Pemeriksaan dijalankan melalui akun WhatsApp yang terhubung ini."
+    },
+    "single": {
+      "title": "Periksa Satu Akun",
+      "phoneLabel": "Nomor Telepon",
+      "phonePlaceholder": "mis. 919876543210 atau 6281234567890 (dengan kode negara)",
+      "check": "Periksa",
+      "checking": "Memeriksa...",
+      "autoPrefix": "Tambahkan awalan <strong>+91</strong> otomatis untuk nomor 10 digit (nomor 12 digit tidak diubah)",
+      "silent": "<strong>Sepenuhnya Senyap:</strong> Pemeriksaan ini langsung mengakses data pendaftaran WhatsApp. Kontak tidak menerima notifikasi, suara, atau pesan apa pun.",
+      "resultTitle": "Hasil Verifikasi",
+      "querying": "Menghubungi server WhatsApp...",
+      "empty": "Masukkan nomor telepon lalu klik \"Periksa\" untuk melihat status WhatsApp-nya."
+    },
+    "preview": {
+      "prefixed": "Akan diperiksa sebagai: <strong>+{{number}}</strong> (10 digit → otomatis diberi awalan 91)",
+      "kept": "Akan diperiksa sebagai: <strong>+{{number}}</strong> (12 digit → tidak diubah)",
+      "digits": "Akan diperiksa sebagai: <strong>+{{number}}</strong> ({{digits}} digit)"
+    },
+    "prefixHint": {
+      "single": "Menambahkan +91 pada nomor 10 digit dan nomor 11 digit yang diawali 0. Nomor yang diawali + atau 00 tetap seperti yang diketik.",
+      "bulk": "Menambahkan +91 pada nomor 10 digit (mis. 96...) dan nomor 11 digit yang diawali 0. Nomor yang diawali + atau 00 tetap seperti yang diketik.",
+      "off": "Nomor diperiksa seperti yang diketik, hanya angka, jadi sertakan kode negara."
+    },
+    "result": {
+      "registered": "Terdaftar di WhatsApp",
+      "notRegistered": "Tidak Terdaftar",
+      "avatarAlt": "Foto profil",
+      "status": "Status",
+      "active": "Akun Aktif",
+      "none": "Akun Tidak Ditemukan",
+      "jid": "JID WhatsApp",
+      "copyJid": "Salin JID",
+      "copy": "Salin",
+      "copied": "Tersalin",
+      "checkedAt": "Diperiksa Pada",
+      "openTester": "Buka di Penguji Pesan"
+    },
+    "recent": {
+      "title": "Pemeriksaan Terbaru",
+      "clear": "Hapus Riwayat"
+    },
+    "table": {
+      "phone": "Nomor Telepon",
+      "status": "Status WhatsApp",
+      "id": "ID WhatsApp",
+      "time": "Waktu"
+    },
+    "status": {
+      "registered": "Terdaftar",
+      "unregistered": "Tidak Terdaftar",
+      "notRegistered": "Tidak Terdaftar",
+      "failed": "Gagal"
+    },
+    "bulk": {
+      "title": "Pemeriksa Nomor Massal",
+      "delayLabel": "Jeda Aman Antar Pemeriksaan (ms)",
+      "delay1": "1000 ms / 1 detik (Disarankan)",
+      "delay2": "2000 ms / 2 detik (Ekstra Aman)",
+      "delay3": "3000 ms / 3 detik (Aman untuk Volume Tinggi)",
+      "delayHint": "Memberi jeda antar pemeriksaan agar tidak melewati batas permintaan gateway (bawaan 100 per menit). Proses berhenti jika gateway menolak pemeriksaan berikutnya.",
+      "countryRule": "Aturan Kode Negara",
+      "autoPrefix": "Tambahkan awalan <strong>+91</strong> (India) otomatis untuk nomor 10 digit",
+      "numbersLabel": "Nomor yang Diperiksa (Satu per baris atau dipisahkan koma)",
+      "numbersHint": "Tempel nomor telepon beserta kode negara, satu per baris atau dipisahkan koma. Maksimal {{max}} nomor per proses.",
+      "parsed": "<strong>{{count}}</strong> nomor unik terdeteksi",
+      "parsed_other": "<strong>{{count}}</strong> nomor unik terdeteksi",
+      "tenDigitAdded": "({{ten}} nomor 10 digit → +91 ditambahkan)",
+      "tenDigitAddedPreserved": "({{ten}} nomor 10 digit → +91 ditambahkan, {{twelve}} nomor 12 digit dipertahankan)",
+      "tooMany": "Terlalu banyak nomor: {{parsed}} terdeteksi, maksimal {{max}} per proses. Hapus {{excess}} nomor untuk memulai.",
+      "start": "Mulai Pemeriksaan Batch",
+      "stop": "Hentikan Pemeriksaan",
+      "export": "Ekspor Hasil (CSV)",
+      "stoppedTitle": "Batch dihentikan",
+      "checked": "Diperiksa",
+      "remaining": "Tersisa",
+      "all": "Semua"
+    },
+    "stopped": {
+      "reason409": "Sesi tidak terhubung",
+      "reason429": "Batas permintaan gateway tercapai",
+      "reason503": "WhatsApp tidak merespons pemeriksaan",
+      "reasonOther": "Gateway menolak pemeriksaan",
+      "partial": "{{reason}} (HTTP {{status}}). Berhenti di nomor {{attempted}} dari {{total}}; {{count}} nomor belum diperiksa. Coba lagi nanti.",
+      "partial_other": "{{reason}} (HTTP {{status}}). Berhenti di nomor {{attempted}} dari {{total}}; {{count}} nomor belum diperiksa. Coba lagi nanti.",
+      "last": "{{reason}} (HTTP {{status}}). Pemeriksaan terakhir gagal. Coba lagi nanti."
+    },
+    "toast": {
+      "enterNumber": "Masukkan nomor telepon yang akan diperiksa.",
+      "noSession": "Tidak ada sesi WhatsApp yang siap.",
+      "checkFailed": "Pemeriksaan gagal",
+      "unknownError": "Kesalahan pemeriksaan tidak diketahui",
+      "lookupFailed": "Pemeriksaan nomor gagal",
+      "enterNumbers": "Masukkan nomor telepon yang valid (satu per baris atau dipisahkan koma).",
+      "completed": "Selesai memeriksa {{count}} nomor.",
+      "completed_other": "Selesai memeriksa {{count}} nomor."
     }
   },
   "infrastructure": {

@@ -167,6 +167,9 @@ version: '3.8'
 services:
   app:
     image: ghcr.io/rmyndharis/openwa:latest
+    # Teardown takes up to 63 s with every datastore on; raise this by the amount SHUTDOWN_DELAY_MS or
+    # WEBHOOK_SHUTDOWN_DRAIN_MS exceeds its default, or Docker's 10 s default kills the container mid-teardown.
+    stop_grace_period: 75s
     deploy:
       replicas: 1
       resources:
@@ -378,7 +381,7 @@ LOG_FORMAT=json
 # DATABASE_NAME=openwa
 # DATABASE_USERNAME=user
 # DATABASE_PASSWORD=pass
-# DATABASE_POOL_SIZE=20
+# DATABASE_POOL_SIZE=10
 # DATABASE_SSL=false
 
 # ===========================================
@@ -428,7 +431,7 @@ LOG_FORMAT=json
 # CACHE & QUEUE
 # ===========================================
 # Both are opt-in and both need a reachable Redis, configured with the discrete host/port pair
-# (there is no REDIS_URL). Defaults: no cache at all (CacheService is a no-op and every read falls
+# (there is no REDIS_URL). Defaults: no cache at all (CacheService stores nothing and every read falls
 # through to the database — there is no in-memory tier) and inline (non-queued) dispatch.
 # REDIS_ENABLED=false
 # REDIS_HOST=localhost
@@ -441,6 +444,14 @@ LOG_FORMAT=json
 # for the queue alone therefore also enables the cache.
 # CACHE_ENABLED=true
 # QUEUE_ENABLED=true   # process webhooks/ingress through the BullMQ queue
+# Deployments that use the queue on one shared Redis need a distinct QUEUE_PREFIX each (default bull; up
+# to 64 letters, digits, dots, underscores or hyphens). A queue is named only by its prefix and name, so
+# two deployments on the same prefix take each other's webhook jobs and complete them without delivering.
+# Replicas of one deployment share a value; changing it on a live deployment leaves the jobs queued under
+# the old prefix unprocessed. The prefix covers the queues only: with REDIS_ENABLED=true the rate-limit
+# counters and the WebSocket fan-out channel are shared as well, and events reach the clients of every
+# deployment on that Redis, so give each such deployment a Redis of its own.
+# QUEUE_PREFIX=bull
 
 # ===========================================
 # WHATSAPP ENGINE

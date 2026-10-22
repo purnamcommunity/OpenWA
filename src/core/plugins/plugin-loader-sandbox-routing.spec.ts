@@ -6,6 +6,8 @@ import { HookContext, HookEvent, HookHandler, HookManager } from '../hooks';
 import { IPlugin, PluginInstance, PluginManifest, PluginStatus, PluginType } from './plugin.interfaces';
 import { PluginWorkerHost } from './sandbox/plugin-worker-host';
 import { PluginLogLevel } from './sandbox/protocol';
+import { PLUGIN_SEARCH_REGISTRY_PORT } from './plugin-host-ports';
+import { SearchProviderRegistry } from '../../modules/search/search-provider.registry';
 
 type FakeHost = {
   load: jest.Mock;
@@ -13,6 +15,7 @@ type FakeHost = {
   terminate: jest.Mock;
   dispatchHook: jest.Mock;
   healthCheck: jest.Mock;
+  dispatchSearch: jest.Mock;
 };
 
 /** Loader that returns fake worker hosts so routing is testable without spawning a real OS thread. */
@@ -20,36 +23,44 @@ class TestableLoader extends PluginLoaderService {
   readonly hosts: FakeHost[] = [];
   capturedOnHookSubscribe?: (event: string, priority?: number) => void;
   capturedOnLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void;
-  capturedOnWorkerExit?: (code: number, intentional: boolean) => void;
+  capturedOnWorkerExit?: (code: number, intentional: boolean, reason?: string) => void;
   capturedOnUnresponsive?: () => void;
+  capturedOnSearchProviderRegister?: () => void;
   protected createSandboxHost(
     _capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
     onHookSubscribe?: (event: string, priority?: number) => void,
     _onWebhookSubscribe?: (route: string) => void,
     onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
     _runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
-    _onSearchProviderRegister?: () => void,
-    onWorkerExit?: (code: number, intentional: boolean) => void,
+    onSearchProviderRegister?: () => void,
+    onWorkerExit?: (code: number, intentional: boolean, reason?: string) => void,
     onUnresponsive?: () => void,
   ): PluginWorkerHost {
     this.capturedOnHookSubscribe = onHookSubscribe;
     this.capturedOnLog = onLog;
     this.capturedOnWorkerExit = onWorkerExit;
     this.capturedOnUnresponsive = onUnresponsive;
+    this.capturedOnSearchProviderRegister = onSearchProviderRegister;
     const host: FakeHost = {
       load: jest.fn().mockResolvedValue(undefined),
       runLifecycle: jest.fn().mockResolvedValue(undefined),
       terminate: jest.fn().mockResolvedValue(undefined),
       dispatchHook: jest.fn().mockResolvedValue({ continue: true }),
       healthCheck: jest.fn().mockResolvedValue({ healthy: true }),
+      dispatchSearch: jest.fn().mockResolvedValue({
+        ok: true,
+        results: { hits: [], total: 0, tookMs: 1, provider: 'plugin:p1' },
+      }),
     };
     this.hosts.push(host);
     return host as unknown as PluginWorkerHost;
   }
 }
 
-function makeLoader(): TestableLoader {
-  const configService = { get: jest.fn().mockReturnValue(undefined) } as unknown as ConfigService;
+function makeLoader(registry?: SearchProviderRegistry, searchMode = 'auto'): TestableLoader {
+  const configService = {
+    get: jest.fn((key: string) => (key === 'search.provider' ? searchMode : undefined)),
+  } as unknown as ConfigService;
   const pluginStorage = {
     createPluginStorage: jest.fn().mockReturnValue({}),
     getPluginConfig: jest.fn().mockReturnValue(undefined),
@@ -57,7 +68,9 @@ function makeLoader(): TestableLoader {
     setPluginEntry: jest.fn(),
     setPluginStatus: jest.fn(),
   } as unknown as PluginStorageService;
-  const moduleRef = { get: jest.fn() } as unknown as ModuleRef;
+  const moduleRef = {
+    get: jest.fn((token: unknown) => (token === PLUGIN_SEARCH_REGISTRY_PORT ? registry : undefined)),
+  } as unknown as ModuleRef;
   return new TestableLoader(configService, new HookManager(), pluginStorage, moduleRef);
 }
 
@@ -144,6 +157,25 @@ describe('PluginLoaderService — sandbox tier routing', () => {
     expect(host.runLifecycle).toHaveBeenCalledTimes(1);
     expect(host.runLifecycle).toHaveBeenCalledWith('onDisable', expect.any(Number));
     expect(host.terminate).toHaveBeenCalledTimes(1);
+    expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
+  });
+
+  it('tears down the second worker when a re-enabled plugin is disabled again', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+
+    await loader.enablePlugin('p1');
+    await loader.disablePlugin('p1');
+    await loader.enablePlugin('p1');
+    await loader.disablePlugin('p1');
+
+    // Each enable starts its own worker and each disable has to end that one. A disable that joined the
+    // settled teardown of the first cycle would report success and leave the second worker running.
+    expect(loader.hosts).toHaveLength(2);
+    for (const host of loader.hosts) {
+      expect(host.runLifecycle).toHaveBeenCalledWith('onDisable', expect.any(Number));
+      expect(host.terminate).toHaveBeenCalledTimes(1);
+    }
     expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
   });
 
@@ -251,6 +283,19 @@ describe('PluginLoaderService — sandbox tier routing', () => {
       healthy: false,
       message: 'plugin is not running (status disabled)',
     });
+  });
+
+  it('shows why a sandboxed worker died when it reported a reason before exiting', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    jest
+      .spyOn((loader as unknown as { logger: { warn: jest.Mock } }).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    loader.capturedOnWorkerExit!(1, false, 'boom: relay answered 500');
+
+    expect(pluginOf(loader).error).toBe('worker exited unexpectedly (code 1): boom: relay answered 500');
   });
 
   it('enables a built-in plugin in-process (no sandbox worker spawned)', async () => {
@@ -442,6 +487,123 @@ describe('PluginLoaderService - blocked sandbox worker', () => {
     const health = await loader.checkPluginHealth('p1');
     expect(health.message).toContain("last hook error in 'message:received'");
     expect(health.message).toContain('timed out');
+  });
+});
+
+describe('PluginLoaderService - sandbox search provider ownership', () => {
+  const setup = async (mode = 'auto', searchEnabled = true) => {
+    const registry = new SearchProviderRegistry();
+    registry.register({ id: 'builtin-fts', label: 'Built-in', search: jest.fn(), health: jest.fn() });
+    const loader = makeLoader(searchEnabled ? registry : undefined, mode);
+    seed(loader, { builtIn: false, instance: null });
+    pluginOf(loader).manifest.permissions = ['search:provide'];
+    await loader.enablePlugin('p1');
+    loader.capturedOnSearchProviderRegister!();
+    return { loader, registry };
+  };
+
+  it.each([true, false])(
+    'preserves the replacement provider when a retired worker exits (intentional=%s)',
+    async intentional => {
+      const { loader, registry } = await setup();
+      const oldExit = loader.capturedOnWorkerExit!;
+      let finishTermination!: () => void;
+      loader.hosts[0].terminate.mockReturnValueOnce(new Promise<void>(resolve => (finishTermination = resolve)));
+      loader.capturedOnUnresponsive!();
+      expect(pluginOf(loader).status).toBe(PluginStatus.ERROR);
+      await loader.enablePlugin('p1');
+      loader.capturedOnSearchProviderRegister!();
+      loader.capturedOnHookSubscribe!('message:received');
+      const currentProvider = registry.active();
+      const hooks = (loader as unknown as { hookManager: HookManager }).hookManager;
+      const unregister = jest.spyOn(hooks, 'unregisterPlugin');
+
+      oldExit(1, intentional);
+      finishTermination();
+
+      expect(registry.active()).toBe(currentProvider);
+      expect(registry.active()?.id).toBe('plugin:p1');
+      await expect(registry.active()!.search({ q: 'hello' })).resolves.toEqual({
+        hits: [],
+        total: 0,
+        tookMs: 1,
+        provider: 'plugin:p1',
+      });
+      expect(loader.hosts[1].dispatchSearch).toHaveBeenCalled();
+      expect(pluginOf(loader).status).toBe(PluginStatus.ENABLED);
+      expect((loader as unknown as { sandboxHosts: Map<string, unknown> }).sandboxHosts.get('p1')).toBe(
+        loader.hosts[1],
+      );
+      expect(unregister).not.toHaveBeenCalled();
+      expect(loader.hosts[1].terminate).not.toHaveBeenCalled();
+    },
+  );
+
+  it('removes an unresponsive worker provider when its host entry is already absent', async () => {
+    const { loader, registry } = await setup();
+    loader.capturedOnUnresponsive!();
+    expect((loader as unknown as { sandboxHosts: Map<string, unknown> }).sandboxHosts.has('p1')).toBe(false);
+
+    loader.capturedOnWorkerExit!(1, true);
+
+    expect(registry.list().map(provider => provider.id)).toEqual(['builtin-fts']);
+    expect(registry.active()?.id).toBe('builtin-fts');
+    expect(pluginOf(loader).status).toBe(PluginStatus.ERROR);
+  });
+
+  it('removes the current worker provider after an unexpected exit', async () => {
+    const { loader, registry } = await setup();
+
+    loader.capturedOnWorkerExit!(1, false);
+
+    expect(registry.list().map(provider => provider.id)).toEqual(['builtin-fts']);
+    expect(registry.active()?.id).toBe('builtin-fts');
+    expect(pluginOf(loader).status).toBe(PluginStatus.ERROR);
+  });
+
+  it.each(['builtin-fts', 'none', 'disabled'])('preserves search mode %s across worker replacement', async mode => {
+    const { loader, registry } = await setup(mode, mode !== 'disabled');
+    const oldExit = loader.capturedOnWorkerExit!;
+    loader.capturedOnUnresponsive!();
+    await loader.enablePlugin('p1');
+    loader.capturedOnSearchProviderRegister!();
+
+    oldExit(1, true);
+
+    expect(registry.active()?.id).toBe('builtin-fts');
+    expect(registry.list().map(provider => provider.id)).toEqual(
+      mode === 'builtin-fts' ? ['builtin-fts', 'plugin:p1'] : ['builtin-fts'],
+    );
+    expect(pluginOf(loader).status).toBe(PluginStatus.ENABLED);
+  });
+
+  it('registers a replacement normally when the retired worker exits first', async () => {
+    const { loader, registry } = await setup();
+    const oldExit = loader.capturedOnWorkerExit!;
+    loader.capturedOnUnresponsive!();
+    oldExit(1, true);
+    expect(registry.active()?.id).toBe('builtin-fts');
+
+    await loader.enablePlugin('p1');
+    loader.capturedOnSearchProviderRegister!();
+
+    expect(registry.active()?.id).toBe('plugin:p1');
+  });
+
+  it.each(['disable', 'unload'])('removes the provider during normal %s', async operation => {
+    const { loader, registry } = await setup();
+    const onExit = loader.capturedOnWorkerExit!;
+
+    if (operation === 'disable') await loader.disablePlugin('p1');
+    else await loader.unloadPlugin('p1');
+    onExit(0, true);
+
+    expect(loader.hosts[0].terminate).toHaveBeenCalledTimes(1);
+    expect(registry.list().map(provider => provider.id)).toEqual(['builtin-fts']);
+    expect(registry.active()?.id).toBe('builtin-fts');
+    expect((loader as unknown as { sandboxHosts: Map<string, unknown> }).sandboxHosts.has('p1')).toBe(false);
+    if (operation === 'disable') expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
+    else expect(pluginOf(loader)).toBeUndefined();
   });
 });
 

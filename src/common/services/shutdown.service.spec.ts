@@ -129,6 +129,18 @@ describe('ShutdownService.shutdown (idempotent, bounded grace)', () => {
     await jest.advanceTimersByTimeAsync(2000);
     expect(cb).toHaveBeenCalledTimes(1);
   });
+
+  // The grace counts 1:1 against the kill deadline (shutdown-budget.ts), so a setting past the cap would
+  // push every stop beyond the stop grace period the packaged runtimes ship.
+  it('caps SHUTDOWN_DELAY_MS at 30 s, however large the setting', async () => {
+    process.env.SHUTDOWN_DELAY_MS = '99999';
+    const { svc, cb } = svcWithCb();
+    svc.shutdown();
+    await jest.advanceTimersByTimeAsync(29_999);
+    expect(cb).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('ShutdownService exit status (teardown outcome)', () => {

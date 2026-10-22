@@ -274,6 +274,19 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ [key]: '36500' })).not.toThrow();
   });
 
+  // The same 36500-day cutoff bound, in hours. A malformed value fell back to 0 downstream, which keeps no
+  // payload on a failure row and leaves the redrive endpoint nothing to replay, with no boot error.
+  it('rejects a malformed or oversized WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS and keeps 0 (no payload kept)', () => {
+    const key = 'WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS';
+    for (const bad of ['24h', '-1', '1.5']) {
+      expect(() => validateEnv({ [key]: bad })).toThrow(new RegExp(`${key} must be a non-negative integer`));
+    }
+    expect(() => validateEnv({ [key]: '876001' })).toThrow(new RegExp(`${key} must be at most 876000`));
+    for (const ok of ['0', '24', '876000']) {
+      expect(() => validateEnv({ [key]: ok })).not.toThrow();
+    }
+  });
+
   it('rejects a non-positive / non-integer WEBHOOK_MAX_PAYLOAD_BYTES (0 would reject every dispatch)', () => {
     expect(() => validateEnv({ WEBHOOK_MAX_PAYLOAD_BYTES: '0' })).toThrow(/WEBHOOK_MAX_PAYLOAD_BYTES/);
     expect(() => validateEnv({ WEBHOOK_MAX_PAYLOAD_BYTES: 'abc' })).toThrow(/WEBHOOK_MAX_PAYLOAD_BYTES/);
@@ -628,6 +641,17 @@ describe('validateEnv', () => {
     },
   );
 
+  // The prefix is joined to the queue name with a colon in every Redis key.
+  it('accepts a plain QUEUE_PREFIX, or none, and rejects one that would build ambiguous keys', () => {
+    for (const ok of ['bull', 'openwa-staging', 'prod_2.eu', '', '  ']) {
+      expect(() => validateEnv({ QUEUE_PREFIX: ok })).not.toThrow();
+    }
+    for (const bad of ['a:b', 'has space', '-lead', '.lead', 'a/b', 'x'.repeat(65)]) {
+      expect(() => validateEnv({ QUEUE_PREFIX: bad })).toThrow(/QUEUE_PREFIX must be 1 to 64/);
+    }
+    expect(() => validateEnv({ QUEUE_PREFIX: 'x'.repeat(64) })).not.toThrow();
+  });
+
   // Read as an exact 'true'/'false' override; anything else falls back to the NODE_ENV default, so
   // CSP_UPGRADE_INSECURE_REQUESTS=False kept the blank-dashboard trap on in production.
   it.each([
@@ -674,7 +698,6 @@ describe('validateEnv', () => {
     ['STORAGE_IMPORT_MAX_BYTES', '200mb'],
     ['STORAGE_IMPORT_MAX_ENTRIES', '1e5'],
     ['STORAGE_IMPORT_MAX_TOTAL_BYTES', '10gb'],
-    ['STORAGE_LIST_MAX_FILES', '100k'],
     ['BAILEYS_MESSAGE_STORE_LIMIT', '5k'],
   ])('rejects a unit-suffixed or zero %s', (key, bad) => {
     expect(() => validateEnv({ [key]: bad })).toThrow(new RegExp(`${key} must be a positive integer`));
@@ -685,6 +708,18 @@ describe('validateEnv', () => {
   it('rejects a unit-suffixed SHUTDOWN_DELAY_MS but keeps 0 (no drain)', () => {
     expect(() => validateEnv({ SHUTDOWN_DELAY_MS: '3s' })).toThrow(/SHUTDOWN_DELAY_MS must be a non-negative integer/);
     expect(() => validateEnv({ SHUTDOWN_DELAY_MS: '0' })).not.toThrow();
+  });
+
+  it('rejects a malformed WEBHOOK_SHUTDOWN_DRAIN_MS but keeps 0 (no wait), like the other shutdown knobs', () => {
+    // A malformed value was silently replaced by 5000, which also sets the force-exit budget, so a typo
+    // such as `30s` quietly cut the drain the operator asked for.
+    for (const bad of ['30s', '-5', 'abc', '1.5']) {
+      expect(() => validateEnv({ WEBHOOK_SHUTDOWN_DRAIN_MS: bad })).toThrow(
+        /WEBHOOK_SHUTDOWN_DRAIN_MS must be a non-negative integer/,
+      );
+    }
+    expect(() => validateEnv({ WEBHOOK_SHUTDOWN_DRAIN_MS: '0' })).not.toThrow();
+    expect(() => validateEnv({ WEBHOOK_SHUTDOWN_DRAIN_MS: '12000' })).not.toThrow();
   });
 
   it.each([

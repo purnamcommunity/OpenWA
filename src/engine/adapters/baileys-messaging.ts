@@ -22,7 +22,7 @@ import {
   Product,
   Quotable,
 } from '../interfaces/whatsapp-engine.interface';
-import { toEngineParticipants } from './baileys-groups';
+import { refusedStatusCode, toEngineParticipants } from './baileys-groups';
 import { findSelfParticipant } from './baileys-group-mapper';
 import { buildVCard } from './vcard';
 import {
@@ -40,10 +40,12 @@ import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
 import { type createLogger } from '../../common/services/logger.service';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
 import { EngineNotSentError } from '../../common/errors/engine-not-sent.error';
 import { parseWaId, userPart } from '../identity/wa-id';
-import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
+import { BAILEYS_QUERY_BUDGET_MS, confirmedWrite, withQueryDeadline } from './baileys-query-deadline';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
+import { describeAudio } from './baileys-audio-probe';
 
 /**
  * Messaging-domain operations extracted from BaileysAdapter. The adapter keeps the public
@@ -134,6 +136,43 @@ export async function loadSharp() {
   } catch (error) {
     throw new InternalServerErrorException(
       `Sticker conversion is unavailable: sharp could not load (${error instanceof Error ? error.message : String(error)}).`,
+    );
+  }
+}
+
+/**
+ * Refuse SVG input process-wide. OpenWA never needs it, yet a sticker and the thumbnail of every outbound
+ * image hand caller-supplied bytes to sharp, which autodetects SVG and parses it with librsvg: a native
+ * decoder with a memory-safety record that is the largest attack surface on those two routes. The block is
+ * libvips state shared by every importer of sharp, Baileys included, so it has to be set before the first
+ * decode and not by the first sticker. Best effort: a sharp that cannot load has nothing to block, and the
+ * routes that need it report that themselves (see loadSharp).
+ */
+export async function blockSvgDecoding(): Promise<void> {
+  try {
+    (await import('sharp')).default.block({ operation: ['VipsForeignLoadSvg'] });
+  } catch {
+    // sharp could not load, so there is no decoder to block.
+  }
+}
+
+/**
+ * Refuse a picture the image decoder cannot read, before Baileys hands it to that decoder: its own
+ * conversion rejects such a file with an error nothing maps, which reached the client as a 500. An SVG is
+ * one since blockSvgDecoding, and so is a file that is no image at all. Only the header is read. A sharp
+ * that cannot load is left to the library, which reports that itself.
+ */
+export async function assertReadableImage(data: Buffer): Promise<void> {
+  const sharp = await import('sharp').then(
+    module => module.default,
+    () => undefined,
+  );
+  if (!sharp) return;
+  try {
+    await sharp(data).metadata();
+  } catch (error) {
+    throw new BadRequestException(
+      `The picture could not be read as an image (SVG is not accepted): ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
@@ -233,6 +272,19 @@ export async function resolveMediaBuffer(
   return { data: Buffer.from(media.data, 'base64'), mimetype: media.mimetype };
 }
 
+/**
+ * Give a WhatsApp throttle or timeout answer (WA code 429 or 408) its retryable 503 instead of letting
+ * the raw Boom surface as a 500. `sendMessage` awaits several IQs before it relays the message (group
+ * roster, devices, sessions) and nothing after the relay awaits a result, so a numeric code here is a
+ * query WhatsApp turned away: a 429 provably sent nothing. Every other failure is returned untouched.
+ */
+export function mapSendRefusal(error: unknown): unknown {
+  const code = refusedStatusCode(error);
+  if (code === 429) return new EngineThrottledError('WhatsApp rate-limited the send (code 429)');
+  if (code === 408) return new EngineTransportError('WhatsApp timed out a query the send depends on (code 408)');
+  return error;
+}
+
 export class BaileysMessaging {
   constructor(
     private readonly host: BaileysMessagingHost,
@@ -241,7 +293,7 @@ export class BaileysMessaging {
 
   /** Bound a write whose confirmation the library discards; see baileys-query-deadline.ts. */
   private confirmed<T>(work: Promise<T>, operation: string): Promise<T> {
-    return withQueryDeadline(work, this.queryBudgetMs, `WhatsApp did not confirm ${operation} in time`);
+    return confirmedWrite(work, this.queryBudgetMs, operation);
   }
 
   /** Post-ensureReady socket handle. */
@@ -443,13 +495,16 @@ export class BaileysMessaging {
   async sendAudioMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.host.ensureReady();
     const { data, mimetype } = await resolveMediaBuffer(media, this.host.sessionProxyUrl(), 'audio/mpeg');
+    const ptt = media.ptt ?? false;
     return this.sendContent(
       chatId,
       // Audio carries no caption, so a mention here tags the recipient through contextInfo without
       // visible @text. It is still forwarded: the route accepts `mentions` (SendAudioMessageDto
       // extends SendMediaMessageDto) and whatsapp-web.js sends it, so dropping it here made the same
       // request notify participants on one engine and silently not on the other.
-      { audio: data, mimetype, ptt: media.ptt ?? false, ...this.withMentions(media.mentions) },
+      // The duration and a voice note's waveform come from describeAudio, never from Baileys, which
+      // would read the file in this process.
+      { audio: data, mimetype, ptt, ...(await describeAudio(data, ptt)), ...this.withMentions(media.mentions) },
       await this.quoteOption(media.quotedMessageId),
     );
   }
@@ -888,7 +943,7 @@ export class BaileysMessaging {
       sent = options ? await sock.sendMessage(jid, content, options) : await sock.sendMessage(jid, content);
     } catch (error) {
       if (this.host.getSocketOrNull() !== sock) throw new EngineNotReadyError();
-      throw error;
+      throw mapSendRefusal(error);
     }
     // Mutations are announced by their library echo; no local callback replaces it.
     if (!('react' in content || 'delete' in content || 'edit' in content)) this.host.rememberOwnSend(sent?.key?.id);

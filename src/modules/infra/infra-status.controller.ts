@@ -293,6 +293,12 @@ export class InfraStatusController {
     description: 'Process is up. This route does not probe dependencies — read /infra/status for those.',
     type: InfraHealthResponseDto,
   })
+  @ApiResponse({
+    status: 503,
+    description:
+      'Shutdown teardown has begun: every route except /api/health and /api/health/* answers 503 then. ' +
+      'Probe /api/health/live for a check that survives teardown.',
+  })
   healthCheck(): { status: string; timestamp: string } {
     return {
       status: 'ok',

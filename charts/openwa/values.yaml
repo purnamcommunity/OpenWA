@@ -86,6 +86,15 @@ resources:
 # this by the same amount too.
 terminationGracePeriodSeconds: 75
 
+# Boot budget of the kubelet startupProbe on /api/health/live: the container is restarted after
+# periodSeconds x (failureThreshold - 1) = 5s x 59 = 295s without an answer. The first boot after an
+# upgrade builds indexes on a large messages table (about 3.8s per million rows) before the port
+# opens, so raise failureThreshold, or run the migrations first (docs/14, section 14.5). A higher
+# value only delays the restart of a boot that is genuinely stuck.
+startupProbe:
+  periodSeconds: 5
+  failureThreshold: 60
+
 # Pod-level securityContext, empty by default. The default image start is as
 # root: the entrypoint re-owns /app/data and the XDG dirs, then drops to the
 # openwa user (uid/gid 997) via gosu, which needs the capabilities added below.
@@ -138,6 +147,10 @@ containerSecurityContext:
 ingress:
   enabled: false
   className: ""
+  # ingress-nginx refuses a request body over 1m by default, below the 25mb the app accepts
+  # (BODY_SIZE_LIMIT), so a base64 media send fails with 413 before it reaches the pod. Raise it
+  # to at least BODY_SIZE_LIMIT, for example:
+  #   nginx.ingress.kubernetes.io/proxy-body-size: 25m
   annotations: {}
   host: openwa.example.com
   paths:

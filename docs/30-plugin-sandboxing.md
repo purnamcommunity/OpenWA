@@ -84,8 +84,8 @@ process can do to the host; it does not confine a plugin away from anything that
   first instruction, with no capabilities added (the chart's `podSecurityContext`). The rest of the
   confinement comes from the bundled `docker-compose.yml`, not from the image: `read_only: true`
   rootfs with a tmpfs `/tmp`, `no-new-privileges`, and `cap_drop: ALL` with a minimal re-add
-  (`CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`SETGID`/`SETUID`) that only the root entrypoint uses — once `gosu`
-  setuids, the Node process keeps no effective capabilities. A plain `docker run` of the image gets
+  (`CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`KILL`/`SETGID`/`SETUID`) that only the root entrypoint and init use —
+  once `gosu` setuids, the Node process keeps no effective capabilities. A plain `docker run` of the image gets
   none of the compose-level settings, so replicate them yourself if you deploy that way.
 - **What a loaded plugin can still reach.** Everything the OpenWA process can, including:
   - the process environment through `/proc/self/environ` on Linux, with every secret the deployment

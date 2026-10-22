@@ -6,14 +6,43 @@ import {
   type RedisConnectionOptions,
 } from '../../config/redis-options';
 
+/** Upper bound for one producer command once connected. Same bound as the throttler's Redis client. */
+export const QUEUE_COMMAND_TIMEOUT_MS = 2000;
+
 /**
  * BullMQ connection for the shared producer (`BullModule.forRootAsync` in queue.module.ts): the common
  * Redis fields plus `enableOfflineQueue: false`, so once connected, `queue.add()` fails fast when Redis
  * drops and the dispatch path can fall back to direct delivery instead of buffering forever. Before the
  * first connect that option never applies: see producerReady.
+ *
+ * `commandTimeout` covers the other failure: a Redis that stays connected and stops answering (a
+ * network partition, a frozen process). Nothing is rejected then, so without a deadline the add of a
+ * delivery or a job lookup never settles, the dispatch slot or the ingress request holding it never
+ * frees, and the direct-delivery fallback never runs. The Worker connection below must not inherit it:
+ * its blocking commands wait on Redis by design.
  */
-export function queueConnectionOptions(): RedisConnectionOptions & { enableOfflineQueue: false } {
-  return { ...redisConnectionOptions(), enableOfflineQueue: false };
+export function queueConnectionOptions(): RedisConnectionOptions & {
+  enableOfflineQueue: false;
+  commandTimeout: number;
+} {
+  return { ...redisConnectionOptions(), enableOfflineQueue: false, commandTimeout: QUEUE_COMMAND_TIMEOUT_MS };
+}
+
+/**
+ * Redis key prefix of the BullMQ queues, handed to every Queue and Worker through the shared module
+ * options. Unset keeps BullMQ's own `bull`, so jobs queued by an earlier version are still found after
+ * an upgrade. A queue is named only by this prefix and its name, so two deployments on one Redis must
+ * each set their own: otherwise one's workers take the other's webhook jobs, find no such webhook in
+ * their own database and complete them without delivering. Replicas of one deployment share a value.
+ */
+export function queuePrefix(): string | undefined {
+  return process.env.QUEUE_PREFIX?.trim() || undefined;
+}
+
+/** `BullModule.forRootAsync` options: the producer connection, plus the prefix when one is set. */
+export function queueRootOptions(): { connection: ReturnType<typeof queueConnectionOptions>; prefix?: string } {
+  const prefix = queuePrefix();
+  return { connection: queueConnectionOptions(), ...(prefix ? { prefix } : {}) };
 }
 
 /**

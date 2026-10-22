@@ -314,7 +314,9 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
    * unchanged. Postgres already uses the tolerant websearch_to_tsquery and needs no equivalent.
    */
   private static toFts5Query(raw: string): string {
-    const tokens = raw.trim().split(/\s+/).filter(Boolean);
+    // A repeated token is dropped: `a a` is `a` under implicit AND, but FTS5 would pay for each copy
+    // on every matching row.
+    const tokens = [...new Set(raw.trim().split(/\s+/).filter(Boolean))];
     if (tokens.length === 0) return '""';
     return tokens.map(tok => `"${tok.replace(/"/g, '""')}"`).join(' ');
   }
@@ -334,7 +336,13 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
     const where: string[] = [`messages_fts MATCH ${ph()}`];
     params.push(BuiltInFtsProvider.toFts5Query(q.q));
     this.applyFilters(where, params, q, 'm.', ph);
-    const cols = `m."id", m."waMessageId" AS wa_message_id, m."sessionId" AS session_id, m."chatId" AS chat_id, m."from" AS "from", m."body", m."timestamp", m."type", m."direction", snippet(messages_fts, 0, '<mark>', '</mark>', '…', ${MAX_SNIPPET_WORDS}) AS snippet, rank AS score`;
+    // bm25 weighs a term by how many messages the whole index holds, so the value of a hit a caller
+    // scoped to some sessions or chats may read still reflects the ones it may not. It keeps ordering the
+    // hits; only the value is withheld. An empty session list is no restriction (applyFilters), an empty
+    // chat list is a restriction to nothing.
+    const scoped = q.chatIds !== undefined || (q.sessionIds?.length ?? 0) > 0;
+    const score = scoped ? 'NULL' : 'rank';
+    const cols = `m."id", m."waMessageId" AS wa_message_id, m."sessionId" AS session_id, m."chatId" AS chat_id, m."from" AS "from", m."body", m."timestamp", m."type", m."direction", snippet(messages_fts, 0, '<mark>', '</mark>', '…', ${MAX_SNIPPET_WORDS}) AS snippet, ${score} AS score`;
     const sql = `SELECT ${cols} FROM messages_fts JOIN messages m ON m."rowid" = messages_fts."rowid" WHERE ${where.join(' AND ')} ORDER BY rank, m."timestamp" DESC, m."id" DESC LIMIT ${ph()} OFFSET ${ph()}`;
     params.push(limit, offset);
     return { sql, params };
@@ -372,8 +380,16 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
       params.push(q.sessionId);
     }
     if (q.chatId) {
-      where.push(`${prefix}"chatId" = ${ph()}`);
-      params.push(q.chatId);
+      // Every stored form of the chat when the host expanded it (a chat first stored under a lid and later
+      // under the phone is one chat, as in the message list), the literal id otherwise.
+      if (q.chatIdAliases?.length) {
+        const placeholders = q.chatIdAliases.map(() => ph()).join(',');
+        where.push(`${prefix}"chatId" IN (${placeholders})`);
+        params.push(...q.chatIdAliases);
+      } else {
+        where.push(`${prefix}"chatId" = ${ph()}`);
+        params.push(q.chatId);
+      }
     }
     if (q.chatIds?.length === 0) where.push('1 = 0');
     else if (q.chatIds) {
@@ -382,8 +398,16 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
       params.push(...q.chatIds);
     }
     if (q.from) {
-      where.push(`${prefix}"from" = ${ph()}`);
-      params.push(q.from);
+      if (q.fromAliases?.length) {
+        // A group message keeps the group id in `from` and the person in `author`, so both are matched.
+        const asSender = q.fromAliases.map(() => ph()).join(',');
+        const asAuthor = q.fromAliases.map(() => ph()).join(',');
+        where.push(`(${prefix}"from" IN (${asSender}) OR ${prefix}"author" IN (${asAuthor}))`);
+        params.push(...q.fromAliases, ...q.fromAliases);
+      } else {
+        where.push(`${prefix}"from" = ${ph()}`);
+        params.push(q.from);
+      }
     }
     if (q.direction) {
       where.push(`${prefix}"direction" = ${ph()}`);
@@ -401,7 +425,7 @@ export class BuiltInFtsProvider implements SearchProvider, OnModuleInit {
     // silently exclude all results.
     if (q.dateFrom != null) {
       where.push(`${prefix}"timestamp" >= ${ph()}`);
-      params.push(Math.floor(q.dateFrom / 1000));
+      params.push(Math.ceil(q.dateFrom / 1000));
     }
     if (q.dateTo != null) {
       where.push(`${prefix}"timestamp" <= ${ph()}`);

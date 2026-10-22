@@ -63,6 +63,22 @@ test('an unmapped neutral phone destination uses the Baileys domain', async t =>
   assert.equal(sock.onWhatsApp.mock.callCount(), 1);
 });
 
+test('a first-contact send goes to the id the number check reported, not the one typed', async t => {
+  // The ninth digit of a Brazilian number: WhatsApp knows it under another digit string than people type.
+  const ASKED = '5511987654321@s.whatsapp.net';
+  const CANON = '551187654321@s.whatsapp.net';
+  for (const lid of [null, LID]) {
+    const { messaging, sock } = build(t);
+    sock.onWhatsApp = t.mock.fn(() => Promise.resolve([{ jid: CANON, exists: true }]));
+    const getLIDForPN = t.mock.fn(pn => Promise.resolve(pn === CANON ? lid : null));
+    sock.signalRepository.lidMapping.getLIDForPN = getLIDForPN;
+    await messaging.sendTextMessage(ASKED.replace('@s.whatsapp.net', '@c.us'), 'hello');
+    assert.equal(sock.onWhatsApp.mock.calls[0].arguments[0], ASKED);
+    assert.equal(getLIDForPN.mock.calls.at(-1).arguments[0], CANON);
+    assert.equal(sock.sendMessage.mock.calls[0].arguments[0], lid ?? CANON);
+  }
+});
+
 test('cold sends resolve through the real Baileys LID store', async t => {
   for (const pairs of [[], [{ pn: PN, lid: LID }]]) {
     const data = {};

@@ -60,6 +60,7 @@ describe('webhook recovery across live ownership and configuration changes', () 
     const delivery = {
       isLocallyPending: jest.fn((key: string) => key === 'key0'),
       isQueueJobPending: jest.fn((id: string) => Promise.resolve(id === 'job1' || id === 'job2')),
+      hasQueueJobCompleted: jest.fn().mockResolvedValue(false),
       // Like the real redeliver, a delivered replay retires its own outbox row.
       redeliver: jest.fn(async (webhook: Webhook, _sessionId: string, _event: string, key: string) => {
         await outbox.close(webhook.id, key, 'dispatched');
@@ -184,6 +185,55 @@ describe('webhook recovery across live ownership and configuration changes', () 
 
     expect(await reconciler.sweep(options)).toMatchObject({ scanned: 0 });
     expect(post).toHaveBeenCalledTimes(2);
+  });
+
+  it('points a replayed row at its new queue job, so the next sweep enqueues nothing', async () => {
+    const config = new ConfigService({ queue: { enabled: true }, webhook: { timeout: 1000 } });
+    const repository = ds.getRepository(WebhookOutboxEvent);
+    const outbox = new WebhookOutboxService(repository);
+    const live = new Set<string>();
+    const queue = {
+      add: jest.fn((_name: string, _data: unknown, options: { jobId: string }) => {
+        live.add(options.jobId);
+        return Promise.resolve({});
+      }),
+      getJob: jest.fn((id: string) =>
+        Promise.resolve(live.has(id) ? { getState: () => Promise.resolve('waiting') } : undefined),
+      ),
+      waitUntilReady: jest.fn().mockResolvedValue(undefined),
+    };
+    const delivery = new WebhookDeliveryService(
+      webhooks,
+      failures,
+      config,
+      new HookManager(),
+      outbox,
+      undefined,
+      queue as never,
+    );
+    const reconciler = new WebhookReconcilerService(webhooks, outbox, delivery, config);
+    const options = { intervalMs: 1000, graceMs: 0, batchSize: 10, maxAttempts: 5 };
+    // A crash before the add left a row that names a job which was never created.
+    await outbox.open({
+      webhookId: primary.id,
+      sessionId: primary.sessionId,
+      event: 'message.received',
+      idempotencyKey: 'key-a',
+      deliveryId: 'job-never-added',
+      payload: { id: 1 },
+    });
+    await repository.update({ idempotencyKey: 'key-a' }, { createdAt: new Date(Date.now() - 600_000) });
+
+    expect(await reconciler.sweep(options)).toMatchObject({ replayed: 1, skipped: 0 });
+    const [[, , added]] = queue.add.mock.calls;
+    expect(await repository.findOneByOrFail({ idempotencyKey: 'key-a' })).toMatchObject({
+      state: 'queued',
+      deliveryId: added.jobId,
+    });
+
+    // The replacement job is alive: with the row pointing at it, the sweep leaves the row alone.
+    expect(await reconciler.sweep(options)).toMatchObject({ replayed: 0, skipped: 1 });
+    expect(queue.add).toHaveBeenCalledTimes(1);
   });
 
   it('rechecks the receiver after a held webhook hook before the first POST', async () => {
@@ -369,6 +419,90 @@ describe('webhook recovery across live ownership and configuration changes', () 
     expect(post).not.toHaveBeenCalled();
     expect(execute.mock.calls.map(([name]) => name).filter(name => name !== 'webhook:before')).toEqual([]);
     expect(await failures.count()).toBe(0);
+  });
+
+  describe('a spent replay budget', () => {
+    const spent = (idempotencyKey: string) => ({
+      id: 'outbox-row',
+      webhookId: primary.id,
+      sessionId: primary.sessionId,
+      event: 'message.received',
+      idempotencyKey,
+      payload: { id: 1 },
+      attempts: 5,
+    });
+    const build = (webhook: Record<string, unknown> = {}) =>
+      new WebhookDeliveryService(
+        webhooks,
+        failures,
+        new ConfigService({ webhook }),
+        new HookManager(),
+        new WebhookOutboxService(ds.getRepository(WebhookOutboxEvent)),
+      );
+
+    it('keeps the reason a shed delivery was recorded with, which the generic row would replace', async () => {
+      await failures.save(
+        failures.create({
+          webhookId: primary.id,
+          sessionId: primary.sessionId,
+          event: 'message.received',
+          url: primary.url,
+          idempotencyKey: 'key-shed',
+          attempts: 0,
+          lastError: 'Webhook payload is 210 bytes after webhook:before hooks, exceeds 50',
+        }),
+      );
+
+      expect(await build().recordReplayExhaustion(spent('key-shed'), primary.url)).toBe(true);
+
+      const rows = await failures.find();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].attempts).toBe(5);
+      expect(rows[0].lastError).toBe(
+        'Webhook replay budget exhausted; last error: Webhook payload is 210 bytes after webhook:before hooks, exceeds 50',
+      );
+    });
+
+    it('records the plain exhaustion reason when nothing was recorded before', async () => {
+      expect(await build().recordReplayExhaustion(spent('key-plain'), primary.url)).toBe(true);
+      expect((await failures.find()).map(row => row.lastError)).toEqual(['Webhook replay budget exhausted']);
+    });
+
+    it('leaves a terminal failure that is already on record as it is', async () => {
+      await failures.save(
+        failures.create({
+          webhookId: primary.id,
+          sessionId: primary.sessionId,
+          event: 'message.received',
+          url: primary.url,
+          idempotencyKey: 'key-failed',
+          attempts: 3,
+          lastStatusCode: 503,
+          lastError: 'HTTP 503: Service Unavailable',
+        }),
+      );
+
+      expect(await build().recordReplayExhaustion(spent('key-failed'), primary.url)).toBe(true);
+
+      // The receiver's own answer is what the operator has to act on; the generic reason would replace it.
+      const rows = await failures.find();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ attempts: 3, lastStatusCode: 503, lastError: 'HTTP 503: Service Unavailable' });
+    });
+
+    it('stores no event body on the exhaustion row while payload retention is off', async () => {
+      await build().recordReplayExhaustion(spent('key-private'), primary.url);
+
+      const [row] = await failures.find({ select: { id: true, payload: true } });
+      expect(row.payload).toBeNull();
+    });
+
+    it('keeps the event body on the exhaustion row for a redrive while payload retention is on', async () => {
+      await build({ failurePayloadRetentionHours: 24 }).recordReplayExhaustion(spent('key-kept'), primary.url);
+
+      const [row] = await failures.find({ select: { id: true, payload: true } });
+      expect(row.payload).toEqual({ id: 1 });
+    });
   });
 
   it('does not replay a row whose pre-checks were under way when destroy began', async () => {

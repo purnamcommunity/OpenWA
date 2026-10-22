@@ -18,6 +18,7 @@ import { ShutdownService } from './common/services/shutdown.service';
 import { injectDashboardCspNonce } from './config/dashboard-csp';
 import { resolveCorsPolicy, isUpgradeInsecureRequestsEnabled, resolveBodyLimit } from './config/bootstrap-security';
 import { resolveRequestTimeoutMs } from './config/http-timeouts';
+import { parseTrustedProxies } from './common/utils/ip';
 
 /** Where the bundled dashboard documents come from, and whether to serve them at all. */
 export interface DashboardSource {
@@ -225,7 +226,8 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
   // Once the shutdown grace has elapsed, teardown runs every destroy hook before the listener
   // closes, and a request admitted then would run against services being torn down. Refuse new
   // requests from that point; admitted ones run until teardown ends and are then cut by the HTTP close
-  // (forceCloseConnections in main.ts). The health probes stay answered so
+  // (forceCloseConnections in main.ts). Socket.IO answers its handshake ahead of Express, so a new
+  // event-stream client is admitted until that close. The health probes stay answered so
   // readiness keeps reporting its draining state. Ahead of the budget, so no body is read.
   const shutdown = optional(ShutdownService);
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -258,10 +260,7 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
   const keyIndex = optional(ActiveKeyIndex);
   app.use(
     createInflightBodyBudget(inflightBudgetBytes, {
-      trustedProxies: (process.env.TRUSTED_PROXIES || '')
-        .split(',')
-        .map(p => p.trim())
-        .filter(Boolean),
+      trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
       classify: (req, clientIp) => keyIndex?.recognise(req.headers, clientIp),
       bodyLimitBytes: parseBodyLimitBytes(bodyLimit),
       requestTimeoutMs: resolveRequestTimeoutMs(process.env.REQUEST_TIMEOUT_MS),

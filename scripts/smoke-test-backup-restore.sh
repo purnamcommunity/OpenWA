@@ -62,6 +62,12 @@
 #       a ./data path or absolute media path from the environment are read as written, an
 #       environment ./uploads is exempt from the empty-volume rule, and a skipped non-empty ./uploads
 #       is named in a warning
+#   (aj) a ./.env this user cannot read stops backup and restore, where it used to read as a file that
+#       sets nothing and send both to the default paths (skipped as root)
+#   (ak) the archive and a BACKUP_DIR backup.sh creates stay private under a permissive umask, and the
+#       staging copy is removed after a backup that succeeds and one that fails
+#   (al) a tar that fails part way exits non-zero and leaves no archive in BACKUP_DIR, so a truncated
+#       file cannot pass for the newest backup
 #
 # Usage: ./scripts/smoke-test-backup-restore.sh
 # Requires: bash, tar, node (restore.sh path resolution). sqlite3 is optional (see (c) and (k)).
@@ -114,7 +120,7 @@ db_fingerprint() {
 # to shadow tar (simulating an incomplete archive) without touching the real scripts.
 populate_shim() {
   shim_dir="$1"
-  tools="env bash sh cp tar gzip mktemp date rm sed mkdir ls cat chmod grep printf uname dirname tr tail"
+  tools="env bash sh cp mv tar gzip mktemp date rm sed mkdir ls cat chmod grep printf uname dirname tr tail"
   if [ "${2:-}" = "with-sqlite3" ]; then
     tools="$tools sqlite3"
   fi
@@ -2156,6 +2162,119 @@ if [ "$(cat "$AI/pg/pg_dump-args" 2>/dev/null || true)" != "data/s3cret|-h|data|
   fail "(ai) Postgres settings from .env.generated were rewritten: $(cat "$AI/pg/pg_dump-args" 2>&1)"
 fi
 pass "(ai) a host run backs up and restores the volume's databases, media, sessions and plugins, not the working directory's"
+
+echo ""
+echo "==> (aj) a ./.env this user cannot read stops backup and restore"
+# A file that exists but cannot be opened (written by sudo or deploy tooling, say) read as a layer that
+# sets nothing. Backup then archived the stale database at the default path and exited 0, and restore
+# wrote to the default paths while the app opened the ones the file names. Root ignores the mode bits.
+if [ "$(id -u)" -ne 0 ]; then
+  AJ="$WORK/aj"
+  mkdir -p "$AJ/src/data" "$AJ/dst"
+  make_fixture "$AJ/src/data/main.sqlite" "aj-main"
+  make_fixture "$AJ/src/data/openwa.sqlite" "aj-data"
+  (cd "$AJ/src" && BACKUP_DIR="$AJ/out" "$BACKUP" >/dev/null 2>&1) || fail "(aj) the setup backup failed"
+  ARCHIVE_AJ="$(ls "$AJ"/out/openwa-backup-*.tar.gz)"
+  for AJ_DIR in src dst; do
+    printf 'DATABASE_NAME=./data/active.sqlite\n' >"$AJ/$AJ_DIR/.env"
+    chmod 000 "$AJ/$AJ_DIR/.env"
+  done
+  set +e
+  OUT_AJ_BACKUP="$(cd "$AJ/src" && BACKUP_DIR="$AJ/out-unread" "$BACKUP" 2>&1)"
+  RC_AJ_BACKUP=$?
+  OUT_AJ_RESTORE="$(cd "$AJ/dst" && "$RESTORE" "$ARCHIVE_AJ" 2>&1)"
+  RC_AJ_RESTORE=$?
+  set -e
+  if [ "$RC_AJ_BACKUP" -eq 0 ] || ! printf '%s' "$OUT_AJ_BACKUP" | grep -q 'cannot be read'; then
+    fail "(aj) backup went on past an unreadable ./.env (rc $RC_AJ_BACKUP): $OUT_AJ_BACKUP"
+  fi
+  if ls "$AJ"/out-unread/openwa-backup-*.tar.gz >/dev/null 2>&1; then
+    fail "(aj) backup archived the default path past an unreadable ./.env"
+  fi
+  if [ "$RC_AJ_RESTORE" -eq 0 ] || ! printf '%s' "$OUT_AJ_RESTORE" | grep -q 'cannot be read'; then
+    fail "(aj) restore went on past an unreadable ./.env (rc $RC_AJ_RESTORE): $OUT_AJ_RESTORE"
+  fi
+  if [ -e "$AJ/dst/data" ]; then
+    fail "(aj) restore wrote into the default data dir past an unreadable ./.env"
+  fi
+  pass "(aj) an unreadable ./.env stops backup and restore before any state moves"
+else
+  echo "SKIP: (aj) running as root, which ignores the permission bits this case relies on"
+fi
+
+echo ""
+echo "==> (ak) the archive and its staging copy stay private"
+# The archive holds the admin key, .env.generated and database secrets in plaintext. backup.sh sets
+# umask 077 so an operator's 022 leaves neither the archive nor a BACKUP_DIR it creates readable by
+# others, and removes its staging copy, which holds the same files, however it exits.
+AK="$WORK/ak"
+mkdir -p "$AK/ok/data" "$AK/bad/data" "$AK/tmp-ok" "$AK/tmp-bad"
+make_fixture "$AK/ok/data/main.sqlite" "ak-main"
+make_fixture "$AK/ok/data/openwa.sqlite" "ak-data"
+printf 'ak-admin-key\n' >"$AK/ok/data/.api-key"
+(umask 022 && cd "$AK/ok" && TMPDIR="$AK/tmp-ok" BACKUP_DIR="$AK/new/out" "$BACKUP" >/dev/null 2>&1) ||
+  fail "(ak) backup under umask 022 failed"
+ARCHIVE_AK="$(ls "$AK"/new/out/openwa-backup-*.tar.gz)"
+if [ -z "$(find "$ARCHIVE_AK" -maxdepth 0 -perm 600)" ]; then
+  fail "(ak) under umask 022 the archive is not mode 600"
+fi
+if [ -z "$(find "$AK/new/out" -maxdepth 0 -perm 700)" ]; then
+  fail "(ak) under umask 022 the BACKUP_DIR backup.sh created is not mode 700"
+fi
+# No database to back up: the run fails after it has staged what it could.
+set +e
+(umask 022 && cd "$AK/bad" && TMPDIR="$AK/tmp-bad" BACKUP_DIR="$AK/bad-out" "$BACKUP" >/dev/null 2>&1)
+RC_AK_BAD=$?
+set -e
+[ "$RC_AK_BAD" -ne 0 ] || fail "(ak) backup with no database exited 0"
+# A mktemp that ignores TMPDIR (BSD and macOS, with no template) puts the staging copy elsewhere, so
+# there is nothing to look for in it.
+AK_PROBE="$(TMPDIR="$AK/tmp-ok" mktemp -d)"
+rmdir "$AK_PROBE"
+case "$AK_PROBE" in
+  "$AK/tmp-ok"/*)
+    if [ -n "$(ls -A "$AK/tmp-ok")" ] || [ -n "$(ls -A "$AK/tmp-bad")" ]; then
+      fail "(ak) a staging copy was left behind: $(ls -A "$AK/tmp-ok" "$AK/tmp-bad")"
+    fi
+    pass "(ak) the archive is 600, a created BACKUP_DIR is 700 and no staging copy outlives a run"
+    ;;
+  *) pass "(ak) the archive is 600 and a created BACKUP_DIR is 700 (staging cleanup not checked: this mktemp ignores TMPDIR)" ;;
+esac
+
+echo ""
+echo "==> (al) a tar that fails part way leaves no archive behind"
+# A full volume stops tar after part of the archive is written. That file must not stay under the
+# openwa-backup-*.tar.gz name, where a listing or a keep-newest rotation reads it as the latest backup.
+AL="$WORK/al"
+mkdir -p "$AL/src/data" "$AL/shim"
+make_fixture "$AL/src/data/main.sqlite" "al-main"
+make_fixture "$AL/src/data/openwa.sqlite" "al-data"
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  populate_shim "$AL/shim" with-sqlite3
+else
+  populate_shim "$AL/shim"
+fi
+# (remove the populate_shim symlink first: writing through it would target the real tar)
+rm -f "$AL/shim/tar"
+cat >"$AL/shim/tar" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "-czf" ]; then
+  printf 'partial' >"\$2"
+  echo "tar: Write error" >&2
+  exit 2
+fi
+exec "$REAL_TAR" "\$@"
+EOF
+chmod +x "$AL/shim/tar"
+set +e
+(cd "$AL/src" && PATH="$AL/shim" BACKUP_DIR="$AL/out" "$BACKUP" >/dev/null 2>&1)
+RC_AL=$?
+set -e
+[ "$RC_AL" -ne 0 ] || fail "(al) backup exited 0 after its tar failed"
+if [ -n "$(ls -A "$AL/out" 2>/dev/null || true)" ]; then
+  fail "(al) a truncated archive was left behind: $(ls -A "$AL/out")"
+fi
+pass "(al) a failed tar exits non-zero and leaves nothing in BACKUP_DIR"
 
 echo ""
 echo "All smoke tests passed!"

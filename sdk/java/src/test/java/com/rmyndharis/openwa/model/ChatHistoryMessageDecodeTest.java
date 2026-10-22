@@ -45,9 +45,10 @@ class ChatHistoryMessageDecodeTest {
 
     @Test
     void decodesPollChoicesWithoutTrimming() {
-        var m = GSON.fromJson("{\"poll\":{\"name\":\"Q\",\"options\":[\" Park \",\"Beach\"],\"allowMultipleAnswers\":false}}", ChatHistoryMessage.class);
+        var m = GSON.fromJson("{\"poll\":{\"name\":\"Q\",\"options\":[\" Park \",\"Beach\"],\"allowMultipleAnswers\":true}}", ChatHistoryMessage.class);
+        assertEquals("Q", m.poll().name());
         assertEquals(List.of(" Park ", "Beach"), m.poll().options());
-        assertFalse(m.poll().allowMultipleAnswers());
+        assertTrue(m.poll().allowMultipleAnswers());
         var legacy = new ChatHistoryMessage("id", "from", "to", "chat", "Q", MessageType.POLL,
             1L, false, false, null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null);

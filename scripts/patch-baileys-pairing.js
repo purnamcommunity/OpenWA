@@ -1,9 +1,12 @@
 /**
- * Exact rc14 backports of WhiskeySockets/Baileys #2749 and #2765.
+ * rc14 backports of WhiskeySockets/Baileys #2749 and #2765, with one adaptation.
  * Pre-login notifications have no creds.me; ACKs must still be sent. When WA
  * retires unpaired registration material, rotate only its advertisement secret,
  * persist it through creds.update and re-render the current QR without spending
  * another ref. Registered/pairing-code sessions and malformed nodes stay intact.
+ * Adaptation: once creds.me is set (a pairing code was requested, or the device
+ * is registered) the QR timer stops. Upstream keeps it running, so there running
+ * out of refs ends the socket with 'QR refs attempts ended'; here it never does.
  * Sources: https://github.com/WhiskeySockets/Baileys/pull/2749 (3868667)
  *          https://github.com/WhiskeySockets/Baileys/pull/2765 (4f263f0)
  * Neither PR is merged. Retire after an upstream release includes both fixes.

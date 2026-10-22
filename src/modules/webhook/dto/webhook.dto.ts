@@ -80,6 +80,7 @@ export const WEBHOOK_EVENTS = [
   'message.received',
   'message.sent',
   'message.ack',
+  'message.receipt',
   'message.failed',
   'message.revoked',
   'message.reaction',
@@ -123,7 +124,8 @@ export class CreateWebhookDto {
   url!: string;
 
   @ApiPropertyOptional({
-    description: "Event types to subscribe to. '*' subscribes to all events.",
+    description:
+      "Event types to subscribe to. '*' subscribes to all events except `message.receipt`, which must be named explicitly.",
     example: ['message.received', 'session.status'],
     enum: [...WEBHOOK_EVENTS, '*'],
     type: String,
@@ -211,7 +213,8 @@ export class UpdateWebhookDto {
   url?: string;
 
   @ApiPropertyOptional({
-    description: "Event types to subscribe to. '*' subscribes to all events.",
+    description:
+      "Event types to subscribe to. '*' subscribes to all events except `message.receipt`, which must be named explicitly.",
     enum: [...WEBHOOK_EVENTS, '*'],
     type: String,
     isArray: true,
@@ -451,6 +454,8 @@ export class RedriveWebhookDeliveriesDto {
     type: [String],
     description: 'Only these failure rows (ids from `GET /webhooks/delivery-failures`).',
     example: ['0a941dac-a965-45e7-b318-74ae8be134f0'],
+    maxItems: 500,
+    items: { type: 'string', maxLength: 128 },
   })
   @IsOptional()
   @IsArray()
@@ -459,7 +464,12 @@ export class RedriveWebhookDeliveriesDto {
   @MaxLength(128, { each: true })
   ids?: string[];
 
-  @ApiPropertyOptional({ description: 'Max rows replayed by this call (1-500, default 100).', example: 100 })
+  @ApiPropertyOptional({
+    description: 'Max rows replayed by this call (1-500, default 100).',
+    example: 100,
+    minimum: 1,
+    maximum: 500,
+  })
   @IsOptional()
   @IsInt()
   @Min(1)

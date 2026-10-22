@@ -1,10 +1,10 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, IsNotEmpty, IsOptional, IsEnum, IsInt, IsNumber, Max, Min } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsEnum, IsInt, IsNumber, Max, MaxLength, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 import { MessageDirection } from '../../message/entities/message.entity';
 import type { MessageType } from '../../../engine/interfaces/whatsapp-engine.interface';
 import { ToStrictNumber } from '../../../common/utils/strict-boolean';
-import { SEARCH_OFFSET_MAX } from '../search.constants';
+import { SEARCH_OFFSET_MAX, SEARCH_QUERY_MAX_LENGTH, SEARCH_TERMS_MAX } from '../search.constants';
 
 /**
  * Request shape for GET /search. Numeric fields are coerced from query-string strings via
@@ -17,9 +17,13 @@ import { SEARCH_OFFSET_MAX } from '../search.constants';
  * API-key allowedSessions/allowedChats (never user-supplied).
  */
 export class SearchQueryDto {
-  @ApiProperty({ description: 'Search term (required, non-empty)' })
+  @ApiProperty({
+    description: `Search term (required, non-empty, at most ${SEARCH_QUERY_MAX_LENGTH} characters and ${SEARCH_TERMS_MAX} words)`,
+    maxLength: SEARCH_QUERY_MAX_LENGTH,
+  })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(SEARCH_QUERY_MAX_LENGTH)
   q!: string;
 
   @ApiPropertyOptional({ description: 'Restrict to a single session' })
@@ -27,12 +31,18 @@ export class SearchQueryDto {
   @IsString()
   sessionId?: string;
 
-  @ApiPropertyOptional({ description: 'Restrict to a single chat id' })
+  @ApiPropertyOptional({
+    description:
+      "Restrict to a single chat id. A phone also matches the chat's other stored forms (the other user dialect and any lid that resolves to it).",
+  })
   @IsOptional()
   @IsString()
   chatId?: string;
 
-  @ApiPropertyOptional({ description: 'Sender filter' })
+  @ApiPropertyOptional({
+    description:
+      "Sender filter. Matches `from` or a group message's `author`; a phone also matches any lid that resolves to it.",
+  })
   @IsOptional()
   @IsString()
   from?: string;

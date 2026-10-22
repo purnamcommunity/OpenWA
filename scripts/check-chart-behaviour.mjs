@@ -309,6 +309,24 @@ const check = (id, ok, detail) => results.push({ id, ok, detail });
   );
 }
 
+// `helm upgrade --reuse-values` renders the new templates with the PREVIOUS release's values, which hold
+// none of the keys a newer chart added. A template that reads one without a default fails the upgrade
+// with a nil pointer, and so does a chart that stops rendering when a block is removed.
+{
+  let detail;
+  let ok = false;
+  try {
+    const probe = mapAt(byKind(render('--set', 'startupProbe=null'), 'StatefulSet')[0] ?? '', ['startupProbe']);
+    ok = probe?.periodSeconds === '5' && probe?.failureThreshold === '60';
+    detail = ok
+      ? 'values without the startupProbe block render with the 5 s period and 60 failures'
+      : `values without startupProbe rendered periodSeconds ${probe?.periodSeconds}, failureThreshold ${probe?.failureThreshold}`;
+  } catch (error) {
+    detail = `the chart does not render with values that predate startupProbe: ${String(error.stderr ?? error.message).split('\n')[0]}`;
+  }
+  check('renders-with-previous-release-values', ok, detail);
+}
+
 const failed = results.filter(r => !r.ok);
 if (failed.length) {
   console.error('\n✖ Chart behaviour check failed:');

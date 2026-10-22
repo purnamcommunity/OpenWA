@@ -6,7 +6,11 @@ namespace OpenWA\Http;
 
 use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\ConnectException;
+use GuzzleHttp\Exception\ConnectTimeoutException;
+use GuzzleHttp\Exception\NetworkTimeoutException;
+use GuzzleHttp\Exception\ResponseTimeoutException;
 use OpenWA\Exceptions\OpenWAApiException;
+use OpenWA\Exceptions\OpenWAException;
 use OpenWA\Exceptions\OpenWATimeoutException;
 use Psr\Http\Message\ResponseInterface;
 
@@ -20,28 +24,42 @@ use Psr\Http\Message\ResponseInterface;
  */
 class HttpExecutor
 {
+    /**
+     * The API keys and default header values of the executors, outside their property tables: print_r,
+     * var_dump, var_export, an (array) cast and a framework's dumper all read properties, and both are
+     * bearer-equivalent (a header often carries the credential of a proxy in front of the gateway).
+     *
+     * @var \WeakMap<HttpExecutor,array{apiKey:string,headers:array<string,string|list<string>>}>|null
+     */
+    private static ?\WeakMap $secrets = null;
+
     private ClientInterface $http;
     private float $timeout;
-    private string $apiKey;
     private string $baseUrl;
-    /** @var array<string,string> */
-    private array $defaultHeaders;
+    /** @var list<string> Only the names: see $secrets for the values. */
+    private array $headerNames;
 
     /**
-     * @param array<string,string> $defaultHeaders Applied UNDER the auth/JSON headers
+     * @param array<string,scalar|null|non-empty-array<array-key,scalar|null>> $defaultHeaders Applied UNDER the auth/JSON headers
      *                                             (which always win), on every request.
      */
     public function __construct(
         string $baseUrl,
-        string $apiKey,
+        #[\SensitiveParameter] string $apiKey,
         float $timeout = 30.0,
         ?ClientInterface $httpClient = null,
-        array $defaultHeaders = []
+        #[\SensitiveParameter] array $defaultHeaders = []
     ) {
+        self::checkDefaultHeaders($defaultHeaders);
+        $defaultHeaders = array_map(
+            static fn ($value) => is_array($value) ? array_map('strval', array_values($value)) : (string) $value,
+            $defaultHeaders
+        );
         $this->timeout = $timeout;
-        $this->apiKey = $apiKey;
+        self::$secrets ??= new \WeakMap();
+        self::$secrets[$this] = ['apiKey' => $apiKey, 'headers' => $defaultHeaders];
         $this->baseUrl = rtrim($baseUrl, '/');
-        $this->defaultHeaders = $defaultHeaders;
+        $this->headerNames = array_map('strval', array_keys($defaultHeaders));
         // Auth/JSON headers are applied per-request (in request()). Request URLs
         // are built absolute (baseUrl . path) so a base path prefix (e.g. /v1
         // behind a reverse proxy) is preserved; base_uri is intentionally unset,
@@ -49,6 +67,65 @@ class HttpExecutor
         $this->http = $httpClient ?? new \GuzzleHttp\Client([
             'timeout' => $timeout,
         ]);
+    }
+
+    /**
+     * Refuse a default header the HTTP stack would refuse, naming the header and never its value: the
+     * stack's own message quotes the value, which would put a proxy credential in the application's log.
+     * Public so that the client can run it before it builds an executor, whose constructor frame holds the
+     * key and, before PHP 8.2, shows its first characters in a trace.
+     *
+     * A number, a boolean or null is sent as its text and a non-empty list as several values.
+     *
+     * @param array<mixed> $headers
+     *
+     * @throws OpenWAException
+     */
+    public static function checkDefaultHeaders(#[\SensitiveParameter] array $headers): void
+    {
+        foreach ($headers as $name => $value) {
+            if (!is_string($name) || preg_match('/\A[!#$%&\'*+\-.^_`|~0-9A-Za-z]+\z/', $name) !== 1) {
+                throw new OpenWAException(
+                    'OpenWA Client: defaultHeaders has a header name that is not a valid HTTP token'
+                );
+            }
+            if ($value === []) {
+                throw new OpenWAException(sprintf('OpenWA Client: defaultHeaders value for "%s" must be text or a non-empty list', $name));
+            }
+            foreach (is_array($value) ? $value : [$value] as $each) {
+                if (is_scalar($each) || $each === null) {
+                    if (preg_match('/\A[\t\x20-\x7e]*\z/', (string) $each) === 1) {
+                        continue;
+                    }
+                    $reason = 'must be text without control or non-ASCII characters; check for a stray newline';
+                } else {
+                    $reason = 'must be text';
+                }
+                throw new OpenWAException(sprintf('OpenWA Client: defaultHeaders value for "%s" %s', $name, $reason));
+            }
+        }
+    }
+
+    /**
+     * What print_r and var_dump show of the executor, and so of every client and resource that holds it.
+     * The key and the header values are not among the properties at all (see $secrets), so no dump,
+     * export or cast can reach them.
+     *
+     * @return array<string,mixed>
+     */
+    public function __debugInfo(): array
+    {
+        return [
+            'baseUrl' => $this->baseUrl,
+            'timeout' => $this->timeout,
+            'apiKey' => '[redacted]',
+            'defaultHeaders' => $this->headerNames,
+        ];
+    }
+
+    /** A copy would have no key, since the key belongs to the object it was given to. */
+    private function __clone()
+    {
     }
 
     /**
@@ -141,6 +218,7 @@ class HttpExecutor
         // Auth/JSON headers are applied per-request so they are correct whether
         // a default or injected client is used (and never leak Guzzle exceptions:
         // http_errors disabled so we translate status into typed SDK exceptions).
+        $secrets = (self::$secrets ?? new \WeakMap())[$this] ?? ['apiKey' => '', 'headers' => []];
         $options = [
             'http_errors' => false,
             // Per-request options override injected Guzzle client defaults, so the SDK's configured
@@ -152,12 +230,12 @@ class HttpExecutor
             // Caller default headers first; auth/JSON win so they can't be clobbered. Header names are
             // case-insensitive and PSR-7 keeps every value, so a caller's copy in another case is dropped.
             'headers' => array_merge(array_filter(
-                $this->defaultHeaders,
+                $secrets['headers'],
                 fn ($name) => !in_array(strtolower((string) $name), ['x-api-key', 'content-type', 'accept'], true)
                     && ($idempotencyKey === null || strtolower((string) $name) !== 'idempotency-key'),
                 ARRAY_FILTER_USE_KEY
             ), [
-                'X-API-Key' => $this->apiKey,
+                'X-API-Key' => $secrets['apiKey'],
                 'Content-Type' => 'application/json',
                 'Accept' => 'application/json',
             ]),
@@ -178,12 +256,11 @@ class HttpExecutor
 
         try {
             $response = $this->http->request($method, $url, $options);
+        } catch (ConnectTimeoutException | NetworkTimeoutException | ResponseTimeoutException $e) {
+            throw new OpenWATimeoutException($this->timeout);
         } catch (ConnectException $e) {
-            // cURL error 28 (CURLE_OPERATION_TIMEDOUT) is the canonical timeout
-            // signal, surfaced via the handler context. We check errno first
-            // (locale- and version-independent) and fall back to message matching
-            // for transports that don't populate the context (e.g. stream handler).
-            $errno = $e->getHandlerContext()['errno'] ?? null;
+            // Guzzle 7 exposes cURL errno 28 in the context; custom transports may only supply a message.
+            $errno = method_exists($e, 'getHandlerContext') ? ($e->getHandlerContext()['errno'] ?? null) : null;
             $isTimeout = $errno === 28 || str_contains($e->getMessage(), 'timed out');
             if ($isTimeout) {
                 throw new OpenWATimeoutException($this->timeout);
@@ -230,11 +307,14 @@ class HttpExecutor
         $reason = $response->getReasonPhrase();
         $message = "OpenWA API {$status} {$reason} — {$method} {$path}: {$messageText}";
 
+        // An intermediary that rewrites the body may send a non-string `error`; the kind stays unset then.
+        $errorKind = is_string($envelope['error'] ?? null) ? $envelope['error'] : null;
+
         return OpenWAApiException::classify(
             $status,
             $message,
             $data,
-            $envelope['error'] ?? null,
+            $errorKind,
             $response->getHeaders(),
         );
     }

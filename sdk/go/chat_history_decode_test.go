@@ -78,10 +78,10 @@ func TestChatSummaryDecodesOptionalLastMessageType(t *testing.T) {
 
 func TestChatHistoryDecodesPollChoices(t *testing.T) {
 	var m ChatHistoryMessage
-	if err := json.Unmarshal([]byte(`{"poll":{"name":"Q","options":[" Park ","Beach"],"allowMultipleAnswers":false}}`), &m); err != nil {
+	if err := json.Unmarshal([]byte(`{"poll":{"name":"Q","options":[" Park ","Beach"],"allowMultipleAnswers":true}}`), &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.Poll == nil || m.Poll.Name != "Q" || m.Poll.Options[0] != " Park " || m.Poll.AllowMultipleAnswers {
+	if m.Poll == nil || m.Poll.Name != "Q" || m.Poll.Options[0] != " Park " || !m.Poll.AllowMultipleAnswers {
 		t.Fatalf("poll = %+v", m.Poll)
 	}
 }

@@ -276,3 +276,80 @@ test('the contact list rejects instead of returning a partial list when a later 
     (err: Error & { status?: number }) => err.status === 429 && err.message === 'Too Many Requests',
   );
 });
+
+function chatResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+for (const size of [1001, 2000, 11001]) {
+  test(`the chat list loads all ${size} conversations in bounded pages`, async () => {
+    const offsets: number[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'http://localhost');
+      const offset = Number(url.searchParams.get('offset'));
+      assert.equal(url.searchParams.get('limit'), '1000');
+      offsets.push(offset);
+      return chatResponse(
+        Array.from({ length: Math.min(1000, size - offset) }, (_, i) => ({ id: `chat-${offset + i}` })),
+      );
+    }) as typeof fetch;
+    const chats = await sessionApi.getChats('s1');
+    assert.equal(chats.length, size);
+    assert.equal(chats.at(-1)?.id, `chat-${size - 1}`);
+    assert.deepEqual(
+      offsets,
+      Array.from({ length: Math.floor(size / 1000) + 1 }, (_, i) => i * 1000),
+    );
+  });
+}
+
+test('chat pagination preserves first-seen order and deduplicates moving rows', async () => {
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const offset = Number(new URL(String(input), 'http://localhost').searchParams.get('offset'));
+    return chatResponse(
+      offset === 0
+        ? Array.from({ length: 1000 }, (_, i) => ({ id: `chat-${i}` }))
+        : [{ id: 'chat-999' }, { id: 'tail' }],
+    );
+  }) as typeof fetch;
+  const chats = await sessionApi.getChats('s1');
+  assert.equal(chats.length, 1001);
+  assert.equal(chats[999].id, 'chat-999');
+  assert.equal(chats[1000].id, 'tail');
+});
+
+for (const status of [500, 429]) {
+  test(`chat pagination rejects a later ${status} without returning a partial list`, async () => {
+    let attempts = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const offset = Number(new URL(String(input), 'http://localhost').searchParams.get('offset'));
+      if (offset === 0) return chatResponse(Array.from({ length: 1000 }, (_, i) => ({ id: `chat-${i}` })));
+      attempts++;
+      return chatResponse({ message: 'Later page failed' }, status);
+    }) as typeof fetch;
+    await assert.rejects(sessionApi.getChats('s1'), (err: Error & { status?: number }) => err.status === status);
+    assert.equal(attempts, status === 429 ? 3 : 1);
+  });
+}
+
+for (const change of ['replace key', 'sign out', 'abort'] as const) {
+  test(`chat pagination stops before the next page after ${change}`, async () => {
+    let release!: (response: Response) => void;
+    let requests = 0;
+    const pending = new Promise<Response>(resolve => {
+      release = resolve;
+    });
+    const controller = new AbortController();
+    globalThis.fetch = (async () => {
+      requests++;
+      return pending;
+    }) as typeof fetch;
+    const result = sessionApi.getChats('s1', controller.signal);
+    if (change === 'replace key') sessionStorage.setItem('openwa_api_key', 'next-key');
+    if (change === 'sign out') sessionStorage.removeItem('openwa_api_key');
+    if (change === 'abort') controller.abort();
+    release(chatResponse(Array.from({ length: 1000 }, (_, i) => ({ id: `chat-${i}` }))));
+    await assert.rejects(result, change === 'abort' ? { name: 'AbortError' } : /Signed out/);
+    assert.equal(requests, 1);
+  });
+}

@@ -99,6 +99,33 @@ describe('webhook failure persistence', () => {
     jest.spyOn(repo, 'update').mockRejectedValueOnce(new Error('disk unavailable'));
     await expect(recordWebhookDeliveryFailure(repo, logger, input)).resolves.toBeNull();
   });
+  it('removes an unattempted row that an earlier terminal record left behind', async () => {
+    // A crash, or a failed delete, right after the terminal insert leaves both rows. Nothing else
+    // reconciles the unattempted one, so every repeat of the terminal record finishes the clean-up.
+    await recordWebhookDeliveryFailure(repo, logger, input);
+    await repo.insert({ ...input, attempts: 0, lastStatusCode: null, lastError: 'ConcurrencyLimiter closed' });
+
+    await expect(recordWebhookDeliveryFailure(repo, logger, { ...input, attempts: 1 })).resolves.toBe(false);
+
+    expect(await repo.count({ where: { attempts: 0 } })).toBe(0);
+    expect((await repo.findOneByOrFail({ idempotencyKey: 'key' })).attempts).toBe(4);
+  });
+  it('still reports an unattempted duplicate as not recorded when refreshing its reason fails', async () => {
+    // A true here would count a loss that is already counted.
+    await recordWebhookDeliveryFailure(repo, logger, { ...input, attempts: 0 });
+    jest.spyOn(repo, 'update').mockRejectedValueOnce(new Error('disk unavailable'));
+
+    await expect(
+      recordWebhookDeliveryFailure(repo, logger, { ...input, attempts: 0, lastError: 'too large' }),
+    ).resolves.toBe(false);
+
+    expect(logger.error).toHaveBeenCalledWith(
+      'Failed to refresh the reason of an unsent webhook delivery',
+      'disk unavailable',
+      expect.objectContaining({ action: 'webhook_failure_record_error' }),
+    );
+    expect((await repo.findOneByOrFail({ idempotencyKey: 'key' })).lastError).toBe('HTTP 503: down');
+  });
   it('records unkeyed losses separately and stores no replay payload by default', async () => {
     await recordWebhookDeliveryFailure(repo, logger, { ...input, idempotencyKey: undefined });
     await recordWebhookDeliveryFailure(repo, logger, { ...input, idempotencyKey: undefined });

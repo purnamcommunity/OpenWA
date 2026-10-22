@@ -416,6 +416,24 @@ describe('PluginLoaderService — graceful shutdown (onModuleDestroy)', () => {
     expect(loader.getPlugin('slow-plg')?.status).toBe(PluginStatus.DISABLED);
   });
 
+  // Shutdown waits on every enable it has recorded, so a settled one left in the set is waited on for the
+  // life of the process and the set grows by one entry per enable.
+  it.each([
+    ['succeeds', () => Promise.resolve()],
+    ['fails', () => Promise.reject(new Error('onEnable failed'))],
+  ])('stops tracking an enable once it %s', async (_outcome, onEnable) => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    loader.registerBuiltInPlugin(ext('tracked-plg'), { onEnable: () => gate.then(onEnable) });
+
+    const enabling = loader.enablePlugin('tracked-plg').catch(() => undefined);
+    expect(loader['pendingEnables'].size).toBe(1);
+
+    release();
+    await enabling;
+    expect(loader['pendingEnables'].size).toBe(0);
+  });
+
   it('disables running plugins without waiting for an enable still in flight', async () => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => (release = resolve));

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { throttlerMessage } from '@nestjs/throttler';
-import { safeEqualStr, verifyIngressSignature } from './ingress-signature';
+import { verifyIngressSignature } from './ingress-signature';
+import { constantTimeEqual } from '../../common/security/constantTimeEqual';
 import { PluginIngressRoute } from '../../core/plugins/plugin.interfaces';
 import { IngressJobData } from '../queue/processors/ingress.processor';
 import type { EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
@@ -119,7 +120,7 @@ export class IngressService {
       const token = req.query[route.challenge.tokenParam];
       const echo = req.query[route.challenge.echoParam];
       // Constant-time compare (mirrors the signature path) so the verify token can't be probed by timing.
-      if (token && instance.verifyToken && safeEqualStr(token, instance.verifyToken)) {
+      if (token && instance.verifyToken && constantTimeEqual(token, instance.verifyToken)) {
         return { status: 200, body: echo ?? '' };
       }
       return { status: 403, body: 'challenge failed' };
@@ -209,7 +210,12 @@ export class IngressService {
     // dead-lettered, and the deliveries were simply gone. Fall through to the body hash, which is
     // exactly the "provider supplied no id" case it already exists for.
     const headerId = req.headers[dedupHeader]?.trim();
-    const deliveryId = route.dedupOn === 'body' || !headerId ? deriveDeliveryId(req) : headerId;
+    // An id past 255 characters is no id a provider mints, and the unique index it is stored under refuses an
+    // entry past about 2.7 KB on PostgreSQL with a 500, so such a header gets the body hash too.
+    const deliveryId =
+      route.dedupOn === 'body' || !headerId || headerId.length > MAX_DELIVERY_ID_LENGTH
+        ? deriveDeliveryId(req)
+        : headerId;
     // Provider request headers persist with the event (redrive/debugging); credentials must not.
     // Signature headers are re-derivable, auth material is not — redact before the first write.
     // A shared-secret route carries the instance secret itself in its declared header, and an hmac
@@ -286,6 +292,9 @@ export class IngressService {
     return ack;
   }
 }
+
+/** The longest dedup header value taken as a delivery id, kept far below the index entry limit of PostgreSQL. */
+const MAX_DELIVERY_ID_LENGTH = 255;
 
 /**
  * Derives a DETERMINISTIC delivery id when the provider sends no dedup header, so a provider retry of

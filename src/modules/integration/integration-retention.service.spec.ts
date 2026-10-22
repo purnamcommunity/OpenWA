@@ -355,6 +355,27 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
     });
   });
 
+  it('hands off the healthy rows behind one whose stored payload is not JSON', async () => {
+    // Only an imported or hand-edited row can hold such text. Read with the batch it failed the whole
+    // read, so nothing behind it was ever dead-lettered and every run failed the same way.
+    await insertEvent('unreadable', { createdAt: daysAgo(10) });
+    await insertEvent('healthy-1', {});
+    await insertEvent('healthy-2', {});
+    await ds.query(`UPDATE ingress_events SET payload = '{oops' WHERE id = 'unreadable'`);
+
+    expect(await service.pruneOlderThan(7, 90)).toEqual({ events: 0, failures: 0 });
+
+    expect(await events.findOneByOrFail({ id: 'healthy-1' })).toMatchObject({ dispatchState: 'failed', payload: null });
+    expect(await events.findOneByOrFail({ id: 'healthy-2' })).toMatchObject({ dispatchState: 'failed', payload: null });
+    expect((await failures.find()).map(row => row.deliveryId).sort()).toEqual(['d-healthy-1', 'd-healthy-2']);
+    // Kept for an operator to remove: neither settled nor deleted, and the next run still moves on.
+    expect(await ds.query(`SELECT "dispatchState", payload FROM ingress_events WHERE id = 'unreadable'`)).toEqual([
+      { dispatchState: 'pending', payload: '{oops' },
+    ]);
+    expect(await service.pruneOlderThan(7, 90)).toEqual({ events: 2, failures: 0 });
+    expect(await events.count()).toBe(1);
+  });
+
   it('retires the payload without a second dead letter when the live path already wrote one', async () => {
     await insertEvent('inline-failed', { dispatchAttempts: 1 });
     await failures.save({
@@ -603,6 +624,55 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
     expect(await events.count()).toBe(0);
   });
 
+  // A dead letter older than the 90-day window, so the first step of a run has something to remove.
+  const insertAgedFailure = () =>
+    failures
+      .createQueryBuilder()
+      .insert()
+      .values({
+        direction: 'inbound',
+        pluginId: 'plug',
+        instanceId: 'inst',
+        attempts: 1,
+        lastError: 'old',
+        redriven: false,
+        createdAt: daysAgo(100),
+      })
+      .execute();
+
+  it('still hands off an aged pending event when the dedup delete fails', async () => {
+    await insertEvent('stranded', {});
+    await insertAgedFailure();
+    jest.spyOn(events, 'delete').mockRejectedValueOnce(new Error('locked'));
+
+    const result = await service.pruneOlderThan(7, 90);
+
+    // The failed delete counts as nothing removed, the dead-letter prune before it still counts, and the
+    // hand-off after it still ran: a locked table must not hold the day's hand-off back another 24 hours.
+    expect(result).toEqual({ events: 0, failures: 1 });
+    expect(await events.findOneByOrFail({ id: 'stranded' })).toMatchObject({ dispatchState: 'failed', payload: null });
+    expect(await failures.count()).toBe(1);
+    expect(logError).toHaveBeenCalledWith(
+      'Integration ingress retention: dedup prune failed',
+      expect.stringContaining('locked'),
+    );
+  });
+
+  it('reports what the prunes removed when the hand-off fails', async () => {
+    await insertEvent('dispatched', { dispatchState: 'dispatched', payload: null });
+    await insertAgedFailure();
+    jest.spyOn(reconciler, 'deadLetterAgedPending').mockRejectedValueOnce(new Error('queue unreachable'));
+
+    const result = await service.pruneOlderThan(7, 90);
+
+    expect(result).toEqual({ events: 1, failures: 1 });
+    expect(await events.count()).toBe(0);
+    expect(logError).toHaveBeenCalledWith(
+      'Integration ingress retention: undispatched event hand-off failed',
+      expect.stringContaining('queue unreachable'),
+    );
+  });
+
   it('hands off a backlog larger than one batch', async () => {
     for (let i = 0; i < 250; i++) await insertEvent(`b${i}`, {});
 
@@ -610,6 +680,26 @@ describe('IntegrationRetentionService.pruneOlderThan with undispatched events', 
 
     expect(await events.count({ where: { dispatchState: 'failed' } })).toBe(250);
     expect(await failures.count()).toBe(250);
+  });
+
+  it('lets the event loop run between rows, which a synchronous driver would otherwise starve for the whole pass', async () => {
+    for (let i = 0; i < 120; i++) await insertEvent(`y${i}`, {});
+    // better-sqlite3 answers every statement at once, so without a yield the pass is one unbroken chain of
+    // microtasks: no timer, request or keep-alive callback runs until it ends, however many rows it holds.
+    let ticks = 0;
+    let probing = true;
+    const probe = (): void => {
+      if (!probing) return;
+      ticks += 1;
+      setImmediate(probe);
+    };
+    setImmediate(probe);
+
+    await service.pruneOlderThan(7, 90);
+    probing = false;
+
+    expect(await events.count({ where: { dispatchState: 'failed' } })).toBe(120);
+    expect(ticks).toBeGreaterThan(60);
   });
 
   it('prunes aged settled markers while the hand-off is still waiting', async () => {

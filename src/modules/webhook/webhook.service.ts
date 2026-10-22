@@ -204,7 +204,9 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
       retryCount: dto.retryCount ?? 3,
     });
 
-    return this.webhookRepository.save(webhook);
+    const saved = await this.webhookRepository.save(webhook);
+    this.delivery.invalidateOptInSubscriptions(sessionId);
+    return saved;
   }
 
   async findBySession(sessionId: string): Promise<Webhook[]> {
@@ -308,6 +310,7 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
     // re-insert a row a concurrent DELETE removed during the URL check, and write back stale values
     // of every column this request did not touch.
     const result = await this.webhookRepository.update({ id, sessionId }, patch);
+    this.delivery.invalidateOptInSubscriptions(sessionId);
     if (!result.affected) throw new NotFoundException(`Webhook with id '${id}' not found`);
     return this.findOne(sessionId, id);
   }
@@ -315,6 +318,7 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
   async delete(sessionId: string, id: string): Promise<void> {
     const webhook = await this.findOne(sessionId, id);
     await this.webhookRepository.remove(webhook);
+    this.delivery.invalidateOptInSubscriptions(sessionId);
   }
 
   async test(sessionId: string, webhookId: string): Promise<{ success: boolean; statusCode?: number; error?: string }> {

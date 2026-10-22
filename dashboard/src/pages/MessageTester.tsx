@@ -31,7 +31,9 @@ import { PageHeader } from '../components/PageHeader';
 import { GroupPicker } from '../components/GroupPicker';
 import { groupLabel, isGatewayRefusal, planGroupSend } from '../utils/groupSelection';
 import { sendSequentially } from '../utils/sendSequentially';
+import { keepsSameKey } from '../utils/authLifecycle';
 import './MessageTester.css';
+import { MEDIA_UPLOAD_MAX_BYTES } from '../utils/mediaUpload';
 
 interface ApiResponse {
   success: boolean;
@@ -113,12 +115,6 @@ const fallbackMime: Record<(typeof messageTypes)[number], string> = {
   forward: 'application/octet-stream',
   bulk: 'application/octet-stream',
 };
-
-// Client pre-check before base64-encoding an upload. Aligned with the default request-body limit: base64
-// inflates ~1.33x, so ~18 MiB raw stays under the 25 MiB BODY_SIZE_LIMIT and lets the backend reject with a
-// clear 413 instead of the tab OOMing on a multi-hundred-MB pick before the request is even sent. The
-// backend's MEDIA_DOWNLOAD_MAX_BYTES (default 50 MiB) stays authoritative for URL sends (fetched server-side).
-const MEDIA_UPLOAD_MAX_BYTES = 18 * 1024 * 1024;
 
 // Batch statuses that stop the progress polling (mirrors the backend BatchStatus enum).
 const TERMINAL_BATCH_STATUSES: readonly BatchStatus[] = ['completed', 'cancelled', 'failed'];
@@ -217,10 +213,12 @@ export function MessageTester() {
   // in flight at unmount resolves later, so startBatchPolling must refuse to start once unmounted.
   // Reset on every mount: StrictMode runs mount, unmount, mount.
   const unmountedRef = useRef(false);
+  const sendGenerationRef = useRef(0);
   useEffect(() => {
     unmountedRef.current = false;
     return () => {
       unmountedRef.current = true;
+      sendGenerationRef.current += 1;
       stopBatchPolling();
     };
   }, []);
@@ -426,7 +424,11 @@ export function MessageTester() {
 
   const isGroupSending = groupSendProgress !== null;
 
-  const sendToGroups = async (chatIds: string[], sendTo: (chatId: string) => Promise<MessageResponse>) => {
+  const sendToGroups = async (
+    chatIds: string[],
+    sendTo: (chatId: string) => Promise<MessageResponse>,
+    isCurrent: () => boolean,
+  ) => {
     const controller = new AbortController();
     groupSendAbort.current = controller;
     const labels = new Map(groups.map(group => [group.id, groupLabel(group)]));
@@ -441,9 +443,12 @@ export function MessageTester() {
           delayMs: GROUP_SEND_DELAY_MS,
           signal: controller.signal,
           stopOn: isGatewayRefusal,
-          onProgress: (current, total) => setGroupSendProgress({ current, total }),
+          onProgress: (current, total) => {
+            if (isCurrent()) setGroupSendProgress({ current, total });
+          },
         },
       );
+      if (!isCurrent()) return;
       setResponse({
         success: outcome.sent === chatIds.length,
         timestamp: new Date().toISOString(),
@@ -461,9 +466,13 @@ export function MessageTester() {
         },
       });
     } finally {
-      groupSendAbort.current = null;
-      setGroupSendProgress(null);
-      setGroupSendCancelling(false);
+      if (groupSendAbort.current === controller) {
+        groupSendAbort.current = null;
+        if (!unmountedRef.current) {
+          setGroupSendProgress(null);
+          setGroupSendCancelling(false);
+        }
+      }
     }
   };
 
@@ -475,6 +484,15 @@ export function MessageTester() {
   const handleSend = async () => {
     const targetId = recipientType === 'group' ? (selectedGroups[0] ?? '') : recipient;
     if (!session || (messageType !== 'bulk' && !targetId)) return;
+    const generation = ++sendGenerationRef.current;
+    const sameKey = keepsSameKey();
+    const isCurrent = () => !unmountedRef.current && generation === sendGenerationRef.current && sameKey();
+    const assertCurrent = () => {
+      if (!isCurrent()) {
+        groupSendAbort.current?.abort();
+        throw new DOMException('Aborted', 'AbortError');
+      }
+    };
     setIsLoading(true);
     setResponse(null);
     // An earlier batch keeps running server-side, but its polling must not overwrite this response.
@@ -489,6 +507,7 @@ export function MessageTester() {
       let chatId = targetId;
       if (messageType !== 'bulk' && recipientType !== 'group') {
         const resolved = await contactApi.checkNumber(session, targetId.replace(/[^0-9]/g, ''));
+        assertCurrent();
         if (!resolved.exists || !resolved.whatsappId) {
           setResponse({
             success: false,
@@ -506,6 +525,7 @@ export function MessageTester() {
           messages: buildBulkMessages(bulkRecipientList, content, bulkAttachment),
           ...(delayMs !== undefined ? { options: { delayBetweenMessages: delayMs } } : {}),
         });
+        assertCurrent();
         batchSessionRef.current = session;
         setResponse({ success: true, timestamp: new Date().toISOString(), batchId: batch.batchId });
         setBatchStatus({
@@ -519,6 +539,7 @@ export function MessageTester() {
       }
 
       const sendTo = async (target: string): Promise<MessageResponse> => {
+        assertCurrent();
         switch (messageType) {
           case 'text':
             return messageApi.sendText(session, target, content);
@@ -568,6 +589,7 @@ export function MessageTester() {
             let toChatId = forwardTo.trim();
             if (!toChatId.includes('@')) {
               const resolvedTo = await contactApi.checkNumber(session, toChatId.replace(/[^0-9]/g, ''));
+              assertCurrent();
               if (!resolvedTo.exists || !resolvedTo.whatsappId) throw new Error(t('messageTester.notOnWhatsApp'));
               toChatId = resolvedTo.whatsappId;
             }
@@ -585,11 +607,12 @@ export function MessageTester() {
 
       const plan = recipientType === 'group' ? planGroupSend(selectedGroups, messageType) : null;
       if (plan?.mode === 'sequential') {
-        await sendToGroups(plan.chatIds, sendTo);
+        await sendToGroups(plan.chatIds, sendTo, isCurrent);
         return;
       }
 
       const result = await sendTo(chatId);
+      assertCurrent();
 
       setResponse({
         success: !!result.messageId,
@@ -597,6 +620,7 @@ export function MessageTester() {
         timestamp: result.timestamp ? new Date(result.timestamp * 1000).toISOString() : new Date().toISOString(),
       });
     } catch (err) {
+      if (!isCurrent()) return;
       setResponse({
         success: false,
         timestamp: new Date().toISOString(),
@@ -604,7 +628,7 @@ export function MessageTester() {
         status: err instanceof Error ? (err as Error & { status?: number }).status : undefined,
       });
     } finally {
-      setIsLoading(false);
+      if (!unmountedRef.current && generation === sendGenerationRef.current) setIsLoading(false);
     }
   };
 

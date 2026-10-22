@@ -15,6 +15,7 @@ import { ScopeBindingService } from '../integration/scope-binding.service';
 import { ReKeyChatStatesBySessionId1786500000000 } from '../../database/migrations/1786500000000-ReKeyChatStatesBySessionId';
 import { ScrubRevokedMessageContent1786900000000 } from '../../database/migrations/1786900000000-ScrubRevokedMessageContent';
 import { ScrubNonPhoneLidMappings1786950000000 } from '../../database/migrations/1786950000000-ScrubNonPhoneLidMappings';
+import { BackfillLegacyMessageTypes1791300000000 } from '../../database/migrations/1791300000000-BackfillLegacyMessageTypes';
 import { Session as SessionEntity, SessionStatus } from '../session/entities/session.entity';
 import { In } from 'typeorm';
 import { DateUtils } from 'typeorm/util/DateUtils';
@@ -753,6 +754,21 @@ export class InfraDataService {
       await queryRunner.startTransaction();
 
       try {
+        const isPostgres = this.dataDataSource.options.type === 'postgres';
+        if (isPostgres) {
+          // The runtime pool carries a statement_timeout sized for request traffic (30 s by default), but
+          // the clears and scrubs below scale with the live tables, not with the archive: restoring an
+          // earlier export onto an instance whose messages table has since grown to millions of rows
+          // would be cancelled mid-DELETE, after the engines of the sessions it drops were already
+          // stopped. Lifted for this transaction only, as the migrations do. A lock wait keeps the bound
+          // the statement timeout gave it, so a stuck lock still fails the import instead of hanging it.
+          const lockWaitMs = Math.max(
+            0,
+            Math.trunc(this.configService.get<number>('dataDatabase.statementTimeoutMs', 30000)) || 0,
+          );
+          await queryRunner.query('SET LOCAL statement_timeout = 0');
+          await queryRunner.query(`SET LOCAL lock_timeout = ${lockWaitMs}`);
+        }
         // Clear existing data (in correct order due to foreign keys). templates and
         // baileys_stored_messages FK sessions ON DELETE CASCADE, so the sessions DELETE would clear
         // them too; clearing them explicitly first keeps the order correct on engines where the
@@ -760,9 +776,9 @@ export class InfraDataService {
         // OTHER failure (lock, I/O, aborted tx) propagate to the transaction rollback below — a blind
         // `.catch(() => {})` here could otherwise silently commit a MERGED (not replaced) restore on
         // SQLite, violating the endpoint's "replaces existing data" contract.
-        const clearTable = async (table: string): Promise<void> => {
+        const clearTable = async (table: string, where = ''): Promise<void> => {
           try {
-            await queryRunner.query(`DELETE FROM ${table}`);
+            await queryRunner.query(`DELETE FROM ${table}${where}`);
           } catch (err) {
             if (!isMissingTableError(err)) throw err;
             this.logger.debug('Skipped clearing a table that does not exist during import', { table });
@@ -774,7 +790,6 @@ export class InfraDataService {
         // and strict binding rejects booleans/undefined — which a Postgres-made backup carries (real
         // booleans survive the JSON round-trip). Postgres needs `$N` and binds booleans natively, so both
         // rewrites apply only on the SQLite path. Safe: every `$N` below occurs once, in ascending order.
-        const isPostgres = this.dataDataSource.options.type === 'postgres';
         const insert = (text: string, params: unknown[]): Promise<unknown> =>
           queryRunner.query(
             isPostgres ? text : text.replace(/\$\d+/g, '?'),
@@ -930,8 +945,32 @@ export class InfraDataService {
           try {
             await ScrubRevokedMessageContent1786900000000.scrub(queryRunner);
             await ScrubNonPhoneLidMappings1786950000000.scrub(queryRunner);
+            // An archive taken before the neutral message vocabulary restores the raw wwebjs tokens, which
+            // the boot-time backfill no longer converts on a migration-managed database.
+            await BackfillLegacyMessageTypes1791300000000.backfill(queryRunner);
           } catch (error) {
             warnings.push(`Failed to clean restored rows: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+
+        // send_idempotency_keys is not archived, so it is trimmed rather than cleared. A claim of a session
+        // this restore dropped would outlive it by up to 24 h, and a later restore that brings the id back
+        // would answer a retried send with the old stored response instead of sending it. The claims of a
+        // session the restore keeps stay: a retry of a send made before the restore still replays.
+        // Asked first rather than caught: on PostgreSQL a statement that fails, a missing table included,
+        // aborts the whole import transaction, and every later statement then fails with it.
+        if (warnings.length === 0 && (await queryRunner.hasTable('send_idempotency_keys'))) {
+          try {
+            // CAST: sessions.id is a uuid on PostgreSQL and the claim's sessionId a varchar, which `IN` does not
+            // compare.
+            await clearTable(
+              'send_idempotency_keys',
+              ' WHERE "sessionId" NOT IN (SELECT CAST("id" AS TEXT) FROM sessions)',
+            );
+          } catch (error) {
+            warnings.push(
+              `Failed to drop the send idempotency claims of removed sessions: ${error instanceof Error ? error.message : String(error)}`,
+            );
           }
         }
 

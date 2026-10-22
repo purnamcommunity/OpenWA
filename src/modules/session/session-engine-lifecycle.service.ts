@@ -75,6 +75,12 @@ export interface ReconnectState extends ReconnectAttemptState {
    * READY or drop, so time spent reconnecting inside the engine never counts as READY time.
    */
   readyEndedAt?: number;
+  /**
+   * The retry of a disconnect whose session row could not be read: the timer (state.timer holds the same
+   * one) and how many have been armed, which is what its backoff counts. Ended by a read that answers
+   * and by READY.
+   */
+  readRetry?: { timer: NodeJS.Timeout; attempts: number };
 }
 
 // Reconnect-backoff bounds. An OPERATOR-supplied session.config feeds this math, so the values
@@ -915,6 +921,7 @@ export class SessionEngineLifecycle {
       if (this.readyStretchHeld(reconnectState)) reconnectState.attempts = 0;
       reconnectState.readyAt = Date.now();
       reconnectState.readyEndedAt = undefined;
+      reconnectState.readRetry = undefined;
       if (reconnectState.timer) {
         clearTimeout(reconnectState.timer);
         reconnectState.timer = null;
@@ -1045,6 +1052,9 @@ export class SessionEngineLifecycle {
         sessionId: id,
         action: 'reconnect_schedule_error',
       });
+      // Nothing else revisits this disconnect: the engine reports DISCONNECTED itself, so the liveness
+      // watchdog skips it, and it stays registered with its lease renewed. Read again shortly.
+      this.retryDisconnectAfterFailedRead(id, engine, reason);
       return;
     }
     // A session deleted just before this ran has nothing left to reconnect; skip it.
@@ -1055,6 +1065,10 @@ export class SessionEngineLifecycle {
     // or change the persisted status — otherwise a stale disconnect would (e.g.) clobber a
     // replacement engine that is already READY.
     if (!this.isLiveEngine(id, engine)) return;
+
+    // This read answered, so a retry an earlier failed read armed is moot: left pending, it would hold
+    // the reconnect slot and publish this same disconnect a second time when it fired.
+    this.endReadRetry(id);
 
     this.logger.warn(`Session disconnected: ${reason}`, {
       sessionId: id,
@@ -1123,6 +1137,38 @@ export class SessionEngineLifecycle {
 
     // Attempt to reconnect
     this.scheduleReconnect(id, session);
+  }
+
+  /**
+   * Handle a disconnect again after its session read failed. The retry sits on the episode's reconnect
+   * timer, so every control that cancels a reconnect (stop, delete, logout, shutdown) cancels it too, and
+   * it re-enters handleEngineDisconnected, whose fences end it once the engine is no longer the live one.
+   * The wait doubles from the base reconnect delay up to the reconnect backoff cap until the read answers,
+   * so a row that never reads does not log an error every few seconds for the life of the process.
+   */
+  private retryDisconnectAfterFailedRead(id: string, engine: IWhatsAppEngine, reason: string): void {
+    const state = this.reconnectStates.get(id);
+    if (!state || state.timer || this.closed || this.shutdownService?.isShuttingDown()) return;
+    const attempts = (state.readRetry?.attempts ?? 0) + 1;
+    const delay = Math.min(state.baseDelay * 2 ** (attempts - 1), RECONNECT_BASE_DELAY_MAX_MS);
+    const timer = setTimeout(() => {
+      state.timer = null;
+      void this.handleEngineDisconnected(id, engine, reason);
+    }, delay);
+    state.timer = timer;
+    state.readRetry = { timer, attempts };
+  }
+
+  /** Ends the read retry: its timer, when it is still the one armed, and the count its backoff keeps. */
+  private endReadRetry(id: string): void {
+    const state = this.reconnectStates.get(id);
+    const retry = state?.readRetry;
+    if (!state || !retry) return;
+    if (state.timer === retry.timer) {
+      clearTimeout(retry.timer);
+      state.timer = null;
+    }
+    state.readRetry = undefined;
   }
 
   private scheduleReconnect(id: string, session: Session): void {
@@ -1396,6 +1442,10 @@ export class SessionEngineLifecycle {
         this.cancelReconnect(id);
         return;
       }
+      // A read retry the disconnect of this attempt's own engine armed waits on an engine that is gone
+      // now: it would hold the timer the next attempt needs, then fire against the evicted engine and
+      // end at its fence, leaving the session with no engine and nothing armed.
+      this.endReadRetry(id);
       // Schedule another attempt. The row stays INITIALIZING through the backoff (an active status, with
       // lastError still showing the reason), so a retryable failure writes nothing per attempt.
       this.scheduleReconnect(id, session);

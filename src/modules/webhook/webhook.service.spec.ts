@@ -473,6 +473,25 @@ describe('WebhookService', () => {
     });
   });
 
+  describe('opt-in subscription invalidation', () => {
+    it('drops the cached opt-in subscriptions after a create, an update and a delete', async () => {
+      const delivery = testingModule.get<WebhookDeliveryService>(WebhookDeliveryService);
+      const invalidate = jest.spyOn(delivery, 'invalidateOptInSubscriptions');
+      const webhook = createMockWebhook();
+      (repository.create as jest.Mock).mockReturnValue(webhook);
+      (repository.save as jest.Mock).mockResolvedValue(webhook);
+      (repository.findOne as jest.Mock).mockResolvedValue(webhook);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (repository.remove as jest.Mock).mockResolvedValue(webhook);
+
+      await service.create('sess-1', { url: 'https://example.com/webhook', events: ['message.receipt'] });
+      await service.update('sess-1', 'wh-uuid-1', { events: ['message.received'] });
+      await service.delete('sess-1', 'wh-uuid-1');
+
+      expect(invalidate.mock.calls).toEqual([['sess-1'], ['sess-1'], ['sess-1']]);
+    });
+  });
+
   // ── dispatch (direct mode — queue disabled) ───────────────────────
 
   describe('delivery-failure retention', () => {

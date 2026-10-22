@@ -119,7 +119,7 @@ class MessagesResourceTest {
         var body = SendTextRequest.builder().chatId("c@c.us").text("hi").build();
         client.messages.sendText("s", body, "valid-key");
         var previous = tx.lastRequest();
-        for (String key : List.of("", "has space", " key", "key ", "key\n", "key\t", "caf\u00e9", "x".repeat(256))) {
+        for (String key : List.of("", "has space", " key", "key ", "key\n", "key\t", "caf\u00e9", "a\u007fb", "x".repeat(256))) {
             assertThrows(IllegalArgumentException.class, () -> client.messages.sendText("s", body, key));
             assertSame(previous, tx.lastRequest());
         }
@@ -129,7 +129,7 @@ class MessagesResourceTest {
     void visibleAsciiKeysAtBothLengthLimitsAreAccepted() {
         tx.respond(201, MSG);
         var body = SendTextRequest.builder().chatId("c@c.us").text("hi").build();
-        for (String key : List.of("!", "x".repeat(255))) {
+        for (String key : List.of("!", "~", "x", "x".repeat(255))) {
             client.messages.sendText("s", body, key);
             assertEquals(key, tx.lastRequest().headers().get("Idempotency-Key"));
         }

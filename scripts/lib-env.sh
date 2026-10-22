@@ -206,6 +206,12 @@ openwa_env_file_value() {
   # A line of well-formed UTF-8, without NUL.
   local utf8=$'([\x01-\x7f]|[\xc2-\xdf][\x80-\xbf]|\xe0[\xa0-\xbf][\x80-\xbf]|[\xe1-\xec\xee\xef][\x80-\xbf]{2}|\xed[\x80-\x9f][\x80-\xbf]|\xf0[\x90-\xbf][\x80-\xbf]{2}|[\xf1-\xf3][\x80-\xbf]{3}|\xf4[\x80-\x8f][\x80-\xbf]{2})*'
   [ -f "$file" ] || return 1
+  # A file this user cannot open would read as one that does not set the key, and the lookup would fall
+  # through to a default the app does not use. Root passes the test whatever the mode.
+  if [ ! -r "$file" ]; then
+    echo "[config] ERROR: $file exists but cannot be read by this user; run as a user that can read it or pass $key in the environment." >&2
+    return 2
+  fi
   # Without these the key's line would read as absent and the lookup would fall through to a default.
   for tool in tr tail sed grep; do
     command -v "$tool" >/dev/null 2>&1 && continue

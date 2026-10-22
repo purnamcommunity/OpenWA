@@ -186,6 +186,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * or not.
    */
   private readonly startReservations = new Map<string, number>();
+  /** Ids whose claim a failed start left to another start in flight; the last start out hands it back. */
+  private readonly releaseOwed = new Set<string>();
 
   constructor(
     @InjectRepository(Session, 'data')
@@ -477,7 +479,17 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // Released only after the engines are actually down, so a peer never claims a session this
     // process is still holding open. A start still in flight may own a browser the teardown could
     // not reach (one the bound above gave up on), so its claim is kept and lapses as after a hard kill.
-    await this.ownership?.releaseAll(this.startReservations.keys());
+    // A failed release is logged and not thrown: a rejection here makes Nest skip every destroy hook
+    // after this one (webhook drain, queue worker close, usage flush, plugin onDisable), and the claims
+    // lapse with their lease anyway.
+    try {
+      await this.ownership?.releaseAll(this.startReservations.keys());
+    } catch (error) {
+      this.logger.warn('Could not release the session claims at shutdown; they lapse with their lease', {
+        action: 'session_claim_release_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async create(dto: CreateSessionDto): Promise<Session> {
@@ -689,7 +701,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       if (this.ownership) await this.assertNotHeldElsewhere(id);
       // A failed row read deleted nothing: the lifecycle drops the mark, and the count goes with it.
       await this.engineLifecycle.delete(id, { onReadFailed: () => this.uncountStopRequest(id) });
-      await this.ownership?.release(id);
+      await this.releaseClaimBestEffort(id);
       this.stopRequests.delete(id);
     } catch (error) {
       this.discardStopMarkForMissingSession(id, error);
@@ -778,8 +790,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       return await this.claimAndStart(id, explicit);
     } finally {
       const left = (this.startReservations.get(id) ?? 1) - 1;
-      if (left > 0) this.startReservations.set(id, left);
-      else this.startReservations.delete(id);
+      if (left > 0) {
+        this.startReservations.set(id, left);
+      } else {
+        this.startReservations.delete(id);
+        if (this.releaseOwed.delete(id)) await this.releaseUnlessEngineActive(id);
+      }
     }
   }
 
@@ -1046,7 +1062,33 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     if (!this.ownership || this.engineLifecycle.isEngineActive(id)) {
       return;
     }
-    await this.ownership.release(id);
+    // Another start of the id is in flight and may have written the claim since: clearing it now would
+    // leave the engine that start launches on a row no node holds. The start that leaves last decides.
+    if ((this.startReservations.get(id) ?? 0) > 1) {
+      this.releaseOwed.add(id);
+      return;
+    }
+    this.releaseOwed.delete(id);
+    await this.releaseClaimBestEffort(id);
+  }
+
+  /**
+   * Best-effort: the outcome of the start or the teardown that asks is already decided, and a claim that
+   * cannot be handed back lapses with its lease, which a peer then adopts. A failure here must not
+   * replace that outcome (a started session reported as failed, a stopped one as an error, a committed
+   * delete as a 500 whose retry answers 404 and writes no audit row).
+   */
+  private async releaseClaimBestEffort(id: string): Promise<void> {
+    if (!this.ownership) return;
+    try {
+      await this.ownership.release(id);
+    } catch (error) {
+      this.logger.warn(`Could not hand back the claim of session ${id}; it lapses with its lease`, {
+        sessionId: id,
+        action: 'session_claim_release_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async getQRCode(

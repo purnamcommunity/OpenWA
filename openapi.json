@@ -91,6 +91,13 @@
                 "integration_instance_secret_regenerated",
                 "integration_instance_deleted",
                 "integration_instance_redriven",
+                "plugin_installed",
+                "plugin_updated",
+                "plugin_uninstalled",
+                "plugin_enabled",
+                "plugin_disabled",
+                "plugin_config_updated",
+                "plugin_sessions_updated",
                 "infra_config_saved",
                 "infra_restart_requested",
                 "infra_data_exported",
@@ -1713,6 +1720,7 @@
     },
     "/api/sessions/{sessionId}/pairing-code": {
       "post": {
+        "description": "On the whatsapp-web.js engine, only request a code for a number you are prepared to re-link. A request for a number that already has a linked session has been observed to end with WhatsApp revoking that device: the linked session logs out, its credentials are deleted and it falls back to `qr_ready`. Nothing refuses such a request, because the guards check the session state and never the number. Baileys was not affected in the same tests. Link by QR when a session of that number must stay up.",
         "operationId": "SessionController_requestPairingCode",
         "parameters": [
           {
@@ -4608,6 +4616,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -4860,6 +4878,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -4992,6 +5020,16 @@
           },
           "403": {
             "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5141,6 +5179,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -5274,6 +5322,16 @@
           },
           "403": {
             "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5424,6 +5482,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -5555,6 +5623,16 @@
               }
             }
           },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
             "content": {
@@ -5677,6 +5755,16 @@
           },
           "403": {
             "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5821,6 +5909,16 @@
           },
           "403": {
             "description": "The API key's role, session or chat scope, or IP allow-list does not allow this operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The `quotedMessageId` could not be resolved: the whatsapp-web.js page does not hold it, or the Baileys store does not (it was never received or sent by this session, or it was evicted or deleted). On whatsapp-web.js a message that resolves but cannot be replied to is sent without the quote.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7178,7 +7276,7 @@
             }
           },
           "404": {
-            "description": "No stored media for this message — it carries no media, media download was disabled or the payload was over the cap when it was stored (size-only marker), it was a URL-based API send (those bytes are never stored), or the message is not in this gateway’s history.",
+            "description": "No stored media for this message — it carries no media, media download was disabled or the payload was over the cap when it was stored (size-only marker), it was a URL-based API send (the gateway stores none of those bytes, though on whatsapp-web.js the own-send echo may), or the message is not in this gateway’s history.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8602,6 +8700,9 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Shutdown teardown has begun: every route except /api/health and /api/health/* answers 503 then. Probe /api/health/live for a check that survives teardown."
           }
         },
         "summary": "Health check endpoint",
@@ -8678,7 +8779,7 @@
             }
           },
           "400": {
-            "description": "Rejected before anything was written: an invalid or unknown field, an unknown engine type, a value with a line break or one that cannot be stored, or a configuration that would not boot in production.",
+            "description": "Rejected before anything was written: an invalid or unknown field, an unknown engine type, a value with a line break or one that cannot be stored, a configuration that would not boot in production, or a media storage path the app cannot write to.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11825,7 +11926,7 @@
             }
           },
           "400": {
-            "description": "The id does not name a group, the session is not active, neither url nor base64 was supplied, or the url answers non-2xx, times out or cannot be reached",
+            "description": "The id does not name a group, the session is not active, neither url nor base64 was supplied, the url answers non-2xx, times out or cannot be reached, or the image cannot be read (Baileys refuses an SVG)",
             "content": {
               "application/json": {
                 "schema": {
@@ -12422,7 +12523,7 @@
             }
           },
           "400": {
-            "description": "Neither url nor base64 provided, base64 without mimetype, session is not started, or the url answers non-2xx, times out or cannot be reached",
+            "description": "Neither url nor base64 provided, base64 without mimetype, session is not started, the url answers non-2xx, times out or cannot be reached, or the image cannot be read (Baileys refuses an SVG)",
             "content": {
               "application/json": {
                 "schema": {
@@ -16153,7 +16254,7 @@
             }
           },
           "400": {
-            "description": "Neither url nor base64 given, the url answers non-2xx, times out or cannot be reached, or ffmpeg refused the input.",
+            "description": "Neither url nor base64 given, the url is not an absolute http(s) URL or answers non-2xx, times out or cannot be reached, or ffmpeg refused the input.",
             "content": {
               "application/json": {
                 "schema": {
@@ -16245,7 +16346,7 @@
             }
           },
           "400": {
-            "description": "Neither url nor base64 given, the url answers non-2xx, times out or cannot be reached, or ffmpeg refused the input.",
+            "description": "Neither url nor base64 given, the url is not an absolute http(s) URL or answers non-2xx, times out or cannot be reached, or ffmpeg refused the input.",
             "content": {
               "application/json": {
                 "schema": {
@@ -16918,7 +17019,7 @@
             }
           },
           "409": {
-            "description": "Plugin already installed",
+            "description": "Plugin already installed, or the plugin is still being restored after startup; retry shortly",
             "content": {
               "application/json": {
                 "schema": {
@@ -17111,6 +17212,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The plugin is still being restored after startup; retry shortly",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Uninstall a plugin (removes its files; built-ins are protected)",
@@ -17172,6 +17283,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The plugin is still being restored after startup; retry shortly",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Enable a plugin",
@@ -17226,6 +17347,16 @@
           },
           "404": {
             "description": "Plugin not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The plugin is still being restored after startup; retry shortly",
             "content": {
               "application/json": {
                 "schema": {
@@ -17619,6 +17750,16 @@
           },
           "404": {
             "description": "Plugin not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The plugin is still being restored after startup; retry shortly",
             "content": {
               "application/json": {
                 "schema": {
@@ -18684,8 +18825,9 @@
             "name": "q",
             "required": true,
             "in": "query",
-            "description": "Search term (required, non-empty)",
+            "description": "Search term (required, non-empty, at most 1000 characters and 32 words)",
             "schema": {
+              "maxLength": 1000,
               "type": "string"
             }
           },
@@ -18702,7 +18844,7 @@
             "name": "chatId",
             "required": false,
             "in": "query",
-            "description": "Restrict to a single chat id",
+            "description": "Restrict to a single chat id. A phone also matches the chat's other stored forms (the other user dialect and any lid that resolves to it).",
             "schema": {
               "type": "string"
             }
@@ -18711,7 +18853,7 @@
             "name": "from",
             "required": false,
             "in": "query",
-            "description": "Sender filter",
+            "description": "Sender filter. Matches `from` or a group message's `author`; a phone also matches any lid that resolves to it.",
             "schema": {
               "type": "string"
             }
@@ -18790,7 +18932,7 @@
             }
           },
           "400": {
-            "description": "Empty or whitespace-only \"q\"",
+            "description": "Empty or whitespace-only \"q\", or one over 1000 characters or 32 words",
             "content": {
               "application/json": {
                 "schema": {
@@ -18859,8 +19001,8 @@
   },
   "info": {
     "title": "OpenWA API",
-    "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API\n\n**Gateway-wide responses.** Three statuses are returned by middleware before routing, so any operation can emit them:\n\n- `415 Unsupported Media Type` — the request body carries a `Content-Encoding` other than `identity`. The aggregate in-flight body cap counts wire bytes, so a compressed body would be admitted on its compressed size and then inflated past the memory it is meant to bound. Send the body uncompressed.\n- `413 Payload Too Large`: the declared `Content-Length` is more than the gateway could hold in flight for this caller even when idle. The body is not read; retrying it unchanged cannot succeed.\n- `503 Service Unavailable` with `Retry-After` — the gateway already has too much request body data in flight. The body is not read; retry after the given delay.\n\nEvery operation that takes an API key can also answer `429 Too Many Requests` (the per-IP rate-limit windows; with send pacing on, a send can also be refused with `code: SEND_PACING_LIMITED` and `retryAfterSeconds`) and `500 Internal Server Error` (an unexpected failure, or `code: ENGINE_PAGE_ERROR` when WhatsApp Web threw inside the page during a whatsapp-web.js send or status post). Error bodies follow the `ErrorResponse` schema.",
-    "version": "0.24.0",
+    "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API\n\n**Gateway-wide responses.** Three statuses are returned by middleware before routing, so any operation can emit them:\n\n- `415 Unsupported Media Type` — the request body carries a `Content-Encoding` other than `identity`. The aggregate in-flight body cap counts wire bytes, so a compressed body would be admitted on its compressed size and then inflated past the memory it is meant to bound. Send the body uncompressed.\n- `413 Payload Too Large`: the declared `Content-Length` is more than the gateway could hold in flight for this caller even when idle. The body is not read; retrying it unchanged cannot succeed.\n- `503 Service Unavailable` with `Retry-After` — the gateway already has too much request body data in flight (the body is not read; retry after the given delay), or, without `Retry-After`, shutdown teardown has begun: every route except `/api/health` and `/api/health/*` then answers it with `Connection: close`.\n\nEvery operation that takes an API key can also answer `429 Too Many Requests` (the per-IP rate-limit windows; with send pacing on, a send can also be refused with `code: SEND_PACING_LIMITED` and `retryAfterSeconds`) and `500 Internal Server Error` (an unexpected failure, or `code: ENGINE_PAGE_ERROR` when WhatsApp Web threw inside the page during a whatsapp-web.js send or status post). Error bodies follow the `ErrorResponse` schema.",
+    "version": "0.25.0",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -19156,6 +19298,7 @@
               "120363000000000000@g.us",
               "919999999999@c.us"
             ],
+            "maxItems": 2000,
             "type": "array",
             "items": {
               "type": "string"
@@ -19342,6 +19485,7 @@
             }
           },
           "allowedChats": {
+            "maxItems": 2000,
             "type": "array",
             "items": {
               "type": "string"
@@ -19969,6 +20113,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890@c.us on whatsapp-web.js)",
             "example": "1234567890@c.us"
           },
@@ -20008,6 +20153,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890@c.us on whatsapp-web.js)",
             "example": "1234567890@c.us"
           }
@@ -20096,6 +20242,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890@c.us on whatsapp-web.js)",
             "example": "1234567890@c.us"
           }
@@ -20109,6 +20256,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
             "example": "1234567890-123@g.us"
           },
@@ -20127,6 +20275,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
             "example": "1234567890-123@g.us"
           },
@@ -20148,6 +20297,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
             "example": "1234567890-123@g.us"
           },
@@ -20166,6 +20316,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
             "example": "1234567890-123@g.us"
           }
@@ -20179,6 +20330,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat ID, in the active engine's native format (e.g. 1234567890@c.us)",
             "example": "1234567890@c.us"
           },
@@ -20350,7 +20502,7 @@
           },
           "events": {
             "type": "array",
-            "description": "Event types to subscribe to. '*' subscribes to all events.",
+            "description": "Event types to subscribe to. '*' subscribes to all events except `message.receipt`, which must be named explicitly.",
             "example": [
               "message.received",
               "session.status"
@@ -20362,6 +20514,7 @@
                 "message.received",
                 "message.sent",
                 "message.ack",
+                "message.receipt",
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
@@ -20460,6 +20613,7 @@
                 "message.received",
                 "message.sent",
                 "message.ack",
+                "message.receipt",
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
@@ -20553,7 +20707,7 @@
           },
           "events": {
             "type": "array",
-            "description": "Event types to subscribe to. '*' subscribes to all events.",
+            "description": "Event types to subscribe to. '*' subscribes to all events except `message.receipt`, which must be named explicitly.",
             "minItems": 1,
             "items": {
               "type": "string",
@@ -20561,6 +20715,7 @@
                 "message.received",
                 "message.sent",
                 "message.ack",
+                "message.receipt",
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
@@ -20749,15 +20904,19 @@
             "example": [
               "0a941dac-a965-45e7-b318-74ae8be134f0"
             ],
-            "type": "array",
+            "maxItems": 500,
             "items": {
-              "type": "string"
-            }
+              "type": "string",
+              "maxLength": 128
+            },
+            "type": "array"
           },
           "limit": {
             "type": "number",
             "description": "Max rows replayed by this call (1-500, default 100).",
-            "example": 100
+            "example": 100,
+            "minimum": 1,
+            "maximum": 500
           }
         }
       },
@@ -21085,7 +21244,8 @@
           "chatId": {
             "type": "string",
             "description": "WhatsApp chat ID (phone@c.us for individual, groupId@g.us for groups)",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "text": {
             "type": "string",
@@ -21154,7 +21314,8 @@
           "chatId": {
             "type": "string",
             "description": "WhatsApp chat ID (phone@c.us for individual, groupId@g.us for groups)",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "templateId": {
             "type": "string",
@@ -21202,7 +21363,8 @@
           "chatId": {
             "type": "string",
             "description": "WhatsApp chat ID",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "url": {
             "type": "string",
@@ -21258,7 +21420,8 @@
           "chatId": {
             "type": "string",
             "description": "WhatsApp chat ID",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "url": {
             "type": "string",
@@ -21317,7 +21480,8 @@
         "properties": {
           "chatId": {
             "type": "string",
-            "description": "Chat ID (e.g. 628123456789@c.us)"
+            "description": "Chat ID (e.g. 628123456789@c.us)",
+            "maxLength": 255
           },
           "latitude": {
             "type": "number",
@@ -21351,7 +21515,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "contactName": {
             "type": "string",
@@ -21378,7 +21543,8 @@
         "properties": {
           "chatId": {
             "type": "string",
-            "description": "Chat ID (e.g. 628123456789@c.us or 1203630000@g.us)"
+            "description": "Chat ID (e.g. 628123456789@c.us or 1203630000@g.us)",
+            "maxLength": 255
           },
           "name": {
             "type": "string",
@@ -21421,7 +21587,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "quotedMessageId": {
             "type": "string"
@@ -21453,7 +21620,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string",
@@ -21480,10 +21648,12 @@
         "type": "object",
         "properties": {
           "fromChatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "toChatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -21499,7 +21669,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -22263,7 +22434,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -22282,7 +22454,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "pollMessageId": {
             "type": "string",
@@ -22307,7 +22480,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -22332,7 +22506,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -22347,7 +22522,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -22367,7 +22543,8 @@
         "type": "object",
         "properties": {
           "chatId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255
           },
           "messageId": {
             "type": "string"
@@ -22486,7 +22663,8 @@
           "chatId": {
             "type": "string",
             "description": "Recipient chat ID",
-            "example": "628123456789@c.us"
+            "example": "628123456789@c.us",
+            "maxLength": 255
           },
           "type": {
             "type": "string",
@@ -22545,7 +22723,8 @@
         "properties": {
           "batchId": {
             "type": "string",
-            "description": "Custom batch ID (auto-generated if not provided)"
+            "description": "Custom batch ID (auto-generated if not provided)",
+            "maxLength": 255
           },
           "messages": {
             "description": "Array of messages (max 100 per request; exact duplicate entries are collapsed — first occurrence wins)",
@@ -24072,7 +24251,7 @@
             ]
           },
           "warnings": {
-            "description": "Why the restore was rolled back (per-row failures, a failed session ownership restore, chat-state re-key or restored-row cleanup, or a backup with no rows). Non-empty only when `imported` is false; non-fatal messages are in `notices`.",
+            "description": "Why the restore was rolled back (per-row failures, a failed session ownership restore, chat-state re-key or restored-row cleanup, a failed trim of the send idempotency claims, or a backup with no rows). Non-empty only when `imported` is false; non-fatal messages are in `notices`.",
             "example": [],
             "type": "array",
             "items": {
@@ -26190,6 +26369,7 @@
         "properties": {
           "chatId": {
             "type": "string",
+            "maxLength": 255,
             "description": "Chat to send the product card to (@c.us or @g.us).",
             "example": "628123456789@c.us"
           },
@@ -26822,11 +27002,18 @@
           },
           "code": {
             "type": "string",
-            "description": "A stable machine-readable reason, on some errors only: SESSION_NAME_TEARDOWN_PENDING (409), SESSION_STOP_INCOMPLETE, SESSION_LOGOUT_INCOMPLETE and SESSION_FORCE_KILL_INCOMPLETE (502), SEND_PACING_LIMITED (429), ENGINE_PAGE_ERROR (500, whatsapp-web.js: WhatsApp Web threw inside the page during a send or status post), IMPORT_ALREADY_RUNNING, EXPORT_IN_PROGRESS, IMPORT_WOULD_ORPHAN_ENGINES and IMPORT_NESTED_TRANSACTION (409)."
+            "description": "A stable machine-readable reason, on some errors only: SESSION_NAME_TEARDOWN_PENDING (409), SESSION_STOP_INCOMPLETE, SESSION_LOGOUT_INCOMPLETE and SESSION_FORCE_KILL_INCOMPLETE (502), SEND_PACING_LIMITED (429), ENGINE_PAGE_ERROR (500, whatsapp-web.js: WhatsApp Web threw inside the page during a send or status post), IMPORT_ALREADY_RUNNING, EXPORT_IN_PROGRESS, IMPORT_WOULD_ORPHAN_ENGINES and IMPORT_NESTED_TRANSACTION (409), IDEMPOTENCY_KEY_INVALID (400), IDEMPOTENCY_KEY_REUSED (422), IDEMPOTENCY_KEY_IN_PROGRESS and IDEMPOTENCY_OUTCOME_UNKNOWN (409), POLL_OPTION_NOT_FOUND (400, whatsapp-web.js vote-poll)."
           },
           "retryAfterSeconds": {
             "type": "integer",
             "description": "With SEND_PACING_LIMITED: seconds until the session accepts sends again."
+          },
+          "validOptions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "With POLL_OPTION_NOT_FOUND: the option texts the poll offers."
           },
           "pageError": {
             "type": "object",

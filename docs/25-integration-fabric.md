@@ -222,8 +222,11 @@ Four tables live on the data connection, each created by a hand-authored dual-di
 - **Egress.** The only sanctioned outbound path remains the SSRF-guarded `ctx.net.fetch`, scoped to the
   manifest's allowed hosts; a direct Node socket opened by the worker is not covered (see [30 - Plugin
   Sandboxing](./30-plugin-sandboxing.md)).
-- **Re-entrancy.** A reply issued _inside_ an ingress handler seeds the in-flight hook set, so an adapter's
-  own outbound message hook cannot echo-loop the reply back out to the external system.
+- **Re-entrancy.** A send issued from inside a hook handler is short-circuited for the event that handler
+  is running, so a hook cannot re-fire itself. A reply issued from an ingress handler carries no hook
+  context: it runs every plugin's `message:sending` hooks, the adapter's own included, so an adapter that
+  mirrors outbound messages to its provider must recognise and skip the replies it sent itself, for example
+  by the message id the send returned.
 
 ## 25.7 Scale and durability
 
@@ -237,6 +240,15 @@ dispatch when Redis is unreachable. Before Redis has ever connected, queue calls
 `REDIS_CONNECT_TIMEOUT_MS` (5s when unset or 0) from the first one, then fall back at once until it
 connects. Providers already deliver over unordered, at-least-once HTTP, so plugin handlers must be
 idempotent and treat ingress as a reconciliation trigger.
+
+A plugin's webhook handler has **5 s** (`INGRESS_DISPATCH_TIMEOUT_MS`) to finish. The host cannot cancel a
+handler that overruns it: the attempt is recorded as failed, the conversation lock is released and the
+delivery is retried (queued) or dead-lettered (inline), while the first run goes on and its work still
+lands. A handler that calls a slow upstream, or sends media, can therefore run twice for one delivery.
+Key every side effect on the delivery id (`req.deliveryId`) and hand work that can outlast the budget to
+a background task instead of awaiting it in the handler. The budget is short because a queue-disabled
+deployment answers the provider only after the inline dispatch, and providers abandon a request within a
+few seconds.
 
 A job waiting on that lock still holds one of the `INGRESS_WORKER_CONCURRENCY` worker slots (default
 10). A burst on one lane larger than that fills every slot with same-lane waiters, and events for other
@@ -281,7 +293,10 @@ row), and a row whose instance or bound session was deleted is dropped, since re
 deleted instance and a session delete purges its dead letters. A delivery whose completed job was
 already removed from the queue, or whose job lookup failed while Redis was down (or, for a Redis
 slow to start at boot, not yet connected within that first-connect wait), is dead-lettered anyway and
-may already have been delivered: check before redriving it. A dead-letter row the prune writes takes
+may already have been delivered: check before redriving it. The check that avoids a second open
+dead-letter row for one delivery reads before it writes, so two nodes pruning the same row at the same
+moment (replicas started together) can leave two, and redriving both delivers it twice. A dead-letter
+row the prune writes takes
 its conversation id from the plugin's current manifest route, as the live path does, so a row whose
 plugin package or route is gone, whose route declares no `conversationId` pointer, or whose pointer
 does not resolve in that delivery carries none and its redrive takes the per-instance lane. There is

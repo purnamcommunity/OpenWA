@@ -543,8 +543,9 @@ export class GroupController {
   @ApiResponse({
     status: 400,
     description:
-      'The id does not name a group, the session is not active, neither url nor base64 was supplied, or ' +
-      'the url answers non-2xx, times out or cannot be reached',
+      'The id does not name a group, the session is not active, neither url nor base64 was supplied, ' +
+      'the url answers non-2xx, times out or cannot be reached, or the image cannot be read (Baileys ' +
+      'refuses an SVG)',
   })
   @ApiResponse({ status: 403, description: 'The engine refused the change — admin rights required' })
   @ApiResponse({

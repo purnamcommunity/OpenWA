@@ -567,3 +567,35 @@ test('hovering the selected template row keeps its selected highlight', () => {
   assert.equal(hover?.replace(/:where\([^)]*\)+/g, ''), '.templates-page .template-list-item:hover');
   assert.ok(css.indexOf('.template-list-item.selected {') > css.indexOf(hover!), 'the selected rule must come last');
 });
+
+// Opening another template while a save is in flight must leave the editor bound to the template opened:
+// the save resolving afterwards may not rebind it, or the next save writes one template's text into the other.
+test('a save that resolves after another template was opened keeps the editor on that template', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  templates = [
+    { id: 'tpl-1', name: 'welcome', body: 'Hello' },
+    { id: 'tpl-2', name: 'invoice', body: 'Due soon' },
+  ];
+  let release!: () => void;
+  saveGate = new Promise<void>(resolve => (release = resolve));
+  window.sessionStorage.setItem('openwa_user_role', 'operator');
+  renderTemplates();
+
+  fireEvent.click(await screen.findByText('welcome'));
+  fireEvent.change(screen.getByLabelText('Body'), { target: { value: 'Hello again' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+  await waitFor(() => assert.equal(updated.length, 1));
+
+  fireEvent.click(screen.getByText('invoice'));
+  assert.equal(screen.getByLabelText<HTMLTextAreaElement>('Body').value, 'Due soon');
+
+  release();
+  await screen.findByText('Template updated successfully');
+  saveGate = null;
+  fireEvent.change(screen.getByLabelText('Body'), { target: { value: 'Due tomorrow' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+  await waitFor(() => assert.equal(updated.length, 2));
+
+  assert.equal(updated[1].path, '/api/sessions/sess-1/templates/tpl-2', 'the invoice text was saved over welcome');
+  assert.equal(updated[1].body, 'Due tomorrow');
+});

@@ -363,6 +363,16 @@ describe('buildIncomingMessageFromBaileys', () => {
     expect(r.isLidSender).toBe(true);
   });
 
+  it('reads an empty participant as none: a lid chat is still a lid sender and a group names no author', () => {
+    // A live key goes through cleanMessage, which writes '' for the participant of a 1:1 chat.
+    const direct = buildIncomingMessageFromBaileys({ ...base, remoteJid: '111@lid', participant: '' });
+    expect(direct.isLidSender).toBe(true);
+    expect(direct.author).toBeUndefined();
+    const group = buildIncomingMessageFromBaileys({ ...base, remoteJid: '123-456@g.us', participant: '' });
+    expect(group.author).toBeUndefined();
+    expect(group.isLidSender).toBeFalsy();
+  });
+
   it('flags a status broadcast', () => {
     const r = buildIncomingMessageFromBaileys({ ...base, remoteJid: 'status@broadcast' });
     expect(r.isStatusBroadcast).toBe(true);

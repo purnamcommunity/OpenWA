@@ -31,4 +31,24 @@ describe('closeWorkerIfStarted', () => {
     await pending;
     await expect(host.worker.close()).resolves.toBeUndefined();
   });
+
+  // A destroy hook that rejects makes Nest skip every hook after it (plugin onDisable, the usage flush).
+  it('lets the teardown go on when the close rejects, and leaves the rejection to the later close', async () => {
+    const failure = new Error('connection lost');
+    const close = jest.fn().mockRejectedValue(failure);
+    const worker = { name: 'q', close };
+
+    await expect(closeWorkerIfStarted({ worker } as unknown as WorkerHost, 1_000)).resolves.toBeUndefined();
+
+    expect(worker.close).toBe(close);
+    await expect(worker.close()).rejects.toBe(failure);
+  });
+
+  it('leaves no timer running once the worker has closed', async () => {
+    const host = { worker: { name: 'q', close: () => Promise.resolve() } } as unknown as WorkerHost;
+
+    await closeWorkerIfStarted(host, MAX_WORKER_CLOSE_WAIT_MS);
+
+    expect(jest.getTimerCount()).toBe(0);
+  });
 });

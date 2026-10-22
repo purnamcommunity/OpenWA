@@ -25,7 +25,7 @@
  *
  * The teardown after the grace has SHUTDOWN_TEARDOWN_LIMIT_MS (67 s), against 60 s of stages in the
  * clustered case. The 7 s left over is the reserve for the waits that have no cap of their own, before
- * and after the HTTP close: the database and plugin hook waits listed at the end, the BullModule
+ * and after the HTTP close: the database waits listed at the end, the BullModule
  * re-await of the worker close (closeWorkerIfStarted settles it once its cap is hit), the DataSource
  * close and the ffmpeg kill. They take milliseconds when nothing is wedged.
  *
@@ -49,10 +49,15 @@
  *
  * Waits with no cap of their own, which only the force-exit bounds: the bulk-message destroy hook (a
  * lookup and an update per processing batch), the pending-message reaper (it awaits its running
- * sweep, whose in-hand row re-emits message:persisted to plugin hooks) and the session ownership
- * release. They wait on the database, and the reaper also on plugin hooks. A wedged database ends the
+ * sweep, which is database statements only: the message:persisted re-emission of its in-hand row is
+ * not awaited) and the session ownership release. They wait on the database. A wedged database ends the
  * stop at the force-exit, with status 1, before the kill; the stages behind these waits (worker close,
  * usage flush, plugin onDisable) get only the time that is left.
+ *
+ * One database does not stay inside that bound: SQLite. better-sqlite3 waits for a lock held by another
+ * process synchronously, up to SQLITE_BUSY_TIMEOUT_MS (30 s) a write, and the event loop is blocked
+ * meanwhile, so neither the grace timer nor the force-exit can run. A lock held past the kill deadline
+ * (a backup or another tool opening the data file) ends in the orchestrator's SIGKILL, with no hook run.
  */
 
 /** Grace before teardown, so a load balancer sees the 503 first. SHUTDOWN_DELAY_MS overrides it. */

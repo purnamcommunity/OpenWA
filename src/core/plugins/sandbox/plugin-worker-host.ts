@@ -24,6 +24,16 @@ const SEND_CAP_VERBS: ReadonlySet<string> = new Set(['messages.sendText', 'messa
 /** Send-verb budget as a multiple of capTimeoutMs (default 30s → 120s: the 30s media download + upload headroom). */
 const SEND_CAP_TIMEOUT_FACTOR = 4;
 
+/** Longest worker-reported error kept for an exit message and the plugin's status. */
+const MAX_WORKER_ERROR_CHARS = 500;
+
+/**
+ * Timed-out hook dispatches whose in-flight claim is still honoured, per worker. A handler that never
+ * returns would otherwise keep one entry per dispatch for as long as the worker lives; past this many,
+ * the oldest claim is given back.
+ */
+const MAX_LATE_HOOK_CLAIMS = 32;
+
 /** Worker replies that finish a host request; one arriving during a liveness probe restarts its window. */
 const PROGRESS_KINDS: ReadonlySet<WorkerToHostMessage['kind']> = new Set([
   'lifecycle-result',
@@ -89,12 +99,18 @@ export class PluginWorkerHost {
   // this set bounds that claim, so a worker can never mark an event in flight that the host did not
   // actually dispatch to it (HookManager's AsyncLocalStorage guard does not span the IPC boundary).
   private readonly inFlightHookEvents = new Map<string, number>();
+  // Dispatches that timed out host-side while their handler may still be running in the worker, oldest
+  // first, each with the release of the in-flight claim it still holds. See holdLateClaim.
+  private readonly lateHookClaims = new Map<number, () => void>();
 
   // Worker-initiated capability calls currently running host-side, bounded by maxInFlightCaps.
   private inFlightCaps = 0;
   // True once terminate() is called, so onExit can tell a deliberate kill (disable/enable-failure) from an
   // unexpected worker crash — only the latter is logged as a warning.
   private terminated = false;
+  // The last error the worker reported (an uncaught exception arrives as one just before the exit), kept for
+  // the exit: once the worker is ready no load() waits for it. Plugin-chosen text, so one bounded line.
+  private lastWorkerError?: string;
   // The liveness probe in flight, if any, and whether onUnresponsive has already fired (it fires once).
   private probe?: { id: number; timer: ReturnType<typeof setTimeout> };
   private unresponsiveReported = false;
@@ -127,7 +143,8 @@ export class PluginWorkerHost {
     private readonly onSearchProviderRegister?: () => void,
     // Called once after the worker exits (crash or terminate), after in-flight calls are drained, so the
     // loader can release plugin-owned host resources (e.g. unregister a search provider the worker declared).
-    private readonly onExit?: (code: number, intentional: boolean) => void,
+    // `reason` is the last error the worker reported before it exited, when it reported one.
+    private readonly onExit?: (code: number, intentional: boolean, reason?: string) => void,
     // Host-side budget for ONE capability call. A worker whose calls hang would otherwise hold its
     // in-flight slots forever (self-DoS once maxInFlightCaps are all wedged). On timeout the worker gets
     // an error cap-result and the slot frees; the underlying host-side work is NOT cancelled (see
@@ -184,17 +201,29 @@ export class PluginWorkerHost {
     const inFlight = [...new Set([...(options.inFlight ?? []), options.event])];
     for (const event of inFlight) this.incInFlightHook(event);
     return new Promise(resolve => {
-      // settle decrements the in-flight counters on every exit path (worker result, timeout, or crash
-      // drain) since it is what the hookPending entry's resolve runs.
-      const settle = (result: { continue: boolean; data?: unknown; error?: string }): void => {
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        this.lateHookClaims.delete(id);
         for (const event of inFlight) this.decInFlightHook(event);
+      };
+      // settle gives the in-flight claim back on every exit path that ends the dispatch (the worker's
+      // result, a late one included, or the crash drain) since it is what the hookPending entry's resolve
+      // runs. Resolving a second time is a no-op, so a late result only releases the claim.
+      const settle = (result: { continue: boolean; data?: unknown; error?: string }): void => {
+        release();
         resolve(result);
       };
       const timer = setTimeout(() => {
-        this.hookPending.delete(id);
         options.onTimeout?.();
         this.probeLiveness();
-        settle({ continue: true });
+        // The chain moves on without this plugin, but its handler is still running in the worker, and
+        // a capability call it makes from here on still names this dispatch. Dropping the claim now
+        // would let that call run outside the re-entrancy guard, re-fire the event and dispatch the
+        // same slow handler again, one more send every timeout for as long as the plugin stays enabled.
+        resolve({ continue: true });
+        this.holdLateClaim(id, release);
       }, options.timeoutMs);
       this.hookPending.set(id, { resolve: settle, timer });
       this.channel.postMessage({
@@ -208,6 +237,20 @@ export class PluginWorkerHost {
         inFlight,
       });
     });
+  }
+
+  /**
+   * Keep the claim of a timed-out dispatch until the worker answers it or exits, bounded by
+   * {@link MAX_LATE_HOOK_CLAIMS}. The hookPending entry stays too, so the late result finds it.
+   */
+  private holdLateClaim(id: number, release: () => void): void {
+    this.lateHookClaims.set(id, release);
+    if (this.lateHookClaims.size <= MAX_LATE_HOOK_CLAIMS) return;
+    const [oldest, giveBack] = this.lateHookClaims.entries().next().value as [number, () => void];
+    const waiter = this.hookPending.get(oldest);
+    if (waiter) clearTimeout(waiter.timer);
+    this.hookPending.delete(oldest); // an answer this late is ignored
+    giveBack();
   }
 
   /**
@@ -424,6 +467,7 @@ export class PluginWorkerHost {
         });
         break;
       case 'error': {
+        this.lastWorkerError = String(message.error).replace(/\s+/g, ' ').slice(0, MAX_WORKER_ERROR_CHARS);
         const error = new Error(message.error);
         this.drain(this.readyWaiters, w => {
           if (w.timer) clearTimeout(w.timer);
@@ -605,7 +649,9 @@ export class PluginWorkerHost {
       clearTimeout(this.probe.timer);
       this.probe = undefined;
     }
-    const error = new Error(`plugin worker exited unexpectedly (code ${code})`);
+    const error = new Error(
+      `plugin worker exited unexpectedly (code ${code})${this.lastWorkerError ? `: ${this.lastWorkerError}` : ''}`,
+    );
     this.drain(this.readyWaiters, w => {
       if (w.timer) clearTimeout(w.timer);
       w.reject(error);
@@ -643,7 +689,7 @@ export class PluginWorkerHost {
       resolve({ ok: false, error: 'plugin worker exited' });
     });
     this.searchPending.clear();
-    this.onExit?.(code, this.terminated);
+    this.onExit?.(code, this.terminated, this.lastWorkerError);
   }
 
   private drain<T>(waiters: T[], fn: (w: T) => void): void {

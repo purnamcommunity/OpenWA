@@ -6,7 +6,7 @@ import {
   type ReactionEvent,
   type EditedMessage,
 } from '../interfaces/whatsapp-engine.interface';
-import { type SerializedWid } from '../types/whatsapp-web-js.types';
+import { readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
 import { buildEditedMessage, buildIncomingMessageBase, mapContactFields } from './message-mapper';
 import { mapWwebjsPollVoteEvent, type RawWwebjsPollVote } from './wwebjs-poll-votes';
 import { extractWwebjsCall, plannedInboundDownload, wwebjsAckToDeliveryStatus } from './wwebjs-messaging';
@@ -32,6 +32,8 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
           chatId: base.chatId,
           status: Boolean(base.isStatusBroadcast),
           needsRoom: mayDownload && plannedInboundDownload(msg),
+          fromMe: base.fromMe,
+          ...(base.author ? { author: base.author } : {}),
         }),
       error =>
         host.logger.error(
@@ -70,7 +72,15 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
 
     let ticket: InboundTicket | undefined;
     const done = (async () => {
-      const incomingMessage = buildIncomingMessageBase(msg);
+      let incomingMessage: IncomingMessage;
+      try {
+        incomingMessage = buildIncomingMessageBase(msg);
+      } catch (error) {
+        // Logged like the incoming handler does: holdWhileProcessing consumes a rejection, so one left to
+        // escape from here would vanish without a log line.
+        host.logger.error('Error processing outgoing message', String(error));
+        return;
+      }
       // Call-log detail, exactly as the incoming path attaches it. Every OUTGOING call log arrives
       // here rather than through `message`, so leaving it off meant a placed call reached a
       // consumer as a bodiless `call` message with nothing to say whether it was video, or
@@ -115,7 +125,7 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
     // has a perfectly good id here, and dropping it strands the message at SENT — including the
     // `ack < 0` that is the only signal a send failed.
     const rawId = msg.id as unknown as SerializedWid | undefined;
-    const ackId = rawId?._serialized ?? rawId?.$1;
+    const ackId = readWid(rawId);
     if (!ackId) {
       host.logger.warn('Dropping an ack whose message id could not be read', { ack });
       return;
@@ -146,8 +156,8 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       const afterId = after.id as unknown as SerializedWid | undefined;
       const beforeId = before?.id as unknown as SerializedWid | undefined;
       const payload: RevokedMessage = {
-        id: afterId?._serialized ?? afterId?.$1 ?? '',
-        revokedId: beforeId?._serialized ?? beforeId?.$1,
+        id: readWid(afterId) ?? '',
+        revokedId: readWid(beforeId),
         // Direction flag, as Message._getChatId: an own message in a LID chat carries the own LID as
         // `from`, which never equals the phone-dialect account wid.
         chatId: after.fromMe ? after.to : after.from,
@@ -176,7 +186,7 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       // emit another message's reactions. Empty string finds nothing and returns cleanly.
       const msgId = reaction.msgId as unknown as SerializedWid;
       const event: ReactionEvent = {
-        messageId: msgId?._serialized ?? msgId?.$1 ?? '',
+        messageId: readWid(msgId) ?? '',
         chatId: reaction.id.remote,
         reaction: reaction.reaction,
         senderId: reaction.senderId,

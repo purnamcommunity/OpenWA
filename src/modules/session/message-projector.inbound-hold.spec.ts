@@ -13,6 +13,7 @@ import type {
   IncomingMessage,
   InboundTicket,
   IWhatsAppEngine,
+  RevokedMessage,
 } from '../../engine/interfaces/whatsapp-engine.interface';
 
 /**
@@ -52,7 +53,14 @@ const message = (id: string, chatId: string, over: Partial<IncomingMessage> = {}
   ...over,
 });
 
-const arrival = (id: string, chatId: string, needsRoom = false, status = false) => ({ id, chatId, needsRoom, status });
+const arrival = (id: string, chatId: string, needsRoom = false, status = false, fromMe?: boolean, author?: string) => ({
+  id,
+  chatId,
+  needsRoom,
+  status,
+  fromMe,
+  author,
+});
 
 describe('MessageProjector holding inbound messages (PostgreSQL)', () => {
   const env = { ...process.env };
@@ -136,6 +144,13 @@ describe('MessageProjector holding inbound messages (PostgreSQL)', () => {
       .map(c => c[1].message);
   const room = () =>
     (projector as unknown as { rooms: Map<string, { gate: { activeCount: number } }> }).rooms.get('s1');
+  // As the real table's unique index refuses a second row under an id.
+  const uniqueIndex = (): void => {
+    insertGate = row =>
+      rows.some(r => r.waMessageId === row.waMessageId)
+        ? Promise.reject(Object.assign(new Error('UNIQUE constraint failed'), { code: 'SQLITE_CONSTRAINT_UNIQUE' }))
+        : Promise.resolve();
+  };
 
   beforeEach(() => {
     process.env.INBOUND_MEDIA_CONCURRENCY = '1';
@@ -194,6 +209,46 @@ describe('MessageProjector holding inbound messages (PostgreSQL)', () => {
     expect(eventsGateway.emitMessage).not.toHaveBeenCalled();
   });
 
+  it('stores a message cleared when an actor-bearing revoke reaches it while the row read is still out', async () => {
+    const t = admit(arrival('A', 'chat1', true));
+    const gate = deferred<void>();
+    const read = repo.findOne as jest.Mock;
+    const unrestricted = read.getMockImplementation() as (arg: unknown) => Promise<unknown>;
+    read.mockImplementation(async (arg: unknown) => {
+      await gate.promise;
+      return unrestricted(arg);
+    });
+    projector.handleMessageRevoked(
+      's1',
+      engine,
+      {
+        id: 'A',
+        revokedId: 'A',
+        chatId: 'chat1',
+        from: 'chat1',
+        to: 'me@c.us',
+        type: 'revoked',
+        body: '',
+        timestamp: 1,
+      },
+      { fromMe: false },
+    );
+    projector.handleInboundMessage(
+      's1',
+      engine,
+      message('A', 'chat1', { type: 'image', body: 'secret', media: { mimetype: 'image/png', data: 'QUJD' } }),
+      t,
+    );
+    await flush();
+    gate.resolve();
+    await flush();
+
+    expect(hookStarts).toEqual([]);
+    expect(rows).toEqual([expect.objectContaining({ waMessageId: 'A', body: '', type: 'revoked', metadata: null })]);
+    expect(dispatched('message.received')).toEqual([]);
+    expect(eventsGateway.emitMessage).not.toHaveBeenCalled();
+  });
+
   it('runs the hook, stores and announces a message edited before its emit with the edit', async () => {
     const t = admit(arrival('A', 'chat1'));
     projector.applyMessageEditQueued('s1', { messageId: 'A', body: 'edited' } as never);
@@ -205,6 +260,558 @@ describe('MessageProjector holding inbound messages (PostgreSQL)', () => {
     expect(hooked?.body).toBe('edited');
     expect(rows[0]).toEqual(expect.objectContaining({ body: 'edited' }));
     expect(dispatched('message.received')[0]).toEqual(expect.objectContaining({ body: 'edited' }));
+  });
+
+  // The entry exists from the arrival, and a change that names another chat or the other party has to be
+  // held to the rule of the row it will become from then on, not only once the message is emitted.
+  describe('a change that reaches a message admitted on arrival', () => {
+    // Phone ids, so that two of them are provably different chats.
+    const CHAT = '15550001111@c.us';
+    const OTHER = '15559998888@c.us';
+
+    it('keeps an edit from another chat out of the message, and does not announce it', async () => {
+      const t = admit(arrival('A', CHAT, false, false, false));
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'A',
+        body: 'FORGED',
+        chatId: OTHER,
+        fromMe: false,
+      } as never);
+      projector.handleInboundMessage('s1', engine, message('A', CHAT, { body: 'original' }), t);
+      await flush();
+
+      expect(rows[0]).toEqual(expect.objectContaining({ body: 'original' }));
+      expect(dispatched('message.edited')).toEqual([]);
+      expect(eventsGateway.emitMessageEdited).not.toHaveBeenCalled();
+    });
+
+    it('keeps an edit that claims to come from the account out of a message the counterparty sent', async () => {
+      const t = admit(arrival('A', CHAT, false, false, false));
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'A',
+        body: 'FORGED',
+        chatId: CHAT,
+        fromMe: true,
+      } as never);
+      projector.handleInboundMessage('s1', engine, message('A', CHAT, { body: 'original' }), t);
+      await flush();
+
+      expect(rows[0]).toEqual(expect.objectContaining({ body: 'original' }));
+      expect(dispatched('message.edited')).toEqual([]);
+    });
+
+    it('keeps a reaction aimed through another chat out of the message, and does not announce it', async () => {
+      const t = admit(arrival('A', CHAT, false, false, false));
+      projector.applyReactionQueued('s1', { messageId: 'A', chatId: OTHER, reaction: 'X', senderId: 'x@c.us' });
+      projector.handleInboundMessage('s1', engine, message('A', CHAT), t);
+      await flush();
+
+      expect((rows[0].metadata as Row | undefined)?.reactions).toBeUndefined();
+      expect(eventsGateway.emitMessageReaction).not.toHaveBeenCalled();
+    });
+
+    it('still takes an edit from the same chat and sender', async () => {
+      const t = admit(arrival('A', CHAT, false, false, false));
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'A',
+        body: 'edited',
+        chatId: CHAT,
+        fromMe: false,
+      } as never);
+      projector.handleInboundMessage('s1', engine, message('A', CHAT, { body: 'original' }), t);
+      await flush();
+
+      expect(rows[0]).toEqual(expect.objectContaining({ body: 'edited' }));
+    });
+
+    // An id names one message. A repeat of it sent from another chat is held under the same entry, and
+    // must not take the entry over: a change aimed through the repeat would be judged by its chat.
+    it('keeps the chat of the first arrival of an own echo too', async () => {
+      const first = admit(arrival('A', CHAT, false, false, true));
+      const repeat = admit(arrival('A', OTHER, false, false, true));
+      const gate = deferred<void>();
+      insertGate = row => (row.chatId === OTHER ? gate.promise : Promise.resolve());
+      projector.handleOwnSendEcho('s1', engine, message('A', OTHER, { fromMe: true, body: 'repeat echo' }), repeat);
+      await flush();
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'A',
+        body: 'FORGED',
+        chatId: OTHER,
+        fromMe: true,
+      } as never);
+      projector.handleOwnSendEcho('s1', engine, message('A', CHAT, { fromMe: true, body: 'echo' }), first);
+      await flush();
+      gate.resolve();
+      await flush();
+
+      expect(rows.find(r => r.chatId === CHAT)).toEqual(expect.objectContaining({ body: 'echo' }));
+      expect(dispatched('message.sent').map(p => p.body)).not.toContain('FORGED');
+    });
+
+    // In a group the edit comes from the participant who wrote the message, which the arrival names.
+    it('keeps a group edit by another participant out of the message, and takes the one by its author', async () => {
+      const GROUP = '120363000000000001@g.us';
+      const author = '15551110001@c.us';
+      const t = admit(arrival('A', GROUP, false, false, false, author));
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'A',
+        body: 'FORGED',
+        chatId: GROUP,
+        fromMe: false,
+        author: '15552220002@c.us',
+      } as never);
+      projector.handleInboundMessage('s1', engine, message('A', GROUP, { body: 'original', author }), t);
+      await flush();
+      expect(rows[0]).toEqual(expect.objectContaining({ body: 'original' }));
+
+      const u = admit(arrival('B', GROUP, false, false, false, author));
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'B',
+        body: 'edited',
+        chatId: GROUP,
+        fromMe: false,
+        author,
+      } as never);
+      projector.handleInboundMessage('s1', engine, message('B', GROUP, { body: 'original', author }), u);
+      await flush();
+      expect(rows[1]).toEqual(expect.objectContaining({ body: 'edited' }));
+    });
+
+    it('keeps the chat of the first arrival when a repeat of the id names another chat', async () => {
+      const first = admit(arrival('A', CHAT, false, false, false));
+      const repeat = admit(arrival('A', OTHER, false, false, false));
+      // The repeat is emitted first and its insert is out; the changes that follow name its chat.
+      const gate = deferred<void>();
+      insertGate = row => (row.chatId === OTHER ? gate.promise : Promise.resolve());
+      projector.handleInboundMessage('s1', engine, message('A', OTHER, { body: 'repeat' }), repeat);
+      await flush();
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'A',
+        body: 'FORGED',
+        chatId: OTHER,
+        fromMe: false,
+      } as never);
+      projector.applyReactionQueued('s1', { messageId: 'A', chatId: OTHER, reaction: 'X', senderId: 'x@c.us' });
+      projector.handleInboundMessage('s1', engine, message('A', CHAT, { body: 'original' }), first);
+      await flush();
+      gate.resolve();
+      await flush();
+
+      const original = rows.find(r => r.chatId === CHAT);
+      expect(original).toEqual(expect.objectContaining({ body: 'original' }));
+      expect((original?.metadata as Row | undefined)?.reactions).toBeUndefined();
+      expect(dispatched('message.received').map(p => p.body)).not.toContain('FORGED');
+    });
+
+    // The entry of a repeat that the engine will drop is no judge of a stored message: its row is.
+    it('lets a change through to the stored row while a repeat of its id from another chat is held', async () => {
+      rows.push({ sessionId: 's1', waMessageId: 'A', chatId: CHAT, direction: 'incoming', body: 'original' });
+      admit(arrival('A', OTHER, false, false, false));
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'A',
+        body: 'edited',
+        chatId: CHAT,
+        fromMe: false,
+      } as never);
+      projector.applyReactionQueued('s1', { messageId: 'A', chatId: CHAT, reaction: 'ok', senderId: 'x@c.us' });
+      await flush();
+
+      expect(rows[0].body).toBe('edited');
+      expect(dispatched('message.edited')).toHaveLength(1);
+      expect((rows[0].metadata as Row).reactions).toEqual({ 'x@c.us': 'ok' });
+    });
+
+    it('still drops a change from the repeat chat aimed at the stored row, and announces nothing', async () => {
+      rows.push({ sessionId: 's1', waMessageId: 'A', chatId: CHAT, direction: 'incoming', body: 'original' });
+      admit(arrival('A', OTHER, false, false, false));
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'A',
+        body: 'FORGED',
+        chatId: OTHER,
+        fromMe: false,
+      } as never);
+      await flush();
+
+      expect(rows[0].body).toBe('original');
+      expect(dispatched('message.edited')).toEqual([]);
+    });
+
+    // The revoke of a message that has no row yet is applied at once, but only when the entry it names
+    // agrees with who made it: the other side of a one-to-one chat cannot clear the account's message.
+    describe('a revoke of a message still arriving', () => {
+      const revoke = (chatId: string): RevokedMessage => ({
+        id: 'A',
+        revokedId: 'A',
+        chatId,
+        from: chatId,
+        to: 'me@c.us',
+        type: 'revoked',
+        body: '',
+        timestamp: 1,
+      });
+
+      it('is dropped when the other side of a one-to-one chat made it, and nothing is announced', async () => {
+        const t = admit(arrival('A', CHAT, false, false, true));
+        projector.handleMessageRevoked('s1', engine, revoke(CHAT), { fromMe: false });
+        await flush();
+        projector.handleInboundMessage('s1', engine, message('A', CHAT, { body: 'mine', fromMe: true }), t);
+        await flush();
+
+        expect(dispatched('message.revoked')).toEqual([]);
+        expect(eventsGateway.emitMessageRevoked).not.toHaveBeenCalled();
+        expect(rows[0]).toEqual(expect.objectContaining({ body: 'mine' }));
+        expect(rows[0].type).not.toBe('revoked');
+      });
+
+      it('is applied when its author made it, before the message is emitted', async () => {
+        const t = admit(arrival('A', CHAT, false, false, true));
+        projector.handleMessageRevoked('s1', engine, revoke(CHAT), { fromMe: true });
+        // Nothing waits for the row read: the emit that follows it at once announces nothing of the message.
+        projector.handleInboundMessage('s1', engine, message('A', CHAT, { body: 'mine', fromMe: true }), t);
+        await flush();
+
+        expect(rows[0]).toEqual(expect.objectContaining({ body: '', type: 'revoked' }));
+        expect(dispatched('message.revoked')).toHaveLength(1);
+        expect(dispatched('message.received')).toEqual([]);
+      });
+
+      it('is judged by the stored row when a repeat of the id from another chat is held', async () => {
+        rows.push({ sessionId: 's1', waMessageId: 'A', chatId: CHAT, direction: 'incoming', body: 'original' });
+        admit(arrival('A', OTHER, false, false, false));
+        projector.handleMessageRevoked('s1', engine, revoke(CHAT), { fromMe: false });
+        await flush();
+
+        expect(dispatched('message.revoked')).toHaveLength(1);
+      });
+
+      it('is dropped when the held entry calls it foreign and no row exists', async () => {
+        admit(arrival('A', OTHER, false, false, false));
+        projector.handleMessageRevoked('s1', engine, revoke(CHAT), { fromMe: false });
+        await flush();
+
+        expect(dispatched('message.revoked')).toEqual([]);
+      });
+    });
+
+    it('does not guess a direction when the engine did not say whose message it is', async () => {
+      const t = admit(arrival('A', CHAT));
+      projector.applyMessageEditQueued('s1', {
+        messageId: 'A',
+        body: 'edited',
+        chatId: CHAT,
+        fromMe: true,
+      } as never);
+      projector.handleInboundMessage('s1', engine, message('A', CHAT, { body: 'original', fromMe: true }), t);
+      await flush();
+
+      expect(rows[0]).toEqual(expect.objectContaining({ body: 'edited' }));
+    });
+  });
+
+  // An id names one message of one chat. A delivery that reuses the id of a message stored under another
+  // chat is held under that id too, and a revoke from its chat agrees with it. That agreement says the
+  // delivery is taken back, not that the stored message is: only the row can say whose revoke it is.
+  describe('a revoke from the chat of a delivery that reuses the id of a stored message', () => {
+    const CHAT = '15550001111@c.us';
+    const OTHER = '15559998888@c.us';
+    const GROUP = '120363000000000001@g.us';
+    const MEMBER = '15551110001@c.us';
+    const stored = (over: Row = {}): Row => ({
+      sessionId: 's1',
+      waMessageId: 'A',
+      chatId: CHAT,
+      direction: 'incoming',
+      type: 'text',
+      body: 'original',
+      metadata: { keep: true },
+      ...over,
+    });
+    const revoke = (chatId: string): RevokedMessage => ({
+      id: 'A',
+      revokedId: 'A',
+      chatId,
+      from: chatId,
+      to: 'me@c.us',
+      type: 'revoked',
+      body: '',
+      timestamp: 1,
+    });
+    it('leaves the stored row alone and announces nothing, while the delivery is held', async () => {
+      rows.push(stored());
+      uniqueIndex();
+      const t = admit(arrival('A', OTHER, false, false, false));
+      projector.handleMessageRevoked('s1', engine, revoke(OTHER), { fromMe: false });
+      await flush();
+      const receipt = projector.handleInboundMessage('s1', engine, message('A', OTHER, { body: 'repeat' }), t);
+      await flush();
+
+      expect(rows).toEqual([stored()]);
+      expect(dispatched('message.revoked')).toEqual([]);
+      expect(eventsGateway.emitMessageRevoked).not.toHaveBeenCalled();
+      expect(dispatched('message.received')).toEqual([]);
+      // The delivery was refused as another message than the one the row holds.
+      await expect(receipt?.settled).resolves.toEqual({ conflict: true });
+    });
+
+    it('leaves the stored row alone on SQLite too, while the delivery runs its hook chain', async () => {
+      build('better-sqlite3');
+      rows.push(stored());
+      uniqueIndex();
+      projector.handleInboundMessage('s1', engine, message('A', OTHER, { body: 'repeat' }));
+      projector.handleMessageRevoked('s1', engine, revoke(OTHER), { fromMe: false });
+      await flush();
+
+      expect(rows).toEqual([stored()]);
+      expect(dispatched('message.revoked')).toEqual([]);
+      expect(eventsGateway.emitMessageRevoked).not.toHaveBeenCalled();
+    });
+
+    it('keeps the revoke for the delivery itself, which is stored cleared where nothing holds the id', async () => {
+      rows.push(stored());
+      uniqueIndex();
+      const t = admit(arrival('A', OTHER, false, false, false));
+      projector.handleMessageRevoked('s1', engine, revoke(OTHER), { fromMe: false });
+      await flush();
+      // The stored message is gone (pruned, say) before the delivery commits.
+      rows.length = 0;
+      projector.handleInboundMessage('s1', engine, message('A', OTHER, { body: 'repeat' }), t);
+      await flush();
+
+      expect(rows).toEqual([expect.objectContaining({ waMessageId: 'A', chatId: OTHER, body: '', type: 'revoked' })]);
+      expect(hookStarts).toEqual([]);
+      expect(dispatched('message.received')).toEqual([]);
+    });
+
+    it('leaves the account own message alone when the other side reuses its id in the same chat', async () => {
+      rows.push(stored({ direction: 'outgoing' }));
+      uniqueIndex();
+      admit(arrival('A', CHAT, false, false, false));
+      projector.handleMessageRevoked('s1', engine, revoke(CHAT), { fromMe: false });
+      await flush();
+
+      expect(rows).toEqual([stored({ direction: 'outgoing' })]);
+      expect(dispatched('message.revoked')).toEqual([]);
+    });
+
+    it('still clears the stored message when its own chat revokes it while a repeat of it is held', async () => {
+      rows.push(stored());
+      admit(arrival('A', CHAT, false, false, false));
+      projector.handleMessageRevoked('s1', engine, revoke(CHAT), { fromMe: false });
+      await flush();
+
+      expect(rows[0]).toEqual(expect.objectContaining({ body: '', type: 'revoked', metadata: null }));
+      expect(dispatched('message.revoked')).toHaveLength(1);
+    });
+
+    it('still clears a member message a group admin revokes while a repeat of it is held', async () => {
+      rows.push(stored({ chatId: GROUP, author: MEMBER }));
+      admit(arrival('A', GROUP, false, false, false, MEMBER));
+      projector.handleMessageRevoked('s1', engine, revoke(GROUP), { fromMe: false });
+      await flush();
+
+      expect(rows[0]).toEqual(expect.objectContaining({ body: '', type: 'revoked' }));
+      expect(dispatched('message.revoked')).toHaveLength(1);
+    });
+
+    it('still clears the account own message when it revokes it from its phone while the echo is held', async () => {
+      rows.push(stored({ direction: 'outgoing' }));
+      admit(arrival('A', CHAT, false, false, true));
+      projector.handleMessageRevoked('s1', engine, revoke(CHAT), { fromMe: true });
+      await flush();
+
+      expect(rows[0]).toEqual(expect.objectContaining({ body: '', type: 'revoked' }));
+      expect(dispatched('message.revoked')).toHaveLength(1);
+    });
+
+    it('still clears a row a REST send stored under the other dialect of the chat', async () => {
+      rows.push(stored({ chatId: '15550001111@s.whatsapp.net', direction: 'outgoing' }));
+      admit(arrival('A', CHAT, false, false, true));
+      projector.handleMessageRevoked('s1', engine, revoke(CHAT), { fromMe: true });
+      await flush();
+
+      expect(rows[0]).toEqual(expect.objectContaining({ body: '', type: 'revoked' }));
+      expect(dispatched('message.revoked')).toHaveLength(1);
+    });
+
+    it('takes back a message still arriving whose row nothing stores, as before', async () => {
+      const t = admit(arrival('A', CHAT, false, false, false));
+      projector.handleMessageRevoked('s1', engine, revoke(CHAT), { fromMe: false });
+      projector.handleInboundMessage('s1', engine, message('A', CHAT), t);
+      await flush();
+
+      expect(rows).toEqual([expect.objectContaining({ waMessageId: 'A', body: '', type: 'revoked' })]);
+      expect(dispatched('message.revoked')).toHaveLength(1);
+      expect(dispatched('message.received')).toEqual([]);
+    });
+
+    // A status post keeps no entry: its own table takes it. A revoke of it reaches the row of the same
+    // id, if there is one, only as a revoke of another chat.
+    it('leaves a message alone that shares its id with a deleted status post', async () => {
+      rows.push(stored());
+      admit(arrival('A', 'status@broadcast', false, true));
+      projector.handleMessageRevoked('s1', engine, revoke('status@broadcast'), { fromMe: false });
+      await flush();
+
+      expect(rows).toEqual([stored()]);
+      expect(dispatched('message.revoked')).toEqual([]);
+    });
+  });
+
+  // The echo of a send the REST writer already stored loses its insert to that row. What reached the message
+  // while it waited is written onto the row once the row says it is the message, and a change that arrives
+  // while the row is read came after it and is stored after it.
+  describe.each([
+    ['PostgreSQL', 'postgres'],
+    ['SQLite', 'better-sqlite3'],
+  ])('an own-send echo whose insert lost to the stored send, on %s', (_name, type) => {
+    const CHAT = '15550001111@c.us';
+    const edit = (body: string): void =>
+      projector.applyMessageEditQueued('s1', { messageId: 'A', body, chatId: CHAT, fromMe: true } as never);
+    const react = (reaction: string): void =>
+      projector.applyReactionQueued('s1', { messageId: 'A', chatId: CHAT, reaction, senderId: CHAT });
+
+    /**
+     * The echo waits in its hook chain while `earlier` reaches it and before the REST send's row exists.
+     * Its insert then loses to that row, and the read that judges the row is held while `later` arrives.
+     */
+    const lose = async (earlier: () => void, later: () => void): Promise<void> => {
+      build(type);
+      uniqueIndex();
+      const hook = deferred<void>();
+      hookManager.execute.mockImplementationOnce(async (_event: string, data: unknown) => {
+        await hook.promise;
+        return { continue: true, data };
+      });
+      const ticket = type === 'postgres' ? admit(arrival('A', CHAT, false, false, true)) : undefined;
+      projector.handleOwnSendEcho('s1', engine, message('A', CHAT, { fromMe: true, body: 'orig' }), ticket);
+      await flush();
+      earlier();
+      await flush();
+      rows.push({ sessionId: 's1', waMessageId: 'A', chatId: CHAT, direction: 'outgoing', type: 'text', body: 'orig' });
+      const read = repo.findOne as jest.Mock;
+      const open = deferred<void>();
+      const unrestricted = read.getMockImplementation() as (arg: unknown) => Promise<unknown>;
+      read.mockImplementationOnce(async (arg: unknown) => {
+        await open.promise;
+        return unrestricted(arg);
+      });
+      hook.resolve();
+      await flush();
+      later();
+      await flush();
+      open.resolve();
+      await flush();
+      expect(dispatched('message.sent')).toHaveLength(1);
+    };
+
+    it('writes the edit recorded for the echo onto the row', async () => {
+      await lose(
+        () => edit('v1'),
+        () => undefined,
+      );
+
+      expect(rows[0].body).toBe('v1');
+    });
+
+    it('writes the reaction recorded for the echo onto the row', async () => {
+      await lose(
+        () => react('thumb'),
+        () => undefined,
+      );
+
+      expect((rows[0].metadata as Row).reactions).toEqual({ [CHAT]: 'thumb' });
+    });
+
+    it('stores an edit that arrives while the row is read after the one recorded for the echo', async () => {
+      await lose(
+        () => edit('v1'),
+        () => edit('v2'),
+      );
+
+      expect(rows[0].body).toBe('v2');
+      expect(
+        (eventsGateway.emitMessageEdited.mock.calls as Array<[string, { body: string }]>).map(c => c[1].body),
+      ).toEqual(['v1', 'v2']);
+    });
+
+    it('stores a reaction that arrives while the row is read after the one recorded for the echo', async () => {
+      await lose(
+        () => react('thumb'),
+        () => react('heart'),
+      );
+
+      expect((rows[0].metadata as Row).reactions).toEqual({ [CHAT]: 'heart' });
+    });
+  });
+
+  // What reached an echo while its hook chain ran is written onto its row once its insert settled, on the
+  // message's mutation chain. When that write is slow, a later change of the message waits behind it, so the
+  // older body is not stored over the newer one, whether the insert lost to the stored send or landed.
+  describe.each([
+    ['PostgreSQL', 'postgres'],
+    ['SQLite', 'better-sqlite3'],
+  ])('an own-send echo whose recorded edit is written slowly, on %s', (_name, type) => {
+    const CHAT = '15550001111@c.us';
+    const edit = (body: string): void =>
+      projector.applyMessageEditQueued('s1', { messageId: 'A', body, chatId: CHAT, fromMe: true } as never);
+
+    /** `v1` reaches the echo in its hook chain; its write is held while `v2` arrives, then released. */
+    const holdWrite = async (storedBySend: boolean): Promise<void> => {
+      build(type);
+      uniqueIndex();
+      const hook = deferred<void>();
+      hookManager.execute.mockImplementationOnce(async (_event: string, data: unknown) => {
+        await hook.promise;
+        return { continue: true, data };
+      });
+      const ticket = type === 'postgres' ? admit(arrival('A', CHAT, false, false, true)) : undefined;
+      projector.handleOwnSendEcho('s1', engine, message('A', CHAT, { fromMe: true, body: 'orig' }), ticket);
+      await flush();
+      edit('v1');
+      await flush();
+      if (storedBySend) {
+        rows.push({
+          sessionId: 's1',
+          waMessageId: 'A',
+          chatId: CHAT,
+          direction: 'outgoing',
+          type: 'text',
+          body: 'orig',
+        });
+      }
+      const open = deferred<void>();
+      let held = 0;
+      const update = repo.update as jest.Mock;
+      const unrestricted = update.getMockImplementation() as (where: Row, patch: Row) => Promise<unknown>;
+      update.mockImplementation(async (where: Row, patch: Row) => {
+        if (patch.body === 'v1') {
+          held++;
+          await open.promise;
+        }
+        return unrestricted(where, patch);
+      });
+      hook.resolve();
+      await flush();
+      expect(held).toBe(1);
+      edit('v2');
+      await flush();
+      open.resolve();
+      await flush();
+    };
+
+    it('keeps a later edit behind the write of the one recorded for an echo that lost its insert', async () => {
+      await holdWrite(true);
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0].body).toBe('v2');
+    });
+
+    it('keeps a later edit behind the write of the one recorded for an echo whose insert landed', async () => {
+      await holdWrite(false);
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0].body).toBe('v2');
+    });
   });
 
   it('stores a reaction and an ack that arrived before the emit once the row is written', async () => {
@@ -363,6 +970,56 @@ describe('MessageProjector holding inbound messages (PostgreSQL)', () => {
     ingest.resolve({ row: {}, created: false });
     await flush();
     expect(granted).toBe(true);
+  });
+
+  // A retired engine keeps emitting while its destroy runs. Admitting it would queue its messages in the
+  // chat's order and take room slots for media that is dropped at emit.
+  it('admits nothing for an engine that is no longer the live one', () => {
+    engines.set('s1', { tag: 'two' } as unknown as IWhatsAppEngine);
+
+    expect(projector.admitInbound('s1', engine, arrival('A', 'chat1', true))).toBeUndefined();
+
+    const internals = projector as unknown as { tickets: Map<string, unknown>; inboundInFlight: Map<string, unknown> };
+    expect(internals.tickets.size).toBe(0);
+    expect(internals.inboundInFlight.size).toBe(0);
+    expect(room()).toBeUndefined();
+  });
+
+  // The turn is only reached once earlier messages of the chat were emitted or dropped, so the engine
+  // can retire while a message waits for it. Its plugins must not see a message of a stopped session.
+  it('skips the hook chain of a message whose engine retired while it waited for its chat turn', async () => {
+    admit(arrival('A', 'chat1'));
+    const b = admit(arrival('B', 'chat1'));
+    projector.handleInboundMessage('s1', engine, message('B', 'chat1'), b);
+    await flush();
+    expect(hookStarts).toEqual([]);
+
+    engines.delete('s1');
+    await flush();
+
+    expect(hookStarts).toEqual([]);
+    expect(rows).toEqual([]);
+  });
+
+  it('forgets the room of a session without an engine once its last slot came back', async () => {
+    const a = admit(arrival('A', 'chat1', true));
+    expect(await a.reserve()).toBe(true);
+
+    engines.delete('s1');
+    expect(room()).toBeDefined();
+    await flush();
+
+    expect(room()).toBeUndefined();
+  });
+
+  it('forgets an idle room when its engine is retired', async () => {
+    admit(arrival('A', 'chat1', true)).drop();
+    await flush();
+    expect(room()).toBeDefined();
+
+    engines.delete('s1');
+
+    expect(room()).toBeUndefined();
   });
 
   it('holds nothing on SQLite: no admission, and the untouched path stores and announces as before', async () => {

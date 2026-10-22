@@ -31,6 +31,7 @@ import {
   isApiKeyPepperMissingInProduction,
   isMainDbSynchronizeInProduction,
   isNodeEnvUnset,
+  rewrittenCorsOrigins,
 } from './config/bootstrap-security';
 import { BullBoardAuthMiddleware } from './common/security/bull-board-auth.middleware';
 import { invalidTrustedProxies } from './common/utils/ip';
@@ -125,6 +126,15 @@ async function bootstrap() {
   if (badTrustedProxies.length > 0) {
     bootstrapLogger.warn(
       `TRUSTED_PROXIES entries that are not an IP address or CIDR range are ignored: ${badTrustedProxies.join(', ')}`,
+    );
+  }
+
+  // Advisory: an origin copied from the address bar carries a path or a trailing slash that a browser never
+  // sends in `Origin`. It is used without them, which is what the operator meant.
+  const rewrittenOrigins = rewrittenCorsOrigins(process.env.CORS_ORIGINS);
+  if (rewrittenOrigins.length > 0) {
+    bootstrapLogger.warn(
+      `CORS_ORIGINS entries are used as an origin, without their path or trailing slash: ${rewrittenOrigins.join(', ')}`,
     );
   }
 

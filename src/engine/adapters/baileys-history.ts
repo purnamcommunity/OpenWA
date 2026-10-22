@@ -10,6 +10,7 @@ import {
   extractBaileysCommerce,
   extractBaileysPoll,
   isBaileysCatalogShare,
+  keyParticipant,
 } from './baileys-message-mapper';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
 import { type createLogger } from '../../common/services/logger.service';
@@ -111,7 +112,7 @@ export class BaileysHistory {
     const targets = new Map(messages.filter(msg => msg.key?.id).map(msg => [msg.key.id!, msg]));
     for (const msg of messages) {
       if (msg.key?.fromMe !== true && msg.pushName) {
-        const sender = msg.key?.participant ?? msg.key?.remoteJid;
+        const sender = keyParticipant(msg.key ?? {}) ?? msg.key?.remoteJid;
         if (sender) {
           nameUpdates.push({ id: sender, notify: msg.pushName });
         }
@@ -161,7 +162,7 @@ export class BaileysHistory {
         id: key.id!,
         remoteJid: key.remoteJid!,
         fromMe: key.fromMe === true,
-        participant: key.participant ?? undefined,
+        participant: keyParticipant(key),
         body: '',
         contentType: undefined,
         timestamp,
@@ -307,7 +308,7 @@ export class BaileysHistory {
         id: msg.key.id,
         remoteJid: msg.key.remoteJid,
         fromMe: msg.key.fromMe === true,
-        participant: msg.key.participant ?? undefined,
+        participant: keyParticipant(msg.key),
         body,
         contentType,
         isPtt: content.audioMessage?.ptt === true,

@@ -7,6 +7,8 @@ import { NulFreeTransformer } from '../../../common/transformers/nul-free.transf
 // webhook_delivery_failures. sessionId is provenance (no FK).
 @Entity('integration_delivery_failures')
 @Index('IDX_integration_delivery_failures_instance', ['pluginId', 'instanceId'])
+// The per-delivery guards (open dead-letter count, tie-break, retire) filter on deliveryId as well.
+@Index('IDX_integration_delivery_failures_instance_delivery', ['pluginId', 'instanceId', 'deliveryId'])
 export class IntegrationDeliveryFailure {
   @PrimaryGeneratedColumn('uuid')
   id!: string;

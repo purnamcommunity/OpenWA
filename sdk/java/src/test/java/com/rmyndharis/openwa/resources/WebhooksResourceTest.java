@@ -54,6 +54,14 @@ class WebhooksResourceTest {
     }
 
     @Test
+    void redriveDeliveryFailuresKeepsAnExplicitEmptyIdsList() {
+        // The gateway reads ids: [] as "replay nothing" and an omitted ids as "replay up to 100 rows".
+        tx.respond(200, "{\"redriven\":0,\"delivered\":0,\"enqueued\":0,\"failed\":0,\"skipped\":0,\"remaining\":3}");
+        client.webhooks.redriveDeliveryFailures(RedriveWebhookDeliveriesRequest.builder().ids(List.of()).build());
+        assertEquals("{\"ids\":[]}", tx.lastRequest().body());
+    }
+
+    @Test
     void listHitsWebhooksRoot() {
         tx.respond(200, "[]");
         client.webhooks.list("s");

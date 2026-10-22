@@ -17,7 +17,7 @@ import { resolveWebVersionPin } from '../wa-web-version';
 import { resolveAuthTimeoutMs, resolveEngineInitTimeoutMs } from '../engine-init-timeout';
 import { killOrphanedChromiumProcesses, removeStaleSingletonFiles } from './chromium-profile-hygiene';
 import { isSupportedProxyUrl, buildProxyLaunchConfig } from './wwebjs-proxy';
-import { BACKPORT_MISSING_MESSAGE, isBackportMissing } from './wwebjs-backport-check';
+import { backportProblem } from './wwebjs-backport-check';
 import { unappliedPatches, unappliedPatchesMessage } from './engine-patch-status';
 import { type EvaluatablePage, reportMissingCallHook } from './wwebjs-call-hook-check';
 import { reportRunningWebBuild } from './wwebjs-running-build';
@@ -183,15 +183,14 @@ const WA_STATE_RESTRICTIONS: Readonly<Record<string, AccountRestriction['kind']>
  * Host surface for {@link WwebjsLifecycle}. The adapter keeps the public engine methods as thin
  * forwarders and builds ONE object literal of these closures, so the delegate drives connection
  * state only through the seams named here: the sibling delegates it coordinates (reconcile,
- * onboarding watcher, call cache, stuck-auth) and the adapter-owned event surface.
+ * onboarding watcher, call cache, stuck-auth) and the adapter-owned callbacks and domain-event
+ * registration.
  */
 export interface WwebjsLifecycleHost {
   readonly logger: ReturnType<typeof createLogger>;
   readonly config: WhatsAppWebJsConfig;
   /** Live callbacks bag — read per event, since initialize() installs it after delegates are built. */
   getCallbacks(): EngineEventCallbacks;
-  /** Re-emit a status transition on the adapter's EventEmitter (`stateChanged`). */
-  emitState(status: EngineStatus): void;
   /** Arm / disarm the post-authentication readiness reconciliation (./wwebjs-reconcile). */
   scheduleReadyReconcile(): void;
   clearReadyReconcile(): void;
@@ -289,8 +288,9 @@ export class WwebjsLifecycle {
 
     // An install that skipped the message-id backport fails later with errors that name no cause
     // (#889) — say so here instead, while the operator is still looking at the startup logs.
-    if (isBackportMissing()) {
-      this.host.logger.error(BACKPORT_MISSING_MESSAGE);
+    const backportProblemText = backportProblem();
+    if (backportProblemText) {
+      this.host.logger.error(backportProblemText);
     }
 
     // The other whatsapp-web.js patchers fail the same way and were equally silent about it.
@@ -609,6 +609,13 @@ export class WwebjsLifecycle {
     // this.client while the old page can still flush a buffered event through its bindings, so the
     // qr, authenticated and ready listeners fence on this identity before touching this.client.
     const source = this.client;
+    const canPublishQr = (): boolean =>
+      this.client === source &&
+      !this.tearingDown &&
+      !this.disconnectReported &&
+      ![EngineStatus.AUTHENTICATING, EngineStatus.READY, EngineStatus.ACTION_REQUIRED, EngineStatus.FAILED].includes(
+        this.getStatus(),
+      );
 
     // eslint-disable-next-line @typescript-eslint/no-misused-promises
     this.client.on('qr', async (qr: string) => {
@@ -619,14 +626,7 @@ export class WwebjsLifecycle {
       // finished adapter to QR_READY and publish a QR that links a phantom device. Mirrors the
       // 'authenticated' guard below; the normal first QR is unaffected (initialize() moves the status to
       // INITIALIZING before any client exists, so the latch is still clear).
-      if (
-        this.client !== source ||
-        this.tearingDown ||
-        this.disconnectReported ||
-        this.status === EngineStatus.FAILED
-      ) {
-        return;
-      }
+      if (!canPublishQr()) return;
       this.qrShown = true;
       // qrcode.toDataURL() is an awaited macrotask: a 'disconnected' (or a teardown nulling this.client)
       // that lands during the encode leaves the pre-await guard stale. Encode to a LOCAL so the stored
@@ -636,17 +636,9 @@ export class WwebjsLifecycle {
         // Post-await fence: the encode resolved, but the source client may have disconnected or been
         // replaced while we were waiting. Re-check the live client identity and the finished flags before
         // assigning state, publishing a QR, or driving any downstream callback/webhook — a late encode for
-        // a dead/finished adapter must be dropped, not resurrected. The status is read through getStatus()
-        // (not `this.status`) so the pre-await guard's narrowing does not elide this comparison:
-        // setStatus(FAILED) can run on another tick during the await.
-        if (
-          this.client !== source ||
-          this.tearingDown ||
-          this.disconnectReported ||
-          this.getStatus() === EngineStatus.FAILED
-        ) {
-          return;
-        }
+        // a dead/finished adapter must be dropped. Authentication or an operator-required state reached
+        // during encoding also makes this QR obsolete.
+        if (!canPublishQr()) return;
         this.qrCode = encodedQr;
         this.qrTiming = nextQrTiming(this.qrTiming, Date.now());
         this.linkedFromQr = true;
@@ -1081,9 +1073,9 @@ export class WwebjsLifecycle {
     void reportRunningWebBuild(page, this.host.logger, this.host.config.sessionId, this.requestedWebVersion);
   }
 
-  /** The single status-transition funnel: latches disconnectReported, fires the callback, re-emits
-   *  on the adapter's EventEmitter. Public because the sibling delegates (reconcile, stuck-auth,
-   *  onboarding watcher) drive transitions through their host slices. */
+  /** The single status-transition funnel: latches disconnectReported and fires the callback. Public
+   *  because the sibling delegates (reconcile, stuck-auth, onboarding watcher) drive transitions
+   *  through their host slices. */
   setStatus(status: EngineStatus): void {
     // Latch before anything observes the transition. The constructor's initial DISCONNECTED is a field
     // initializer and never reaches here, so this only ever fires on a real transition — startup is
@@ -1104,7 +1096,6 @@ export class WwebjsLifecycle {
     }
     this.status = status;
     this.host.getCallbacks().onStateChanged?.(status);
-    this.host.emitState(status);
   }
 
   private beginClientTeardown(): Client | null {
@@ -1291,7 +1282,11 @@ export class WwebjsLifecycle {
    * failing probe answers alive, since the page is healing, not dead (#1081).
    */
   async probeLiveness(): Promise<boolean> {
-    if (this.status !== EngineStatus.READY || !this.client) return false;
+    // The watchdog also probes an ACTION_REQUIRED session, observe-only (it never reconnects one): the page
+    // is still up while the operator acts. Answering false without asking made every such session look
+    // dead on the first tick, and hid a page that really had died.
+    const probeable = this.status === EngineStatus.READY || this.status === EngineStatus.ACTION_REQUIRED;
+    if (!probeable || !this.client) return false;
 
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -1371,7 +1366,8 @@ export class WwebjsLifecycle {
         const transient =
           error instanceof PairingCodeAttemptTimeoutError ||
           isExecutionContextDestroyedError(reason) ||
-          /callfunctionon timed out|timed out\. increase the 'protocoltimeout'/i.test(reason);
+          isProtocolTimeout(error) ||
+          /callfunctionon timed out/i.test(reason);
         if (!transient) {
           throw error;
         }

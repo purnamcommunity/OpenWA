@@ -1,6 +1,6 @@
 import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { fetchAllPages } from './fetchAllPages.ts';
+import { fetchAllPages, retryThrottled } from './fetchAllPages.ts';
 
 before(async () => {
   const { installJsdomGlobals } = await import('../test-helpers/jsdom.ts');
@@ -228,4 +228,47 @@ test('a walk stops once the key it started with is signed out or replaced', asyn
     /Signed out/,
   );
   assert.equal(refused, 3, 'the walk did not reach the last retry');
+});
+
+test('a walk does not send its retry when the key is signed out during the throttle wait', async () => {
+  const { fetchPage } = fakeSource(1_000, 200);
+  const sentWith: Array<string | null> = [];
+  let refused = false;
+  await assert.rejects(
+    fetchAllPages(
+      async (limit, offset) => {
+        sentWith.push(sessionStorage.getItem('openwa_api_key'));
+        if (offset === 200 && !refused) {
+          refused = true;
+          // The refusal settles first; the operator signs out while the walk waits to retry it.
+          setTimeout(() => sessionStorage.removeItem('openwa_api_key'), 5);
+          throw httpError(429);
+        }
+        return fetchPage(limit, offset);
+      },
+      { retryDelayMs: 40 },
+    ),
+    /Signed out/,
+  );
+  assert.deepEqual(sentWith, ['key-a', 'key-a'], 'the retry went out after the sign-out');
+});
+
+test('the throttle backoff doubles on each retry', async () => {
+  const delays: number[] = [];
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: () => void, ms?: number) => {
+    delays.push(ms ?? 0);
+    return realSetTimeout(fn, 0);
+  }) as typeof setTimeout;
+  try {
+    await assert.rejects(
+      retryThrottled(async () => {
+        throw httpError(429);
+      }, 40),
+      { status: 429 },
+    );
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  assert.deepEqual(delays, [40, 80]);
 });

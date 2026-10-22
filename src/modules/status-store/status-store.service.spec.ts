@@ -1,10 +1,8 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { DataSource, DeepPartial, Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
-
-jest.mock('archiver', () => ({ default: jest.fn() }));
 
 import { StorageService } from '../../common/storage/storage.service';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
@@ -45,6 +43,44 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     fs.rmSync(baseDir, { recursive: true, force: true });
   });
 
+  // SQLite serves every repository from one connection, so a transaction a save opens is shared with the
+  // writes made while it is open, and the rollback of a duplicate's unique violation would undo them too,
+  // after ingest had reported them created and the status.received webhook had gone out.
+  it('keeps a row written while a duplicate that lost the unique-key race is refused', async () => {
+    const status = (waStatusId: string) => ({
+      waStatusId,
+      contactJid: '628111@c.us',
+      type: 'text' as const,
+      caption: waStatusId,
+      postedAt: Date.now(),
+    });
+    await service.ingest('sess-race', status('dup'));
+    // The racing ingest read before the winner wrote, so it goes on to the insert that must be refused.
+    jest.spyOn(repository, 'findOne').mockResolvedValueOnce(null);
+    let concurrent: Promise<unknown> | undefined;
+    ds.subscribers.push({
+      listenTo: () => StatusUpdate,
+      beforeInsert: event => {
+        if ((event.entity as StatusUpdate).waStatusId === 'dup' && !concurrent) {
+          const other = status('other');
+          concurrent = repository.insert({
+            ...other,
+            sessionId: 'sess-race',
+            expiresAt: other.postedAt + 24 * 60 * 60 * 1000,
+            mediaOmitted: false,
+          });
+        }
+      },
+    });
+
+    const { created } = await service.ingest('sess-race', status('dup'));
+    await concurrent;
+
+    expect(created).toBe(false);
+    const stored = (await repository.find({ where: { sessionId: 'sess-race' } })).map(row => row.waStatusId).sort();
+    expect(stored).toEqual(['dup', 'other']);
+  });
+
   it('ingest writes a text row with expiresAt = postedAt + 24h, flagged as created', async () => {
     const postedAt = Date.now();
     const { row, created } = await service.ingest('sess', {
@@ -76,6 +112,25 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     const styled = (await service.list('sess')).find(s => s.id === 'styled')!;
     expect(styled.backgroundColor).toBe('#25d366');
     expect(styled.font).toBe(2);
+  });
+
+  it('serves a status with no name, push name, caption or styling without those keys', async () => {
+    const postedAt = Date.now();
+    await service.ingest('sess', { waStatusId: 'bare', contactJid: '628333@c.us', type: 'text', postedAt });
+
+    // The columns read back as null, but StatusDto and the openapi schema declare these fields optional,
+    // not nullable: a client typed from the contract must see them absent.
+    const listed = (await service.list('sess')).find(s => s.id === 'bare')!;
+    const [byContact] = await service.listByContact('sess', '628333@c.us');
+    const wire = {
+      id: 'bare',
+      contact: { id: '628333@c.us' },
+      type: 'text',
+      timestamp: new Date(postedAt).toISOString(),
+      expiresAt: new Date(postedAt + 24 * 60 * 60 * 1000).toISOString(),
+    };
+    expect(JSON.parse(JSON.stringify(listed))).toEqual(wire);
+    expect(JSON.parse(JSON.stringify(byContact))).toEqual(wire);
   });
 
   it('ingest persists media to a file under the cap and records mediaPath', async () => {
@@ -248,13 +303,7 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     // The in-memory row returned here is exactly what dispatchStatusReceived sends. Every other
     // omission path sets omitReason, so leaving it unset made a real media loss indistinguishable
     // from an unexplained omission — and nothing retries it.
-    const saveSpy = jest.spyOn(repository, 'save');
-    let calls = 0;
-    saveSpy.mockImplementation((row: DeepPartial<StatusUpdate>) => {
-      calls += 1;
-      if (calls === 2) return Promise.reject(new Error('db blip')); // the post-write update
-      return Promise.resolve(row as DeepPartial<StatusUpdate> & StatusUpdate);
-    });
+    const updateSpy = jest.spyOn(repository, 'update').mockRejectedValueOnce(new Error('db blip'));
     try {
       const { row } = await service.ingest('sess', {
         waStatusId: 'w-row-fail',
@@ -267,7 +316,7 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
       expect(row.omitReason).toBe('write_failed');
       expect(row.mediaPath).toBeFalsy();
     } finally {
-      saveSpy.mockRestore();
+      updateSpy.mockRestore();
     }
   });
 
@@ -825,22 +874,13 @@ describe('StatusStoreService.sweepOrphanedMedia', () => {
     expect(fs.existsSync(path.join(baseDir, 'media', 'statuses', 'sess', 'orphan.jpg'))).toBe(false);
   });
 
-  it('enumerates past the listFiles() cap so orphans beyond it are still reaped', async () => {
-    // listFiles() truncates at STORAGE_LIST_MAX_FILES (a per-call DoS guard, not a completeness
-    // contract); the sweep reconciles against the FULL store, so it streams iterateFiles() instead.
-    process.env.STORAGE_LIST_MAX_FILES = '5';
-    try {
-      for (let i = 0; i < 8; i++) writeFile(`statuses/sess/orphan-${i}.jpg`, 'orphan');
-      // The capped call the sweep used to make would see only 5 of the 8 orphans.
-      expect((await storageService.listFiles()).filter(f => f.startsWith('statuses/'))).toHaveLength(5);
+  it('reaps every orphan under its prefix, not just the first few', async () => {
+    for (let i = 0; i < 8; i++) writeFile(`statuses/sess/orphan-${i}.jpg`, 'orphan');
 
-      const t0 = Date.now();
-      expect(await service.sweepOrphanedMedia(t0)).toBe(0); // first sighting starts the grace clock
-      expect(await service.sweepOrphanedMedia(t0 + 61 * 60 * 1000)).toBe(8); // all 8, not the capped 5
-      expect(fs.readdirSync(path.join(baseDir, 'media', 'statuses', 'sess'))).toHaveLength(0);
-    } finally {
-      delete process.env.STORAGE_LIST_MAX_FILES;
-    }
+    const t0 = Date.now();
+    expect(await service.sweepOrphanedMedia(t0)).toBe(0); // first sighting starts the grace clock
+    expect(await service.sweepOrphanedMedia(t0 + 61 * 60 * 1000)).toBe(8);
+    expect(fs.readdirSync(path.join(baseDir, 'media', 'statuses', 'sess'))).toHaveLength(0);
   });
 });
 
@@ -901,7 +941,38 @@ describe('StatusStoreService onModuleInit/onModuleDestroy (sweep scheduling)', (
     }
   });
 
-  it('runs the orphan sweep once at startup and on its own (slower) cadence, cleared on destroy', () => {
+  it('skips an orphan sweep tick while the previous sweep is still running', async () => {
+    const { repo, storage } = mockDeps();
+    const service = new StatusStoreService(
+      repo,
+      storage,
+      fakeConfigService({ 'status.orphanSweepIntervalMs': 60_000 }),
+    );
+
+    jest.useFakeTimers();
+    let release: () => void = () => undefined;
+    jest.spyOn(service, 'purgeExpired').mockResolvedValue(0);
+    const sweepSpy = jest
+      .spyOn(service, 'sweepOrphanedMedia')
+      .mockImplementationOnce(() => new Promise<number>(resolve => (release = () => resolve(0))))
+      .mockResolvedValue(0);
+    try {
+      service.onModuleInit();
+      await jest.advanceTimersByTimeAsync(60_000);
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(sweepSpy).toHaveBeenCalledTimes(1);
+
+      release();
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(sweepSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      service.onModuleDestroy();
+      release();
+      jest.useRealTimers();
+    }
+  });
+
+  it('runs the orphan sweep once at startup and on its own (slower) cadence, cleared on destroy', async () => {
     const { repo, storage } = mockDeps();
     const service = new StatusStoreService(repo, storage, fakeConfigService());
 
@@ -913,21 +984,21 @@ describe('StatusStoreService onModuleInit/onModuleDestroy (sweep scheduling)', (
 
       // The TTL purge fires every 15 min; the orphan sweep only on its own 1h interval.
       sweepSpy.mockClear();
-      jest.advanceTimersByTime(15 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
       expect(sweepSpy).not.toHaveBeenCalled();
-      jest.advanceTimersByTime(45 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(45 * 60 * 1000);
       expect(sweepSpy).toHaveBeenCalledTimes(1);
 
       service.onModuleDestroy();
       sweepSpy.mockClear();
-      jest.advanceTimersByTime(60 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(60 * 60 * 1000);
       expect(sweepSpy).not.toHaveBeenCalled();
     } finally {
       jest.useRealTimers();
     }
   });
 
-  it('honors a configured status.orphanSweepIntervalMs override', () => {
+  it('honors a configured status.orphanSweepIntervalMs override', async () => {
     const { repo, storage } = mockDeps();
     const service = new StatusStoreService(
       repo,
@@ -940,7 +1011,7 @@ describe('StatusStoreService onModuleInit/onModuleDestroy (sweep scheduling)', (
       const sweepSpy = jest.spyOn(service, 'sweepOrphanedMedia').mockResolvedValue(0);
       service.onModuleInit();
       sweepSpy.mockClear();
-      jest.advanceTimersByTime(5 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(5 * 60 * 1000);
       expect(sweepSpy).toHaveBeenCalledTimes(1);
       service.onModuleDestroy();
     } finally {

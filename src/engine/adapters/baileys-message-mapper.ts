@@ -10,8 +10,10 @@ import { chatKind } from '../identity/wa-id';
 /**
  * Content types that change or annotate another message and carry nothing of their own: a poll vote,
  * an in-chat pin, a keep-in-chat toggle, an album header (its photos arrive as their own messages), an
- * encrypted reaction, an event RSVP, an encrypted edit (an event edit) and an encrypted comment. Mapped,
- * they would surface as a bodyless `unknown` message, so the live and history paths drop them instead.
+ * encrypted reaction, an event RSVP, an encrypted edit and an encrypted comment. Mapped, they would
+ * surface as a bodyless `unknown` message, so the live and history paths drop them instead. The live
+ * path first reads an encrypted edit or reaction it holds the secret for (baileys-secret-payload.ts),
+ * and drops only what it cannot read.
  */
 export const BAILEYS_NON_CONTENT_TYPES: ReadonlySet<string> = new Set([
   'pollUpdateMessage',
@@ -1020,6 +1022,15 @@ export function storedKeyInChat(
 }
 
 /**
+ * The participant a live key names, or undefined when it names none. Baileys passes every live key
+ * through cleanMessage, which writes jidNormalizedUser(participant) back, and that is '' for the absent
+ * participant of a 1:1 chat. `??` keeps the empty string, which then reads as a sender that is nobody.
+ */
+export function keyParticipant(key: { participant?: string | null }): string | undefined {
+  return key.participant ? key.participant : undefined;
+}
+
+/**
  * Build a neutral {@link IncomingMessage} from extracted Baileys fields. The chat is `remoteJid`
  * (Baileys reports the conversation directly), except that a received broadcast-list message is filed
  * under its sender's chat (see {@link baileysChatJid}); `fromMe` only flips from/to. The group sender,
@@ -1065,7 +1076,7 @@ export function buildIncomingMessageFromBaileys(
   }
 
   // The lid check uses the RAW sender (participant in a group, else the chat JID) before normalization.
-  const senderJid = fields.participant ?? rawChatId;
+  const senderJid = fields.participant ? fields.participant : rawChatId;
   if (senderJid.endsWith('@lid')) {
     incoming.isLidSender = true;
   }

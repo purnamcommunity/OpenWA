@@ -58,6 +58,13 @@ describe('MessagesResource idempotency keys', () => {
     expect(t.lastCall!.body).toEqual(originalBody);
   });
 
+  it('treats a null key from an untyped caller as no key, as the Python and PHP SDKs do', async () => {
+    const t = new MockTransport().on('POST', /\/messages\/send-text$/, { body: { messageId: 'm', timestamp: 1 } });
+    const c = new OpenWAClient({ baseUrl: 'http://localhost', apiKey: 'k', fetch: t.asFetch() });
+    await c.messages.sendText('s', { chatId: 'c@c.us', text: 'hi' }, null as unknown as string);
+    expect(t.lastCall!.headers['idempotency-key']).toBeUndefined();
+  });
+
   it('overrides a mixed-case default without changing later calls', async () => {
     const t = new MockTransport().on('POST', /send-text$/, { body: { messageId: 'm', timestamp: 1 } });
     const headers = { 'iDeMpOtEnCy-KeY': 'default-key', 'X-Trace': 'trace' };
@@ -71,7 +78,7 @@ describe('MessagesResource idempotency keys', () => {
     expect(t.lastCall!.headers['idempotency-key']).toBe('default-key');
   });
 
-  it.each(['', 'has space', ' key', 'key ', 'key\n', 'key\t', 'caf\u00e9', 'x'.repeat(256)])(
+  it.each(['', 'has space', ' key', 'key ', 'key\n', 'key\t', 'caf\u00e9', 'a\u007fb', 'x'.repeat(256)])(
     'rejects invalid key %j before transport',
     async key => {
       const t = new MockTransport().on('POST', /send-text$/, { body: { messageId: 'm', timestamp: 1 } });
@@ -81,7 +88,7 @@ describe('MessagesResource idempotency keys', () => {
     },
   );
 
-  it.each(['!', 'x'.repeat(255)])('accepts visible ASCII key %j', async key => {
+  it.each(['!', '~', 'x', 'x'.repeat(255)])('accepts visible ASCII key %j', async key => {
     const t = new MockTransport().on('POST', /send-text$/, { body: { messageId: 'm', timestamp: 1 } });
     const c = new OpenWAClient({ baseUrl: 'http://localhost', apiKey: 'k', fetch: t.asFetch() });
     await c.messages.sendText('s', { chatId: 'c@c.us', text: 'hi' }, key);

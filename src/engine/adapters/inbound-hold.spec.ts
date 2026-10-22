@@ -1,11 +1,13 @@
 import { EventEmitter } from 'events';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { WAState } from 'whatsapp-web.js';
+import { WAState, type Message as WwebjsMessage } from 'whatsapp-web.js';
 import type { Repository } from 'typeorm';
 import type { WAMessage, WASocket } from '@whiskeysockets/baileys';
 import { BaileysEvents, type BaileysEventsHost } from './baileys-events';
 import { WhatsAppWebJsAdapter } from './whatsapp-web-js.adapter';
+import { plannedInboundDownload } from './wwebjs-messaging';
+import type { WwebjsLifecycle } from './wwebjs-lifecycle';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 import { createLogger } from '../../common/services/logger.service';
 import { EngineRegistry } from '../engine-registry.service';
@@ -33,14 +35,18 @@ const flush = async (): Promise<void> => {
 };
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
-/** The real projector over a stand-in `messages` table whose inserts a test can stall per message. */
-function heldProjector() {
+/**
+ * The real projector over a stand-in `messages` table whose inserts a test can stall per message. With
+ * `unique`, an insert of an id the table already holds fails as the real table's unique index does. With
+ * `sqlite`, it is wired as SQLite is: no message is admitted before its emit.
+ */
+function heldProjector(options: { unique?: boolean; sqlite?: boolean } = {}) {
   const rows: Row[] = [];
   const hookStarts: string[] = [];
   const hookedBodies: Record<string, string> = {};
   const stalls = new Map<string, Promise<void>>();
   const repo = {
-    manager: { connection: { options: { type: 'postgres' } } },
+    manager: { connection: { options: { type: options.sqlite ? 'better-sqlite3' : 'postgres' } } },
     find: jest.fn().mockResolvedValue([]),
     findOne: jest.fn(({ where }: { where: Row }) =>
       Promise.resolve(rows.find(r => r.waMessageId === where.waMessageId) ?? null),
@@ -48,6 +54,9 @@ function heldProjector() {
     create: jest.fn((x: Row) => ({ ...x })),
     insert: jest.fn(async (row: Row) => {
       await stalls.get(String(row.waMessageId));
+      if (options.unique && rows.some(r => r.waMessageId === row.waMessageId)) {
+        throw Object.assign(new Error('UNIQUE constraint failed'), { code: 'SQLITE_CONSTRAINT_UNIQUE' });
+      }
       rows.push({ ...row });
       return { identifiers: [{ id: `pk-${String(row.waMessageId)}` }], generatedMaps: [] };
     }),
@@ -90,11 +99,15 @@ function heldProjector() {
   );
   // The same table SessionEngineEventWiring builds on PostgreSQL.
   const callbacksFor = (e: IWhatsAppEngine): EngineEventCallbacks => ({
-    admitInbound: a => projector.admitInbound('s1', e, a),
+    // Only PostgreSQL holds a message from its arrival.
+    ...(options.sqlite
+      ? {}
+      : { admitInbound: (a: Parameters<MessageProjector['admitInbound']>[2]) => projector.admitInbound('s1', e, a) }),
     onMessage: (m, t) => projector.handleInboundMessage('s1', e, m, t),
     onMessageCreate: (m, t) => projector.handleOwnSendEcho('s1', e, m, t),
-    onMessageRevoked: m => projector.handleMessageRevoked('s1', e, m),
+    onMessageRevoked: (m, actor) => projector.handleMessageRevoked('s1', e, m, actor),
     onMessageEdited: m => projector.applyMessageEditQueued('s1', m),
+    onMessageReaction: r => projector.applyReactionQueued('s1', r),
   });
   const callbacks = callbacksFor(engine);
   const stall = (id: string): (() => void) => {
@@ -106,6 +119,8 @@ function heldProjector() {
     (webhookService.dispatch.mock.calls as Array<[string, string, Row]>)
       .filter(c => c[1] === 'message.received')
       .map(c => String(c[2].id));
+  const announcedAs = (event: string): Row[] =>
+    (webhookService.dispatch.mock.calls as Array<[string, string, Row]>).filter(c => c[1] === event).map(c => c[2]);
   return {
     projector,
     rows,
@@ -116,6 +131,7 @@ function heldProjector() {
     engines,
     stall,
     announced,
+    announcedAs,
     ingested,
     inserted: () => rows.map(r => r.waMessageId),
   };
@@ -155,7 +171,31 @@ describe('Baileys inbound messages held for storage', () => {
     destroy: jest.fn(),
   });
 
-  const build = (concurrency: number, callbacks?: EngineEventCallbacks) => {
+  /** The adapter's message store, in memory: what the host reads, writes and deletes copies through. */
+  const memoryStore = () => {
+    const copies = new Map<string, WAMessage>();
+    return {
+      copies,
+      getStoredMessage: (id: string) => Promise.resolve(structuredClone(copies.get(id) ?? null)),
+      putStoredMessage: (msg: WAMessage) => {
+        copies.set(msg.key.id!, structuredClone(msg));
+        return Promise.resolve();
+      },
+      updateStoredMessage: (id: string, change: (stored: WAMessage) => WAMessage | null) => {
+        const held = copies.get(id);
+        const next = held && change(structuredClone(held));
+        if (next) copies.set(id, next);
+        return Promise.resolve();
+      },
+      removeStoredMessage: (id: string, accept: (stored: WAMessage) => boolean) => {
+        const held = copies.get(id);
+        if (held && accept(structuredClone(held))) copies.delete(id);
+        return Promise.resolve();
+      },
+    };
+  };
+
+  const build = (concurrency: number, callbacks?: EngineEventCallbacks, store?: ReturnType<typeof memoryStore>) => {
     const emitted: string[] = [];
     const recordKeyLidMappings = jest.fn();
     const host = {
@@ -178,7 +218,7 @@ describe('Baileys inbound messages held for storage', () => {
       getAdmitInbound: () => callbacks?.admitInbound,
       getOnMessage: () => (m: IncomingMessage, t?: never) => {
         emitted.push(m.id);
-        callbacks?.onMessage?.(m, t);
+        return callbacks?.onMessage?.(m, t);
       },
       getOnMessageCreate: () => callbacks?.onMessageCreate,
       getOnMessageRevoked: () => callbacks?.onMessageRevoked,
@@ -189,6 +229,7 @@ describe('Baileys inbound messages held for storage', () => {
       getOnCall: () => undefined,
       getOnPresenceUpdate: () => undefined,
       getOnCallOutcome: () => undefined,
+      ...store,
     } as unknown as BaileysEventsHost;
     return { events: new BaileysEvents(host), emitted, recordKeyLidMappings };
   };
@@ -229,7 +270,7 @@ describe('Baileys inbound messages held for storage', () => {
     it('lets another chat text through while media waits for room, its limiter slot given up', async () => {
       const h = heldProjector();
       const { events, emitted } = build(k, h.callbacks);
-      await fillRoom(h, events);
+      const release = await fillRoom(h, events);
 
       // K media waiting for room would hold every limiter slot if they did not give theirs up.
       upsert(events, ...Array.from({ length: k }, (_, i) => media(`W${i}`, `wait${i}@s.whatsapp.net`)));
@@ -239,6 +280,11 @@ describe('Baileys inbound messages held for storage', () => {
       expect(emitted).toContain('T');
       expect(h.inserted()).toEqual(['T']);
       expect(downloadMediaMessage).toHaveBeenCalledTimes(k);
+
+      // Room frees: the media that waited is stored here, not by its wait timer after the file is done.
+      release();
+      await flush();
+      expect(h.inserted()).toEqual(expect.arrayContaining(Array.from({ length: k }, (_, i) => `W${i}`)));
     });
 
     it('commits a same-chat text after the media it arrived behind', async () => {
@@ -384,8 +430,8 @@ describe('Baileys inbound messages held for storage', () => {
   });
 
   it.each([
-    ['from another chat', { remoteJid: 'other@s.whatsapp.net', fromMe: false }],
-    ['from the wrong author', { remoteJid: 'chat@s.whatsapp.net', fromMe: true }],
+    ['from another chat', { remoteJid: '628222@s.whatsapp.net', fromMe: false }],
+    ['from the wrong author', { remoteJid: '628111@s.whatsapp.net', fromMe: true }],
   ])('ignores a delete and an edit %s aimed at media waiting for room', async (_, envelope) => {
     process.env.INBOUND_MEDIA_CONCURRENCY = '1';
     const h = heldProjector();
@@ -394,8 +440,8 @@ describe('Baileys inbound messages held for storage', () => {
     upsert(
       events,
       media('H', 'hold@s.whatsapp.net'),
-      media('MREV', 'chat@s.whatsapp.net', { caption: 'real caption' }),
-      media('MEDIT', 'chat@s.whatsapp.net', { caption: 'real caption 2' }),
+      media('MREV', '628111@s.whatsapp.net', { caption: 'real caption' }),
+      media('MEDIT', '628111@s.whatsapp.net', { caption: 'real caption 2' }),
     );
     await flush();
     const target = (id: string) => ({ id, remoteJid: envelope.remoteJid, fromMe: false });
@@ -436,8 +482,9 @@ describe('Baileys inbound messages held for storage', () => {
     let release: () => void;
     let callbacks: EngineEventCallbacks;
     if (admitted) {
+      // The session judges what the engine hands it, as it does in production.
       release = h.stall('H');
-      callbacks = { ...h.callbacks, onMessageReaction };
+      callbacks = h.callbacks;
     } else {
       // No admission callback, as SQLite wires the engine: M is held only by its own download.
       release = () => download.resolve();
@@ -445,7 +492,7 @@ describe('Baileys inbound messages held for storage', () => {
       callbacks = { onMessage: jest.fn(), onMessageReaction };
     }
     const { events } = build(4, callbacks);
-    const chat = 'chat@s.whatsapp.net';
+    const chat = '628111@s.whatsapp.net';
     upsert(events, ...(admitted ? [media('H', 'hold@s.whatsapp.net')] : []), media('M', chat));
     await flush();
     const react = (id: string, remoteJid: string, text: string): WAMessage => ({
@@ -453,12 +500,13 @@ describe('Baileys inbound messages held for storage', () => {
       messageTimestamp: 1_700_000_001,
       message: { reactionMessage: { key: { id: 'M', remoteJid, fromMe: false }, text } },
     });
-    upsert(events, react('R1', 'other@s.whatsapp.net', 'forged'), react('R2', chat, 'genuine'));
+    upsert(events, react('R1', '628222@s.whatsapp.net', 'forged'), react('R2', chat, 'genuine'));
     await flush();
     release();
     await flush();
 
-    expect(reactions).toEqual([expect.objectContaining({ messageId: 'M', chatId: chat, reaction: 'genuine' })]);
+    const reached = admitted ? h.announcedAs('message.reaction') : reactions;
+    expect(reached).toEqual([expect.objectContaining({ messageId: 'M', chatId: chat, reaction: 'genuine' })]);
   });
 
   it('neither ingests nor emits a status post deleted while it waits for room', async () => {
@@ -503,6 +551,138 @@ describe('Baileys inbound messages held for storage', () => {
     expect(h.hookStarts).toEqual(['H']);
     expect(h.inserted()).toEqual(['H']);
     expect(h.announced()).toEqual(['H']);
+  });
+
+  // An id names one message of one chat. The table refuses a delivery that reuses the id of a message it
+  // holds under another chat, and a delete from the reusing chat is the delete of that delivery, never of
+  // the stored message: its row keeps its content, and nothing announces it as deleted.
+  describe.each([
+    ['PostgreSQL', false],
+    ['SQLite', true],
+  ])('a delivery that reuses the id of a stored message of another chat, deleted by its sender on %s', (_, sqlite) => {
+    const CHAT_A = '628111@s.whatsapp.net';
+    const CHAT_B = '628222@s.whatsapp.net';
+    const real = (): Row => ({
+      sessionId: 's1',
+      waMessageId: 'X',
+      chatId: CHAT_A,
+      direction: 'incoming',
+      type: 'text',
+      body: 'the real one',
+      metadata: null,
+    });
+    const revokeFrom = (chat: string): WAMessage => ({
+      key: { id: 'REV', remoteJid: chat, fromMe: false },
+      messageTimestamp: 1_700_000_001,
+      message: { protocolMessage: { type: 0, key: { id: 'X', remoteJid: chat, fromMe: false } } },
+    });
+
+    it.each([
+      ['text', (): WAMessage => text('X', CHAT_B)],
+      ['media', (): WAMessage => media('X', CHAT_B)],
+    ])('leaves the stored message alone when the delivery is %s', async (_kind, reuse) => {
+      process.env.INBOUND_MEDIA_CONCURRENCY = '1';
+      const h = heldProjector({ unique: true, sqlite });
+      h.rows.push(real());
+      const download = deferred<ReturnType<typeof stream>>();
+      downloadMediaMessage.mockImplementationOnce(() => download.promise);
+      const { events } = build(4, h.callbacks);
+      upsert(events, reuse(), revokeFrom(CHAT_B));
+      await flush();
+      download.resolve(stream());
+      await flush();
+
+      expect(h.rows).toEqual([real()]);
+      expect(h.announcedAs('message.revoked')).toEqual([]);
+      expect(h.announced()).toEqual([]);
+    });
+
+    // The delivery's row waits for an earlier message of its chat: on SQLite as well, it is in flight
+    // from its emit until that commit ends, and a delete from its chat reaches it there.
+    it('leaves the stored message alone when the delivery waits for an earlier message of its chat', async () => {
+      const h = heldProjector({ unique: true, sqlite });
+      h.rows.push(real());
+      const release = h.stall('EARLIER');
+      const { events } = build(4, h.callbacks);
+      upsert(events, text('EARLIER', CHAT_B), text('X', CHAT_B));
+      await flush();
+      upsert(events, revokeFrom(CHAT_B));
+      await flush();
+      release();
+      await flush();
+
+      expect(h.rows.find(r => r.waMessageId === 'X')).toEqual(real());
+      expect(h.inserted()).toEqual(['X', 'EARLIER']);
+      expect(h.announcedAs('message.revoked')).toEqual([]);
+      expect(h.announced()).toEqual(['EARLIER']);
+    });
+
+    it('still takes a later edit from the real message chat', async () => {
+      const h = heldProjector({ unique: true, sqlite });
+      h.rows.push(real());
+      const { events } = build(4, h.callbacks);
+      upsert(events, text('X', CHAT_B), revokeFrom(CHAT_B));
+      await flush();
+      upsert(events, {
+        key: { id: 'ENV', remoteJid: CHAT_A, fromMe: false },
+        messageTimestamp: 1_700_000_002,
+        message: {
+          protocolMessage: {
+            type: 14,
+            key: { id: 'X', remoteJid: CHAT_A, fromMe: false },
+            editedMessage: { conversation: 'fixed' },
+            timestampMs: 1_700_000_002_000,
+          },
+        },
+      });
+      await flush();
+
+      expect(h.rows).toEqual([{ ...real(), body: 'fixed', metadata: { edited: true } }]);
+    });
+  });
+
+  // The session holds a change that reaches a message before its emit to the rule of the row it will
+  // become, which needs the direction and the sender from the arrival on.
+  it('names whose message it is in the arrival, and the sender behind a group message', async () => {
+    const h = heldProjector();
+    const admitInbound = jest.fn(h.callbacks.admitInbound);
+    const { events } = build(4, { ...h.callbacks, admitInbound });
+    const own = { ...text('B', 'c@s.whatsapp.net'), key: { id: 'B', remoteJid: 'c@s.whatsapp.net', fromMe: true } };
+    const member = {
+      ...text('C', '120363000000000001@g.us'),
+      key: { id: 'C', remoteJid: '120363000000000001@g.us', fromMe: false, participant: 'm@s.whatsapp.net' },
+    };
+    upsert(events, text('A', 'c@s.whatsapp.net'), own, member);
+    await flush();
+
+    expect(admitInbound.mock.calls.map(([a]) => [a.id, a.fromMe, a.author])).toEqual([
+      ['A', false, undefined],
+      ['B', true, undefined],
+      ['C', false, 'm@s.whatsapp.net'],
+    ]);
+  });
+
+  it('names the sender behind a broadcast-list or status message too, and none behind a one-to-one chat', async () => {
+    const h = heldProjector();
+    const admitInbound = jest.fn(h.callbacks.admitInbound);
+    const { events } = build(4, { ...h.callbacks, admitInbound });
+    const key = (id: string, remoteJid: string, fromMe: boolean, participant?: string) => ({
+      ...text(id, remoteJid),
+      key: { id, remoteJid, fromMe, ...(participant ? { participant } : {}) },
+    });
+    upsert(
+      events,
+      key('L', '1700000002@broadcast', false, 'p@s.whatsapp.net'),
+      key('S', 'status@broadcast', false, 's@s.whatsapp.net'),
+      key('M', 'c@s.whatsapp.net', false, 'x@s.whatsapp.net'),
+    );
+    await flush();
+
+    expect(admitInbound.mock.calls.map(([a]) => [a.id, a.author])).toEqual([
+      ['L', 'p@s.whatsapp.net'],
+      ['S', 's@s.whatsapp.net'],
+      ['M', undefined],
+    ]);
   });
 
   it('still processes a message, and the rest of its batch, when its admission throws', async () => {
@@ -586,6 +766,382 @@ describe('Baileys inbound messages held for storage', () => {
     expect(held.recordKeyLidMappings).toHaveBeenCalledTimes(1);
     expect(plain.recordKeyLidMappings).toHaveBeenCalledTimes(1);
   });
+
+  // A message the table holds from history is not in the adapter's store, so a delivery that reuses its id
+  // from another chat is stored there under its own key before the table refuses its row.
+  describe('a delivery that reuses the id of a message the table holds', () => {
+    const CHAT_A = '628111@s.whatsapp.net';
+    const CHAT_B = '628222@s.whatsapp.net';
+    const seeded = (): Row => ({ waMessageId: 'X', chatId: CHAT_A, direction: 'incoming', body: 'the real one' });
+    /** An edit of X sent from `chat`, under an envelope id of its own. */
+    const editFrom = (chat: string, envelopeId: string, body: string): WAMessage => ({
+      key: { id: envelopeId, remoteJid: chat, fromMe: false },
+      messageTimestamp: 1_700_000_002,
+      message: {
+        protocolMessage: {
+          type: 14,
+          key: { id: 'X', remoteJid: chat, fromMe: false },
+          editedMessage: { conversation: body },
+          timestampMs: 1_700_000_002_000,
+        },
+      },
+    });
+    const realEdit = (): WAMessage => editFrom(CHAT_A, 'EDIT_ENV', 'fixed');
+
+    it('removes the copy it stored, so the real message edit lands on the row', async () => {
+      const h = heldProjector({ unique: true });
+      h.rows.push(seeded());
+      const store = memoryStore();
+      const { events } = build(4, h.callbacks, store);
+
+      upsert(events, text('X', CHAT_B));
+      await flush();
+
+      // The row is not touched and nothing is announced; the copy that stood in for it is gone.
+      expect(h.rows).toEqual([seeded()]);
+      expect(h.announced()).toEqual([]);
+      expect(store.copies.has('X')).toBe(false);
+
+      upsert(events, realEdit());
+      await flush();
+      expect(h.rows[0]).toEqual(expect.objectContaining({ body: 'fixed' }));
+    });
+
+    it('keeps the copy of a re-fire of the message the table holds', async () => {
+      const h = heldProjector({ unique: true });
+      h.rows.push({ ...seeded(), chatId: CHAT_B });
+      const store = memoryStore();
+      const { events } = build(4, h.callbacks, store);
+
+      upsert(events, text('X', CHAT_B));
+      await flush();
+
+      expect(store.copies.get('X')?.key.remoteJid).toBe(CHAT_B);
+      expect(h.announced()).toEqual([]);
+    });
+
+    it('holds the real edit while the repeat is held, and lands it once the copy is refused', async () => {
+      const h = heldProjector({ unique: true });
+      h.rows.push(seeded());
+      const release = h.stall('X');
+      const store = memoryStore();
+      const { events } = build(4, h.callbacks, store);
+
+      upsert(events, text('X', CHAT_B));
+      await flush();
+      expect(store.copies.get('X')?.key.remoteJid).toBe(CHAT_B);
+
+      // Judged against the copy alone it would be foreign, and lost with the copy's removal still to come.
+      upsert(events, realEdit());
+      await flush();
+      expect(h.rows).toEqual([seeded()]);
+      expect(h.announcedAs('message.edited')).toEqual([]);
+      expect(store.copies.has('X')).toBe(true);
+
+      release();
+      await flush();
+      expect(store.copies.has('X')).toBe(false);
+      expect(h.rows).toEqual([expect.objectContaining({ chatId: CHAT_A, body: 'fixed' })]);
+    });
+
+    it('still drops an edit from a third chat, before and after the session answers', async () => {
+      const h = heldProjector({ unique: true });
+      h.rows.push(seeded());
+      const release = h.stall('X');
+      const { events } = build(4, h.callbacks, memoryStore());
+
+      upsert(events, text('X', CHAT_B));
+      await flush();
+      upsert(events, editFrom('628333@s.whatsapp.net', 'FORGED_1', 'forged'));
+      await flush();
+      release();
+      await flush();
+      upsert(events, editFrom('628333@s.whatsapp.net', 'FORGED_2', 'forged again'));
+      await flush();
+
+      expect(h.rows).toEqual([seeded()]);
+    });
+
+    // The copy the change was judged foreign to is gone when the hold ends, wiped with the account or not
+    // readable, and no conflict removed it: the key it was judged by stands, as it does for a delivery in flight.
+    it('drops a change judged foreign to a copy that is gone when the hold ends, and was not removed as a conflict', async () => {
+      const h = heldProjector({ unique: true });
+      const release = h.stall('X');
+      const store = memoryStore();
+      const onMessageEdited = jest.fn(h.callbacks.onMessageEdited);
+      const { events } = build(4, { ...h.callbacks, onMessageEdited }, store);
+
+      upsert(events, text('X', CHAT_B));
+      await flush();
+      expect(store.copies.get('X')?.key.remoteJid).toBe(CHAT_B);
+      upsert(events, editFrom('628333@s.whatsapp.net', 'FORGED_ENV', 'forged'));
+      await flush();
+      expect(onMessageEdited).not.toHaveBeenCalled();
+
+      store.copies.clear();
+      release();
+      await flush();
+
+      expect(onMessageEdited).not.toHaveBeenCalled();
+      expect(h.rows).toEqual([expect.objectContaining({ waMessageId: 'X', chatId: CHAT_B })]);
+    });
+
+    // The delivery is not stored, and the session has no receipt for it, until its processing is over (the
+    // limiter queue, the repeat check, a download). A change that arrives meanwhile is judged against the key
+    // the delivery arrived under, which cannot say which message the id names.
+    describe('while the delivery is still being processed', () => {
+      type Kind = 'edit' | 'delete' | 'reaction';
+      const CHAT_C = '628333@s.whatsapp.net';
+
+      /**
+       * A store whose reads of X wait until released, counted from 1 in the order they are made. Each answers
+       * what the store held when it began; the first is the delivery's repeat check.
+       */
+      const holdingReads = (held: number[]) => {
+        const store = memoryStore();
+        const read = store.getStoredMessage;
+        const gates = new Map<number, ReturnType<typeof deferred<void>>>();
+        for (const n of held) gates.set(n, deferred<void>());
+        let reads = 0;
+        store.getStoredMessage = async (id: string) => {
+          if (id !== 'X') return read(id);
+          const n = ++reads;
+          const seen = await read(id);
+          await gates.get(n)?.promise;
+          return seen;
+        };
+        return { store, open: (n: number) => gates.get(n)!.resolve() };
+      };
+
+      const change = (kind: Kind, chat: string, envelopeId: string): WAMessage => {
+        if (kind === 'edit') return editFrom(chat, envelopeId, 'fixed');
+        const target = { id: 'X', remoteJid: chat, fromMe: false };
+        return {
+          key: { id: envelopeId, remoteJid: chat, fromMe: false },
+          messageTimestamp: 1_700_000_002,
+          message:
+            kind === 'delete'
+              ? { protocolMessage: { type: 0, key: target } }
+              : { reactionMessage: { key: target, text: 'ok' } },
+        };
+      };
+
+      /** What the change has done to the session: the stored body, the stored type, or the reactions announced. */
+      const effect = (h: ReturnType<typeof heldProjector>, kind: Kind): unknown => {
+        const row = h.rows.find(r => r.waMessageId === 'X');
+        if (kind === 'edit') return row?.body;
+        if (kind === 'delete') return row?.type;
+        return h.announcedAs('message.reaction').map(r => r.messageId);
+      };
+
+      /** The seeded row says 'the real one' and has no type; a delivery that is the message stores 'text X'. */
+      const untouched = (kind: Kind, seededRow: boolean): unknown => {
+        if (kind === 'reaction') return [];
+        if (kind === 'edit') return seededRow ? 'the real one' : 'text X';
+        return seededRow ? undefined : 'text';
+      };
+      const landed: Record<Kind, unknown> = { edit: 'fixed', delete: 'revoked', reaction: ['X'] };
+      const kinds = ['edit', 'delete', 'reaction'] as const;
+
+      describe.each([
+        ['PostgreSQL', false],
+        ['SQLite', true],
+      ])('on %s', (_, sqlite) => {
+        it.each(kinds.flatMap(kind => [true, false].map(stall => [kind, stall] as const)))(
+          'lands the real %s once the delivery is refused (answer held: %s)',
+          async (kind, stall) => {
+            const h = heldProjector({ unique: true, sqlite });
+            h.rows.push(seeded());
+            const release = stall ? h.stall('X') : undefined;
+            const { store, open } = holdingReads([1]);
+            const { events } = build(4, h.callbacks, store);
+
+            upsert(events, text('X', CHAT_B));
+            await flush();
+            upsert(events, change(kind, CHAT_A, 'REAL_ENV'));
+            await flush();
+            expect(effect(h, kind)).toEqual(untouched(kind, true));
+
+            open(1);
+            await flush();
+            release?.();
+            await flush();
+
+            expect(effect(h, kind)).toEqual(landed[kind]);
+            expect(store.copies.has('X')).toBe(false);
+            expect(h.announced()).toEqual([]);
+          },
+        );
+
+        // The delivery's answer is pending when the change is judged, so the adapter holds it: it does nothing
+        // for it until the answer, when it drops it, or, with the copy gone, leaves it to the session, which
+        // drops it by the row.
+        it.each(kinds.flatMap(kind => [true, false].map(conflicts => [kind, conflicts] as const)))(
+          'holds a forged %s from a third chat until the delivery is answered, then drops it (delivery conflicts: %s)',
+          async (kind, conflicts) => {
+            const h = heldProjector({ unique: true, sqlite });
+            // Without a row of another message, the delivery is the message the id names.
+            if (conflicts) h.rows.push(seeded());
+            const release = h.stall('X');
+            const { store, open } = holdingReads([1]);
+            const handedOn = {
+              onMessageEdited: jest.fn(h.callbacks.onMessageEdited),
+              onMessageRevoked: jest.fn(h.callbacks.onMessageRevoked),
+              onMessageReaction: jest.fn(h.callbacks.onMessageReaction),
+            };
+            const { events } = build(4, { ...h.callbacks, ...handedOn }, store);
+            const reached = (): number => Object.values(handedOn).reduce((n, fn) => n + fn.mock.calls.length, 0);
+
+            upsert(events, text('X', CHAT_B));
+            await flush();
+            upsert(events, change(kind, CHAT_C, 'FORGED_ENV'));
+            await flush();
+            open(1);
+            await flush();
+            expect(reached()).toBe(0);
+            release();
+            await flush();
+
+            expect(reached()).toBe(conflicts ? 1 : 0);
+            expect(effect(h, kind)).toEqual(untouched(kind, conflicts));
+            expect(h.announcedAs('message.edited')).toEqual([]);
+            expect(h.announcedAs('message.revoked')).toEqual([]);
+          },
+        );
+
+        // The answer comes before the change is judged again, so the adapter has the copy (the delivery is
+        // the message) or nothing (it conflicted and the copy was removed) to judge it by.
+        it.each(kinds.flatMap(kind => [true, false].map(conflicts => [kind, conflicts] as const)))(
+          'drops a forged %s from a third chat judged after the answer (delivery conflicts: %s)',
+          async (kind, conflicts) => {
+            const h = heldProjector({ unique: true, sqlite });
+            if (conflicts) h.rows.push(seeded());
+            const { store, open } = holdingReads([1, 3]);
+            const { events } = build(4, h.callbacks, store);
+
+            upsert(events, text('X', CHAT_B));
+            await flush();
+            upsert(events, change(kind, CHAT_C, 'FORGED_ENV'));
+            await flush();
+            open(1);
+            await flush();
+            open(3);
+            await flush();
+
+            expect(effect(h, kind)).toEqual(untouched(kind, conflicts));
+            expect(h.announcedAs('message.edited')).toEqual([]);
+            expect(h.announcedAs('message.revoked')).toEqual([]);
+            // The copy of a delivery that is the message stays; a conflicting one is gone.
+            expect(store.copies.has('X')).toBe(!conflicts);
+          },
+        );
+      });
+
+      // The park gives up what the change holds, whichever kind it is: it is announced as nothing, and the
+      // delivery it waits for needs its slot and its turn back.
+      it.each(kinds)(
+        'lets the delivery take its limiter slot back when its room frees, while a %s waits',
+        async kind => {
+          process.env.INBOUND_MEDIA_CONCURRENCY = '1';
+          process.env.MEDIA_DOWNLOAD_TIMEOUT_MS = '1000';
+          const h = heldProjector({ unique: true });
+          h.rows.push(seeded());
+          const { events, emitted } = build(1, h.callbacks, memoryStore());
+          const release = h.stall('H');
+
+          upsert(events, media('H', 'hold@s.whatsapp.net'));
+          await flush();
+          // X asks for the room H holds until its row is written, and gives its only limiter slot up meanwhile.
+          upsert(events, media('X', CHAT_B));
+          await flush();
+          upsert(events, change(kind, CHAT_A, 'REAL_ENV'));
+          await flush();
+          expect(emitted).toEqual(['H']);
+          expect(h.rows).toEqual([seeded()]);
+
+          release();
+          await flush();
+          expect(emitted).toEqual(['H', 'X']);
+          expect(h.rows.find(r => r.waMessageId === 'X')).toEqual(expect.objectContaining({ chatId: CHAT_A }));
+          expect(effect(h, kind)).toEqual(landed[kind]);
+        },
+      );
+
+      it.each(kinds)('keeps no limiter slot while a %s waits for the answer', async kind => {
+        process.env.INBOUND_MEDIA_CONCURRENCY = '1';
+        const h = heldProjector({ unique: true });
+        h.rows.push(seeded());
+        const release = h.stall('X');
+        const { events } = build(1, h.callbacks, memoryStore());
+
+        upsert(events, text('X', CHAT_B));
+        await flush();
+        upsert(events, change(kind, CHAT_A, 'REAL_ENV'));
+        await flush();
+        // The only slot is free for what arrives next, though the change has not been judged.
+        upsert(events, text('N', CHAT_C));
+        await flush();
+        expect(h.inserted()).toContain('N');
+        expect(effect(h, kind)).toEqual(untouched(kind, true));
+
+        release();
+        await flush();
+        expect(h.rows.find(r => r.waMessageId === 'X')).toEqual(expect.objectContaining({ chatId: CHAT_A }));
+        expect(effect(h, kind)).toEqual(landed[kind]);
+      });
+
+      it.each(kinds)('does not hold back the later messages of its own chat while a %s waits', async kind => {
+        const h = heldProjector({ unique: true });
+        h.rows.push(seeded());
+        const { store, open } = holdingReads([1]);
+        const { events } = build(4, h.callbacks, store);
+
+        upsert(events, text('X', CHAT_B));
+        await flush();
+        upsert(events, change(kind, CHAT_A, 'REAL_ENV'), text('F', CHAT_A));
+        await flush();
+
+        expect(h.hookStarts).toContain('F');
+        expect(h.inserted()).toContain('F');
+        open(1);
+        await flush();
+        expect(h.rows[0]).toEqual(expect.objectContaining({ waMessageId: 'X', chatId: CHAT_A }));
+        expect(effect(h, kind)).toEqual(landed[kind]);
+      });
+
+      // The host keeps no copy and cannot remove one, so the key the delivery arrived under judges the change,
+      // and the removal of the conflicting copy of U fails. A message of another id that conflicts meanwhile has
+      // no say in what X is.
+      it.each([
+        ['PostgreSQL', false],
+        ['SQLite', true],
+      ])(
+        'keeps holding a forged change when another id conflicts while the delivery downloads, on %s',
+        async (_, sqlite) => {
+          const h = heldProjector({ unique: true, sqlite });
+          h.rows.push({ waMessageId: 'U', chatId: CHAT_A, direction: 'incoming', body: 'another real one' });
+          const download = deferred<ReturnType<typeof stream>>();
+          downloadMediaMessage.mockImplementationOnce(() => download.promise);
+          const onMessageEdited = jest.fn(h.callbacks.onMessageEdited);
+          const { events } = build(4, { ...h.callbacks, onMessageEdited });
+
+          upsert(events, media('X', CHAT_B));
+          await flush();
+          upsert(events, change('edit', CHAT_C, 'FORGED_ENV'));
+          await flush();
+          upsert(events, text('U', '628444@s.whatsapp.net'));
+          await flush();
+          expect(h.rows.find(r => r.waMessageId === 'U')?.body).toBe('another real one');
+
+          download.resolve(stream());
+          await flush();
+
+          expect(onMessageEdited).not.toHaveBeenCalled();
+          expect(h.announcedAs('message.edited')).toEqual([]);
+        },
+      );
+    });
+  });
 });
 
 describe('whatsapp-web.js inbound messages held for storage', () => {
@@ -598,7 +1154,7 @@ describe('whatsapp-web.js inbound messages held for storage', () => {
     });
     (adapter as unknown as { client: unknown }).client = client;
     (adapter as unknown as { callbacks: unknown }).callbacks = callbacks;
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { adapter, client };
   };
   const incoming = (id: string, from: string, page?: jest.Mock, body = '') => ({
@@ -614,6 +1170,12 @@ describe('whatsapp-web.js inbound messages held for storage', () => {
     client: { pupPage: { evaluate: page } },
     getContact: jest.fn().mockResolvedValue(null),
     hasQuotedMsg: false,
+  });
+  // The account's own send as whatsapp-web.js echoes it: `from` is the account, `to` the conversation.
+  const ownEcho = (id: string, to: string, page?: jest.Mock, body = '') => ({
+    ...incoming(id, '628123@c.us', page, body),
+    to,
+    fromMe: true,
   });
 
   beforeEach(() => {
@@ -667,6 +1229,63 @@ describe('whatsapp-web.js inbound messages held for storage', () => {
       }
     },
   );
+
+  it('keeps its slot while the processing of a downloaded message is parked, across a reconnect', async () => {
+    process.env.MEDIA_DOWNLOAD_TIMEOUT_MS = '5000';
+    const h = heldProjector();
+    const { client } = build(h.callbacks);
+    const quoted = deferred<{ id: { _serialized: string }; body: string }>();
+    const first = jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD' });
+    client.emit('message', {
+      ...incoming('m1', '628111@c.us', first),
+      hasQuotedMsg: true,
+      getQuotedMessage: jest.fn(() => quoted.promise),
+    });
+    await flush();
+    // The payload is downloaded; the processing waits for the quoted message, which a held message bounds
+    // only by MEDIA_DOWNLOAD_TIMEOUT_MS.
+    expect(first).toHaveBeenCalledTimes(1);
+
+    // The engine is retired and its pending turn dropped, so only the hold on the processing keeps the slot.
+    const fresh = {} as IWhatsAppEngine;
+    h.engines.set('s1', fresh);
+    const next = build(h.callbacksFor(fresh));
+    const second = jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD' });
+    next.client.emit('message', incoming('m2', '628222@c.us', second));
+    await flush();
+    expect(second).not.toHaveBeenCalled();
+
+    quoted.resolve({ id: { _serialized: 'q' }, body: 'quoted' });
+    await flush();
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it('plans the download of a declared size at the cap, and of none above it', () => {
+    process.env.MEDIA_DOWNLOAD_MAX_BYTES = '1000';
+    process.env.MEDIA_DOWNLOAD_ENABLED = 'true';
+    const declared = (size: number): WwebjsMessage => ({ hasMedia: true, _data: { size } }) as unknown as WwebjsMessage;
+
+    expect(plannedInboundDownload(declared(1000))).toBe(true);
+    expect(plannedInboundDownload(declared(1001))).toBe(false);
+  });
+
+  it('ignores message_create for a message the account did not send, which has its own message event', async () => {
+    const h = heldProjector();
+    const callbacks = {
+      ...h.callbacks,
+      admitInbound: jest.fn(h.callbacks.admitInbound),
+      onMessageCreate: jest.fn(),
+    };
+    const { client } = build(callbacks);
+    const page = jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD' });
+
+    client.emit('message_create', incoming('m1', '628111@c.us', page));
+    await flush();
+
+    expect(callbacks.admitInbound).not.toHaveBeenCalled();
+    expect(callbacks.onMessageCreate).not.toHaveBeenCalled();
+    expect(page).not.toHaveBeenCalled();
+  });
 
   it('keeps the slot of a timed-out page download until the page settles', async () => {
     process.env.MEDIA_DOWNLOAD_TIMEOUT_MS = '100';
@@ -825,5 +1444,127 @@ describe('whatsapp-web.js inbound messages held for storage', () => {
       .filter(f => f.startsWith('wwebjs-') && f.endsWith('.ts') && !f.endsWith('.spec.ts'))
       .filter(f => readFileSync(join(__dirname, f), 'utf8').includes('admitInbound'));
     expect(callers).toEqual(['wwebjs-message-events.ts']);
+  });
+
+  it('holds the room for an own media echo until its row is written, so the next echo waits', async () => {
+    const h = heldProjector();
+    const release = h.stall('echo1');
+    const { client } = build(h.callbacks);
+    const first = jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD' });
+    const second = jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD' });
+    client.emit('message_create', ownEcho('echo1', '628111@c.us', first));
+    client.emit('message_create', ownEcho('echo2', '628222@c.us', second));
+    await flush();
+
+    // One slot of room: the first payload waits for its insert, so the second page download has not started.
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).not.toHaveBeenCalled();
+    release();
+    await flush();
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(h.inserted()).toEqual(['echo1', 'echo2']);
+  });
+
+  it('commits an own text echo after the own media echo it arrived behind in its chat', async () => {
+    const h = heldProjector();
+    const { client } = build(h.callbacks);
+    const page = deferred<{ mimetype: string; data: string }>();
+    client.emit(
+      'message_create',
+      ownEcho(
+        'echo-image',
+        '628111@c.us',
+        jest.fn(() => page.promise),
+      ),
+    );
+    client.emit('message_create', ownEcho('echo-text', '628111@c.us', undefined, 'after'));
+    await flush();
+    // The text is processed meanwhile, but its hook and row wait for the image.
+    expect(h.hookStarts).toEqual([]);
+    expect(h.inserted()).toEqual([]);
+
+    page.resolve({ mimetype: 'image/png', data: 'QUJD' });
+    await flush();
+    expect(h.hookStarts).toEqual(['echo-image', 'echo-text']);
+    expect(h.inserted()).toEqual(['echo-image', 'echo-text']);
+  });
+
+  it('asks the room for a slot only for an own echo that downloads, and stores no status echo', async () => {
+    const h = heldProjector();
+    const admitInbound = jest.fn(h.callbacks.admitInbound);
+    const { client } = build({ ...h.callbacks, admitInbound });
+    const page = jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD' });
+    client.emit('message_create', ownEcho('echo-image', '628111@c.us', page));
+    client.emit('message_create', ownEcho('echo-status', 'status@broadcast', page));
+    client.emit('message_create', ownEcho('echo-text', '628111@c.us', undefined, 'hi'));
+    await flush();
+
+    expect(admitInbound.mock.calls.map(([a]) => [a.id, a.status, a.needsRoom])).toEqual([
+      ['echo-image', false, true],
+      ['echo-status', true, false],
+      ['echo-text', false, false],
+    ]);
+    expect(page).toHaveBeenCalledTimes(1);
+    expect(h.inserted()).toEqual(['echo-image', 'echo-text']);
+  });
+
+  it('names whose message it is in the arrival', async () => {
+    const h = heldProjector();
+    const admitInbound = jest.fn(h.callbacks.admitInbound);
+    const { client } = build({ ...h.callbacks, admitInbound });
+    client.emit('message_create', ownEcho('mine', '628111@c.us', undefined, 'hi'));
+    client.emit('message', incoming('theirs', '628111@c.us', undefined, 'hello'));
+    await flush();
+
+    expect(admitInbound.mock.calls.map(([a]) => [a.id, a.fromMe])).toEqual([
+      ['mine', true],
+      ['theirs', false],
+    ]);
+  });
+
+  it('names the sender behind a group message in the arrival', async () => {
+    const h = heldProjector();
+    const admitInbound = jest.fn(h.callbacks.admitInbound);
+    const { client } = build({ ...h.callbacks, admitInbound });
+    client.emit('message', { ...incoming('grp', '120363000000000001@g.us', undefined, 'hi'), author: '628222@c.us' });
+    client.emit('message', incoming('one', '628111@c.us', undefined, 'hello'));
+    await flush();
+
+    expect(admitInbound.mock.calls.map(([a]) => [a.id, a.fromMe, a.author])).toEqual([
+      ['grp', false, '628222@c.us'],
+      ['one', false, undefined],
+    ]);
+  });
+
+  it('settles the ticket of an own echo its handler never takes, so the chat is not held up', async () => {
+    const h = heldProjector();
+    // The handler ignores the ticket it is handed: only the adapter's own settle can release it.
+    const { client } = build({ ...h.callbacks, onMessageCreate: () => undefined });
+    client.emit('message_create', ownEcho('echo', '628111@c.us'));
+    client.emit('message', incoming('after', '628111@c.us', undefined, 'hello'));
+    await flush();
+
+    expect(h.inserted()).toEqual(['after']);
+  });
+
+  it.each<[string, boolean, number, Record<string, string>, boolean]>([
+    ['an image', true, 3, {}, true],
+    ['an image with media downloads disabled', true, 3, { MEDIA_DOWNLOAD_ENABLED: 'false' }, false],
+    ['media declared over the cap', true, 5000, { MEDIA_DOWNLOAD_MAX_BYTES: '1000' }, false],
+    ['a text', false, 0, {}, false],
+  ])('plans a download for %s exactly when processing downloads it', async (_case, media, size, vars, planned) => {
+    Object.assign(process.env, vars);
+    const h = heldProjector();
+    const admitInbound = jest.fn(h.callbacks.admitInbound);
+    const { client } = build({ ...h.callbacks, admitInbound });
+    const page = jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD' });
+    const msg = { ...incoming('a', '628111@c.us', media ? page : undefined), _data: { mimetype: 'image/png', size } };
+
+    expect(plannedInboundDownload(msg as unknown as WwebjsMessage)).toBe(planned);
+    client.emit('message', msg);
+    await flush();
+
+    expect(admitInbound).toHaveBeenCalledWith(expect.objectContaining({ id: 'a', needsRoom: planned }));
+    expect(page).toHaveBeenCalledTimes(planned ? 1 : 0);
   });
 });

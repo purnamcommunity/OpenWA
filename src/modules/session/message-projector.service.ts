@@ -10,6 +10,7 @@ import { KeyedMutationQueue } from '../../common/utils/keyed-mutation-queue';
 import { SessionLidResolver } from './session-lid-resolver.service';
 import { buildMessageMetadata, REVOKED_ROW_PATCH, storableWaMessageId } from './message-row.mapper';
 import { MessageMutationProjector } from './message-mutation-projector';
+import { mutationTargetsForeignRow, type MutationSource, type StoredMessageRef } from './message-mutation-guard';
 import { updateMessageMetadata } from '../message/message-metadata';
 import { persistHistoryMessages } from './message-history-projector';
 import { isTransientDbError, isUniqueViolation } from '../../common/utils/db-errors';
@@ -22,7 +23,10 @@ import type { StatusUpdate } from '../status-store/entities/status-update.entity
 import {
   IWhatsAppEngine,
   DeliveryStatus,
+  MessageReceiptEvent,
   IncomingMessage,
+  InboundOutcome,
+  InboundReceipt,
   InboundTicket,
   ReactionEvent,
   EditedMessage,
@@ -91,12 +95,30 @@ type InboundMessageData = { [K in keyof IncomingMessage]: IncomingMessage[K] };
 
 const quoteOf = (m: Pick<IncomingMessage, 'chatId' | 'body'>) => ({ chatId: m.chatId, body: m.body });
 
+/** Where a message lives and who wrote it: what a change aimed at it is held to (see mutationTargetsForeignRow). */
+const refOf = (m: Pick<IncomingMessage, 'chatId' | 'fromMe' | 'author'>): StoredMessageRef => ({
+  chatId: m.chatId,
+  direction: m.fromMe ? MessageDirection.OUTGOING : MessageDirection.INCOMING,
+  author: m.author,
+});
+
+/** What a delivery claims to be, as the rule that refuses a change aimed at a stored row reads it. */
+const claimOf = (m: Pick<IncomingMessage, 'chatId' | 'fromMe' | 'author'>): MutationSource => ({
+  kind: 'edit',
+  chatId: m.chatId,
+  fromMe: m.fromMe,
+  author: m.author,
+});
+
 /** A message not yet written, and the changes that reached it meanwhile (see inboundInFlight). */
 interface InFlightEntry {
   // What a quote of it may lend, as the hook chain last left it. Never the message itself: a repeat
   // delivery shares the entry, and its payload must not outlive the slot that accounts for it.
   // Unset while the message is admitted but not yet emitted (see admitInbound).
   quote?: Pick<IncomingMessage, 'chatId' | 'body'>;
+  // Where the message lives and who wrote it, so a change recorded for it meanwhile is held to the same
+  // chat, direction and author rule as the row it will become (see mutationTargetsForeignRow).
+  ref?: StoredMessageRef;
   revoked?: boolean;
   // Set when the revoke came from the engine, so message.revoked went out for it.
   revokeAnnounced?: boolean;
@@ -266,7 +288,7 @@ export class MessageProjector {
   admitInbound(
     id: string,
     engine: IWhatsAppEngine,
-    a: { id: string; chatId: string; needsRoom: boolean; status: boolean },
+    a: { id: string; chatId: string; needsRoom: boolean; status: boolean; fromMe?: boolean; author?: string },
   ): InboundTicket | undefined {
     if (!this.engines.isLive(id, engine)) return undefined;
     const key = a.status || !a.id ? null : `${id}:${a.id}`;
@@ -274,6 +296,10 @@ export class MessageProjector {
     if (key) {
       entry = this.inboundInFlight.get(key) ?? entry;
       this.inboundInFlight.set(key, entry);
+      // From the arrival, so a change that reaches the message while it downloads media is held to the rule
+      // of the row it will become. Only when the engine says whose message it is: a guessed direction
+      // would refuse the account's own change.
+      if (a.fromMe !== undefined) entry.ref ??= refOf({ chatId: a.chatId, fromMe: a.fromMe, author: a.author });
     }
     entry.holders = (entry.holders ?? 0) + 1;
     const room = a.needsRoom ? this.room(id) : undefined;
@@ -326,24 +352,46 @@ export class MessageProjector {
   /**
    * Engine callback body, lifted out of initializeEngine so the wiring table stays readable. With a
    * ticket (PostgreSQL), the hook chain starts in the chat's arrival order and the commit takes the
-   * turn admitInbound reserved; whatever path returns early drops the ticket.
+   * turn admitInbound reserved; whatever path returns early drops the ticket. The receipt, for an
+   * engine that wants to know what became of its message, settles once the commit ends (see
+   * {@link InboundOutcome}). There is none when the engine is no longer live or the message is skipped as
+   * ephemeral; one that settles with nothing says nothing, as when the hook chain failed.
    */
-  handleInboundMessage(id: string, engine: IWhatsAppEngine, message: IncomingMessage, ticket?: InboundTicket): void {
+  handleInboundMessage(
+    id: string,
+    engine: IWhatsAppEngine,
+    message: IncomingMessage,
+    ticket?: InboundTicket,
+  ): InboundReceipt | undefined {
     const turn = ticket instanceof InboundTurn ? ticket : undefined;
     try {
-      this.receiveInbound(id, engine, message, turn);
+      return this.receiveInbound(id, engine, message, turn);
     } finally {
       turn?.drop();
     }
   }
 
-  private receiveInbound(id: string, engine: IWhatsAppEngine, message: IncomingMessage, turn?: InboundTurn): void {
+  private receiveInbound(
+    id: string,
+    engine: IWhatsAppEngine,
+    message: IncomingMessage,
+    turn?: InboundTurn,
+  ): InboundReceipt | undefined {
     if (!this.engines.isLive(id, engine)) return;
     if (message.isStatusBroadcast) {
       const ingest = this.ingestInboundStatus(id, engine, message);
       // The status store holds the payload until the ingest settles.
       turn?.holdUntil(ingest);
-      return;
+      // Its own table takes the status whatever the id, and a story is never a row of `messages`: one
+      // that finds a message there under its id reuses that id. Only an engine that keeps its own copy of
+      // a message reads the outcome, so the lookup is made when it is asked for, and once.
+      let judged: Promise<InboundOutcome | undefined> | undefined;
+      const judge = (): Promise<InboundOutcome | undefined> => ingest.then(() => this.judgeRepeat(id, message));
+      return {
+        get settled(): Promise<InboundOutcome | undefined> {
+          return (judged ??= judge());
+        },
+      };
     }
     if (this.shouldSkipEphemeralMessage(id, message)) return;
     this.logger.debug(`Message received from ${message.from}`, {
@@ -360,7 +408,7 @@ export class MessageProjector {
     // handler's rewrite.
     const inFlightKey = `${id}:${message.id}`;
     const inFlight = turn
-      ? Object.assign(turn.entry, { quote: quoteOf(messageData) })
+      ? Object.assign(turn.entry, { quote: quoteOf(messageData), ref: turn.entry.ref ?? refOf(messageData) })
       : this.trackInFlight(inFlightKey, messageData);
 
     const onFailure = (err: unknown): null => {
@@ -385,16 +433,19 @@ export class MessageProjector {
           this.prepareInboundMessage(id, this.messageOrEngineCopy(id, 'message:received', data, message)),
         ),
     ).catch(onFailure);
+    const outcome = deferred<InboundOutcome | undefined>();
     this.commitInTurn(id, message, turn, async () => {
       try {
         const finalMessage = await prepared;
-        if (finalMessage) await this.commitInboundMessage(id, engine, finalMessage);
+        if (finalMessage) outcome.resolve(await this.commitInboundMessage(id, engine, finalMessage));
       } catch (err) {
         onFailure(err);
       } finally {
+        outcome.resolve(undefined); // no effect once settled above
         if (!turn) this.untrackInFlight(inFlightKey, inFlight);
       }
     });
+    return { settled: outcome.promise };
   }
 
   /**
@@ -432,8 +483,18 @@ export class MessageProjector {
 
   /** Record a message as not yet written; a re-fire of the same id keeps the changes recorded so far. */
   private trackInFlight(key: string, message: InboundMessageData) {
-    const { revoked, revokeAnnounced, editedBody, ackStatus, reactions } = this.inboundInFlight.get(key) ?? {};
-    const inFlight = { quote: quoteOf(message), revoked, revokeAnnounced, editedBody, ackStatus, reactions };
+    const { ref, revoked, revokeAnnounced, editedBody, ackStatus, reactions } = this.inboundInFlight.get(key) ?? {};
+    const inFlight = {
+      quote: quoteOf(message),
+      // The first delivery of an id says whose message it is: a repeat sent from another chat must not
+      // take that over from it, or a change aimed through the repeat would be judged by the wrong rule.
+      ref: ref ?? refOf(message),
+      revoked,
+      revokeAnnounced,
+      editedBody,
+      ackStatus,
+      reactions,
+    };
     this.inboundInFlight.set(key, inFlight);
     return inFlight;
   }
@@ -582,21 +643,47 @@ export class MessageProjector {
     id: string,
     engine: IWhatsAppEngine,
     finalMessage: InboundMessageData,
-  ): Promise<void> {
+  ): Promise<InboundOutcome | undefined> {
     const outcome = await this.persistInboundMessage(id, engine, finalMessage);
-    if (!outcome) return;
-    this.dispatchInboundMessage(id, finalMessage, outcome);
+    if (outcome === 'repeat') return this.judgeRepeat(id, finalMessage);
+    if (outcome) this.dispatchInboundMessage(id, finalMessage, outcome);
+    return undefined;
+  }
+
+  /**
+   * Whether a message the insert refused as a repeat is another message than the one holding its id.
+   * A re-fire of the same message is not, but an id reused from another chat, another side of the
+   * conversation or another author of a group is: the engine is told, so its copy under that id does
+   * not stand in for the stored message. Judged by the rule that refuses a change aimed at the row, so
+   * what that rule would refuse to edit is not this message. A row that cannot be read, or that does
+   * not prove a difference, says nothing and the engine keeps its copy.
+   */
+  private async judgeRepeat(id: string, message: InboundMessageData): Promise<InboundOutcome | undefined> {
+    const reason = await this.mutationProjector.foreignRowReason(
+      id,
+      storableWaMessageId(message.id) ?? '',
+      claimOf(message),
+    );
+    if (!reason) return undefined;
+    this.logger.warn('Dropping a message that reuses the id of a different stored message', {
+      sessionId: id,
+      messageId: message.id,
+      reason,
+      action: 'message_id_reused',
+    });
+    return { conflict: true };
   }
 
   /**
    * Build the inbound row and insert it under the UNIQUE dedup oracle. Returns the row plus whether
-   * the insert landed, or null when the pipeline must stop (stale engine, or duplicate re-fire).
+   * the insert landed, 'repeat' when the id already has a row (an engine re-fire, or another message
+   * under the same id), or null when the pipeline must stop (stale engine).
    */
   private async persistInboundMessage(
     id: string,
     engine: IWhatsAppEngine,
     incoming: IncomingMessage,
-  ): Promise<InboundPersistOutcome | null> {
+  ): Promise<InboundPersistOutcome | 'repeat' | null> {
     const metadata = buildMessageMetadata(incoming);
 
     const chatName = incoming.contact?.pushName ?? incoming.contact?.name ?? undefined;
@@ -641,8 +728,8 @@ export class MessageProjector {
     // A duplicate on the retry is ambiguous: the first attempt may have committed before its error,
     // in which case nothing dispatched yet, so dispatch fail-open (without the row-bound hook), and
     // that row still has to take a revoke or edit that arrived in flight.
-    if (outcome.landed === 'dup' && !outcome.retried) return null;
-    if (outcome.landed === 'dup') this.applyChangesMadeInFlight(id, incoming.id);
+    if (outcome.landed === 'dup' && !outcome.retried) return 'repeat';
+    if (outcome.landed === 'dup') this.applyChangesMadeInFlight(id, incoming.id, false, claimOf(incoming));
     return { dbMessage, persisted: false };
   }
 
@@ -710,29 +797,76 @@ export class MessageProjector {
    * just inserted: its own write matched no row then. Queued on the message's mutation chain, so it
    * lands after any edit already queued, and a revoke wins over the rest. A change arriving after the
    * insert finds the row itself. Reactions are only stored here; their event already went out. A row
-   * inserted cleared is cleared again, in case a change raced the insert, but `message:persisted`
-   * already carried it cleared and does not fire twice.
+   * inserted cleared is cleared again, in case a change raced the insert, without announcing it:
+   * `message:persisted` already carried it cleared. Where the insert lost, a pending revoke announces the
+   * row it clears, which an earlier revoke may have cleared and announced already, and a revoke event still
+   * waiting for its own row read when the insert lands announces it once more: a consumer may see the
+   * cleared row more than once under the same id.
+   *
+   * `lostInsert`, set when the delivery's insert lost to a row under the id, says what the delivery claims
+   * to be. That row may be the message itself (its first attempt committed before the error) or another
+   * message's (an id reused from another chat): the changes go to it only if it is the message. The
+   * judgement is the first step of the slot taken on the chain here, not a read ahead of it, so a change
+   * of the message that arrives while the row is read queues behind the write instead of being
+   * overwritten by it.
    */
-  private applyChangesMadeInFlight(id: string, waMessageId: string, insertedCleared = false): void {
+  private applyChangesMadeInFlight(
+    id: string,
+    waMessageId: string,
+    insertedCleared = false,
+    lostInsert?: MutationSource,
+  ): void {
     const pending = waMessageId ? this.inboundInFlight.get(`${id}:${waMessageId}`) : undefined;
-    const ackStatus = pending?.ackStatus;
-    if (ackStatus) {
+    if (!pending) return;
+    const { ackStatus } = pending;
+    const rowChanges = Boolean(pending.revoked || pending.editedBody !== undefined || pending.reactions);
+    if (!ackStatus && !rowChanges) return;
+    const advance = (): void => {
+      if (!ackStatus) return;
       void this.advanceAck(id, waMessageId, ackStatus).catch(err =>
         this.logger.error(`Failed to advance ack for ${waMessageId}`, String(err)),
       );
-    }
-    if (!pending?.revoked && pending?.editedBody === undefined && !pending?.reactions) return;
-    this.enqueueMessageMutation(id, waMessageId, async () => {
-      if (pending.revoked) return this.revokeRow(id, waMessageId, !insertedCleared);
-      try {
-        if (pending.editedBody !== undefined) {
-          await this.messageRepository.update({ sessionId: id, waMessageId }, { body: pending.editedBody });
-        }
-        if (pending.reactions) await this.storeReactions(id, waMessageId, pending.reactions);
-      } catch (err) {
-        this.logger.error(`Failed to apply changes to message ${waMessageId}`, String(err));
+    };
+    if (!lostInsert) {
+      advance();
+      if (rowChanges) {
+        this.enqueueMessageMutation(id, waMessageId, () =>
+          this.writeChangesMadeInFlight(id, waMessageId, pending, insertedCleared),
+        );
       }
+      return;
+    }
+    this.enqueueMessageMutation(id, waMessageId, async () => {
+      const reason = await this.mutationProjector.foreignRowReason(id, waMessageId, lostInsert);
+      if (reason) {
+        this.logger.warn('Not applying the changes of a message to the stored message that holds its id', {
+          sessionId: id,
+          messageId: waMessageId,
+          reason,
+        });
+        return;
+      }
+      advance();
+      await this.writeChangesMadeInFlight(id, waMessageId, pending, insertedCleared);
     });
+  }
+
+  /** The row part of {@link applyChangesMadeInFlight}. Must run on the mutation chain. */
+  private async writeChangesMadeInFlight(
+    id: string,
+    waMessageId: string,
+    pending: InFlightEntry,
+    insertedCleared: boolean,
+  ): Promise<void> {
+    if (pending.revoked) return this.revokeRow(id, waMessageId, !insertedCleared);
+    try {
+      if (pending.editedBody !== undefined) {
+        await this.messageRepository.update({ sessionId: id, waMessageId }, { body: pending.editedBody });
+      }
+      if (pending.reactions) await this.storeReactions(id, waMessageId, pending.reactions);
+    } catch (err) {
+      this.logger.error(`Failed to apply changes to message ${waMessageId}`, String(err));
+    }
   }
 
   /** Merge reactions into the row's metadata, withdrawing a sender's on ''. Must run on the mutation chain. */
@@ -752,30 +886,52 @@ export class MessageProjector {
    * before it cannot write content back afterwards. Used by the engine's revoke event and by the REST
    * delete. Best-effort like every stored-message mutation: never rejects, and resolves once the write
    * has run.
+   *
+   * With `source`, the caller has not had the stored row judge the revoke yet: the message still arriving
+   * is taken back only if the revoke agrees with it, and the row is cleared only if the revoke is not
+   * foreign to it. Without one, the revoke was judged by the caller (the engine's revoke event is).
    */
-  recordRevoke(sessionId: string, waMessageId: string): Promise<void> {
+  recordRevoke(sessionId: string, waMessageId: string, source?: MutationSource): Promise<void> {
     // A message not written yet takes the revoke once its row lands; the UPDATE below matches nothing.
     const inFlight = this.inboundInFlight.get(`${sessionId}:${waMessageId}`);
-    if (inFlight) {
-      inFlight.revoked = true;
-      // Media still waiting for room needs none now: wake it, so it is stored cleared at once.
-      for (const t of this.tickets.get(sessionId) ?? []) if (t.entry === inFlight) t.giveUp();
-    }
+    if (inFlight && !(source && this.foreignToInFlight(inFlight, source))) this.holdRevoked(sessionId, inFlight);
     return new Promise(resolve =>
       this.enqueueMessageMutation(sessionId, waMessageId, () =>
-        this.revokeRow(sessionId, waMessageId).finally(resolve),
+        this.revokeRow(sessionId, waMessageId, true, source).finally(resolve),
       ),
     );
   }
 
+  /** Take back a message not written yet: its row is stored cleared, and media waiting for room needs none. */
+  private holdRevoked(sessionId: string, entry: InFlightEntry): void {
+    entry.revoked = true;
+    for (const t of this.tickets.get(sessionId) ?? []) if (t.entry === entry) t.giveUp();
+  }
+
   /**
    * Apply {@link REVOKED_ROW_PATCH}, then hand the cleared row to `message:persisted` so a plugin index
-   * keyed by row id drops the content too. Must run on the message's mutation chain.
+   * keyed by row id drops the content too. Must run on the message's mutation chain. The row is the
+   * table's one under the id, which another chat's message may hold: a `source` that the row proves
+   * foreign leaves it alone.
    */
-  private async revokeRow(sessionId: string, waMessageId: string, notify = true): Promise<void> {
+  private async revokeRow(
+    sessionId: string,
+    waMessageId: string,
+    notify = true,
+    source?: MutationSource,
+  ): Promise<void> {
     // An undefined condition is DROPPED from the where-clause, which would clear every row of the session.
     if (!waMessageId) return;
     try {
+      const reason = source && (await this.mutationProjector.foreignRowReason(sessionId, waMessageId, source));
+      if (reason) {
+        this.logger.warn('Dropping a revoke aimed at a message of another chat or sender', {
+          sessionId,
+          messageId: waMessageId,
+          reason,
+        });
+        return;
+      }
       const result = await this.messageRepository.update({ sessionId, waMessageId }, REVOKED_ROW_PATCH);
       if (!result?.affected || !notify) return;
       const row = await this.messageRepository.findOne({ where: { sessionId, waMessageId } });
@@ -892,7 +1048,7 @@ export class MessageProjector {
     // path, the entry follows the chain's rewrites, so a quote carries what the row will hold.
     const inFlightKey = `${id}:${message.id}`;
     const inFlight = turn
-      ? Object.assign(turn.entry, { quote: quoteOf(messageData) })
+      ? Object.assign(turn.entry, { quote: quoteOf(messageData), ref: turn.entry.ref ?? refOf(messageData) })
       : this.trackInFlight(inFlightKey, messageData);
     // Execute hook for message sent - plugins can modify or stop processing. Like the inbound path,
     // the hook chain runs concurrently and the commit waits its turn on the chat's queue.
@@ -973,7 +1129,7 @@ export class MessageProjector {
       const outcome = await this.insertWithRetry(id, engine, dbMessage, 'outgoing');
       if (outcome.landed === 'stale') return;
       // The REST writer may have won either attempt; its row still takes the echo's pending changes.
-      if (outcome.landed === 'dup') this.applyChangesMadeInFlight(id, outgoing.id);
+      if (outcome.landed === 'dup') this.applyChangesMadeInFlight(id, outgoing.id, false, claimOf(outgoing));
       if (outcome.landed === 'yes') {
         this.applyChangesMadeInFlight(id, outgoing.id, insertedCleared);
         // Fire-and-forget, mirroring onMessage: plugin providers (search etc.) see phone-
@@ -1105,6 +1261,26 @@ export class MessageProjector {
   }
 
   /**
+   * Engine callback body for one recipient's receipt (Baileys group and status messages). Nothing is
+   * stored: the event is forwarded as is, over the socket and the webhook with the same shape. `id`
+   * mirrors the other message.* events (and is what the idempotency-key resolver reads); `chatId` lets
+   * webhook chatId filters scope it.
+   */
+  handleMessageReceipt(id: string, engine: IWhatsAppEngine, event: MessageReceiptEvent): void {
+    if (!this.engines.isLive(id, engine)) return;
+    const payload = {
+      id: event.messageId,
+      messageId: event.messageId,
+      chatId: event.chatId,
+      participant: event.participant,
+      status: event.status,
+      timestamp: event.timestamp,
+    };
+    this.eventsGateway.emitMessageReceipt(id, payload);
+    void this.webhookService.dispatch(id, 'message.receipt', payload);
+  }
+
+  /**
    * Advance a stored message's delivery status, returning the rows changed. Scoped by sessionId:
    * waMessageId is unique per account/chat, not global, so an ack on one session must never advance a
    * same-id row in another session. The In() guard makes the UPDATE forward-only (a late/out-of-order
@@ -1120,7 +1296,12 @@ export class MessageProjector {
   }
 
   /** Engine callback body, lifted out of initializeEngine so the wiring table stays readable. */
-  handleMessageRevoked(id: string, engine: IWhatsAppEngine, message: RevokedMessage): void {
+  handleMessageRevoked(
+    id: string,
+    engine: IWhatsAppEngine,
+    message: RevokedMessage,
+    actor?: { fromMe: boolean },
+  ): void {
     if (!this.engines.isLive(id, engine)) return;
     this.logger.debug(`Message revoked: ${message.id}`, {
       sessionId: id,
@@ -1136,15 +1317,53 @@ export class MessageProjector {
     // `message.id` is the revocation notification, which never matches a stored row.
     // `revokedId` falls back to `id` (Baileys, where the two are the same).
     const revokedWaMessageId = message.revokedId ?? message.id;
-    void this.recordRevoke(id, revokedWaMessageId);
-    const inFlight = this.inboundInFlight.get(`${id}:${revokedWaMessageId}`);
-    if (inFlight) inFlight.revokeAnnounced = true;
+    const apply = (): void => {
+      void this.recordRevoke(id, revokedWaMessageId);
+      const inFlight = this.inboundInFlight.get(`${id}:${revokedWaMessageId}`);
+      if (inFlight) inFlight.revokeAnnounced = true;
 
-    // Notify consumers regardless of whether the row existed: webhook (message.revoked
-    // is a declared event) + the real-time dashboard stream.
-    const revokedPayload = message as unknown as Record<string, unknown>;
-    void this.webhookService.dispatch(id, 'message.revoked', revokedPayload);
-    this.eventsGateway.emitMessageRevoked(id, revokedPayload);
+      // Notify consumers regardless of whether the row existed: webhook (message.revoked
+      // is a declared event) + the real-time dashboard stream.
+      const revokedPayload = message as unknown as Record<string, unknown>;
+      void this.webhookService.dispatch(id, 'message.revoked', revokedPayload);
+      this.eventsGateway.emitMessageRevoked(id, revokedPayload);
+    };
+    // whatsapp-web.js reports only what WhatsApp Web itself accepted, so it passes no actor and is applied at
+    // once: its ids name the chat, so no row of another chat can hold the id. An engine that applies no
+    // validation to a revoke says who made it, and the stored row says whose message it names: a revoke the
+    // row proves foreign is dropped, announcement included.
+    if (!actor) {
+      apply();
+      return;
+    }
+    const source = { kind: 'revoke', chatId: message.chatId, fromMe: actor.fromMe } as const;
+    const inFlight = this.inboundInFlight.get(`${id}:${revokedWaMessageId}`);
+    // A message still arriving, once the entry it is held under agrees with the revoke, is taken back at
+    // once: waiting for a read would let its emit run, and announce the deleted content, first. That is all
+    // the entry can vouch for. A repeat of an id sent from another chat is held under it too, and the row
+    // under the id may be the other chat's message, which only the row can say: the announcement and the
+    // clearing of the row wait for it.
+    const held = inFlight !== undefined && !this.foreignToInFlight(inFlight, source);
+    if (held) {
+      this.holdRevoked(id, inFlight);
+      inFlight.revokeAnnounced = true;
+    }
+    // Otherwise judged by the stored row, which a change the entry called foreign has to find, and accept.
+    const needsRow = inFlight !== undefined && !held;
+    void this.mutationProjector.storedRowVerdict(id, revokedWaMessageId, source).then(verdict => {
+      if (!this.engines.isLive(id, engine)) return;
+      if (verdict.reason || (needsRow && !verdict.exists)) {
+        if (verdict.reason) {
+          this.logger.warn('Dropping a revoke aimed at a message of another chat or sender', {
+            sessionId: id,
+            messageId: revokedWaMessageId,
+            reason: verdict.reason,
+          });
+        }
+        return;
+      }
+      apply();
+    });
   }
 
   /** History backfill persist, extracted to message-history-projector.ts (stateless function). */
@@ -1169,15 +1388,45 @@ export class MessageProjector {
   applyReactionQueued(id: string, event: ReactionEvent): void {
     // A message not written yet keeps the reaction for its row; the live event still goes out now.
     const inFlight = event.messageId ? this.inboundInFlight.get(`${id}:${event.messageId}`) : undefined;
-    if (inFlight) (inFlight.reactions ??= {})[event.senderId] = event.reaction ?? '';
-    this.mutationProjector.applyReactionQueued(id, event);
+    let needsRow = false;
+    if (inFlight) {
+      // The row it will become would drop the change, so it is not kept for it. Nothing is announced on
+      // that word alone either: a stored row of the same id (a repeat sent from another chat reached the
+      // entry, not the message it repeats) is the one to ask, and without one the change goes no further.
+      if (this.foreignToInFlight(inFlight, { kind: 'reaction', chatId: event.chatId })) needsRow = true;
+      else (inFlight.reactions ??= {})[event.senderId] = event.reaction ?? '';
+    }
+    this.mutationProjector.applyReactionQueued(id, event, needsRow);
   }
 
   /** Edit apply, queued on the per-message mutation chain — see MessageMutationProjector. */
   applyMessageEditQueued(id: string, message: EditedMessage): void {
     const inFlight = this.inboundInFlight.get(`${id}:${message.messageId}`);
-    if (inFlight) inFlight.editedBody = message.body;
-    this.mutationProjector.applyMessageEditQueued(id, message);
+    let needsRow = false;
+    if (inFlight) {
+      // See applyReactionQueued: judged foreign, it is not kept for the row, and a stored row decides.
+      const source = { kind: 'edit', chatId: message.chatId, fromMe: message.fromMe, author: message.author } as const;
+      if (this.foreignToInFlight(inFlight, source)) needsRow = true;
+      else inFlight.editedBody = message.body;
+    }
+    this.mutationProjector.applyMessageEditQueued(id, message, needsRow);
+  }
+
+  /**
+   * Whether a change names a message of another chat, or one it may not change, judged against the
+   * message still waiting for its row. Recording it for the row would carry it into `message.received`
+   * and the insert, past the check the row's own update applies.
+   */
+  private foreignToInFlight(inFlight: InFlightEntry, source: MutationSource): boolean {
+    if (!inFlight.ref || !source.chatId) return false;
+    const foreign = mutationTargetsForeignRow(inFlight.ref, source);
+    if (foreign) {
+      this.logger.warn('Not keeping a change aimed at a message of another chat or sender', {
+        reason: foreign,
+        kind: source.kind,
+      });
+    }
+    return foreign !== null;
   }
 
   /** Queue a message-scoped mutation. A failed operation is isolated so later events still run. */
@@ -1186,10 +1435,17 @@ export class MessageProjector {
   }
 
   /** Stored-row update for a REST outbound edit, on the same mutation chain — see MessageMutationProjector. */
-  recordOutboundMessageEdit(sessionId: string, messageId: string, body: string): Promise<void> {
+  recordOutboundMessageEdit(
+    sessionId: string,
+    messageId: string,
+    body: string,
+    source?: MutationSource,
+  ): Promise<void> {
+    // With a `source`, the message still arriving takes the edit only if it agrees with it, and the row
+    // only if it is not foreign to it, as for recordRevoke.
     const inFlight = this.inboundInFlight.get(`${sessionId}:${messageId}`);
-    if (inFlight) inFlight.editedBody = body;
-    return this.mutationProjector.recordOutboundMessageEdit(sessionId, messageId, body);
+    if (inFlight && !(source && this.foreignToInFlight(inFlight, source))) inFlight.editedBody = body;
+    return this.mutationProjector.recordOutboundMessageEdit(sessionId, messageId, body, source);
   }
 
   /**

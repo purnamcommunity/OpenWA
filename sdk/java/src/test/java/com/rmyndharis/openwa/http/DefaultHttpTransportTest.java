@@ -1,6 +1,7 @@
 package com.rmyndharis.openwa.http;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -11,18 +12,36 @@ import com.rmyndharis.openwa.OpenWAClient;
 import com.rmyndharis.openwa.errors.OpenWAApiError;
 import com.rmyndharis.openwa.errors.OpenWATimeoutError;
 import com.sun.net.httpserver.HttpServer;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.Authenticator;
+import java.net.CookieHandler;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ProxySelector;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Duration;
-import java.time.temporal.ChronoUnit;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 /** Runs the real transport against a local server: no client test covers it otherwise. */
 class DefaultHttpTransportTest {
@@ -89,12 +108,15 @@ class DefaultHttpTransportTest {
     }
 
     @Test
+    @Timeout(30)
     void mapsABodyStallToOpenWATimeoutErrorAndDropsTheConnection() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
         CountDownLatch clientClosed = new CountDownLatch(1);
         server.createContext("/stall", ex -> {
             try {
                 // A body that never ends: keeps writing until the client hangs up.
                 ex.sendResponseHeaders(200, 0);
+                started.countDown();
                 while (!release.await(20, TimeUnit.MILLISECONDS)) {
                     ex.getResponseBody().write(' ');
                     ex.getResponseBody().flush();
@@ -108,27 +130,136 @@ class DefaultHttpTransportTest {
             }
         });
 
+        // The budget covers connecting and a fresh client's first use as well, so a starved machine
+        // needs more than the 100 ms of the header-timeout test; the server stalls for as long as it takes.
         assertThrows(OpenWATimeoutError.class,
-            () -> client(Duration.ofMillis(100)).requestVoid(HttpMethod.GET, "/stall", null, null));
+            () -> client(Duration.ofMillis(1500)).requestVoid(HttpMethod.GET, "/stall", null, null));
+        assertTrue(started.await(5, TimeUnit.SECONDS), "the stalled exchange never reached the server");
         assertTrue(clientClosed.await(5, TimeUnit.SECONDS), "the timed-out exchange was not cancelled");
     }
 
     @Test
     void reportsAFailedExchangeAsAnIOException() {
-        AtomicInteger hits = new AtomicInteger();
-        server.createContext("/ok", ex -> {
-            hits.incrementAndGet();
-            ex.sendResponseHeaders(204, -1);
-            ex.close();
-        });
-        // HttpClient fails this exchange with an ArithmeticException; it must not escape as one.
+        // HttpClient fails an exchange it cannot schedule (a deadline that overflows, a closed selector
+        // manager) with a runtime exception, and it must not escape the transport as one. The failure is
+        // injected: which exchanges a JDK fails that way differs between releases.
+        RecordingClient failing = new RecordingClient(new ArithmeticException("long overflow"));
         HttpRequestData req = new HttpRequestData(
-            HttpMethod.GET, baseUrl + "/ok", Map.of(), null, ChronoUnit.FOREVER.getDuration());
+            HttpMethod.GET, baseUrl + "/ok", Map.of(), null, Duration.ofSeconds(5));
 
-        IOException err = assertThrows(IOException.class, () -> new DefaultHttpTransport().send(req));
+        IOException err = assertThrows(IOException.class, () -> new DefaultHttpTransport(failing).send(req));
 
         assertInstanceOf(ArithmeticException.class, err.getCause());
-        assertEquals(0, hits.get());
+        assertEquals(1, failing.started.get());
+    }
+
+    /** A client that records the exchanges it is asked to start, and fails them when given a failure. */
+    private static final class RecordingClient extends HttpClient {
+        final AtomicInteger started = new AtomicInteger();
+        private final Throwable failure;
+
+        RecordingClient() {
+            this(null);
+        }
+
+        RecordingClient(Throwable failure) {
+            this.failure = failure;
+        }
+
+        @Override public Optional<CookieHandler> cookieHandler() { return Optional.empty(); }
+        @Override public Optional<Duration> connectTimeout() { return Optional.empty(); }
+        @Override public Redirect followRedirects() { return Redirect.NEVER; }
+        @Override public Optional<ProxySelector> proxy() { return Optional.empty(); }
+        @Override public SSLContext sslContext() { throw new UnsupportedOperationException(); }
+        @Override public SSLParameters sslParameters() { throw new UnsupportedOperationException(); }
+        @Override public Optional<Authenticator> authenticator() { return Optional.empty(); }
+        @Override public Version version() { return Version.HTTP_1_1; }
+        @Override public Optional<Executor> executor() { return Optional.empty(); }
+
+        @Override
+        public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <T> CompletableFuture<HttpResponse<T>> sendAsync(
+            HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+            started.incrementAndGet();
+            return failure == null ? new CompletableFuture<>() : CompletableFuture.failedFuture(failure);
+        }
+
+        @Override
+        public <T> CompletableFuture<HttpResponse<T>> sendAsync(
+            HttpRequest request, HttpResponse.BodyHandler<T> handler, HttpResponse.PushPromiseHandler<T> push) {
+            return sendAsync(request, handler);
+        }
+    }
+
+    @Test
+    void aCallerThatIsAlreadyInterruptedStartsNoExchange() {
+        // HttpClient.send refuses before dispatching anything when the thread's interrupt flag is set;
+        // starting the exchange first could still deliver a request the caller is told was interrupted.
+        RecordingClient recording = new RecordingClient();
+        HttpRequestData req = new HttpRequestData(
+            HttpMethod.GET, baseUrl + "/ok", Map.of(), null, Duration.ofSeconds(5));
+        Thread.currentThread().interrupt();
+        try {
+            assertThrows(InterruptedException.class, () -> new DefaultHttpTransport(recording).send(req));
+        } finally {
+            Thread.interrupted();
+        }
+        assertEquals(0, recording.started.get());
+    }
+
+    @Test
+    @Timeout(30)
+    void speaksHttp1ToAServerThatAnswersNothingToAnH2cUpgrade() throws Exception {
+        // The gateway's HTTP server hands a request that asks to upgrade to Socket.IO, which answers
+        // nothing when the path is not its own. The JDK client asks for h2c on a cleartext connection
+        // unless it is pinned to HTTP/1.1, and com.sun.net.httpserver ignores the header, so only a
+        // raw socket reproduces the server.
+        try (ServerSocket raw = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))) {
+            Thread serving = new Thread(() -> {
+                try {
+                    while (true) {
+                        try (Socket socket = raw.accept()) {
+                            String head = readHead(socket.getInputStream()).toLowerCase(Locale.ROOT);
+                            if (!head.contains("upgrade: h2c")) {
+                                socket.getOutputStream().write((
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                        + "Content-Length: 2\r\nConnection: close\r\n\r\n{}")
+                                    .getBytes(StandardCharsets.US_ASCII));
+                            }
+                        }
+                    }
+                } catch (IOException closed) {
+                    // the test ended
+                }
+            });
+            serving.setDaemon(true);
+            serving.start();
+            OpenWAClient plain = new OpenWAClient(ClientConfig.builder()
+                .baseUrl("http://127.0.0.1:" + raw.getLocalPort())
+                .apiKey("owa_k1_x")
+                .timeout(Duration.ofSeconds(5))
+                .build());
+
+            assertDoesNotThrow(() -> plain.requestVoid(HttpMethod.GET, "/api/health", null, null));
+        }
+    }
+
+    private static String readHead(InputStream in) throws IOException {
+        ByteArrayOutputStream head = new ByteArrayOutputStream();
+        int last4 = 0;
+        int b;
+        while ((b = in.read()) != -1) {
+            head.write(b);
+            last4 = (last4 << 8) | b;
+            if (last4 == 0x0d0a0d0a) {
+                break;
+            }
+        }
+        return head.toString(StandardCharsets.US_ASCII);
     }
 
     @Test

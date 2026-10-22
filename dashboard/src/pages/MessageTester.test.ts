@@ -875,3 +875,186 @@ test('Send stays disabled while a batch cancel is in flight, so its answer canno
   });
   assert.equal(sendButton().disabled, false);
 });
+
+for (const mode of ['text', 'forward'] as const) {
+  for (const change of ['replace key', 'sign out', 'unmount', 'sign in again'] as const) {
+    test(`a pending ${mode} lookup cannot dispatch after ${change}`, async () => {
+      let release!: (response: Response) => void;
+      const pending = new Promise<Response>(resolve => {
+        release = resolve;
+      });
+      const writes: { key: string | null; body: unknown }[] = [];
+      let lookups = 0;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/sessions')) return jsonResponse([{ id: 's1', name: 'Main', status: 'ready' }]);
+        if (url.includes('/contacts/check/')) {
+          lookups++;
+          if (mode === 'text' || lookups === 2) return pending;
+          return jsonResponse({ number: '15550000001', exists: true, whatsappId: 'primary@lid' });
+        }
+        if (url.includes('/messages/')) {
+          writes.push({ key: new Headers(init?.headers).get('X-API-Key'), body: JSON.parse(String(init?.body)) });
+          return jsonResponse({ messageId: 'sent', timestamp: 1 });
+        }
+        return jsonResponse([]);
+      }) as typeof fetch;
+      sessionStorage.setItem('openwa_api_key', 'original-key');
+      sessionStorage.setItem('openwa_user_role', 'operator');
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1 } } });
+      const tree = () =>
+        createElement(QueryClientProvider, { client }, createElement(RoleProvider, null, createElement(MessageTester)));
+      const view = rtl.render(tree());
+      await rtl.screen.findByRole('option', { name: /Main/ });
+      type(view.container, '#mt-13', '15550000001');
+      if (mode === 'forward') {
+        rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Forward' }));
+        type(view.container, '#mt-9', '15550000002');
+        type(view.container, '#mt-10', 'original-message');
+      } else type(view.container, '#mt-2', 'hello');
+      await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
+      rtl.fireEvent.click(sendButton());
+      await rtl.waitFor(() => assert.equal(lookups, mode === 'text' ? 1 : 2));
+      if (change === 'replace key') sessionStorage.setItem('openwa_api_key', 'replacement-key');
+      if (change === 'sign out') sessionStorage.removeItem('openwa_api_key');
+      if (change === 'unmount' || change === 'sign in again') view.unmount();
+      if (change === 'sign in again') {
+        sessionStorage.removeItem('openwa_api_key');
+        sessionStorage.setItem('openwa_api_key', 'original-key');
+        client.clear();
+        rtl.render(tree());
+        await rtl.screen.findByRole('option', { name: /Main/ });
+      }
+      await rtl.act(async () => {
+        release(jsonResponse({ number: '15550000002', exists: true, whatsappId: 'destination@lid' }));
+        await new Promise(resolve => setImmediate(resolve));
+      });
+      assert.deepEqual(writes, [], 'the abandoned lookup issued a write');
+      client.clear();
+      sessionStorage.removeItem('openwa_api_key');
+    });
+  }
+}
+
+test('an unchanged actor sends to canonical personal and forward destinations', async () => {
+  const writes: { path: string; key: string | null; body: unknown }[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (path.endsWith('/sessions')) return jsonResponse([{ id: 's1', name: 'Main', status: 'ready' }]);
+    if (path.includes('/contacts/check/'))
+      return jsonResponse({
+        number: '15550000001',
+        exists: true,
+        whatsappId: path.endsWith('2') ? 'destination@lid' : 'primary@lid',
+      });
+    if (path.includes('/messages/')) {
+      writes.push({ path, key: new Headers(init?.headers).get('X-API-Key'), body: JSON.parse(String(init?.body)) });
+      return jsonResponse({ messageId: 'sent', timestamp: 1 });
+    }
+    return jsonResponse([]);
+  }) as typeof fetch;
+  sessionStorage.setItem('openwa_api_key', 'original-key');
+  sessionStorage.setItem('openwa_user_role', 'operator');
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1 } } });
+  const view = rtl.render(
+    createElement(QueryClientProvider, { client }, createElement(RoleProvider, null, createElement(MessageTester))),
+  );
+  await rtl.screen.findByRole('option', { name: /Main/ });
+  type(view.container, '#mt-13', '15550000001');
+  type(view.container, '#mt-2', 'hello');
+  rtl.fireEvent.click(sendButton());
+  await rtl.waitFor(() => assert.equal(writes.length, 1));
+  await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Forward' }));
+  type(view.container, '#mt-9', '15550000002');
+  type(view.container, '#mt-10', 'original-message');
+  rtl.fireEvent.click(sendButton());
+  await rtl.waitFor(() => assert.equal(writes.length, 2));
+  assert.equal(writes[0].key, 'original-key');
+  assert.deepEqual(writes[0].body, { chatId: 'primary@lid', text: 'hello' });
+  assert.equal(writes[1].key, 'original-key');
+  assert.deepEqual(writes[1].body, {
+    fromChatId: 'primary@lid',
+    toChatId: 'destination@lid',
+    messageId: 'original-message',
+  });
+  client.clear();
+  sessionStorage.removeItem('openwa_api_key');
+});
+
+test('replacing the key stops a sequential group send and releases the composer', async () => {
+  sessionStorage.setItem('openwa_api_key', 'original-key');
+  const gateway = stubGroupGateway([
+    { id: 'g1@g.us', name: 'Family' },
+    { id: 'g2@g.us', name: 'Work' },
+  ]);
+  await renderGroupsAsWriter();
+  await sendTextToAllGroups();
+  await rtl.waitFor(() => assert.equal(gateway.textSends.length, 1));
+  sessionStorage.setItem('openwa_api_key', 'replacement-key');
+  await rtl.waitFor(() => assert.equal(sendMessageButton().disabled, false), { timeout: 4000 });
+  assert.deepEqual(gateway.textSends, ['g1@g.us']);
+  assert.equal(field(window.document.body, '#mt-2').matches(':disabled'), false);
+  assert.equal(rtl.screen.queryByText('Success'), null);
+  sessionStorage.removeItem('openwa_api_key');
+});
+
+test('an old lookup cannot complete a new operation after signing in with the same key', async () => {
+  const releases: ((response: Response) => void)[] = [];
+  const writes: unknown[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/sessions')) return jsonResponse([{ id: 's1', name: 'Main', status: 'ready' }]);
+    if (url.includes('/contacts/check/'))
+      return new Promise<Response>(resolve => {
+        releases.push(resolve);
+      });
+    if (url.endsWith('/messages/send-text')) {
+      writes.push(JSON.parse(String(init?.body)));
+      return jsonResponse({ messageId: 'new-operation', timestamp: 1 });
+    }
+    return jsonResponse([]);
+  }) as typeof fetch;
+  sessionStorage.setItem('openwa_api_key', 'same-key');
+  sessionStorage.setItem('openwa_user_role', 'operator');
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1 } } });
+  const render = () =>
+    rtl.render(
+      createElement(QueryClientProvider, { client }, createElement(RoleProvider, null, createElement(MessageTester))),
+    );
+  const start = async (view: ReturnType<typeof render>, content: string) => {
+    await rtl.screen.findByRole('option', { name: /Main/ });
+    type(view.container, '#mt-13', '15550000001');
+    type(view.container, '#mt-2', content);
+    rtl.fireEvent.click(sendButton());
+  };
+  const original = render();
+  await start(original, 'old operation');
+  await rtl.waitFor(() => assert.equal(releases.length, 1));
+  original.unmount();
+  client.clear();
+  sessionStorage.removeItem('openwa_api_key');
+  sessionStorage.setItem('openwa_api_key', 'same-key');
+  const current = render();
+  await start(current, 'new operation');
+  await rtl.waitFor(() => assert.equal(releases.length, 2));
+  const resolved = () => jsonResponse({ number: '15550000001', exists: true, whatsappId: 'canonical@lid' });
+  await rtl.act(async () => {
+    releases[0](resolved());
+    await new Promise(resolve => setImmediate(resolve));
+  });
+  assert.deepEqual(writes, []);
+  assert.equal(
+    (current.container.querySelector('.send-btn') as HTMLButtonElement).disabled,
+    true,
+    'the old completion unlocked the new operation',
+  );
+  await rtl.act(async () => {
+    releases[1](resolved());
+    await new Promise(resolve => setImmediate(resolve));
+  });
+  assert.deepEqual(writes, [{ chatId: 'canonical@lid', text: 'new operation' }]);
+  assert.ok(rtl.screen.getByText('new-operation'));
+  client.clear();
+  sessionStorage.removeItem('openwa_api_key');
+});

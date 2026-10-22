@@ -48,6 +48,25 @@ describe('MessageController - message-time selection', () => {
       }),
     );
   });
+  it('passes the type and message reference filters into the list', async () => {
+    await controller.getMessages(
+      's1',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'image',
+      'wamid.ABC',
+    );
+    expect(getMessages).toHaveBeenCalledWith('s1', expect.objectContaining({ type: 'image', messageId: 'wamid.ABC' }));
+  });
   it('rejects invalid selection before accessing storage', async () => {
     await expect(
       controller.getMessages(

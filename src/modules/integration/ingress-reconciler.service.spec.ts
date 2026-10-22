@@ -132,6 +132,86 @@ describe('IngressReconcilerService.sweep', () => {
     expect((await stored(id)).payload).toBeNull();
   });
 
+  it('replays the healthy rows behind one whose stored payload is not JSON', async () => {
+    // Only an imported or hand-edited row can hold such text. Read with the batch it failed the whole
+    // read, so no row behind it was ever replayed and every sweep failed the same way.
+    const unreadable = await insertEvent({ createdAt: minutesAgo(10) });
+    const healthy = await insertEvent();
+    await ds.query(`UPDATE ingress_events SET payload = '{oops' WHERE id = ?`, [unreadable]);
+
+    const stats = await service.sweep(OPTS);
+
+    expect(stats).toMatchObject({ replayed: 1, failed: 0 });
+    expect(enqueuedJobs().map(([, jobId]) => jobId)).toEqual(['d-2']);
+    expect((await stored(healthy)).dispatchState).toBe('dispatched');
+    expect(await ds.query(`SELECT "dispatchState", payload FROM ingress_events WHERE id = ?`, [unreadable])).toEqual([
+      { dispatchState: 'pending', payload: '{oops' },
+    ]);
+  });
+
+  it('replays a healthy row behind a whole batch of rows whose payload cannot be read', async () => {
+    // Oldest first, a full batch of them heads every sweep: nothing behind it would ever be replayed.
+    const unreadable: string[] = [];
+    for (let i = 0; i < OPTS.batchSize; i++) unreadable.push(await insertEvent({ createdAt: minutesAgo(30) }));
+    const healthy = await insertEvent();
+    for (const id of unreadable) await ds.query(`UPDATE ingress_events SET payload = '{oops' WHERE id = ?`, [id]);
+
+    const first = await service.sweep(OPTS);
+    expect(first).toMatchObject({ replayed: 0, skipped: OPTS.batchSize });
+    expect((await stored(healthy)).dispatchState).toBe('pending');
+
+    const second = await service.sweep(OPTS);
+    expect(second).toMatchObject({ replayed: 1, failed: 0 });
+    expect((await stored(healthy)).dispatchState).toBe('dispatched');
+    // No budget of the unreadable rows was spent, and they are looked at again once the hour is over.
+    expect(await ds.query(`SELECT DISTINCT "dispatchAttempts" FROM ingress_events WHERE payload = '{oops'`)).toEqual([
+      { dispatchAttempts: 0 },
+    ]);
+    const later = new Date(Date.now() + 61 * 60_000);
+    const third = await service.sweep(OPTS, later);
+    expect(third.skipped).toBe(OPTS.batchSize);
+  });
+
+  it('sets aside a row whose payload is text that reads like a connection error', async () => {
+    // The SyntaxError of JSON.parse quotes the start of the text, so by its message alone this row would
+    // be taken for a database that said "not now" and kept at the head of every sweep.
+    const unreadable: string[] = [];
+    for (let i = 0; i < OPTS.batchSize; i++) unreadable.push(await insertEvent({ createdAt: minutesAgo(30) }));
+    const healthy = await insertEvent();
+    for (const id of unreadable) {
+      await ds.query(`UPDATE ingress_events SET payload = 'connection reset by peer' WHERE id = ?`, [id]);
+    }
+
+    const first = await service.sweep(OPTS);
+    expect(first).toMatchObject({ replayed: 0, skipped: OPTS.batchSize });
+    const second = await service.sweep(OPTS);
+
+    expect(second).toMatchObject({ replayed: 1, failed: 0 });
+    expect((await stored(healthy)).dispatchState).toBe('dispatched');
+  });
+
+  it('reads a row again on the next sweep when the read failed because the database was busy', async () => {
+    // Not a row that cannot be read: a lock or a dropped connection says nothing about its payload, and the
+    // delivery is one the reconciler exists to replay within minutes.
+    const id = await insertEvent();
+    const real = events.findOneBy.bind(events);
+    let failed = false;
+    jest.spyOn(events, 'findOneBy').mockImplementation(((where: never) => {
+      if (!failed) {
+        failed = true;
+        return Promise.reject(Object.assign(new Error('SQLITE_BUSY: database is locked'), { code: 'SQLITE_BUSY' }));
+      }
+      return real(where);
+    }) as never);
+
+    const first = await service.sweep(OPTS);
+    expect(first).toMatchObject({ replayed: 0, skipped: 1 });
+
+    const second = await service.sweep(OPTS);
+    expect(second).toMatchObject({ replayed: 1, failed: 0 });
+    expect((await stored(id)).dispatchState).toBe('dispatched');
+  });
+
   it('skips a pending row whose payload is gone (nothing to replay from) without burning its budget', async () => {
     const id = await insertEvent({ payload: null });
 

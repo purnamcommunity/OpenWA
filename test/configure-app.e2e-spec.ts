@@ -157,6 +157,31 @@ describe('production HTTP surface (configureApp)', () => {
     expect(res.headers['access-control-allow-origin']).toBe('https://allowed.example');
   });
 
+  // Neither send-idempotency header is CORS-safelisted: a browser sends Idempotency-Key only if the preflight
+  // lists it, and reads Idempotent-Replayed only if the response exposes it.
+  const listed = (header: string | undefined): string[] => (header ?? '').split(',').map(name => name.trim());
+
+  it('lists Idempotency-Key in the preflight answer for an allowed Origin', async () => {
+    const res = await request(app.getHttpServer())
+      .options('/api/echo')
+      .set('Origin', 'https://allowed.example')
+      .set('Access-Control-Request-Method', 'POST')
+      .set('Access-Control-Request-Headers', 'idempotency-key');
+
+    expect(res.headers['access-control-allow-origin']).toBe('https://allowed.example');
+    expect(listed(res.headers['access-control-allow-headers'])).toContain('Idempotency-Key');
+  });
+
+  it('exposes Idempotent-Replayed to an allowed Origin', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/api/echo')
+      .set('Content-Type', 'application/json')
+      .set('Origin', 'https://allowed.example')
+      .send({});
+
+    expect(listed(res.headers['access-control-expose-headers'])).toContain('Idempotent-Replayed');
+  });
+
   it('denies a disallowed Origin by omitting the CORS headers, not by failing the request', async () => {
     // Deliberately an /api route: the document handler answers `/` before the CORS layer is
     // reached, so asserting the denial there passes whatever CORS does.

@@ -62,6 +62,7 @@
     "dashboard": "Dashboard",
     "sessions": "Sitzungen",
     "chats": "Chats",
+    "numberChecker": "Nummernprüfung",
     "webhooks": "Webhooks",
     "templates": "Vorlagen",
     "apiKeys": "API-Schlüssel",
@@ -71,6 +72,7 @@
     "logs": "Protokolle"
   },
   "chats": {
+    "edited": "Bearbeitet",
     "media": {
       "location": "Standort",
       "call": "Anruf",
@@ -95,6 +97,7 @@
     "loadingMessages": "Nachrichten werden geladen...",
     "loadingOlderMessages": "Ältere Nachrichten werden geladen...",
     "loadOlderMessagesError": "Ältere Nachrichten konnten nicht geladen werden. Zum erneuten Versuch nach oben scrollen.",
+    "loadOlderMessagesRetryHint": "Zum erneuten Versuch nach oben scrollen.",
     "noMessagesInChat": "Noch keine Nachrichten. Sende die erste Nachricht, um zu beginnen!",
     "downloadDocument": "Dokument herunterladen",
     "actions": {
@@ -199,6 +202,133 @@
       "delivered": "Zugestellt",
       "read": "Gelesen",
       "failed": "Fehlgeschlagen"
+    },
+    "clearSearch": "Suche leeren",
+    "filters": {
+      "label": "Chats filtern",
+      "all": "Alle",
+      "unread": "Ungelesen",
+      "direct": "1:1-Chats",
+      "groups": "Gruppen",
+      "unknown": "Unbekannt"
+    },
+    "noFilterResults": "Keine Chats für diesen Filter",
+    "moreActions": "Weitere Aktionen",
+    "copyChatId": "Chat-ID kopieren",
+    "chatIdCopied": "Chat-ID kopiert",
+    "copyFailed": "Kopieren in die Zwischenablage fehlgeschlagen",
+    "closeChat": "Chat schließen",
+    "chatId": "Chat-ID",
+    "newChat": {
+      "title": "Neuer Chat",
+      "searchPlaceholder": "Name oder Nummer mit Ländervorwahl",
+      "startWithNumber": "Chat mit {{number}} starten",
+      "contacts": "Kontakte",
+      "noContacts": "Keine Kontakte gefunden",
+      "loadingContacts": "Kontakte werden geladen...",
+      "contactsError": "Kontakte konnten nicht geladen werden",
+      "checking": "Nummer wird geprüft...",
+      "notOnWhatsApp": "{{number}} ist nicht bei WhatsApp registriert",
+      "checkFailed": "Nummer konnte nicht geprüft werden",
+      "numberHint": "Bitte Nummern mit Ländervorwahl eingeben, z. B. +49 170 1234567"
+    },
+    "newGroup": {
+      "title": "Neue Gruppe",
+      "namePlaceholder": "Gruppenname",
+      "participantsPlaceholder": "Teilnehmer suchen oder Nummer eingeben",
+      "addNumber": "{{number}} hinzufügen",
+      "selected": "{{count}} ausgewählt",
+      "create": "Gruppe erstellen",
+      "created": "Gruppe „{{name}}“ erstellt",
+      "createFailed": "Gruppe konnte nicht erstellt werden",
+      "removeParticipant": "{{name}} entfernen"
+    },
+    "group": {
+      "info": "Gruppeninfo",
+      "leave": "Gruppe verlassen",
+      "leaveConfirm": "Die Gruppe „{{name}}“ verlassen?",
+      "left": "„{{name}}“ verlassen",
+      "leaveFailed": "Gruppe konnte nicht verlassen werden",
+      "editTitle": "Gruppe bearbeiten",
+      "tabInfo": "Info",
+      "tabParticipants": "Teilnehmer",
+      "managedBy": "Verwaltung über {{session}}",
+      "notAdmin": "Kein Admin über {{session}}",
+      "name": "Gruppenname",
+      "picture": "Gruppenbild",
+      "pictureHint": "Klicke auf dieses Feld, um ein neues Gruppenbild auszuwählen.",
+      "readOnlyHint": "Nur Gruppen-Admins können diese Gruppe ändern.",
+      "description": "Beschreibung",
+      "descriptionPlaceholder": "Gruppenbeschreibung (optional)",
+      "save": "Änderungen speichern",
+      "saved": "Gruppe aktualisiert",
+      "saveFailed": "Gruppe konnte nicht gespeichert werden",
+      "loadFailed": "Gruppeninfo konnte nicht geladen werden",
+      "participantCount": "Teilnehmer: {{count}}",
+      "admin": "Admin",
+      "owner": "Ersteller",
+      "makeAdmin": "Zum Admin machen",
+      "removeAdmin": "Admin entfernen",
+      "remove": "Entfernen",
+      "removeConfirm": "{{name}} aus der Gruppe entfernen?",
+      "add": "Hinzufügen",
+      "addPlaceholder": "Nummer mit Ländervorwahl hinzufügen",
+      "memberActionFailed": "Die Aktion ist fehlgeschlagen",
+      "leaveWarning": "Du erhältst danach keine Nachrichten mehr aus der Gruppe, und nur ein Gruppen-Admin kann dich wieder hinzufügen."
+    },
+    "rowActions": {
+      "actionsFor": "Aktionen für {{name}}",
+      "markUnread": "Als ungelesen markieren",
+      "markUnreadFailed": "Chat konnte nicht als ungelesen markiert werden",
+      "clear": "Chat leeren",
+      "clearConfirm": "Alle Nachrichten im Chat mit {{name}} löschen?",
+      "clearWarning": "Der Chat bleibt in der Liste. Das Gateway löscht auch seine gespeicherten Nachrichten samt Medien; exportiere den Verlauf vorher, wenn du ihn brauchst.",
+      "cleared": "Chat mit {{name}} geleert",
+      "clearFailed": "Chat konnte nicht geleert werden",
+      "delete": "Chat löschen",
+      "deleteConfirm": "Den Chat mit {{name}} löschen?",
+      "deleteWarning": "Der Chat verschwindet aus der Liste, und das Gateway löscht seine gespeicherten Nachrichten samt Medien.",
+      "deleted": "Chat mit {{name}} gelöscht",
+      "deleteFailed": "Chat konnte nicht gelöscht werden",
+      "saveContact": "Kontakt speichern",
+      "renameContact": "Kontakt umbenennen",
+      "firstName": "Vorname",
+      "lastName": "Nachname (optional)",
+      "contactSaved": "Kontakt gespeichert",
+      "contactSaveFailed": "Kontakt konnte nicht gespeichert werden",
+      "pin": "Chat anheften",
+      "unpin": "Chat lösen",
+      "pinFailed": "Chat konnte nicht angeheftet werden. WhatsApp erlaubt höchstens drei angeheftete Chats.",
+      "unpinFailed": "Chat konnte nicht gelöst werden",
+      "pinnedLabel": "Angeheftet",
+      "mute": "Stummschalten",
+      "unmute": "Stummschaltung aufheben",
+      "mutedLabel": "Stummgeschaltet",
+      "muteTitle": "„{{name}}“ stummschalten",
+      "muteHint": "Die anderen Teilnehmer erfahren nicht, dass du den Chat stummgeschaltet hast. Wirst du erwähnt, wirst du trotzdem benachrichtigt.",
+      "muteFailed": "Benachrichtigungen konnten nicht geändert werden",
+      "archive": "Chat archivieren",
+      "unarchive": "Chat aus dem Archiv holen",
+      "archived": "Chat archiviert",
+      "unarchived": "Chat aus dem Archiv geholt",
+      "archiveFailed": "Archiv konnte nicht geändert werden",
+      "archivedEntry": "Archiviert",
+      "archivedTitle": "Archivierte Chats",
+      "archiveEmpty": "Keine archivierten Chats",
+      "declined": "WhatsApp hat die Änderung abgelehnt.",
+      "block": "Kontakt blockieren",
+      "unblock": "Kontakt entsperren",
+      "blockConfirm": "{{name}} blockieren?",
+      "blockWarning": "Blockierte Kontakte können dich nicht mehr anrufen und dir keine Nachrichten mehr senden.",
+      "blocked": "{{name}} blockiert",
+      "unblocked": "{{name}} entsperrt",
+      "blockFailed": "Blockierung konnte nicht geändert werden",
+      "muteFor": {
+        "8h": "8 Stunden",
+        "1w": "1 Woche",
+        "always": "Immer"
+      },
+      "saveContactUnavailable": "Braucht eine bekannte Telefonnummer: Dieser Chat hat nur eine Datenschutz-ID (@lid)."
     }
   },
   "errorBoundary": {
@@ -518,6 +648,7 @@
       "message.received": "Wenn eine Nachricht empfangen wird",
       "message.sent": "Wenn eine Nachricht gesendet wird",
       "message.ack": "Wenn sich der Zustell- oder Lesestatus einer Nachricht ändert",
+      "message.receipt": "Jeder Empfänger, der eine von Ihnen gesendete Gruppen- oder Statusnachricht erhält, liest oder abspielt (nur Baileys; nicht in * enthalten)",
       "message.failed": "Wenn eine ausgehende Nachricht nicht zugestellt werden kann",
       "message.revoked": "Wenn eine Nachricht für alle gelöscht wird",
       "message.reaction": "Wenn eine Reaktion hinzugefügt, geändert oder entfernt wird",
@@ -703,8 +834,9 @@
     },
     "chats": {
       "label": "Chat-Zugriff (optional)",
-      "hint": "Ein Chat pro Zeile: eine Gruppen-ID mit @g.us, eine Kontakt-ID mit @c.us oder @lid oder eine Telefonnummer. Leer lassen für alle Chats. Ein auf Chats beschränkter Schlüssel kann nur die für solche Schlüssel freigegebenen Routen nutzen; der Events-WebSocket und MCP lehnen ihn ab.",
-      "invalid": "Keine Chat-ID und keine Telefonnummer: {{value}}"
+      "hint": "Ein Chat pro Zeile: eine Gruppen-ID mit @g.us, eine Kontakt-ID mit @c.us oder @lid oder eine Telefonnummer. Leer lassen für alle Chats. Ein auf Chats beschränkter Schlüssel kann nur die für solche Schlüssel freigegebenen Routen nutzen; sein Zugriff über den Events-WebSocket und MCP bleibt auf diese Chats beschränkt.",
+      "invalid": "Keine Chat-ID und keine Telefonnummer: {{value}}",
+      "tooMany": "Zu viele Chats ({{count}}): Ein Schlüssel darf höchstens {{max}} auflisten."
     },
     "expiry": {
       "label": "Läuft ab am (optional)",
@@ -861,6 +993,119 @@
       "progress": "{{sent}} von {{total}} gesendet · {{failed}} fehlgeschlagen · {{pending}} ausstehend",
       "cancel": "Batch abbrechen",
       "cancelling": "Wird abgebrochen..."
+    }
+  },
+  "numberChecker": {
+    "subtitle": "Unbemerkt prüfen, ob Telefonnummern ein aktives WhatsApp-Konto haben, ohne Nachrichten zu senden",
+    "zeroMessages": "Keine Nachrichten gesendet",
+    "noSession": {
+      "title": "Keine aktive WhatsApp-Sitzung verbunden.",
+      "desc": "Zum Prüfen von Telefonnummern benötigt OpenWA mindestens eine authentifizierte Sitzung.",
+      "goToSessions": "Zu den Sitzungen"
+    },
+    "tabs": {
+      "single": "Einzelprüfung",
+      "bulk": "Massenprüfung"
+    },
+    "session": {
+      "label": "WhatsApp-Sitzung",
+      "none": "Keine einsatzbereite Sitzung verfügbar",
+      "hint": "Abfragen laufen über dieses verbundene WhatsApp-Konto."
+    },
+    "single": {
+      "title": "Einzelnes Konto prüfen",
+      "phoneLabel": "Telefonnummer",
+      "phonePlaceholder": "z. B. 919876543210 oder 6281234567890 (mit Ländervorwahl)",
+      "check": "Prüfen",
+      "checking": "Wird geprüft...",
+      "autoPrefix": "<strong>+91</strong> bei 10-stelligen Nummern automatisch voranstellen (12-stellige Nummern bleiben unverändert)",
+      "silent": "<strong>Völlig unbemerkt:</strong> Diese Abfrage geht direkt an das Registrierungsverzeichnis von WhatsApp. Der Kontakt erhält keine Benachrichtigung, keinen Ton und keine Nachricht.",
+      "resultTitle": "Prüfergebnis",
+      "querying": "WhatsApp-Server werden abgefragt...",
+      "empty": "Gib eine Telefonnummer ein und klicke auf „Prüfen“, um den WhatsApp-Status zu sehen."
+    },
+    "preview": {
+      "prefixed": "Zu prüfende Nummer: <strong>+{{number}}</strong> (10 Ziffern → 91 automatisch vorangestellt)",
+      "kept": "Zu prüfende Nummer: <strong>+{{number}}</strong> (12 Ziffern → unverändert)",
+      "digits": "Zu prüfende Nummer: <strong>+{{number}}</strong> ({{digits}} Ziffern)"
+    },
+    "prefixHint": {
+      "single": "Stellt +91 vor 10-stellige Nummern und vor 11-stellige Nummern mit führender 0. Nummern mit + oder 00 bleiben wie eingegeben.",
+      "bulk": "Stellt +91 vor 10-stellige Nummern (z. B. 96...) und vor 11-stellige Nummern mit führender 0. Nummern mit + oder 00 bleiben wie eingegeben.",
+      "off": "Nummern werden wie eingegeben geprüft (nur Ziffern). Gib daher die Ländervorwahl mit an."
+    },
+    "result": {
+      "registered": "Bei WhatsApp registriert",
+      "notRegistered": "Nicht registriert",
+      "avatarAlt": "Avatar",
+      "status": "Status",
+      "active": "Aktives Konto",
+      "none": "Kein Konto gefunden",
+      "jid": "WhatsApp-JID",
+      "copyJid": "JID kopieren",
+      "copy": "Kopieren",
+      "copied": "Kopiert",
+      "checkedAt": "Geprüft um",
+      "openTester": "Im Nachrichtentester öffnen"
+    },
+    "recent": {
+      "title": "Letzte Prüfungen",
+      "clear": "Verlauf löschen"
+    },
+    "table": {
+      "phone": "Telefonnummer",
+      "status": "WhatsApp-Status",
+      "id": "WhatsApp-ID",
+      "time": "Uhrzeit"
+    },
+    "status": {
+      "registered": "Registriert",
+      "unregistered": "Nicht registriert",
+      "notRegistered": "Nicht registriert",
+      "failed": "Fehlgeschlagen"
+    },
+    "bulk": {
+      "title": "Massenprüfung von Nummern",
+      "delayLabel": "Sichere Verzögerung zwischen Abfragen (ms)",
+      "delay1": "1000 ms / 1 Sek. (empfohlen)",
+      "delay2": "2000 ms / 2 Sek. (extra sicher)",
+      "delay3": "3000 ms / 3 Sek. (sicher für große Mengen)",
+      "delayHint": "Wartet zwischen den Abfragen, um unter dem Anfragelimit des Gateways zu bleiben (standardmäßig 100 pro Minute). Die Prüfung stoppt, sobald das Gateway weitere Abfragen ablehnt.",
+      "countryRule": "Regel für die Ländervorwahl",
+      "autoPrefix": "<strong>+91</strong> (Indien) bei 10-stelligen Nummern automatisch voranstellen",
+      "numbersLabel": "Zu prüfende Nummern (eine pro Zeile oder durch Kommas getrennt)",
+      "numbersHint": "Füge Telefonnummern mit Ländervorwahl ein, eine pro Zeile oder durch Kommas getrennt. Bis zu {{max}} Nummern pro Durchlauf.",
+      "parsed": "<strong>{{count}}</strong> eindeutige Nummer erkannt",
+      "parsed_other": "<strong>{{count}}</strong> eindeutige Nummern erkannt",
+      "tenDigitAdded": "({{ten}} zehnstellige → +91 ergänzt)",
+      "tenDigitAddedPreserved": "({{ten}} zehnstellige → +91 ergänzt, {{twelve}} zwölfstellige unverändert)",
+      "tooMany": "Zu viele Nummern: {{parsed}} erkannt, höchstens {{max}} pro Durchlauf. Entferne {{excess}} davon, um zu starten.",
+      "start": "Batch-Prüfung starten",
+      "stop": "Prüfung stoppen",
+      "export": "Ergebnisse exportieren (CSV)",
+      "stoppedTitle": "Batch gestoppt",
+      "checked": "Geprüft",
+      "remaining": "Verbleibend",
+      "all": "Alle"
+    },
+    "stopped": {
+      "reason409": "Die Sitzung ist nicht verbunden",
+      "reason429": "Das Anfragelimit des Gateways wurde erreicht",
+      "reason503": "WhatsApp hat eine Abfrage nicht beantwortet",
+      "reasonOther": "Das Gateway hat eine Abfrage abgelehnt",
+      "partial": "{{reason}} (HTTP {{status}}). Gestoppt bei Nummer {{attempted}} von {{total}}; {{count}} Nummer wurde nicht geprüft. Versuche es später erneut.",
+      "partial_other": "{{reason}} (HTTP {{status}}). Gestoppt bei Nummer {{attempted}} von {{total}}; {{count}} Nummern wurden nicht geprüft. Versuche es später erneut.",
+      "last": "{{reason}} (HTTP {{status}}). Die letzte Abfrage ist fehlgeschlagen. Versuche es später erneut."
+    },
+    "toast": {
+      "enterNumber": "Bitte gib eine Telefonnummer zum Prüfen ein.",
+      "noSession": "Keine einsatzbereite WhatsApp-Sitzung verfügbar.",
+      "checkFailed": "Prüfung fehlgeschlagen",
+      "unknownError": "Unbekannter Fehler bei der Abfrage",
+      "lookupFailed": "Abfrage fehlgeschlagen",
+      "enterNumbers": "Bitte gib gültige Telefonnummern ein (eine pro Zeile oder durch Kommas getrennt).",
+      "completed": "Prüfung von {{count}} Nummer abgeschlossen.",
+      "completed_other": "Prüfung von {{count}} Nummern abgeschlossen."
     }
   },
   "infrastructure": {

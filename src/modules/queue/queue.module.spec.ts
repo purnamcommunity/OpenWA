@@ -4,6 +4,9 @@ import { getQueueToken } from '@nestjs/bullmq';
 import { QUEUE_NAMES } from './queue-names';
 import { QueueModule, WEBHOOK_QUEUE_JOB_OPTIONS } from './queue.module';
 import { ShutdownSafeQueue } from './shutdown-safe-queue';
+import { WebhookModule } from '../webhook/webhook.module';
+import { WebhookOutboxModule } from '../webhook/webhook-outbox.module';
+import { WebhookOutboxService } from '../webhook/webhook-outbox.service';
 
 // A stub base keeps the factory from opening a Redis connection; ShutdownSafeQueue still extends it.
 jest.mock('bullmq', () => ({
@@ -47,5 +50,18 @@ describe('WEBHOOK_QUEUE_JOB_OPTIONS', () => {
     expect(typeof opts).toBe('object');
     expect(opts.count).toBeGreaterThan(0);
     expect(opts.age).toBeGreaterThan(0);
+  });
+});
+
+// The processors and the webhook module both need the outbox. Providing the service in each module made
+// two instances with queue on, and its startup prune and daily timer ran twice.
+describe('WebhookOutboxService wiring', () => {
+  it('is provided by one module and imported by the queue and webhook modules', () => {
+    for (const owner of [QueueModule, WebhookModule]) {
+      expect(Reflect.getMetadata('providers', owner)).not.toContain(WebhookOutboxService);
+      expect(Reflect.getMetadata('imports', owner)).toContain(WebhookOutboxModule);
+    }
+    expect(Reflect.getMetadata('providers', WebhookOutboxModule)).toEqual([WebhookOutboxService]);
+    expect(Reflect.getMetadata('exports', WebhookOutboxModule)).toEqual([WebhookOutboxService]);
   });
 });
