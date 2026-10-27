@@ -8,11 +8,12 @@ import {
   IsArray,
   ArrayMaxSize,
   IsBoolean,
+  IsObject,
   Validate,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { IsMentionWidConstraint } from './is-mention-wid.validator';
-import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
+import { ToStrictArray, ToStrictBoolean, ToStrictString } from '../../../common/utils/strict-boolean';
 import { IsMediaUrl } from '../../../common/media/media-url';
 import { stripBase64DataUri } from '../media-cap.util';
 
@@ -49,6 +50,15 @@ export const MESSAGE_TEXT_MAX_LENGTH = 4096;
  */
 export const CHAT_ID_MAX_LENGTH = 255;
 export const BATCH_ID_MAX_LENGTH = 255;
+
+/**
+ * The structural check on a chat id for the chat routes that also verify its form: localpart@host with
+ * no whitespace, engine-neutral so another engine's JID scheme (Baileys' `@s.whatsapp.net`) passes and
+ * the adapter normalises further. Exported so the MCP tools that reach the same operations hold the
+ * rule too: they call the service directly, and a restated pattern is how the two drift apart.
+ */
+export const CHAT_JID_PATTERN = /^[^\s@]+@[^\s@]+$/;
+export const CHAT_JID_MESSAGE = 'chatId must be a valid chat JID in the form localpart@host';
 
 // The cap on a prompt choice's id. It must equal BUTTON_TEXT_MAX_LENGTH in the Baileys message
 // mapper, which refuses to offer any inbound choice whose id is longer, so an id past this bound
@@ -91,6 +101,7 @@ export class CustomLinkPreviewDto {
     example: 'https://example.com/launch',
     maxLength: CUSTOM_PREVIEW_URL_MAX_LENGTH,
   })
+  @ToStrictString()
   @IsString()
   @IsNotEmpty()
   @MaxLength(CUSTOM_PREVIEW_URL_MAX_LENGTH)
@@ -101,6 +112,7 @@ export class CustomLinkPreviewDto {
     example: 'We just launched',
     maxLength: 256,
   })
+  @ToStrictString()
   @IsString()
   @IsNotEmpty()
   @MaxLength(CUSTOM_PREVIEW_TITLE_MAX_LENGTH)
@@ -108,6 +120,7 @@ export class CustomLinkPreviewDto {
 
   @ApiPropertyOptional({ description: 'Preview description', example: 'Read the announcement.', maxLength: 1024 })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   @MaxLength(CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH)
   description?: string;
@@ -119,6 +132,7 @@ export class SendTextMessageDto {
     example: '628123456789@c.us',
     maxLength: CHAT_ID_MAX_LENGTH,
   })
+  @ToStrictString()
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
@@ -129,6 +143,7 @@ export class SendTextMessageDto {
     example: 'Hello from OpenWA!',
     maxLength: MESSAGE_TEXT_MAX_LENGTH,
   })
+  @ToStrictString()
   @IsString()
   @IsNotEmpty()
   @MaxLength(MESSAGE_TEXT_MAX_LENGTH)
@@ -142,6 +157,7 @@ export class SendTextMessageDto {
     items: { type: 'string', maxLength: MENTION_WID_MAX_LENGTH },
   })
   @IsOptional()
+  @ToStrictArray()
   @IsArray()
   @ArrayMaxSize(MENTIONS_MAX)
   @IsString({ each: true })
@@ -173,6 +189,7 @@ export class SendTextMessageDto {
       'with `linkPreview: false`, which asks for the opposite.',
   })
   @IsOptional()
+  @IsObject()
   @ValidateNested()
   @Type(() => CustomLinkPreviewDto)
   customLinkPreview?: CustomLinkPreviewDto;
@@ -182,6 +199,7 @@ export class SendTextMessageDto {
     example: QUOTED_MESSAGE_ID_EXAMPLE,
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   @IsNotEmpty()
   quotedMessageId?: string;
@@ -220,6 +238,7 @@ export class SendMediaMessageDto {
     example: '628123456789@c.us',
     maxLength: CHAT_ID_MAX_LENGTH,
   })
+  @ToStrictString()
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
@@ -239,6 +258,7 @@ export class SendMediaMessageDto {
     description: 'Base64 encoded media data',
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   base64?: string;
 
@@ -247,6 +267,7 @@ export class SendMediaMessageDto {
     example: 'image/jpeg',
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   mimetype?: string;
 
@@ -257,6 +278,7 @@ export class SendMediaMessageDto {
     maxLength: 255,
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   @MaxLength(255)
   filename?: string;
@@ -267,6 +289,7 @@ export class SendMediaMessageDto {
     maxLength: MEDIA_CAPTION_MAX_LENGTH,
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   @MaxLength(MEDIA_CAPTION_MAX_LENGTH)
   caption?: string;
@@ -279,6 +302,7 @@ export class SendMediaMessageDto {
     items: { type: 'string', maxLength: MENTION_WID_MAX_LENGTH },
   })
   @IsOptional()
+  @ToStrictArray()
   @IsArray()
   @ArrayMaxSize(MENTIONS_MAX)
   @IsString({ each: true })
@@ -291,6 +315,7 @@ export class SendMediaMessageDto {
     example: QUOTED_MESSAGE_ID_EXAMPLE,
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   @IsNotEmpty()
   quotedMessageId?: string;

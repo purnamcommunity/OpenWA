@@ -201,7 +201,7 @@ COPY package*.json ./
 # scripts/postinstall.js rides along so a bare local `npm ci` keeps working, but the
 # --ignore-scripts install below skips the hook here: the explicit fatal run right
 # after is the sole (and stricter) applier for the image.
-COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-wwebjs-group-description.js scripts/patch-wwebjs-call-state.js scripts/patch-wwebjs-call-log-event.js scripts/patch-wwebjs-contact-alt-wid.js scripts/patch-wwebjs-message-secret.js scripts/patch-wwebjs-media-id.js scripts/patch-wwebjs-group-invite.js scripts/patch-wwebjs-send-error.js scripts/patch-wwebjs-forward-bundle.js scripts/patch-wwebjs-pushname-bundle.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js scripts/patch-baileys-pairing.js ./scripts/
+COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js scripts/patch-wwebjs-status.js scripts/patch-wwebjs-ready-sync.js scripts/patch-wwebjs-participant-arity.js scripts/patch-wwebjs-block.js scripts/patch-wwebjs-group-description.js scripts/patch-wwebjs-call-state.js scripts/patch-wwebjs-call-log-event.js scripts/patch-wwebjs-contact-alt-wid.js scripts/patch-wwebjs-message-secret.js scripts/patch-wwebjs-media-id.js scripts/patch-wwebjs-group-invite.js scripts/patch-wwebjs-send-error.js scripts/patch-wwebjs-forward-bundle.js scripts/patch-wwebjs-pushname-bundle.js scripts/patch-wwebjs-puppeteer.js scripts/patch-baileys-appstate.js scripts/patch-baileys-newsletter-create.js scripts/patch-baileys-pairing.js ./scripts/
 
 # Install production dependencies only, then apply the backports. The status patcher runs after
 # the two patchers it depends on: its transforms were written against the tree they leave behind.
@@ -239,6 +239,7 @@ RUN npm ci --omit=dev --ignore-scripts \
     && node scripts/patch-baileys-appstate.js \
     && node scripts/patch-baileys-newsletter-create.js \
     && node scripts/patch-baileys-pairing.js \
+    && node scripts/patch-wwebjs-puppeteer.js \
     && npm cache clean --force
 
 # Replace the npm the base image bundles. npm is not on the request path — the entrypoint runs
@@ -250,7 +251,16 @@ RUN npm ci --omit=dev --ignore-scripts \
 # Deliberately AFTER `npm ci`, so the application tree is still resolved by the npm the lockfile
 # was generated with and only the global CLI is swapped. Pinned to the exact patch release —
 # a floating npm@12 would make the image's bundled npm tree depend on when the build happened.
-RUN npm install -g npm@12.1.0 && npm cache clean --force
+# npm 12.2.1 still bundles Undici 6.29.0. Replace only that package with its compatible patch;
+# npm's bundled private packages prevent reinstalling its dependency tree from the registry.
+RUN npm install -g npm@12.2.1 && \
+    node -e "if (require('/usr/local/lib/node_modules/npm/node_modules/undici/package.json').version !== '6.29.0') throw new Error('Recheck npm Undici replacement');" && \
+    npm_http_patch_dir=$(mktemp -d) && \
+    npm install --prefix "$npm_http_patch_dir" --no-save --package-lock=false --ignore-scripts --no-audit --fund=false undici@6.29.1 && \
+    rm -rf /usr/local/lib/node_modules/npm/node_modules/undici && \
+    mv "$npm_http_patch_dir/node_modules/undici" /usr/local/lib/node_modules/npm/node_modules/undici && \
+    rm -rf "$npm_http_patch_dir" && \
+    npm cache clean --force
 
 # amd64: download Chrome for Testing via Puppeteer and symlink it.
 # arm64: use Debian's chromium installed above (a choice; see the note at that install).
@@ -283,7 +293,7 @@ RUN if [ "$TARGETARCH" = arm64 ]; then \
         ln -s /usr/bin/chromium /usr/local/bin/puppeteer-chrome; \
     else \
         mkdir -p /opt/puppeteer && \
-        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@153.0.8010.36' && \
+        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@156.0.8078.47' && \
         chown -R openwa:openwa /opt/puppeteer && \
         chrome_path=$(find /opt/puppeteer/chrome/linux*/chrome-linux64/chrome | head -n 1) && \
         test -n "$chrome_path" && \

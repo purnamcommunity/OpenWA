@@ -9,6 +9,25 @@ import { readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
 import { chatKind } from '../identity/wa-id';
 
 /**
+ * Bounds on an inbound poll, applied by both engines. WhatsApp itself allows 12 options of 100
+ * characters under a 255-character question; these sit well above that, so nothing a client can send
+ * is cut, while a malformed poll cannot bloat a stored row, a webhook payload or a socket frame. A poll
+ * over a bound is truncated, not dropped.
+ */
+export const POLL_MAX_OPTIONS = 32;
+export const POLL_TEXT_MAX_LENGTH = 1024;
+
+/** A poll question or option text, cut to {@link POLL_TEXT_MAX_LENGTH}. */
+export function boundPollText(text: string): string {
+  return text.slice(0, POLL_TEXT_MAX_LENGTH);
+}
+
+/** A poll's options, cut to {@link POLL_MAX_OPTIONS} entries of at most {@link POLL_TEXT_MAX_LENGTH}. */
+export function boundPollOptions(options: string[]): string[] {
+  return options.slice(0, POLL_MAX_OPTIONS).map(boundPollText);
+}
+
+/**
  * Map a whatsapp-web.js `MessageTypes` token to the engine-neutral {@link MessageType}, so no
  * consumer outside the adapter sees wwebjs-specific type strings. Notably `chat` -> `text` (aligning
  * incoming with the neutral types outgoing sends already use) and `ptt` -> `voice`. Anything not
@@ -186,8 +205,10 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   // mapper already derived rather than off the raw token, so the one place that knows
   // `poll_creation` -> `poll` stays the only place that knows it.
   if (incoming.type === 'poll') {
+    // The question is the body of a poll, so it is bounded with the poll.
+    incoming.body = boundPollText(incoming.body);
     const poll = readPollDetails(msg);
-    if (poll) incoming.poll = poll;
+    if (poll) incoming.poll = { ...poll, name: boundPollText(poll.name), options: boundPollOptions(poll.options) };
   }
 
   // Replies drawn by a community announcement. Carried on the message because WhatsApp keeps the

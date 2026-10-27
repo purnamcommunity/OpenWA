@@ -11,6 +11,9 @@ package com.rmyndharis.openwa.model;
  * <p>{@code verifiedName} is the name a business account publishes. A business this account never
  * saved has no other name — no {@code name} (never saved) and usually no {@code pushName} — so read
  * it before falling back to the number.
+ *
+ * <p>{@code profilePicUrl} is a cached URL that only Baileys can fill (whatsapp-web.js never sets it)
+ * and it is often absent there too, so its absence does not say whether the contact has a picture.
  */
 public record ContactRecord(
     String id,
