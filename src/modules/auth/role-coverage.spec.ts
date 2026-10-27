@@ -139,6 +139,9 @@ describe('role of every message and session route', () => {
     cancelBatch: ApiKeyRole.OPERATOR,
     getChatHistory: OPEN,
     getReactions: OPEN,
+    getPollVotes: OPEN,
+    getComments: OPEN,
+    sendComment: ApiKeyRole.OPERATOR,
     getChatMedia: OPEN,
     deleteMessage: ApiKeyRole.OPERATOR,
     votePoll: ApiKeyRole.OPERATOR,
@@ -165,6 +168,7 @@ describe('role of every message and session route', () => {
     // A GET, but the QR code links a device to the account, like the invite codes above.
     getQRCode: ApiKeyRole.OPERATOR,
     requestPairingCode: ApiKeyRole.OPERATOR,
+    cancelPairingCode: ApiKeyRole.OPERATOR,
     getGroups: OPEN,
     getChats: OPEN,
     markChatRead: ApiKeyRole.OPERATOR,
