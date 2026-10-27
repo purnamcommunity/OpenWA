@@ -321,6 +321,7 @@ export class SendMessageCommentDto {
     description: 'The reply text. Goes into the announcement’s thread, not into the chat.',
     example: 'Detachment 🕊️',
   })
+  @ToStrictString()
   @IsString()
   @IsNotEmpty()
   text!: string;
