@@ -78,12 +78,12 @@ const ROWS: Row[] = [
     invalid: text(256),
   },
   {
-    label: 'SendMediaMessageDto.caption is at most 1024 characters',
+    label: 'SendMediaMessageDto.caption is at most 4096 characters',
     dto: SendMediaMessageDto,
     base: { chatId: CHAT, url: 'https://example.com/a.jpg' },
     field: 'caption',
-    valid: text(1024),
-    invalid: text(1025),
+    valid: text(4096),
+    invalid: text(4097),
   },
   {
     label: 'SendPollDto.name is at most 255 characters',

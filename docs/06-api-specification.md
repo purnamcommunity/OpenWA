@@ -152,7 +152,7 @@ All media send routes (`send-image`, `send-video`, `send-audio`, `send-document`
 | `base64`   | string   | conditional | required when `url` absent                          | Raw base64 media data. Decoded size is checked against the media cap                                                                                                                      |
 | `mimetype` | string   | conditional | required when `base64` is used                      | MIME type, e.g. `image/jpeg`, `video/mp4`, `application/pdf`                                                                                                                              |
 | `filename` | string   | no          | max 255 chars                                       | Optional file name (also used as the persisted body fallback for documents)                                                                                                               |
-| `caption`  | string   | no          | max 1024 chars                                      | Optional caption (not persisted for audio)                                                                                                                                                |
+| `caption`  | string   | no          | max 4096 chars                                      | Optional caption (not persisted for audio)                                                                                                                                                |
 | `mentions` | string[] | no          | array of WIDs, max 1024 of 64 characters            | WIDs to @mention in the caption (e.g. `["62811@c.us"]`). See **Mentions** below                                                                                                           |
 
 Provide **exactly one** of `url` or `base64`. Omitting both, or supplying `base64` without `mimetype`, returns `400`.
@@ -184,7 +184,7 @@ A whole request body is separately capped by `BODY_SIZE_LIMIT` (`25mb` by defaul
 
 ### Text Limit
 
-`send-text` enforces a maximum body length of **4096 characters** (`text` is `@MaxLength(4096)`). Media captions are limited to **1024 characters**.
+`send-text` enforces a maximum body length of **4096 characters** (`text` is `@MaxLength(4096)`). Media captions share that limit of **4096 characters**.
 
 ### Mentions
 
@@ -2152,7 +2152,7 @@ Send an image (by URL or base64) with an optional caption.
 | base64          | string   | Conditional | string; required when `url` is absent    | Base64 media data (capped to the media byte limit)                                       |
 | mimetype        | string   | Conditional | string; required when using `base64`     | MIME type of the media                                                                   |
 | filename        | string   | No          | max 255                                  | File name                                                                                |
-| caption         | string   | No          | max 1024                                 | Caption text                                                                             |
+| caption         | string   | No          | max 4096                                 | Caption text                                                                             |
 | mentions        | string[] | No          | array of WIDs, max 1024 of 64 characters | WIDs to @mention in the caption. See **Mentions** above                                  |
 | quotedMessageId | string   | No          | non-empty                                | Quote an earlier message, making this a reply — see [Quoted sends](#quoted-sends)        |
 
