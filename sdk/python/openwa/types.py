@@ -342,6 +342,10 @@ class CreateSessionRequest(TypedDict):
 class QrCodeResponse(TypedDict):
     qrCode: str
     status: SessionStatus
+    # ISO 8601. expiresAt is when WhatsApp stops accepting the code: 60 s for a round's first code,
+    # 20 s for each later one.
+    issuedAt: NotRequired[str]
+    expiresAt: NotRequired[str]
 
 
 class PairingCodeResponse(TypedDict):
@@ -684,7 +688,7 @@ class ReactionRecord(TypedDict):
     senders: list[ReactionSender]
 
 
-class PollVoteRecord(TypedDict, total=False):
+class PollVoteRecord(TypedDict):
     """One voter's CURRENT selection on a poll — not a running count.
 
     A voter who changes their mind sends their whole new selection, and an empty
@@ -696,26 +700,26 @@ class PollVoteRecord(TypedDict, total=False):
     voterId: str
     selectedOptions: list[str]
     timestamp: int
-    isMe: bool
-    voterName: str
-    voterPushName: str
-    voterPhone: str
+    isMe: NotRequired[bool]
+    voterName: NotRequired[str]
+    voterPushName: NotRequired[str]
+    voterPhone: NotRequired[str]
 
 
-class SendCommentRequest(TypedDict, total=False):
+class SendCommentRequest(TypedDict):
     """A reply to post into a community announcement's thread."""
 
     text: str
 
 
-class CommentRecord(TypedDict, total=False):
+class CommentRecord(TypedDict):
     """One reply in a community announcement's reply thread (server returns MessageComment[])."""
 
     id: str
     parentMessageId: str
     authorId: str
     timestamp: int
-    body: str | None
+    body: NotRequired[str | None]
     revoked: bool
     fromMe: bool
 
@@ -1112,7 +1116,7 @@ class WebhookRedriveResult(TypedDict):
 # ── Chat ──────────────────────────────────────────────────────────
 
 
-class ChatActivityPreview(TypedDict, total=False):
+class ChatActivityPreview(TypedDict):
     """The newest thing in a chat when that thing is not a message.
 
     A reply on a community announcement, a reaction, a vote. These move a chat to the top of the
@@ -1123,7 +1127,7 @@ class ChatActivityPreview(TypedDict, total=False):
     senderId: str
     isMe: bool
     timestamp: int
-    parentMessageId: str
+    parentMessageId: NotRequired[str]
 
 
 class ChatSummary(TypedDict):

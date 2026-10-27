@@ -411,14 +411,14 @@ type SendCommentRequest struct {
 
 // CommentRecord is one reply in a community announcement's reply thread. These are
 // add-ons on the announcement rather than chat messages, so they appear in no history
-// read. Body is empty for a deleted reply and for one carrying no text.
+// read. Body is nil for a deleted reply and for one carrying no text.
 type CommentRecord struct {
 	ID              string `json:"id"`
 	ParentMessageID string `json:"parentMessageId"`
 	// AuthorID may be an @lid privacy id, which carries no phone number.
-	AuthorID  string `json:"authorId"`
-	Timestamp int64  `json:"timestamp"`
-	Body      string `json:"body"`
+	AuthorID  string  `json:"authorId"`
+	Timestamp int64   `json:"timestamp"`
+	Body      *string `json:"body,omitempty"`
 	// Revoked is true once the author deletes the reply; it stays in the thread.
 	Revoked bool `json:"revoked"`
 	FromMe  bool `json:"fromMe"`

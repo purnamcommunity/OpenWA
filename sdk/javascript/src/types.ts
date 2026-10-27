@@ -242,6 +242,10 @@ export interface QrCodeResponse {
   /** Data URL, e.g. `data:image/png;base64,…`. */
   qrCode: string;
   status: SessionStatus;
+  /** When the gateway received this QR code (ISO 8601). */
+  issuedAt?: string;
+  /** When WhatsApp stops accepting this QR code (ISO 8601): 60 s for a round's first code, 20 s for each later one. */
+  expiresAt?: string;
 }
 
 export interface PairingCodeResponse {
@@ -722,8 +726,8 @@ export interface CommentRecord {
   /** May be an `@lid` privacy id, which carries no phone number. */
   authorId: string;
   timestamp: number;
-  /** Null for a deleted reply and for one carrying no text. */
-  body: string | null;
+  /** Null or absent for a deleted reply and for one carrying no text. */
+  body?: string | null;
   /** True once the author deletes it; the reply stays in the thread. */
   revoked: boolean;
   fromMe: boolean;

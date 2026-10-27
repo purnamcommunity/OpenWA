@@ -270,6 +270,11 @@ func (r UpdateSessionProxyRequest) MarshalJSON() ([]byte, error) {
 type QrCodeResponse struct {
 	QrCode string        `json:"qrCode"`
 	Status SessionStatus `json:"status"`
+	// IssuedAt is when the gateway received the code (ISO 8601).
+	IssuedAt *string `json:"issuedAt,omitempty"`
+	// ExpiresAt is when WhatsApp stops accepting the code (ISO 8601): 60 s for a round's first
+	// code, 20 s for each later one.
+	ExpiresAt *string `json:"expiresAt,omitempty"`
 }
 
 // PairingCodeResponse carries a phone-pairing code.
