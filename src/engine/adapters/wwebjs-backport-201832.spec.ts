@@ -23,6 +23,10 @@ const WWJS_SRC = path.join(__dirname, '..', '..', '..', 'node_modules', 'whatsap
 const { GROUPS: GROUP_INVITE_GROUPS } = require('../../../scripts/patch-wwebjs-group-invite') as {
   GROUPS: { file: string; find: string; replace: string }[];
 };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { GROUPS: INVITE_MESSAGE_GROUPS } = require('../../../scripts/patch-wwebjs-invite-message') as {
+  GROUPS: { file: string; find: string; replace: string }[];
+};
 /** The patcher's CLI entrypoint — the `--best-effort` cases exercise the process, not just applyBackport. */
 const SCRIPT = path.join(__dirname, '..', '..', '..', 'scripts', 'patch-wwebjs-201832.js');
 
@@ -83,9 +87,10 @@ describe('patch-wwebjs-201832 (build-time backport of upstream #201832)', () => 
     const copy = path.join(tmp, 'whatsapp-web.js');
     fs.cpSync(WWJS_SRC, copy, { recursive: true });
 
-    // patch-wwebjs-group-invite rewrites acceptInvite's join line, which is context for this diff's
-    // Client.js hunk, so it is undone first or the reverse apply below cannot place that hunk.
-    for (const group of GROUP_INVITE_GROUPS) {
+    // patch-wwebjs-group-invite rewrites acceptInvite's join line, and patch-wwebjs-invite-message the
+    // private-invite sends, both inside this diff's Client.js and GroupChat.js hunks, so both are undone
+    // first or the reverse apply below cannot place those hunks.
+    for (const group of [...GROUP_INVITE_GROUPS, ...INVITE_MESSAGE_GROUPS]) {
       const file = path.join(copy, group.file);
       const source = fs.readFileSync(file, 'utf8');
       if (source.includes(group.replace)) fs.writeFileSync(file, source.replace(group.replace, group.find));
