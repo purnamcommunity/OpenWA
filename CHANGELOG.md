@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On whatsapp-web.js, adding a participant whose privacy settings refuse a direct add, in `addParticipants` or `createGroup`, sends them a private group invite again. WhatsApp Web moved the send into a lazy bundle and it takes one options object; the new `patch-wwebjs-invite-message` loads the bundle and passes the object.
 - Index a Baileys clear, delete, archive or unread by the same chat jid as its message key, so the phone applies it (#1891). Thanks @rjsebening.
 - Key Baileys chat writes and read receipts to the gateway's newest stored message when the session holds none in memory (#1891). Thanks @rjsebening.
 - Send a Baileys archive or mark unread without a range for a chat the session knows but holds no message for, where it answered `success: false` (#1891). Thanks @rjsebening.

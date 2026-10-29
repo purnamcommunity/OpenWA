@@ -46,15 +46,18 @@
  *      forward bundle so a forward reaches its page function, gated the same way.
  *  17. `node scripts/patch-wwebjs-pushname-bundle.js --best-effort` when present, loading the lazy
  *      profile bundle so a display-name change reaches its page action, gated the same way.
- *  18. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
+ *  18. `node scripts/patch-wwebjs-invite-message.js --best-effort` when present, loading the lazy
+ *      private-invite bundle and calling its send with one options object, so a participant who
+ *      cannot be added directly is invited instead. It runs after every other Client.js patcher.
+ *  19. `node scripts/patch-baileys-appstate.js --best-effort` when present, the app-state resync
  *      bound, gated the same way.
- *  19. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
+ *  20. `node scripts/patch-baileys-newsletter-create.js --best-effort` when present, the
  *      newsletter-create parse fix.
- *  20. `node scripts/patch-baileys-pairing.js --best-effort` when present, preserving pre-login
+ *  21. `node scripts/patch-baileys-pairing.js --best-effort` when present, preserving pre-login
  *      notification ACKs and refreshing pairing credentials. A partial patch remains fatal.
- *      Steps 18-20 are the Baileys patches. Every patcher runs whenever its script is present,
+ *      Steps 19-21 are the Baileys patches. Every patcher runs whenever its script is present,
  *      whatever ENGINE_TYPE is set to.
- *  21. `node scripts/patch-wwebjs-puppeteer.js` when present. Browser teardown must use the
+ *  22. `node scripts/patch-wwebjs-puppeteer.js` when present. Browser teardown must use the
  *      connected getter required by Puppeteer 25; an unknown source shape aborts the install.
  *      This list is the order `planSteps` plans, which `scripts/postinstall.spec.js` pins
  *      against the patchers on disk.
@@ -248,6 +251,16 @@ function planSteps(root, env = process.env) {
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }
+  const inviteMessagePatcher = path.join(root, 'scripts', 'patch-wwebjs-invite-message.js');
+  if (fs.existsSync(inviteMessagePatcher)) {
+    steps.push({
+      name: 'whatsapp-web.js private invite send (scripts/patch-wwebjs-invite-message.js --best-effort)',
+      command: process.execPath,
+      args: [inviteMessagePatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+
   const baileysAppStatePatcher = path.join(root, 'scripts', 'patch-baileys-appstate.js');
   if (fs.existsSync(baileysAppStatePatcher)) {
     steps.push({
