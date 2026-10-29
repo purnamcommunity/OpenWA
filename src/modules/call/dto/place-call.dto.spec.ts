@@ -28,6 +28,10 @@ describe('PlaceCallDto chatId', () => {
     expect(errorsFor({ chatId: '9@c.us.evil' })).not.toEqual([]);
   });
 
+  it.each(['@c.us', '9198 76543210@c.us', 'a@b@c.us'])('rejects %j, which is not localpart@host', chatId => {
+    expect(errorsFor({ chatId })).toContain('chatId must be a valid chat JID in the form localpart@host');
+  });
+
   it('rejects a missing chatId', () => {
     expect(errorsFor({})).not.toEqual([]);
   });

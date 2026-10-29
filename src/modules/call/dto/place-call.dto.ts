@@ -1,6 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { IsBoolean, IsOptional, IsString, Matches } from 'class-validator';
 import { ToStrictBoolean } from '../../../common/utils/strict-boolean';
+import { CHAT_JID_MESSAGE, CHAT_JID_PATTERN } from '../../message/dto/send-message.dto';
 
 export class PlaceCallDto {
   @ApiProperty({
@@ -12,6 +13,7 @@ export class PlaceCallDto {
     example: '919876543210@c.us',
   })
   @IsString()
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   @Matches(/@(c\.us|lid)$/, {
     message: 'chatId must be a 1:1 user id ending in @c.us or @lid',
   })
