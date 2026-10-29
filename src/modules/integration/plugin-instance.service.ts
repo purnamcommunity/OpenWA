@@ -6,7 +6,8 @@ import { PluginInstance } from './entities/plugin-instance.entity';
 import { ConversationMapping } from './entities/conversation-mapping.entity';
 import { isUniqueViolation } from '../../common/utils/db-errors';
 import { awaitNoOpenTransaction } from '../../common/utils/shared-connection';
-import type { PluginConfigSchema } from '../../core/plugins/plugin.interfaces';
+import type { PluginConfigSchema, PluginManifest } from '../../core/plugins/plugin.interfaces';
+import { restorableConfig } from '../../core/plugins/plugin-activation';
 import { redactSecretConfig, restoreSecretConfig, SECRET_SENTINEL } from '../plugins/redact-config';
 // Type-only: the module binds this class to PLUGIN_INSTANCE_PORT with a `useExisting` alias, which
 // TypeScript does not check, so `implements` is what keeps the two in step.
@@ -123,6 +124,7 @@ export class PluginInstanceService implements PluginInstancePort {
     instanceId: string,
     patch: { enabled?: boolean; sessionScope?: string | null; config?: Record<string, unknown> },
     schema?: PluginConfigSchema,
+    layer?: { net?: PluginManifest['net']; beneath?: Record<string, unknown> },
   ): Promise<PluginInstance | null> {
     const inst = await this.resolve(pluginId, instanceId);
     if (!inst) return null;
@@ -133,7 +135,14 @@ export class PluginInstanceService implements PluginInstancePort {
       // The operator view masks secrets as the sentinel, so a round-tripped config carries '***' for
       // unchanged secrets. Restore the stored values instead of persisting the mask (which would corrupt
       // the credential); genuinely-new values are written as provided.
-      changes.config = restoreSecretConfig(patch.config, inst.config ?? undefined, schema);
+      // A PATCH that points a host key at another origin gets no stored secret back, see restorableConfig.
+      const stored = restorableConfig(
+        inst.config ?? undefined,
+        patch.config,
+        { configSchema: schema, net: layer?.net },
+        layer?.beneath,
+      );
+      changes.config = restoreSecretConfig(patch.config, stored, schema);
     }
     if (Object.keys(changes).length === 0) return inst;
     const { affected } = await this.repo.update({ id: inst.id }, changes as QueryDeepPartialEntity<PluginInstance>);

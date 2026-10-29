@@ -348,6 +348,45 @@ class ClientTest extends TestCase
         $this->assertCount(1, $backend->calls()); // the redirect target was never requested
     }
 
+    /** @dataProvider finalResponseStatuses */
+    public function testOnlyFinal2xxResponsesSucceed(int $status, bool $binary, bool $shouldError): void
+    {
+        $body = $status < 200 || $status === 204 ? '' : ($binary ? "\0PNG_fixture" : '{"ok":true}');
+        $backend = (new MockBackend())->onRaw($status, $body, [
+            'Content-Type' => $binary ? 'application/octet-stream' : 'application/json',
+        ]);
+        $client = $backend->makeClient();
+        $request = fn () => $binary ? $client->status->media('s', 'item') : $client->request('GET', '/api/anything');
+
+        if ($shouldError) {
+            try {
+                $request();
+                $this->fail('Expected an API exception for final HTTP ' . $status);
+            } catch (OpenWAApiException $error) {
+                $this->assertSame($status, $error->getStatus());
+            }
+        } elseif ($binary) {
+            $this->assertSame([
+                'data' => $status === 204 ? '' : "\0PNG_fixture",
+                'contentType' => $status === 204 ? null : 'application/octet-stream',
+            ], $request());
+        } else {
+            $this->assertSame($status === 204 ? null : ['ok' => true], $request());
+        }
+        $this->assertCount(1, $backend->calls());
+    }
+
+    public static function finalResponseStatuses(): array
+    {
+        $cases = [];
+        foreach (['JSON' => false, 'binary' => true] as $kind => $binary) {
+            foreach ([100 => true, 101 => true, 199 => true, 200 => false, 204 => false, 299 => false, 300 => true, 401 => true, 429 => true, 503 => true] as $status => $shouldError) {
+                $cases[$kind . ' ' . $status] = [$status, $binary, $shouldError];
+            }
+        }
+        return $cases;
+    }
+
     public function test204DeleteSucceedsWithNoBody(): void
     {
         $backend = (new MockBackend())->on(204);
@@ -500,6 +539,42 @@ class ClientTest extends TestCase
         $this->assertSame([], (new OpenWARateLimitException('m', 429))->getHeaders());
     }
 
+    public function testAnOversizedRetryAfterBodyDoesNotWrapAround(): void
+    {
+        foreach ([9.3e18, 1.5e19, 1e20] as $seconds) {
+            $backend = (new MockBackend())->on(429, ['statusCode' => 429, 'message' => 'x', 'retryAfterSeconds' => $seconds]);
+            try {
+                $backend->makeClient()->sessions->list();
+                $this->fail('Expected exception');
+            } catch (OpenWARateLimitException $e) {
+                $this->assertSame(PHP_INT_MAX, $e->getRetryAfterSeconds(), "retryAfterSeconds {$seconds}");
+            }
+        }
+    }
+
+    public function testAnOversizedRetryAfterHeaderSaturatesInsteadOfReadingAsZero(): void
+    {
+        // A numeric string of 309 digits or more converts through INF, which casts to 0.
+        $cases = [
+            [str_repeat('9', 19), PHP_INT_MAX],
+            [str_repeat('9', 25), PHP_INT_MAX],
+            [str_repeat('9', 308), PHP_INT_MAX],
+            [str_repeat('9', 309), PHP_INT_MAX],
+            [str_repeat('9', 400), PHP_INT_MAX],
+            [str_repeat('0', 400) . '7', 7],
+            ['0', 0],
+        ];
+        foreach ($cases as [$header, $expected]) {
+            $backend = (new MockBackend())->on(503, ['statusCode' => 503, 'message' => 'x'], ['Retry-After' => $header]);
+            try {
+                $backend->makeClient()->sessions->list();
+                $this->fail('Expected exception');
+            } catch (OpenWAApiException $e) {
+                $this->assertSame($expected, $e->getRetryAfterSeconds(), 'Retry-After of ' . strlen($header) . ' characters');
+            }
+        }
+    }
+
     public function testRetryAfterParsesWithoutTheCtypeExtension(): void
     {
         // The SDK does not require ext-ctype, so a build without it must still
@@ -546,6 +621,27 @@ class ClientTest extends TestCase
         // The JSON literal null is JSON: it decodes to null, not to the text "null".
         $backend->onRaw(200, 'null', ['Content-Type' => 'application/json']);
         $this->assertNull($client->request('GET', '/api/anything'));
+    }
+
+    public function testATypedResourceRefusesASuccessBodyThatIsNotJson(): void
+    {
+        $backend = new MockBackend();
+        $client = $backend->makeClient();
+        // A baseUrl that points at a page server answers every route 200 with HTML.
+        $backend->onRaw(200, '<html>sign in</html>', ['Content-Type' => 'text/html']);
+        $backend->onRaw(200, '<html>sign in</html>', ['Content-Type' => 'text/html']);
+        $calls = [
+            fn () => $client->sessions->get('s'),
+            fn () => $client->auth(),
+        ];
+        foreach ($calls as $call) {
+            try {
+                $call();
+                $this->fail('Expected an OpenWAException for a body that is not JSON');
+            } catch (\OpenWA\Exceptions\OpenWAException $e) {
+                $this->assertStringContainsString('non-JSON response for', $e->getMessage());
+            }
+        }
     }
 
     public function testAnErrorBodyThatIsNotJsonIsKeptAsText(): void
@@ -737,6 +833,125 @@ class ClientTest extends TestCase
             $this->assertFalse($failedAfterTimeout($started), "{$type} start, no time elapsed");
             $this->assertTrue($failedAfterTimeout($started - 2_000_000_000), "{$type} start, 2 s elapsed");
         }
+    }
+
+    /** @dataProvider responseBodyKinds */
+    public function testAnInjectedStreamingClientClassifiesBodyTimeouts(string $kind): void
+    {
+        $this->withNativeResponse($kind, false, function (\OpenWA\Client $client) use ($kind): void {
+            if ($kind === 'error') {
+                try {
+                    $client->request('GET', '/api/anything');
+                    $this->fail('Expected the complete 503 response');
+                } catch (OpenWAServiceUnavailableException $error) {
+                    $this->assertSame(503, $error->getStatus());
+                    $this->assertSame('fixture failure', $error->getBody()['message']);
+                }
+            } elseif ($kind === 'binary') {
+                $this->assertSame(
+                    ['data' => "\0PNG_fixture", 'contentType' => 'application/octet-stream'],
+                    $client->status->media('s', 'item')
+                );
+            } else {
+                $this->assertSame(['ok' => true], $client->request('GET', '/api/anything'));
+            }
+        });
+
+        $this->withNativeResponse($kind, true, function (\OpenWA\Client $client) use ($kind): void {
+            try {
+                $kind === 'binary' ? $client->status->media('s', 'item') : $client->request('GET', '/api/anything');
+                $this->fail('Expected a body timeout, not partial response data');
+            } catch (OpenWATimeoutException $error) {
+                $this->assertSame(0.1, $error->getTimeout());
+            }
+        });
+    }
+
+    public static function responseBodyKinds(): array
+    {
+        return ['JSON' => ['json'], 'binary' => ['binary'], 'error' => ['error']];
+    }
+
+    private function withNativeResponse(string $kind, bool $stall, callable $check): void
+    {
+        $server = <<<'PHP'
+$socket = stream_socket_server('tcp://127.0.0.1:0', $errno, $error);
+if ($socket === false) { exit(2); }
+fwrite(STDOUT, stream_socket_get_name($socket, false) . "\n");
+fflush(STDOUT);
+$connection = stream_socket_accept($socket, 2.0);
+if ($connection === false) { fclose($socket); exit(3); }
+stream_set_timeout($connection, 1);
+$request = '';
+while (!str_contains($request, "\r\n\r\n") && strlen($request) < 16_384) {
+    $part = fread($connection, 1024);
+    if ($part === false || $part === '') { break; }
+    $request .= $part;
+}
+if (!str_contains($request, "\r\n\r\n")) { fclose($connection); fclose($socket); exit(4); }
+$body = match ($argv[1]) {
+    'binary' => "\0PNG_fixture",
+    'error' => '{"statusCode":503,"message":"fixture failure","error":"Service Unavailable"}',
+    default => '{"ok":true}',
+};
+$status = $argv[1] === 'error' ? '503 Service Unavailable' : '200 OK';
+$type = $argv[1] === 'binary' ? 'application/octet-stream' : 'application/json';
+@fwrite($connection, "HTTP/1.1 {$status}\r\nContent-Type: {$type}\r\nContent-Length: " . strlen($body) . "\r\nConnection: close\r\n\r\n");
+@fwrite($connection, substr($body, 0, 1));
+fflush($connection);
+if ($argv[2] === '1') { usleep(500_000); }
+@fwrite($connection, substr($body, 1));
+fclose($connection);
+fclose($socket);
+PHP;
+        $process = proc_open(
+            [PHP_BINARY, '-n', '-r', $server, $kind, $stall ? '1' : '0'],
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes,
+            null,
+            ['TZ' => 'UTC']
+        );
+        $this->assertIsResource($process);
+        stream_set_blocking($pipes[1], false);
+        stream_set_blocking($pipes[2], false);
+        try {
+            $address = '';
+            $deadline = hrtime(true) + 2_000_000_000;
+            while (!str_contains($address, "\n") && hrtime(true) < $deadline) {
+                $address .= (string) fread($pipes[1], 256);
+                $this->assertLessThan(512, strlen($address));
+                usleep(2_000);
+            }
+            $this->assertMatchesRegularExpression('/\A127\.0\.0\.1:[1-9][0-9]{0,4}\n\z/', $address);
+            $http = new \GuzzleHttp\Client([
+                'handler' => \GuzzleHttp\HandlerStack::create(new \GuzzleHttp\Handler\StreamHandler()),
+                'stream' => true,
+            ]);
+            $check(new \OpenWA\Client([
+                'baseUrl' => 'http://' . trim($address),
+                'apiKey' => 'fixture-key',
+                'timeout' => $stall ? 0.1 : 1.0,
+                'httpClient' => $http,
+            ]));
+        } finally {
+            $deadline = hrtime(true) + 1_000_000_000;
+            while (proc_get_status($process)['running'] && hrtime(true) < $deadline) {
+                usleep(5_000);
+            }
+            if (proc_get_status($process)['running']) {
+                proc_terminate($process);
+                usleep(30_000);
+                if (proc_get_status($process)['running']) {
+                    proc_terminate($process, 9);
+                }
+            }
+            $serverError = (string) stream_get_contents($pipes[2], 8192);
+            foreach ($pipes as $pipe) {
+                fclose($pipe);
+            }
+            proc_close($process);
+        }
+        $this->assertSame('', $serverError);
     }
 
     private static function clientWhoseHandlerFails(\Throwable $failure, float $timeout, float $afterSeconds): \OpenWA\Client

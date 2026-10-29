@@ -213,6 +213,9 @@
       "read": "Gelesen",
       "failed": "Fehlgeschlagen"
     },
+    "today": "Heute",
+    "switchSession": "Sitzung wechseln",
+    "searchMessages": "Nachrichten durchsuchen",
     "clearSearch": "Suche leeren",
     "filters": {
       "label": "Chats filtern",
@@ -223,11 +226,13 @@
       "unknown": "Unbekannt"
     },
     "noFilterResults": "Keine Chats für diesen Filter",
+    "contactInfo": "Kontaktinfo",
     "moreActions": "Weitere Aktionen",
     "copyChatId": "Chat-ID kopieren",
     "chatIdCopied": "Chat-ID kopiert",
     "copyFailed": "Kopieren in die Zwischenablage fehlgeschlagen",
     "closeChat": "Chat schließen",
+    "phone": "Telefonnummer",
     "chatId": "Chat-ID",
     "newChat": {
       "title": "Neuer Chat",
@@ -252,6 +257,12 @@
       "created": "Gruppe „{{name}}“ erstellt",
       "createFailed": "Gruppe konnte nicht erstellt werden",
       "removeParticipant": "{{name}} entfernen"
+    },
+    "sessionPicker": {
+      "searchPlaceholder": "Sitzung suchen...",
+      "noMatch": "Keine passende Sitzung",
+      "addTitle": "Weitere Nummer koppeln",
+      "addHint": "Sitzung anlegen und per QR-Code verbinden"
     },
     "group": {
       "info": "Gruppeninfo",
@@ -663,7 +674,6 @@
       "message.revoked": "Wenn eine Nachricht für alle gelöscht wird",
       "message.reaction": "Wenn eine Reaktion hinzugefügt, geändert oder entfernt wird",
       "message.edited": "Wenn eine Nachricht bearbeitet wird",
-      "message.poll_vote": "Wenn jemand in einer Umfrage abstimmt oder seine Stimme ändert",
       "session.status": "Wenn sich der Status einer Sitzung ändert",
       "session.qr": "Wenn ein QR-Code erstellt wird",
       "session.authenticated": "Wenn eine Sitzung gekoppelt und bereit ist",
@@ -672,6 +682,7 @@
       "session.restriction": "Wenn WhatsApp das Konto einschränkt oder eine Einschränkung aufhebt",
       "presence.update": "Wenn ein abonnierter Chat online geht, tippt oder offline geht",
       "event.response": "Wenn ein Gast auf eine WhatsApp-Veranstaltung antwortet (Zusage, Absage, Vielleicht)",
+      "poll.vote": "Wenn jemand bei einer Umfrage Optionen auswählt oder abwählt (whatsapp-web.js)",
       "group.join": "Wenn Teilnehmer einer Gruppe beitreten oder hinzugefügt werden",
       "group.leave": "Wenn Teilnehmer eine Gruppe verlassen oder entfernt werden",
       "group.update": "Wenn sich Name, Beschreibung oder Einstellungen einer Gruppe ändern",
@@ -1026,7 +1037,7 @@
     "single": {
       "title": "Einzelnes Konto prüfen",
       "phoneLabel": "Telefonnummer",
-      "phonePlaceholder": "z. B. 919876543210 oder 6281234567890 (mit Ländervorwahl)",
+      "phonePlaceholder": "z. B. 919876543210 oder 6281234567890",
       "check": "Prüfen",
       "checking": "Wird geprüft...",
       "autoPrefix": "<strong>+91</strong> bei 10-stelligen Nummern automatisch voranstellen (12-stellige Nummern bleiben unverändert)",

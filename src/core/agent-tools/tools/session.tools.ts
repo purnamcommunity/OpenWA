@@ -121,7 +121,8 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
           .optional()
           .describe(
             'Specific message IDs to acknowledge. Baileys acknowledges individual messages, so without ' +
-              'this only the newest received message still held in memory gets a receipt.',
+              'this only the newest received message gets a receipt: the one held in memory, else the ' +
+              'newest received one the gateway stored.',
           ),
       }),
       handler: input =>
@@ -149,7 +150,7 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID (e.g. 1234567890@c.us)'),
+        chatId: chatJidSchema.describe('Chat JID (e.g. 1234567890@c.us)'),
         state: z
           .enum(['typing', 'recording', 'paused'])
           .describe("'typing' or 'recording' shows the indicator; 'paused' clears it"),

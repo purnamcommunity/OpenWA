@@ -31,6 +31,8 @@ let createBody: Record<string, unknown> | undefined;
 let createGate: Promise<void> | undefined;
 let updateBodies: Record<string, unknown>[] = [];
 let updateStatus = 200;
+let updateGate: Promise<void> | undefined;
+const updatePaths: string[] = [];
 
 function installFetchStub(): void {
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -44,10 +46,12 @@ function installFetchStub(): void {
     }
     if (init?.method === 'PUT' && path.startsWith('/api/auth/api-keys/')) {
       updateBodies.push(JSON.parse(String(init.body)));
-      if (updateStatus === 409) {
-        return Promise.resolve(jsonResponse({ message: 'Cannot remove the last active admin key' }, 409));
-      }
-      return Promise.resolve(jsonResponse(billingBot));
+      updatePaths.push(path);
+      const status = updateStatus;
+      return (updateGate ?? Promise.resolve()).then(() => {
+        if (status === 409) return jsonResponse({ message: 'Cannot remove the last active admin key' }, 409);
+        return jsonResponse(billingBot);
+      });
     }
     if (path === '/api/auth/api-keys') {
       if (listStatus !== 200) {
@@ -85,6 +89,8 @@ afterEach(() => {
   createGate = undefined;
   updateBodies = [];
   updateStatus = 200;
+  updateGate = undefined;
+  updatePaths.length = 0;
   window.sessionStorage.removeItem('openwa_api_key');
 });
 
@@ -696,4 +702,94 @@ test('a chat list past the gateway limit blocks Create and says how many it hold
 
   fireEvent.change(screen.getByLabelText('Chat access (optional)'), { target: { value: '6281234' } });
   await rtl.waitFor(() => assert.equal(create.disabled, false));
+});
+
+for (const dismissal of ['Cancel', 'Close'] as const) {
+  test(`a completed key update keeps the editor opened after ${dismissal}`, async () => {
+    const { screen, fireEvent, within, waitFor, act } = rtl;
+    keyList = [billingBot, { ...billingBot, id: 'key-2', name: 'support-bot', keyPrefix: 'owa_k1cd' }];
+    let release!: () => void;
+    updateGate = new Promise<void>(resolve => (release = resolve));
+    renderApiKeys();
+    await screen.findByText('owa_k1ab****');
+    const firstRow = screen.getByText('billing-bot').closest('tr') as HTMLElement;
+    fireEvent.click(within(firstRow).getByTitle('Edit access'));
+    const firstDialog = await screen.findByRole('dialog');
+    fireEvent.change(within(firstDialog).getByLabelText('Role'), { target: { value: 'viewer' } });
+    fireEvent.click(within(firstDialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => assert.equal(updateBodies.length, 1));
+    fireEvent.click(within(firstDialog).getByRole('button', { name: dismissal }));
+    assert.equal(screen.queryByRole('dialog') === null, true);
+
+    const secondRow = screen.getByText('support-bot').closest('tr') as HTMLElement;
+    fireEvent.click(within(secondRow).getByTitle('Edit access'));
+    const secondDialog = await screen.findByRole('dialog');
+    within(secondDialog).getByText('support-bot');
+    assert.equal(within(secondDialog).getByLabelText<HTMLSelectElement>('Role').disabled, true);
+    await act(async () => {
+      release();
+      await updateGate;
+    });
+    await waitFor(() => assert.equal(queryClient!.isMutating(), 0));
+    assert.equal(
+      screen.queryByRole('dialog') === secondDialog,
+      true,
+      'the completed key update closed the replacement editor',
+    );
+    within(secondDialog).getByText('support-bot');
+    assert.equal(within(secondDialog).getByLabelText<HTMLSelectElement>('Role').value, 'operator');
+    assert.deepEqual(updatePaths, ['/api/auth/api-keys/key-1']);
+    assert.deepEqual(updateBodies, [{ role: 'viewer' }]);
+  });
+}
+
+test('a successful key update closes its own editor after the response settles', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  let release!: () => void;
+  updateGate = new Promise<void>(resolve => (release = resolve));
+  const save = await openEdit(billingBot);
+  fireEvent.change(screen.getByLabelText('Role'), { target: { value: 'viewer' } });
+  fireEvent.click(save);
+  await waitFor(() => assert.equal(updateBodies.length, 1));
+  assert.equal(screen.getByLabelText<HTMLSelectElement>('Role').disabled, true);
+  assert.equal(save.disabled, true);
+  fireEvent.click(save);
+  assert.equal(updateBodies.length, 1, 'a pending save sent another update');
+  release();
+  await waitFor(() => assert.equal(screen.queryByRole('dialog') === null, true));
+  assert.deepEqual(updatePaths, ['/api/auth/api-keys/key-1']);
+  assert.deepEqual(updateBodies, [{ role: 'viewer' }]);
+});
+
+test('cancelling an unsaved key edit closes it without an update', async () => {
+  const { screen, fireEvent, within } = rtl;
+  await openEdit(billingBot);
+  fireEvent.change(screen.getByLabelText('Role'), { target: { value: 'viewer' } });
+  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+  assert.equal(screen.queryByRole('dialog') === null, true);
+  assert.deepEqual(updateBodies, []);
+});
+
+test('a refused delayed key update keeps the draft available for retry and cancellation', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  updateStatus = 409;
+  let release!: () => void;
+  updateGate = new Promise<void>(resolve => (release = resolve));
+  const save = await openEdit({ ...billingBot, role: 'admin' });
+  const dialog = screen.getByRole('dialog');
+  fireEvent.change(within(dialog).getByLabelText('Role'), { target: { value: 'viewer' } });
+  fireEvent.click(save);
+  await waitFor(() => assert.equal(updateBodies.length, 1));
+  assert.equal(within(dialog).getByLabelText<HTMLSelectElement>('Role').disabled, true);
+  assert.equal(save.disabled, true);
+  release();
+  await screen.findByText('Cannot remove the last active admin key');
+  await waitFor(() => assert.equal(save.disabled, false));
+  assert.equal(screen.getByRole('dialog') === dialog, true);
+  assert.equal(within(dialog).getByLabelText<HTMLSelectElement>('Role').value, 'viewer');
+  assert.equal(within(dialog).getByLabelText<HTMLSelectElement>('Role').disabled, false);
+  assert.deepEqual(updatePaths, ['/api/auth/api-keys/key-1']);
+  assert.deepEqual(updateBodies, [{ role: 'viewer' }]);
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+  assert.equal(screen.queryByRole('dialog') === null, true);
 });

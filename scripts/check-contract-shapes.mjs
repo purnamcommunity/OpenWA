@@ -97,6 +97,7 @@ const MAPPINGS = {
     EditMessageRequest: 'EditMessageDto',
     ForwardMessageRequest: 'ForwardMessageDto',
     GroupDescriptionRequest: 'GroupDescriptionDto',
+    GroupMemberLabelRequest: 'GroupMemberLabelDto',
     GroupInfo: 'GroupInfoDto',
     GroupJoinInfo: 'GroupJoinInfoDto',
     GroupMembershipRequest: 'GroupMembershipRequestDto',
@@ -630,6 +631,7 @@ const JAVA_MAPPING = {
   EditMessageRequest: 'EditMessageDto',
   ForwardMessageRequest: 'ForwardMessageDto',
   GroupDescriptionRequest: 'GroupDescriptionDto',
+  GroupMemberLabelRequest: 'GroupMemberLabelDto',
   GroupInfo: 'GroupInfoDto',
   GroupJoinInfo: 'GroupJoinInfoDto',
   GroupMembershipRequest: 'GroupMembershipRequestDto',
@@ -812,25 +814,26 @@ function countUnbalanced(s) {
 
 const MAX_DEPTH = 4;
 
-/** Sort enum members the same way on both sides: numerically when every member is numeric, else
- *  lexicographically. The two token builders previously both used default .sort() (lexicographic),
- *  which ordered 10 before 2 - consistent by accident, and unable to recognize unquoted numeric
- *  unions in hand types at all, leaving numeric enums ungated.
- */
+/** Preserve JSON kinds while sorting numeric enums numerically and other enums by their encoded values. */
 const sortEnumMembers = members =>
-  members.every(m => /^-?\d+(\.\d+)?$/.test(m))
-    ? members.slice().sort((a, b) => Number(a) - Number(b))
-    : members.slice().sort();
+  members.every(member => typeof member === 'number')
+    ? members.slice().sort((a, b) => a - b)
+    : members.slice().sort((a, b) => {
+        const left = JSON.stringify(a);
+        const right = JSON.stringify(b);
+        return left < right ? -1 : left > right ? 1 : 0;
+      });
+const enumToken = members => `enum(${JSON.stringify(sortEnumMembers(members))})`;
 
 export function handToken(text, types, depth = 0) {
   const t = text.trim().replace(/;$/, '');
   if (t.endsWith('[]')) return `array<${handToken(t.slice(0, -2), types, depth)}>`;
   if (/^(string|number|boolean|unknown|any)$/.test(t)) return t;
-  const literals = [...t.matchAll(/'([^']+)'/g)].map(m => m[1]);
+  const literals = [...t.matchAll(/'([^']*)'|"([^"]*)"/g)].map(m => m[1] ?? m[2]);
   // Unquoted numeric literals (font enums like 0|1|2|6) count too.
-  const numerics = [...t.matchAll(/(?<![\w.'])(-?\d+(?:\.\d+)?)(?![\w.])/g)].map(m => m[1]);
-  if (literals.length && literals.length === t.split('|').length) return `enum(${sortEnumMembers(literals).join(',')})`;
-  if (numerics.length && numerics.length === t.split('|').length) return `enum(${sortEnumMembers(numerics).join(',')})`;
+  const numerics = [...t.matchAll(/(?<![\w.'"])(-?\d+(?:\.\d+)?)(?![\w.])/g)].map(m => Number(m[1]));
+  if (literals.length && literals.length === t.split('|').length) return enumToken(literals);
+  if (numerics.length && numerics.length === t.split('|').length) return enumToken(numerics);
   if (t.includes('|')) {
     const parts = t
       .split('|')
@@ -873,7 +876,7 @@ function baseSchemaToken(node, schemas, depth = 0) {
   if (node.enum) {
     // OpenAPI 3.0 lists null among the members of a nullable enum; schemaToken adds the null arm back.
     const members = node.nullable === true ? node.enum.filter(m => m !== null) : node.enum;
-    return `enum(${sortEnumMembers(members.map(String)).join(',')})`;
+    return enumToken(members);
   }
   if (node.type === 'array') return `array<${schemaToken(node.items, schemas, depth)}>`;
   if (node.anyOf || node.oneOf) {
@@ -912,7 +915,21 @@ export function parseObjectToken(token) {
   const members = {};
   let depth = 0;
   let buffer = '';
+  let quoted = false;
+  let escaped = false;
   for (const ch of inner) {
+    if (quoted) {
+      buffer += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') quoted = false;
+      continue;
+    }
+    if (ch === '"') {
+      quoted = true;
+      buffer += ch;
+      continue;
+    }
     if (ch === ',' && depth === 0) {
       pushMember();
       continue;
@@ -936,7 +953,7 @@ export function parseObjectToken(token) {
  *  above all, on every client at once. So does a null arm after an enum or an array: a nullable
  *  field was skipped, and with it the vocabulary of SessionProxy.proxyType. */
 function isSimpleToken(token) {
-  return /^(string|number|boolean|unknown|any)(\|null)?$|^enum\([^)]*\)(\|null)?$|^array<((string|number|boolean)(\|null)?|enum\([^)]*\))>(\|null)?$/.test(
+  return /^(string|number|boolean|unknown|any)(\|null)?$|^enum\(\[[\s\S]*\]\)(\|null)?$|^array<((string|number|boolean)(\|null)?|enum\(\[[\s\S]*\]\))>(\|null)?$/.test(
     token,
   );
 }
@@ -985,7 +1002,9 @@ export function comparePair(
         // "86400" for a field the contract types as a number. Those components stay `Integer`
         // here; the literal set is gated on every other client. String enums ARE modelled as Java
         // enums and keep comparing by presence.
-        if (/^enum\(-?\d+(?:\.\d+)?(?:,-?\d+(?:\.\d+)?)*\)$/.test(contract) && hand === 'number') {
+        const enumMembers = /^enum\((\[[\s\S]*\])\)$/.exec(contract)?.[1];
+        const members = enumMembers ? JSON.parse(enumMembers) : [];
+        if (hand === 'number' && members.length > 0 && members.every(value => typeof value === 'number')) {
           hand = contract;
         }
       }
@@ -1177,8 +1196,8 @@ function pythonToken(text, resolve, depth = 0) {
       // members went unread fell through to a non-simple token, which comparePair then skips, so
       // the field silently stopped being gated.
       const quoted = [...lit[1].matchAll(/["']([^"']+)["']/g)].map(m => m[1]);
-      const vals = quoted.length ? quoted : [...lit[1].matchAll(/-?\d+(?:\.\d+)?/g)].map(m => m[0]);
-      if (vals.length) return `enum(${sortEnumMembers(vals).join(',')})`;
+      const vals = quoted.length ? quoted : [...lit[1].matchAll(/-?\d+(?:\.\d+)?/g)].map(m => Number(m[0]));
+      if (vals.length) return enumToken(vals);
     }
     const lst = t.match(/^(?:List|list)\[(.+)\]$/s);
     if (lst) return `array<${pythonToken(lst[1], resolve, depth + 1)}>`;
@@ -1238,14 +1257,14 @@ export function parseGoTypes(sources) {
         // fonts). Reading only the quoted form left every numeric Go enum resolving to plain
         // `number`, which reports as drift against an enum schema and cannot be satisfied.
         const m = line.match(/^\s*\w+\s+(\w+)\s+=\s+(?:["']([^"']+)["']|(-?\d+(?:\.\d+)?))\s*(?:\/\/.*)?$/);
-        if (m) (constGroups[m[1]] ??= []).push(m[2] ?? m[3]);
+        if (m) (constGroups[m[1]] ??= []).push(m[2] ?? Number(m[3]));
       }
     }
   }
 
   // defined scalar types whose consts exist become enums
   for (const [tname, vals] of Object.entries(constGroups)) {
-    if (scalarAliases[tname]) scalarAliases[tname] = `enum(${sortEnumMembers([...new Set(vals)]).join(',')})`;
+    if (scalarAliases[tname]) scalarAliases[tname] = enumToken([...new Set(vals)]);
   }
 
   const expand = (typeText, depth = 0) => {
@@ -1329,7 +1348,7 @@ export function parseJavaTypes(sources) {
         // a wire member. An annotated @SerializedName("unknown") is a real member and counts above.
         if (bare && bare[1] !== 'UNKNOWN') members.push(bare[1]);
       }
-      if (members.length) enums[m[1]] = `enum(${sortEnumMembers([...new Set(members)]).join(',')})`;
+      if (members.length) enums[m[1]] = enumToken([...new Set(members)]);
     }
   }
   for (const raw of sources) {

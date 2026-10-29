@@ -297,7 +297,7 @@ export class InfraConfigDatabaseDto {
   @ApiProperty({ example: 'openwa' })
   username!: string;
 
-  @ApiProperty({ description: 'Database name, or the SQLite file path.', example: 'openwa' })
+  @ApiProperty({ description: 'Database name under PostgreSQL; empty under SQLite.', example: 'openwa' })
   database!: string;
 
   @ApiProperty({ example: 'public' })

@@ -8,7 +8,7 @@ import { type createLogger } from '../../common/services/logger.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { type WhatsAppWebJsConfig } from './whatsapp-web-js.adapter';
-import { toCapturedPageError } from './wwebjs-lifecycle';
+import { PAGE_RELOADING_MESSAGE, isNavigationError, toCapturedPageError } from './wwebjs-lifecycle';
 
 /**
  * Shared host surface for the delegates extracted from WhatsAppWebJsAdapter (./wwebjs-groups,
@@ -55,9 +55,23 @@ export function requireClient(host: WwebjsEngineHost): Client {
 }
 
 /**
+ * Answer the retryable 409 the adapter gives inside the navigation window when the error says the page
+ * navigated under the call, and return for any other error. A call already in flight when WhatsApp Web
+ * reloads dies with Puppeteer's navigation error before the window is stamped, so it would otherwise be a
+ * bare 500, or, where a catch folds a failed lookup into "not found", a 404 for a group, contact or label
+ * that exists. A navigation is not a death: nothing is reported.
+ */
+export function rethrowIfNavigation(host: WwebjsEngineHost, error: unknown): void {
+  // A page the host already reads as dead is reported as dead, whatever the message says.
+  if (isNavigationError(error) && !host.isPageTransportError(error))
+    throw new EngineNotReadyError(PAGE_RELOADING_MESSAGE);
+}
+
+/**
  * Run a client operation, classifying a dead page/transport as the documented 503 plus an early
  * death signal instead of an opaque 500 under a status that still says READY - the split every
- * chats read already makes (#1081). Other errors propagate unchanged.
+ * chats read already makes (#1081), and a page that navigated under the call as the 409 of
+ * {@link rethrowIfNavigation}. Other errors propagate unchanged.
  *
  * Lives here rather than per delegate: ./wwebjs-channels, ./wwebjs-profile and ./wwebjs-status each
  * held a byte-identical private copy, and ./wwebjs-contacts needed a fourth.
@@ -66,6 +80,7 @@ export async function withPage<T>(host: WwebjsEngineHost, context: string, op: (
   try {
     return await op();
   } catch (error) {
+    rethrowIfNavigation(host, error);
     if (host.isPageTransportError(error)) {
       host.reportIfPageTransportError(error, context);
       throw new EngineTransportError(`Transport died during ${context}`);

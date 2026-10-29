@@ -21,6 +21,7 @@ import {
   BUNDLED_SERVICE_ENV,
   DockerService,
   MANAGED_DOCKER_PROFILES,
+  datastoreInUse,
   hostPinnedElsewhere,
   namesBundledContainer,
 } from '../docker';
@@ -30,8 +31,10 @@ import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { SaveConfigDto } from './dto/save-config.dto';
 import { assertNoDefaultSecretsInProduction } from '../../config/bootstrap-security';
+import { s3EndpointError, validateEnv } from '../../config/env.validation';
 import { BLANK_SHADOWED_ENV_KEYS, isEnvPinned, isOsProvidedEnv } from '../../config/env-precedence';
 import { resolveStorageRoot } from '../../config/storage-root';
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
@@ -83,6 +86,9 @@ interface SavedConfigResponse {
   engine: { type: string; headless: boolean; sessionDataPath: string; browserArgs: string };
 }
 
+// Errors of replacing the overlay by rename that the in-place write v0.25.0 used can still get past.
+const IN_PLACE_FALLBACK_CODES = ['EBUSY', 'EXDEV', 'EACCES', 'EPERM', 'EROFS'];
+
 @ApiTags('infrastructure')
 @Controller('infra')
 // Every route here is deployment-global (data export/import, infra config, service orchestration),
@@ -127,14 +133,16 @@ export class InfraConfigController {
     // Secrets (passwords, S3 keys) are never returned; the form shows a "set" indicator
     // and an empty submission preserves the stored value (see saveConfig). This lets
     // the dashboard hydrate the form so a save no longer overwrites unseen fields (#226).
+    const databaseType = effective('DATABASE_TYPE') === 'postgres' ? 'postgres' : 'sqlite';
     return {
       database: {
-        type: effective('DATABASE_TYPE') === 'postgres' ? 'postgres' : 'sqlite',
+        type: databaseType,
         ...savedBuiltInMode('database', saved),
         host: effective('DATABASE_HOST') || '',
         port: effective('DATABASE_PORT') || '',
         username: effective('DATABASE_USERNAME') || '',
-        database: effective('DATABASE_NAME') || '',
+        // The form sends this back for a PostgreSQL save; under SQLite the key holds a file path, not a name.
+        database: databaseType === 'postgres' ? effective('DATABASE_NAME') || '' : '',
         schema: effective('POSTGRES_SCHEMA') || 'public',
         poolSize: Number(effective('DATABASE_POOL_SIZE')) || 10,
         sslEnabled: effective('DATABASE_SSL') === 'true',
@@ -182,8 +190,8 @@ export class InfraConfigController {
     status: 400,
     description:
       'Rejected before anything was written: an invalid or unknown field, an unknown engine type, a value with a ' +
-      'line break or one that cannot be stored, a configuration that would not boot in production, or a media ' +
-      'storage path the app cannot write to.',
+      'line break or one that cannot be stored, a configuration that would not boot in production or that the boot ' +
+      'environment validation rejects, or a media storage path the app cannot write to.',
   })
   @ApiBody({ description: 'Configuration to save', type: SaveConfigDto })
   saveConfig(@Body() config: SaveConfigDto): { message: string; saved: boolean; envPath: string; profiles: string[] } {
@@ -211,6 +219,7 @@ export class InfraConfigController {
       this.assertNoLineBreakValues(updates);
       const merged = this.mergeWithExisting(existing, ctx);
       this.assertProductionBootable(merged);
+      this.assertBootValidates(existing, merged);
       this.assertStorageRootWritable(updates, merged);
       this.persistGeneratedEnv(envPath, merged);
       this.auditConfigSaved(config, profiles);
@@ -346,6 +355,29 @@ export class InfraConfigController {
     }
   }
 
+  // The environment validation the next boot runs (env.validation.ts), applied to the same view of the merged result.
+  // Without it a save the dashboard accepts, a PostgreSQL selection with no host or a pool size that is not a plain
+  // integer, crash-loops the instance and the dashboard that could undo it.
+  // The boot only reports an S3 endpoint the client cannot use, so an instance that stored one keeps starting and keeps
+  // saving. The dashboard sends the storage type and endpoint with every save, so the endpoint is refused only when this
+  // save changes what the boot reads for it or newly selects S3; resubmitting it, an environment pin the page cannot
+  // change, or a switch to local storage goes through.
+  private assertBootValidates(existing: Record<string, string>, merged: Record<string, string>): void {
+    const bootValue = this.bootValueReader(merged);
+    const before = this.bootValueReader(existing);
+    try {
+      const env = Object.fromEntries(Object.keys({ ...process.env, ...merged }).map(key => [key, bootValue(key)]));
+      validateEnv(env);
+      const endpointChanged = (before('S3_ENDPOINT') ?? '').trim() !== (bootValue('S3_ENDPOINT') ?? '').trim();
+      const newlyS3 = before('STORAGE_TYPE') !== 's3' && bootValue('STORAGE_TYPE') === 's3';
+      const s3Problem = endpointChanged || newlyS3 ? s3EndpointError(env) : null;
+      if (s3Problem) throw new Error(s3Problem);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new BadRequestException(`Refusing to save a configuration that fails boot validation. ${detail}`);
+    }
+  }
+
   // A storage path the app cannot create or write is refused by the next boot before Nest builds, which
   // crash-loops the instance with the dashboard that could undo the save down. Only a path this save
   // names is judged, and only when the boot will read it: a value the host or the project .env pins
@@ -395,8 +427,47 @@ export class InfraConfigController {
 
     // Write to data/ so it persists across container restarts. Owner-only (0600): this file holds
     // the DB/S3/Redis credentials, so it must not be world-readable between save and next restart.
-    writeSecretFile(envPath, contents);
+    // Staged beside the target and renamed over it: a write that fails part-way (disk full) would
+    // otherwise leave a truncated overlay for the next boot to load. A symlink is written through to its
+    // target. A file the filesystem will not replace by rename (a single-file bind mount, another device) or
+    // that cannot be staged beside (a directory the app cannot write, holding a file it can) is written in
+    // place, as before. Any other failure, a full disk included, leaves the previous overlay untouched.
+    const target = this.overlayTarget(envPath);
+    if (target === undefined) {
+      writeSecretFile(envPath, contents);
+    } else {
+      const staged = `${target}.${randomUUID()}.tmp`;
+      try {
+        writeSecretFile(staged, contents);
+        fs.renameSync(staged, target);
+      } catch (error) {
+        try {
+          fs.rmSync(staged, { force: true });
+        } catch {
+          // Keep the original write or rename error if cleanup also fails.
+        }
+        if (!IN_PLACE_FALLBACK_CODES.includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+        writeSecretFile(target, contents);
+      }
+    }
     this.logger.log('Configuration saved', { envPath });
+  }
+
+  // The file a save replaces: the overlay itself, or what a symlink at its path points to. Undefined for a link
+  // that points nowhere, which only an in-place write through it can create.
+  private overlayTarget(envPath: string): string | undefined {
+    let isLink: boolean;
+    try {
+      isLink = fs.lstatSync(envPath).isSymbolicLink();
+    } catch {
+      return envPath;
+    }
+    if (!isLink) return envPath;
+    try {
+      return fs.realpathSync(envPath);
+    } catch {
+      return undefined;
+    }
   }
 
   private auditConfigSaved(config: SaveConfigDto, profiles: string[]): void {
@@ -457,7 +528,9 @@ export class InfraConfigController {
       const bundled = BUNDLED_SERVICE_ENV[profile];
       if (!bundled) return false;
       const [key] = bundled;
-      return namesBundledContainer(profile, isEnvPinned(key) ? process.env[key] : (saved ??= readGeneratedEnv())[key]);
+      const bootValue = this.bootValueReader((saved ??= readGeneratedEnv()));
+      // A host that still names the container keeps it only while the next boot uses that datastore.
+      return datastoreInUse(profile, bootValue) && namesBundledContainer(profile, bootValue(key));
     };
     const requestedRemoval = body?.profilesToRemove || [];
     const keptRunning = requestedRemoval.filter(dialsBundled);

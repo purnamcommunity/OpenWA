@@ -451,6 +451,49 @@ describe('createExportStream and the entry-count limit this deployment lowered',
   });
 });
 
+// A backend that does not report a length (ExportFileSource.size is optional) still exports a file the
+// destination may refuse, so the warning is worked out from the bytes actually read.
+describe('createExportStream warns about import limits for files of unreported size', () => {
+  const exportWithLimits = async (limits: Record<string, string>, sizes: number[]) => {
+    const previous = Object.fromEntries(Object.keys(limits).map(key => [key, process.env[key]]));
+    Object.assign(process.env, limits);
+    const logger = makeLogger();
+    try {
+      const names = sizes.map((_, index) => `media/unknown-${index}.bin`);
+      const output = await createExportStream(
+        () => Promise.resolve(names),
+        name => Promise.resolve({ stream: Readable.from([Buffer.alloc(sizes[names.indexOf(name)], 0x61)]) }),
+        logger as never,
+      );
+      await new Promise<void>(resolve => output.on('end', resolve).resume());
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+    return logger;
+  };
+
+  it('warns when one file is above the per-entry limit', async () => {
+    const logger = await exportWithLimits({ STORAGE_IMPORT_MAX_BYTES: '5' }, [6]);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('Raise STORAGE_IMPORT_MAX_BYTES'));
+  });
+
+  it('warns when the files together are above the total limit', async () => {
+    const logger = await exportWithLimits({ STORAGE_IMPORT_MAX_TOTAL_BYTES: '5' }, [3, 3]);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('Raise STORAGE_IMPORT_MAX_TOTAL_BYTES'));
+  });
+
+  it('stays quiet at exactly the limits', async () => {
+    const logger = await exportWithLimits(
+      { STORAGE_IMPORT_MAX_BYTES: '3', STORAGE_IMPORT_MAX_TOTAL_BYTES: '6' },
+      [3, 3],
+    );
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
 // docs/14, .env.example and the upgrade notes state these figures, and an operator sizes an import
 // against them: a drifted default changes what an import is allowed to extract without a word.
 describe('storage import caps', () => {

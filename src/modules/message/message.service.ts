@@ -1,6 +1,6 @@
 import { Injectable, BadRequestException, NotFoundException, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, ObjectLiteral, Repository } from 'typeorm';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import type { IWhatsAppEngine, PollVote } from '../../engine/interfaces/whatsapp-engine.interface';
 import { MessageProjector } from '../session/message-projector.service';
@@ -230,6 +230,19 @@ export class MessageService implements PluginMessagePort {
     return this.messageRepository.manager?.connection?.options?.type === 'postgres' ? 'id' : 'rowid';
   }
 
+  /**
+   * The columns of a predicate, taken out of index consideration on SQLite, so a read of rows by `id` is a
+   * primary key lookup. Nothing runs ANALYZE there, and from about ten ids on it prefers an index on the session
+   * (or the chat) and visits every row of it, on the event loop. PostgreSQL has statistics and the plain
+   * predicate. The column is quoted because TypeORM only quotes a path that follows a space, `=` or `(`, and
+   * `from` is a keyword.
+   */
+  private byPrimaryKey(predicate: string): string {
+    return this.orderTiebreak === 'rowid'
+      ? predicate.replace(/\bmessage\.(?!id\b)(\w+)/g, '+"message"."$1"')
+      : predicate;
+  }
+
   // ========== Outbound sends (delegated) ==========
   //
   // The send family lives on MessageSendService; these pass-throughs keep the MessageService
@@ -375,13 +388,21 @@ export class MessageService implements PluginMessagePort {
       query.skip(offset);
     }
 
+    // The filters a page's rows are read against again once its ids are picked (readPageSpendingBudget). Not the
+    // whole query: that also carries the order, the page bounds and the cursor, which the picked ids encode.
+    const rowFilters: Array<[clause: string, parameters?: ObjectLiteral]> = [];
+    const narrow = (clause: string, parameters?: ObjectLiteral): void => {
+      query.andWhere(clause, parameters);
+      rowFilters.push([clause, parameters]);
+    };
+
     if (chatIds) {
-      query.andWhere('message.chatId IN (:...chatIds)', { chatIds });
+      narrow('message.chatId IN (:...chatIds)', { chatIds });
     }
     if (options.direction !== undefined) {
-      query.andWhere('message.direction = :direction', { direction: options.direction });
+      narrow('message.direction = :direction', { direction: options.direction });
     }
-    if (options.type !== undefined) query.andWhere('message.type = :messageType', { messageType: options.type });
+    if (options.type !== undefined) narrow('message.type = :messageType', { messageType: options.type });
 
     if (from) {
       // Resolve the filter through the lid->phone table so a phone matches not just the stored
@@ -394,14 +415,14 @@ export class MessageService implements PluginMessagePort {
       // OR costs nothing the old plan didn't already pay. No new index: per-session narrowing
       // dominates selectivity and a single btree cannot serve an OR across two columns anyway.
       const froms = await this.resolveJidCandidates(from);
-      query.andWhere('(message.from IN (:...froms) OR message.author IN (:...authorFroms))', {
+      narrow('(message.from IN (:...froms) OR message.author IN (:...authorFroms))', {
         froms,
         authorFroms: froms,
       });
     }
 
     if (options.messageId !== undefined) {
-      query.andWhere('message.waMessageId = :messageId', { messageId: options.messageId });
+      narrow('message.waMessageId = :messageId', { messageId: options.messageId });
     }
     const hasTimeSelection = messageTimeOrder || options.since !== undefined || options.until !== undefined;
     // Unknown times cannot belong to a verified time window. Count the gap within the same
@@ -409,13 +430,13 @@ export class MessageService implements PluginMessagePort {
     const unknownTimestampTotal = hasTimeSelection
       ? await query.clone().andWhere('message.timestamp IS NULL').getCount()
       : undefined;
-    if (messageTimeOrder) query.andWhere('message.timestamp IS NOT NULL');
+    if (messageTimeOrder) narrow('message.timestamp IS NOT NULL');
     // Integer seconds preserve both boundaries with ceil; fractional bigint parameters fail on PostgreSQL.
     if (options.since !== undefined) {
-      query.andWhere('message.timestamp >= :since', { since: messageTimeBoundarySeconds(options.since) });
+      narrow('message.timestamp >= :since', { since: messageTimeBoundarySeconds(options.since) });
     }
     if (options.until !== undefined) {
-      query.andWhere('message.timestamp < :until', { until: messageTimeBoundarySeconds(options.until) });
+      narrow('message.timestamp < :until', { until: messageTimeBoundarySeconds(options.until) });
     }
 
     // A budget of 0 means "never inline" and grants no single-payload allowance, which is exactly
@@ -427,7 +448,9 @@ export class MessageService implements PluginMessagePort {
 
     if (after !== undefined) {
       // A selection cursor must name a row inside this same selection, not merely a row from the
-      // session. Otherwise an unrelated chat/time/direction could silently truncate a valid walk.
+      // session. Otherwise an unrelated time/direction/type could silently truncate a valid walk. A chat or
+      // sender filter is left out: its candidate set can change between pages (a lid mapping learned or lost),
+      // and the cursor is only a position in time, so a row stored under an alias must still anchor the walk.
       if (
         (messageTimeOrder ||
           options.since !== undefined ||
@@ -475,7 +498,7 @@ export class MessageService implements PluginMessagePort {
     // base64 in metadata.media.data. Spent newest-first in the selected order, so the
     // most recently viewed media still arrives inline and the rest keeps its omitted marker.
     return {
-      messages: await this.readPageSpendingBudget(sessionId, page, inlineMediaBudget),
+      messages: await this.readPageSpendingBudget(sessionId, rowFilters, page, inlineMediaBudget),
       total,
       ...(unknownTimestampTotal !== undefined ? { unknownTimestampTotal } : {}),
     };
@@ -496,7 +519,7 @@ export class MessageService implements PluginMessagePort {
       .select('message.id', 'id')
       .addSelect('OCTET_LENGTH(message.metadata)', 'metadataLength')
       .where('message.id IN (:...pageIds)', { pageIds })
-      .andWhere('message.sessionId = :sessionId', { sessionId })
+      .andWhere(`${this.byPrimaryKey('message.sessionId')} = :sessionId`, { sessionId })
       .getRawMany<{ id: string; metadataLength: number | string | null }>();
     const sizeById = new Map(sizes.map(r => [r.id, r.metadataLength]));
     return pageIds.map(id => ({ id, metadataLength: sizeById.get(id) ?? null }));
@@ -506,10 +529,12 @@ export class MessageService implements PluginMessagePort {
    * Load the rows of a page in its order, in chunks of at most `max(budget, 1 MiB)` stored metadata
    * bytes (at least one row per chunk), spending the inline media budget on each chunk before the
    * next is read. Loading the whole page at once put every payload on the heap before the budget
-   * dropped most of them. A row deleted since the page was picked is left out.
+   * dropped most of them. The rows are re-read against the filters of the selection, so a row deleted or
+   * replaced since the page was picked, and no longer matching, is left out.
    */
   private async readPageSpendingBudget(
     sessionId: string,
+    filters: Array<[clause: string, parameters?: ObjectLiteral]>,
     page: Array<{ id: string; metadataLength: number | string | null }>,
     budgetBytes: number,
   ): Promise<Message[]> {
@@ -520,7 +545,13 @@ export class MessageService implements PluginMessagePort {
     let chunkBytes = 0;
 
     const flush = async (): Promise<void> => {
-      const rows = await this.messageRepository.find({ where: { id: In(chunk), sessionId } });
+      const query = this.messageRepository
+        .createQueryBuilder('message')
+        .select('message')
+        .where(`${this.byPrimaryKey('message.sessionId')} = :sessionId`, { sessionId })
+        .andWhere('message.id IN (:...chunkIds)', { chunkIds: chunk });
+      for (const [clause, parameters] of filters) query.andWhere(this.byPrimaryKey(clause), parameters);
+      const rows = await query.getMany();
       const byId = new Map(rows.map(row => [row.id, row]));
       for (const id of chunk) {
         const row = byId.get(id);

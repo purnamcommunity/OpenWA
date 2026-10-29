@@ -70,6 +70,7 @@ function makeWorld(focusableCount = 2) {
       doc.activeElement = card as never;
     },
     querySelectorAll: () => focusables,
+    contains: (el: unknown) => el === card || focusables.includes(el as (typeof focusables)[number]),
   };
   attached.add(card);
 
@@ -273,4 +274,94 @@ test('Tab and Shift+Tab on a control that is neither first nor last are left to 
   doc.dispatchKey(forwardFromFirst);
   assert.equal(forwardFromFirst.defaultPrevented, false);
   unbind();
+});
+
+test('Tab stays on an empty dialog card in either direction', () => {
+  const { doc, card } = makeWorld(0);
+  const unbind = bindModalA11y(doc as never, card as never, () => {});
+  try {
+    for (const shiftKey of [false, true]) {
+      const event = makeKeyEvent('Tab', shiftKey);
+      doc.dispatchKey(event);
+      assert.equal(event.defaultPrevented, true);
+      assert.equal(doc.activeElement, card as never);
+    }
+  } finally {
+    unbind();
+  }
+});
+
+test('a dialog regains focus after its last controls disappear', () => {
+  const { doc, card, focusables } = makeWorld(2);
+  const unbind = bindModalA11y(doc as never, card as never, () => {});
+  try {
+    focusables.splice(0);
+    const event = makeKeyEvent('Tab');
+    doc.dispatchKey(event);
+    assert.equal(event.defaultPrevented, true);
+    assert.equal(doc.activeElement, card as never);
+  } finally {
+    unbind();
+  }
+});
+
+test('Tab recovers focus from outside the active dialog in either direction', () => {
+  const { doc, card, focusables, makeElement } = makeWorld(2);
+  const background = makeElement();
+  const unbind = bindModalA11y(doc as never, card as never, () => {});
+  try {
+    for (const shiftKey of [false, true]) {
+      background.focus();
+      const event = makeKeyEvent('Tab', shiftKey);
+      doc.dispatchKey(event);
+      assert.equal(event.defaultPrevented, true);
+      assert.equal(doc.activeElement, focusables[shiftKey ? 1 : 0] as never);
+    }
+  } finally {
+    unbind();
+  }
+});
+
+test('a lower dialog does not handle Tab while the nested dialog owns focus', () => {
+  const { doc, card, makeElement } = makeWorld(0);
+  const controls = Array.from({ length: 3 }, makeElement);
+  const nested = {
+    focus() {
+      doc.activeElement = nested as never;
+    },
+    querySelectorAll: () => controls,
+    contains: (el: unknown) => el === nested || controls.includes(el as (typeof controls)[number]),
+  };
+  const unbindParent = bindModalA11y(doc as never, card as never, () => {});
+  const unbindNested = bindModalA11y(doc as never, nested as never, () => {});
+  try {
+    controls[1].focus();
+    const event = makeKeyEvent('Tab');
+    doc.dispatchKey(event);
+    assert.equal(event.defaultPrevented, false);
+    assert.equal(doc.activeElement, controls[1] as never);
+  } finally {
+    unbindNested();
+    unbindParent();
+  }
+});
+
+test('Shift+Tab from the dialog card wraps to the last control, and Tab from it is left to the browser', () => {
+  const { doc, card, focusables } = makeWorld(2);
+  const unbind = bindModalA11y(doc as never, card as never, () => {});
+  try {
+    card.focus();
+    const back = makeKeyEvent('Tab', true);
+    doc.dispatchKey(back);
+    assert.equal(back.defaultPrevented, true);
+    assert.equal(doc.activeElement, focusables[1] as never);
+
+    card.focus();
+    const forward = makeKeyEvent('Tab');
+    doc.dispatchKey(forward);
+    assert.equal(forward.defaultPrevented, false);
+    assert.equal(doc.activeElement, card as never);
+  } finally {
+    unbind();
+  }
 });

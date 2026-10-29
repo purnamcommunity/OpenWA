@@ -184,9 +184,6 @@ export class InfraStorageController implements OnApplicationBootstrap {
     await this.assertStorageBackendReady();
     // Note: In production, this would return a StreamableFile
     // For simplicity, we'll save to a temp file and return the path
-    const stream = await this.storageService
-      .createExportStream()
-      .catch((error: unknown) => InfraStorageController.refusalAsConflict(error));
     // Keep the export INSIDE data/ (under data/exports/): the import handler only accepts paths under
     // data/, and the documented backend-migration flow re-imports this file AFTER a container restart,
     // so it must live on the persistent volume — the OS temp dir is wiped on restart. The original
@@ -198,15 +195,19 @@ export class InfraStorageController implements OnApplicationBootstrap {
     }
     const exportPath = path.join(exportDir, `storage-export-${Date.now()}-${randomUUID()}.tar.gz`);
 
-    const writeStream = fs.createWriteStream(exportPath);
-    stream.pipe(writeStream);
-
+    // Created only once the destination can be prepared: the archive starts reading files at once, and one
+    // nothing consumes would hold its open file and buffered bytes until the process exits.
+    const stream = await this.storageService
+      .createExportStream()
+      .catch((error: unknown) => InfraStorageController.refusalAsConflict(error));
+    let writeStream: fs.WriteStream | undefined;
     try {
+      const sink = (writeStream = fs.createWriteStream(exportPath));
       await new Promise<void>((resolve, reject) => {
-        writeStream.on('finish', resolve);
+        sink.on('finish', resolve);
         // The archive is filled while it is written: destroying the source stops the export from
         // opening further files once the sink has failed.
-        writeStream.on('error', (err: Error) => {
+        sink.on('error', (err: Error) => {
           stream.destroy();
           reject(err);
         });
@@ -214,15 +215,21 @@ export class InfraStorageController implements OnApplicationBootstrap {
         // the source stream, which without a listener crashes the process. Fail the request instead and
         // tear down the sink so its fd isn't held open waiting for a 'finish' that never comes.
         stream.on('error', (err: Error) => {
-          writeStream.destroy();
+          sink.destroy();
           reject(err);
         });
+        stream.pipe(sink);
       });
     } catch (error) {
       // The TTL sweep below only covers a finished archive; a failed one would otherwise stay on the
       // data volume until a restart a day later. Wait for the sink to close so the unlink cannot race
       // an open that is still pending.
-      if (!writeStream.closed) await new Promise<void>(resolve => writeStream.once('close', () => resolve()));
+      stream.destroy();
+      if (writeStream) {
+        const sink = writeStream;
+        sink.destroy();
+        if (!sink.closed) await new Promise<void>(resolve => sink.once('close', () => resolve()));
+      }
       await fs.promises.unlink(exportPath).catch(() => undefined);
       throw error;
     }

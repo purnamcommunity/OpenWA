@@ -3,7 +3,7 @@
 Three-way comparison of every capability: the **Baileys library** (`@whiskeysockets/baileys`
 7.0.0-rc14), the **whatsapp-web.js library** (1.34.7), and what **OpenWA actually exposes** through
 its adapter layer and REST API — including which "supported" cells only work because OpenWA patches
-the installed library. Coverage is total: all 123 `IWhatsAppEngine` methods (29.4), **all 152
+the installed library. Coverage is total: all 124 `IWhatsAppEngine` methods (29.4), **all 152
 Baileys + 81 whatsapp-web.js library methods** (29.5), all 34 + 31 library events (29.5.4), and all
 20 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
 
@@ -26,7 +26,7 @@ Statuses used in the tables:
 
 Two complementary views:
 
-- **29.4 — the OpenWA contract view.** Rows are the 123 `IWhatsAppEngine` methods; use it to see
+- **29.4 — the OpenWA contract view.** Rows are the 124 `IWhatsAppEngine` methods; use it to see
   what a REST caller gets per engine. Source of truth: `src/engine/engine-capability-matrix.ts`
   (per-cell `evidence` strings cite the exact library `file:symbol` inspected).
 - **29.5 — the full engine inventory.** Rows are **every method the installed libraries expose**,
@@ -38,14 +38,14 @@ Two complementary views:
 ## 29.2 Adapter architecture
 
 OpenWA never calls a WhatsApp library directly from a controller. Every session owns one engine
-instance behind the neutral `IWhatsAppEngine` interface (123 methods +
+instance behind the neutral `IWhatsAppEngine` interface (124 methods +
 `EngineEventCallbacks`), and all modules go through it:
 
 ```mermaid
 flowchart LR
     subgraph OpenWA["OpenWA"]
         API["REST API controllers"] --> SVC["Modules / services"]
-        SVC --> IF["IWhatsAppEngine - 123 methods"]
+        SVC --> IF["IWhatsAppEngine - 124 methods"]
         IF --> WA["WhatsAppWebJsAdapter"]
         IF --> BA["BaileysAdapter"]
         SVC --> STORE["OpenWA-side stores"]
@@ -230,7 +230,7 @@ opens `if (!channel) return false;` before its try, so its `false` conflates _ch
 _WhatsApp refused_, and the adapter answers 403 for both. That distinction is ours to make in our own
 adapter and involves no library change.
 
-## 29.4 Full capability matrix — the OpenWA contract view (123 methods)
+## 29.4 Full capability matrix — the OpenWA contract view (124 methods)
 
 Legend recap: **✅** supported · **✅🔧ⁿ** supported via OpenWA patch `🔧ⁿ` (29.3) ·
 **❌ gap** adapter-gap · **❌ lib** library-limitation. Column headers carry the engine-wide
@@ -356,6 +356,7 @@ socket is caught by the transport instead. No REST route: the session watchdog p
 | `setGroupInfoAdminsOnly`         | ✅                  | ✅               | ✅              |
 | `setGroupMemberAddMode`          | ✅                  | ✅               | ✅              |
 | `setGroupEphemeral`              | ✅                  | ❌ lib           | ⚠️ baileys only |
+| `setGroupMemberLabel`            | ✅                  | ❌ lib           | ⚠️ baileys only |
 
 ### 29.4.7 Channels
 
@@ -439,9 +440,9 @@ answers 501.
 > Booting the VoIP stack, placing, answering, ending and reading a call all run through WhatsApp
 > Web's own VoIP stack in the page.
 
-**Totals:** 123 methods → 246 adapter cells: **212 ✅, 34 ❌** (2 adapter-gaps, 32
-library-limitations, 0 uncertain) across 33 methods. From the REST caller's side: **92** methods
-work on any engine (90 fully supported + 2 store-backed status reads), **13** are Baileys-only,
+**Totals:** 124 methods → 248 adapter cells: **213 ✅, 35 ❌** (2 adapter-gaps, 33
+library-limitations, 0 uncertain) across 34 methods. From the REST caller's side: **92** methods
+work on any engine (90 fully supported + 2 store-backed status reads), **14** are Baileys-only,
 **17** are wwjs-only (the 2 store-backed rows excluded); `sendCatalog`, unavailable on both engines,
 is not exposed. Three of the 92 (`probeLiveness`, `getPhoneNumber`, `getPushName`) are ⚙️ internal and
 have no route.
@@ -598,7 +599,7 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 | `addMessageLabel`    | ❌ **not exposed**              |
 | `removeChatLabel`    | ✅ `removeLabelFromChat`        |
 | `removeMessageLabel` | ❌ **not exposed**              |
-| `updateMemberLabel`  | ❌ **not exposed**              |
+| `updateMemberLabel`  | ✅ `setGroupMemberLabel`        |
 
 **Privacy & account settings** (13)
 
@@ -880,7 +881,7 @@ OpenWA consumes events by normalizing them into `EngineEventCallbacks`; anything
 | `group_leave`               | ✅           |     | `group_update`         | ✅                                                                              |
 | `group_membership_request`  | ✅           |     |                        |                                                                                 |
 
-## 29.6 The 34 not-available cells in detail
+## 29.6 The 35 not-available cells in detail
 
 Every ❌ in 29.4, with the exact library symbol inspected (full evidence strings:
 `engine-capability-matrix.ts`). All of these throw `EngineNotSupportedError` → HTTP 501 at the
@@ -911,7 +912,7 @@ adapter boundary — none silently stubs.
 | `endCall`               | lib   | `rejectCall` ends only a RINGING call; nothing ends a connected one, and Baileys never holds one.                                                                                                                                                                                                                                                        |
 | `callState`             | lib   | Call events arrive as outcomes only (`Types/Call.d.ts` `WACallUpdateType`); the socket holds no live call object whose state could be read.                                                                                                                                                                                                              |
 
-### 29.6.2 wwjs adapter (14 cells)
+### 29.6.2 wwjs adapter (15 cells)
 
 | Method                     | Cause | What's missing (evidence)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | -------------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -928,6 +929,7 @@ adapter boundary — none silently stubs.
 | `sendProduct`              | lib   | No outbound product content type.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `sendCatalog`              | lib   | No `Client.sendCatalog` in `index.d.ts` (0 hits).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `setGroupEphemeral`        | lib   | No disappearing-timer setter (0 hits for `ephemeral` in `index.d.ts`); only the create-time `messageTimer` option (`Client.js:2328`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `setGroupMemberLabel`      | lib   | No member-label setter (0 hits for `memberLabel` or member tag in `index.d.ts` and `src/`). Baileys relays it with `updateMemberLabel` (`Socket/messages-send.js:274`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `clickButton`              | lib   | No interactive button-reply send path; inbound buttons are not exposable as a clickable Client action. Baileys uses `sendMessage({buttonReply})` / `sendMessage({listReply})` for classic prompts. Native-flow `interactiveMessage` replies are unverified.                                                                                                                                                                                                                                                                                                                                                                      |
 
 ## 29.7 Caveats on supported rows
@@ -1001,15 +1003,40 @@ adapter boundary — none silently stubs.
   return a code, but on whatsapp-web.js the request runs in the shared WhatsApp Web page and checks
   no precondition: measured twice, a request for a number that already had a linked session was
   followed within about a minute by WhatsApp revoking that device, whatsapp-web.js deleting its
-  credentials and the session returning to `qr_ready`. Baileys writes only its own credentials and
-  showed no such effect. Link by QR when the session of that number must stay up.
+  credentials and the session returning to `qr_ready`. The gateway now answers `409` on whatsapp-web.js
+  for a number that is the stored phone of another of its sessions (the mobile-marker spellings of a
+  Brazilian, Mexican or Argentine number count as one), but it cannot see a link made on another gateway
+  or only on the phone. Baileys writes only its own credentials, showed no such effect and is not
+  refused. Link by QR when the session of that number must stay up.
 - **`archiveChat` / `clearChatMessages` / `deleteChat` / `sendSeen` / `markUnread` (baileys).** The
-  four `chatModify` actions (archive, clear, delete, unread) need the chat's last known message, which
-  the patch carries. `sendSeen` without message ids is `readMessages([key])` for the newest _received_
-  (not `fromMe`) message, since Baileys drops own keys from a receipt. A chat with no such message
-  resolves `false` rather than throwing, so a chat the session has seen no message in, or one holding
-  only this account's own sends, answers `POST chats/read` with `{"success": false}`, where
-  whatsapp-web.js marks it read from the page-side chat object without needing any local history.
+  four `chatModify` actions (archive, clear, delete, unread) are keyed to the chat's newest message:
+  the one the session holds in memory, else the newest one the gateway stored (#1891). The patch is
+  indexed by the same jid as that message's key: a message in memory under the jid it arrived with,
+  a stored one under the lid its row is filed under, or the chat's only reported lid, else a lid the
+  session's cache holds for it, else its phone jid; an own group message goes without its participant.
+  A stored message filed under the phone of a chat the persisted table maps to two or more lids, or
+  received in a group from a sender it maps to two or more, is not used, since keying it to any one of
+  them would be a guess: the write proceeds as for a chat with no stored message. A key that does not
+  belong to the chat is not used. Nor is a message sent at or before WhatsApp deleted the chat (on the
+  phone, or through the API), and it does not make the chat known either: the gateway keeps a deleted
+  chat's stored messages, and a write keyed to one names a message the phone no longer holds, while
+  Baileys applies the write locally and the deleted chat would be listed again. Such a chat is not
+  listed, and the four writes and a `sendSeen` without message ids resolve `false`, until a newer
+  message re-creates it. A deletion synced on a reconnect is dated when it arrives, so a message
+  delivered in the same reconnect counts as older. A chat id not spelled the way the engine keys chats (`<id>@g.us`,
+  `<lid>@lid` or a phone jid, lowercase, with no device suffix), such as `120363@G.US` or a bare
+  number, is served only by a message in memory: without one, the four writes and a `sendSeen` without
+  message ids resolve `false`. With no usable message, clear and delete resolve `false`, and archive
+  and unread are sent
+  without a range for a chat the session knows (a chat record, a persisted state row or a stored
+  message, under its lid or its phone whichever the caller names) whose jid belongs to it, and resolve
+  `false` otherwise; unread also resolves `false` for an archived chat, which the phone leaves unmarked
+  without a range. `sendSeen`
+  without message ids is `readMessages([key])` for the newest _received_ (not `fromMe`) message, in
+  memory or stored, since Baileys drops own keys from a receipt. A chat with no such message resolves
+  `false`, so one holding only this account's own sends answers `POST chats/read` with
+  `{"success": false}`, where whatsapp-web.js marks it read from the page-side chat object without
+  needing any local history.
   With message ids, a group id the message store never held (history backfill) takes its receipt's
   participant from the author the gateway stored for it; one with no stored author is left out of the
   receipt, and the answer is `false` when no id could be named.
@@ -1071,25 +1098,25 @@ adapter boundary — none silently stubs.
 Recomputed from `engine-capability-matrix.ts`, `upstream-surface.snapshot.json`, and a scan of the
 adapter sources — re-derive the same way when anything changes:
 
-- **123** interface methods → **246** adapter cells: **212 ✅** / **34 ❌** (2 adapter-gaps, 32
-  library-limitations, 0 uncertain), spanning **33** methods.
-- Of the 212 ✅ cells, **20 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
+- **124** interface methods → **248** adapter cells: **213 ✅** / **35 ❌** (2 adapter-gaps, 33
+  library-limitations, 0 uncertain), spanning **34** methods.
+- Of the 213 ✅ cells, **20 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
   1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 1 × 🔧⁷ participant arity, 2 × 🔧⁸
   block/unblock, 1 × 🔧⁹ group description, 1 × 🔧¹² contact alternate wid, 4 × 🔧¹⁴ media send
   id, 3 × 🔧¹⁵ group invite, 1 × 🔧¹⁷ forward bundle, 1 × 🔧¹⁸ profile bundle) and one baileys cell
   does (1 × 🔧⁶ newsletter-create parse); the whole wwjs column additionally
   depends on 🔧¹, the whole Baileys column on 🔧⁵ — so every row rests on a patch on each side,
   even though no row carries a row-level mark on both.
-- REST caller's view: **92** engine-neutral (90 + 2 store-backed status reads), **13** Baileys-only,
+- REST caller's view: **92** engine-neutral (90 + 2 store-backed status reads), **14** Baileys-only,
   **17** wwjs-only; `sendCatalog` (unavailable on both engines) is not exposed; three of the 92
   (`probeLiveness`, `getPhoneNumber`, `getPushName`) are ⚙️ internal and have no route.
 - Full engine inventory (29.5), split by the exposure legend rather than lumped: Baileys **152**
-  socket methods — 48 wired into interface methods, 5 internal wiring, 29 plumbing, **70 ❌ not
+  socket methods — 49 wired into interface methods, 5 internal wiring, 29 plumbing, **69 ❌ not
   exposed** (incl. the whole 23-method community cluster); wwjs **81** Client methods — 42 wired,
   4 internal wiring, 1 class plumbing, **34 ❌ not exposed** (26 real capabilities + 8
   session/transport settings that are not WhatsApp capabilities). The backlog is the ❌ rows minus
   those 8 settings; 🔩 plumbing is correctly never exposed.
-- Events: Baileys **34** (18 consumed / 16 dropped), wwjs **31** (17 consumed / 14 dropped).
+- Events: Baileys **34** (18 consumed / 16 dropped), wwjs **31** (18 consumed / 13 dropped).
 - **0** capabilities in 29.5.3: every capability with first-class symbols on both libraries is
   either wired or classified with evidence. Three of them are Baileys-only despite typed
   whatsapp-web.js symbols: `demoteChannelAdmin`, whose page function WhatsApp Web no longer

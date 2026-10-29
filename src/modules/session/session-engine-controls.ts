@@ -7,8 +7,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { isUUID } from 'class-validator';
-import { EntityTarget, EntityManager, In, IsNull, Repository, DataSource } from 'typeorm';
+import { EntityTarget, EntityManager, In, IsNull, Raw, Repository, DataSource } from 'typeorm';
 import { Session, SessionStatus } from './entities/session.entity';
 import { Message } from '../message/entities/message.entity';
 import { MessageBatch } from '../message/entities/message-batch.entity';
@@ -138,7 +137,7 @@ export class StopMarks extends Set<string> {
   }
 }
 
-/** Caller callbacks for stop()/delete(), run around the session read that opens each verb. */
+/** Caller callbacks for stop(), delete(), forceKill() and logout(), run around the session read that opens each verb. */
 export interface StopHooks {
   /** delete() only: the ownership captured by its caller still covers this operation. */
   ownsClaim?: () => boolean;
@@ -149,7 +148,7 @@ export interface StopHooks {
    * withdraws the caller's stop request.
    */
   onReadFailed?: () => void;
-  /** forceKill() only: runs synchronously once there is an engine to kill; records the stop request. */
+  /** forceKill()/logout(): runs synchronously once there is an engine to retire. */
   onEngineFound?: () => void;
   /** forceKill() only: persist the stop with the caller's current ownership predicate. */
   recordStop?: () => Promise<void>;
@@ -683,13 +682,17 @@ export class SessionEngineControls {
    * the 502 path (the controller audits SESSION_LOGGED_OUT only after the service resolves). The
    * operator can start the session and retry the logout.
    */
-  async logout(id: string): Promise<Session> {
-    const session = await this.requireSession(id);
+  async logout(id: string, hooks: StopHooks = {}): Promise<Session> {
+    const session = await this.requireSession(id).catch((error: unknown) => {
+      hooks.onReadFailed?.();
+      throw error;
+    });
     const engine = this.engines.get(id);
 
     if (!engine) {
       throw new BadRequestException('Session is not started. Call POST /sessions/:sessionId/start first.');
     }
+    hooks.onEngineFound?.();
 
     // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
     this.stoppingSessions.add(id);
@@ -957,14 +960,16 @@ export class SessionEngineControls {
       // carried before 0.23.5, and the boot migration keeps a legacy one it could not rename. Unless
       // it is another session's id, whatever its shape (an import accepts any safe key): the dirs it
       // names are then that session's live login, the same exact-id guard the migration keeps. A
-      // failed lookup withholds the name rather than fail a delete that has already committed. On
-      // PostgreSQL the id column is a uuid, so a name of any other shape is no session's id there, and
-      // looking it up would fail rather than miss.
+      // failed lookup withholds the name rather than fail a delete that has already committed. The id
+      // column is varchar on PostgreSQL too (an import keeps any safe key), so a name of any shape can be
+      // a session's id there; it is compared as text, so only a name that really is an id withholds itself.
       // Keyed by `id`, not `session.id`: TypeORM clears a removed entity's primary key, so session.id
       // is undefined here and the purge would refuse it as an unsafe key and remove nothing.
-      const nameIsAnId =
-        (dataSource.options.type !== 'postgres' || isUUID(session.name)) &&
-        (await this.sessionRepository.exists({ where: { id: session.name } }).catch(() => true));
+      const legacyId =
+        dataSource.options.type === 'postgres'
+          ? Raw(alias => `CAST(${alias} AS text) = :legacyId`, { legacyId: session.name })
+          : session.name;
+      const nameIsAnId = await this.sessionRepository.exists({ where: { id: legacyId } }).catch(() => true);
       await this.engineFactory.purgeSessionData(id, nameIsAnId ? undefined : session.name);
     } catch (error) {
       // The session survives, but the write scopes closed above stay retired for good: a bulk batch

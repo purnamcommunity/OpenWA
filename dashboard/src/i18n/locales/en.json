@@ -213,6 +213,9 @@
       "read": "Read",
       "failed": "Failed"
     },
+    "today": "Today",
+    "switchSession": "Switch session",
+    "searchMessages": "Search messages",
     "clearSearch": "Clear search",
     "filters": {
       "label": "Filter chats",
@@ -223,11 +226,13 @@
       "unknown": "Unknown"
     },
     "noFilterResults": "No chats match this filter",
+    "contactInfo": "Contact info",
     "moreActions": "More actions",
     "copyChatId": "Copy chat ID",
     "chatIdCopied": "Chat ID copied",
     "copyFailed": "Could not copy to clipboard",
     "closeChat": "Close chat",
+    "phone": "Phone number",
     "chatId": "Chat ID",
     "newChat": {
       "title": "New chat",
@@ -252,6 +257,12 @@
       "created": "Group \"{{name}}\" created",
       "createFailed": "Could not create the group",
       "removeParticipant": "Remove {{name}}"
+    },
+    "sessionPicker": {
+      "searchPlaceholder": "Search sessions...",
+      "noMatch": "No session matches",
+      "addTitle": "Pair another number",
+      "addHint": "Create a session and link it with a QR code"
     },
     "group": {
       "info": "Group info",
@@ -663,7 +674,6 @@
       "message.revoked": "When a message is deleted for everyone",
       "message.reaction": "When a reaction is added, changed or removed",
       "message.edited": "When a message is edited",
-      "message.poll_vote": "When someone votes on a poll or changes their vote",
       "session.status": "When a session's status changes",
       "session.qr": "When QR code is generated",
       "session.authenticated": "When a session is paired and ready",
@@ -672,6 +682,7 @@
       "session.restriction": "When WhatsApp restricts the account or lifts a restriction",
       "presence.update": "When a subscribed chat comes online, types or goes offline",
       "event.response": "When a guest answers a WhatsApp event invitation (going, not going, maybe)",
+      "poll.vote": "When a voter selects or clears options on a poll (whatsapp-web.js)",
       "group.join": "When participants join or are added to a group",
       "group.leave": "When participants leave or are removed from a group",
       "group.update": "When a group's name, description or settings change",
@@ -1026,7 +1037,7 @@
     "single": {
       "title": "Check Single Account",
       "phoneLabel": "Phone Number",
-      "phonePlaceholder": "e.g. 919876543210 or 6281234567890 (with country code)",
+      "phonePlaceholder": "e.g. 919876543210 or 6281234567890",
       "check": "Check",
       "checking": "Checking...",
       "autoPrefix": "Auto-prefix <strong>+91</strong> for 10-digit numbers (keep 12-digit numbers as-is)",

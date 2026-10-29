@@ -1,5 +1,5 @@
 import { LogLevel } from '../common/services/logger.service';
-import { validateEnv } from './env.validation';
+import { s3EndpointError, validateEnv } from './env.validation';
 
 /** Regression locks for boot-time env validation (no silent coercion). */
 describe('validateEnv', () => {
@@ -427,6 +427,12 @@ describe('validateEnv', () => {
     expect(() => validateEnv({})).not.toThrow();
   });
 
+  it('rejects a SEARCH_CONTAINS_ENABLED typo instead of silently leaving contains search off', () => {
+    expect(() => validateEnv({ SEARCH_CONTAINS_ENABLED: 'yes' })).toThrow(/SEARCH_CONTAINS_ENABLED/);
+    expect(() => validateEnv({ SEARCH_CONTAINS_ENABLED: 'true' })).not.toThrow();
+    expect(() => validateEnv({ SEARCH_CONTAINS_ENABLED: '' })).not.toThrow();
+  });
+
   it('rejects a LOG_LEVEL misspelling instead of silently logging at info', () => {
     // Plausible spellings from neighbouring vocabularies that this repo's LogLevel does not carry;
     // every one of them silently meant INFO before this check existed.
@@ -625,6 +631,50 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ NODE_URL: 'http://user:pw@10.0.0.5:2785' })).toThrow(/must not embed credentials/);
     expect(() => validateEnv({ NODE_URL: 'http://10.0.0.5:2785' })).not.toThrow();
     expect(() => validateEnv({ NODE_URL: 'https://node-a.internal' })).not.toThrow();
+  });
+
+  // Without a scheme the S3 client throws "Invalid URL" on every call and media quietly lands on local disk. That
+  // deployment runs today, so the boot reports the endpoint instead of refusing it (validateEnv never throws for
+  // it); the Infrastructure save is what refuses.
+  describe('S3_ENDPOINT', () => {
+    const s3 = (S3_ENDPOINT: string | undefined, STORAGE_TYPE = 's3') => ({ STORAGE_TYPE, S3_ENDPOINT });
+
+    it.each(['minio:9000', '127.0.0.1:9000', 'localhost:9000', 'minio', 'ftp://minio:9000'])(
+      'reports %s while S3 is the selected storage, and still lets validateEnv pass',
+      endpoint => {
+        expect(s3EndpointError(s3(endpoint))).toMatch(/^S3_ENDPOINT must be an absolute http\(s\) URL/);
+        expect(() => validateEnv(s3(endpoint))).not.toThrow();
+      },
+    );
+
+    it('says where to fix it', () => {
+      expect(s3EndpointError(s3('minio:9000'))).toMatch(
+        /environment, \.\/\.env or data\/\.env\.generated, or on the Infrastructure page/,
+      );
+    });
+
+    it('does not echo the value, which may carry credentials', () => {
+      const message = s3EndpointError(s3('AKIAKEY:hunter2@s3host:9000'));
+      expect(message).toMatch(/S3_ENDPOINT/);
+      expect(message).not.toMatch(/hunter2|AKIAKEY|s3host/);
+    });
+
+    it.each([
+      'http://minio:9000',
+      'https://s3.example.com',
+      'https://gateway.example.com/s3/',
+      ' http://minio:9000 ',
+      'HTTP://minio:9000',
+    ])('accepts %s', endpoint => {
+      expect(s3EndpointError(s3(endpoint))).toBeNull();
+    });
+
+    it('leaves an unset or blank endpoint alone, and a stale one while storage is local', () => {
+      expect(s3EndpointError(s3(undefined))).toBeNull();
+      expect(s3EndpointError(s3('  '))).toBeNull();
+      expect(s3EndpointError(s3('minio:9000', 'local'))).toBeNull();
+      expect(s3EndpointError({ S3_ENDPOINT: 'minio:9000' })).toBeNull();
+    });
   });
 
   it('rejects a non-positive media-conversion knob instead of silently using the default', () => {
@@ -850,5 +900,77 @@ describe('validateEnv', () => {
       /WEBHOOK_RETRY_DELAY must not exceed 268435455 ms/,
     );
     expect(() => validateEnv({ WEBHOOK_RETRY_DELAY: '268435455' })).not.toThrow();
+  });
+});
+
+// The bundled Redis container runs a plaintext listener with only its default user. A connection that
+// asks for TLS, or authenticates as a named user, fails on every attempt, as the bundled PostgreSQL does
+// with DATABASE_SSL=true.
+describe('validateEnv built-in Redis connection settings', () => {
+  const builtin = { REDIS_ENABLED: 'true', REDIS_BUILTIN: 'true', REDIS_HOST: 'redis' };
+
+  describe('REDIS_TLS', () => {
+    it.each(['redis', 'REDIS.', 'openwa-redis'])('rejects TLS against the bundled host %s', host => {
+      expect(() => validateEnv({ ...builtin, REDIS_HOST: host, REDIS_TLS: 'true' })).toThrow(/REDIS_TLS/);
+    });
+
+    it.each(['QUEUE_ENABLED', 'CACHE_ENABLED'])('rejects it when only %s uses Redis', consumer => {
+      expect(() => validateEnv({ ...builtin, REDIS_ENABLED: 'false', [consumer]: 'true', REDIS_TLS: 'true' })).toThrow(
+        /REDIS_TLS/,
+      );
+    });
+
+    it('says where to fix it and names the external Redis way out', () => {
+      const message = () => {
+        try {
+          validateEnv({ ...builtin, REDIS_TLS: 'true' });
+        } catch (error) {
+          return (error as Error).message;
+        }
+        return '';
+      };
+      expect(message()).toMatch(/set REDIS_TLS=false in the environment, \.\/\.env or data\/\.env\.generated/);
+      expect(message()).toMatch(
+        /use an external Redis \(REDIS_BUILTIN=false with its REDIS_HOST, also on the Infrastructure page\)/,
+      );
+    });
+
+    it('keeps TLS to an external host, and accepts plaintext or a Redis nothing uses', () => {
+      expect(() => validateEnv({ ...builtin, REDIS_HOST: 'cache.example.com', REDIS_TLS: 'true' })).not.toThrow();
+      expect(() => validateEnv({ ...builtin, REDIS_TLS: 'false' })).not.toThrow();
+      expect(() => validateEnv({ ...builtin, REDIS_ENABLED: 'false', REDIS_TLS: 'true' })).not.toThrow();
+      expect(() => validateEnv({ ...builtin, REDIS_BUILTIN: 'false', REDIS_TLS: 'true' })).not.toThrow();
+    });
+  });
+
+  describe('REDIS_USERNAME', () => {
+    it.each(['REDIS_ENABLED', 'QUEUE_ENABLED', 'CACHE_ENABLED'])('rejects a named user for %s', consumer => {
+      expect(() =>
+        validateEnv({ ...builtin, REDIS_ENABLED: 'false', [consumer]: 'true', REDIS_USERNAME: 'worker' }),
+      ).toThrow(/REDIS_USERNAME/);
+    });
+
+    // The username is passed to the server as written, so only the exact word `default` names the default user.
+    it.each(['DEFAULT', 'default ', ' '])('does not normalize the user name %j', username => {
+      expect(() => validateEnv({ ...builtin, REDIS_USERNAME: username })).toThrow(/REDIS_USERNAME/);
+    });
+
+    it.each([undefined, '', 'default'])('accepts the default user as %j', username => {
+      expect(() => validateEnv({ ...builtin, REDIS_USERNAME: username })).not.toThrow();
+    });
+
+    it('says where to fix it and names the external Redis way out', () => {
+      expect(() => validateEnv({ ...builtin, REDIS_USERNAME: 'worker' })).toThrow(
+        /remove the named username in the environment, \.\/\.env or data\/\.env\.generated, or use an external Redis \(REDIS_BUILTIN=false with its REDIS_HOST, also on the Infrastructure page\)/,
+      );
+    });
+
+    it('keeps a named user for an external host, and accepts one when Redis is not the bundled one in use', () => {
+      expect(() =>
+        validateEnv({ ...builtin, REDIS_HOST: 'cache.example.com', REDIS_USERNAME: 'worker' }),
+      ).not.toThrow();
+      expect(() => validateEnv({ ...builtin, REDIS_BUILTIN: 'false', REDIS_USERNAME: 'worker' })).not.toThrow();
+      expect(() => validateEnv({ ...builtin, REDIS_ENABLED: 'false', REDIS_USERNAME: 'worker' })).not.toThrow();
+    });
   });
 });

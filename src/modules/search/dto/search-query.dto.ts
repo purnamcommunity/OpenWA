@@ -1,10 +1,20 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, IsNotEmpty, IsOptional, IsEnum, IsInt, IsNumber, Max, MaxLength, Min } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsEnum, IsIn, IsInt, IsNumber, Max, MaxLength, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 import { MessageDirection } from '../../message/entities/message.entity';
 import type { MessageType } from '../../../engine/interfaces/whatsapp-engine.interface';
 import { ToStrictNumber, ToStrictString } from '../../../common/utils/strict-boolean';
-import { SEARCH_OFFSET_MAX, SEARCH_QUERY_MAX_LENGTH, SEARCH_TERMS_MAX } from '../search.constants';
+import { NoNulCharacter } from '../../../common/validation/no-nul-character';
+import {
+  SEARCH_CONTAINS_MIN_TERM_LENGTH,
+  SEARCH_CONTAINS_TERMS_MAX_LENGTH,
+  SEARCH_CONTAINS_WINDOW,
+  SEARCH_MATCH_MODES,
+  SEARCH_OFFSET_MAX,
+  SEARCH_QUERY_MAX_LENGTH,
+  SEARCH_TERMS_MAX,
+} from '../search.constants';
+import type { SearchMatch } from '../search.types';
 
 /**
  * Request shape for GET /search. Numeric fields are coerced from query-string strings via
@@ -20,14 +30,33 @@ import { SEARCH_OFFSET_MAX, SEARCH_QUERY_MAX_LENGTH, SEARCH_TERMS_MAX } from '..
  */
 export class SearchQueryDto {
   @ApiProperty({
-    description: `Search term (required, non-empty, at most ${SEARCH_QUERY_MAX_LENGTH} characters and ${SEARCH_TERMS_MAX} words)`,
+    description: `Search term (required, non-empty, at most ${SEARCH_QUERY_MAX_LENGTH} characters and ${SEARCH_TERMS_MAX} words, no NUL character)`,
     maxLength: SEARCH_QUERY_MAX_LENGTH,
   })
   @ToStrictString()
   @IsString()
   @IsNotEmpty()
   @MaxLength(SEARCH_QUERY_MAX_LENGTH)
+  // PostgreSQL refuses U+0000 in a bound parameter, and SQLite's FTS5 in a contains query: both a 500.
+  @NoNulCharacter()
   q!: string;
+
+  @ApiPropertyOptional({
+    enum: SEARCH_MATCH_MODES,
+    default: 'word',
+    description:
+      '`word` (default) matches whole words. `contains` matches any part of a word, ignoring case and ' +
+      `accents (\`voic\` finds "Invoice", \`cafe\` finds "Café"); it is opt-in on the built-in provider ` +
+      '(SEARCH_CONTAINS_ENABLED=true, else 501) and needs at least one term of ' +
+      `${SEARCH_CONTAINS_MIN_TERM_LENGTH} or more characters (on PostgreSQL, ${SEARCH_CONTAINS_MIN_TERM_LENGTH} letters or digits in a row) ` +
+      `and at most ${SEARCH_CONTAINS_TERMS_MAX_LENGTH} characters in all its terms, spaces not counted (400 otherwise), so a ` +
+      'query of two-character words alone, as most Korean and many Chinese and Japanese words are, needs `word`. ' +
+      `It ranks the ${SEARCH_CONTAINS_WINDOW} most recently stored matches by match quality, so \`total\` is at most ` +
+      `${SEARCH_CONTAINS_WINDOW}.`,
+  })
+  @IsOptional()
+  @IsIn(SEARCH_MATCH_MODES)
+  match?: SearchMatch;
 
   @ApiPropertyOptional({ description: 'Restrict to a single session' })
   @IsOptional()

@@ -1,4 +1,4 @@
-import { renderedLength, renderTemplate, TemplateRenderError } from './template-render';
+import { renderedLength, renderTemplate, TemplateRenderError, templateVariableNames } from './template-render';
 
 describe('renderTemplate', () => {
   describe('canonical double-brace {{name}}', () => {
@@ -117,5 +117,25 @@ describe('a variable that is not a string', () => {
     const { toString, value } = counting();
     expect(renderedLength('{{a}}-'.repeat(1000), { a: value })).toBe(11_000);
     expect(toString).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('templateVariableNames', () => {
+  it.each([
+    ['', []],
+    ['no placeholders', []],
+    ['Hi {{name}} and {name}', ['name', 'name']],
+    ['{{ first.name }}-{{order-id}}-{plain}', ['first.name', 'order-id', 'plain']],
+    ['{{}} { } {a b} {{a b}}', []],
+  ])('lists the variables of %p', (body, names) => {
+    expect(templateVariableNames(body)).toEqual(names);
+  });
+
+  it('names exactly the placeholders the renderer substitutes', () => {
+    const body = 'a {{x}} b {y} c {{ z.w }} d {{-}} e {not a var} f {{q}}{r}';
+    const names = templateVariableNames(body);
+    const vars = Object.fromEntries(names.map(name => [name, '#']));
+    // Every listed name is replaced, and nothing else is: the unlisted braces are left as written.
+    expect(renderTemplate(body, vars)).toBe('a # b # c # d # e {not a var} f ##');
   });
 });

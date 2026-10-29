@@ -34,6 +34,7 @@ function makeHost(overrides: Partial<Record<keyof BaileysContactsHost, unknown>>
     findPersistedLidPhone: () => Promise.resolve(null),
     listChats: () => [],
     lastInboundMessage: () => ({ key: { id: 'M1', remoteJid: '628123@s.whatsapp.net' }, timestamp: 1 }),
+    chatDeletedAt: () => null,
     getStoredMessages: () => Promise.resolve([]),
     toEngineJid,
     ...overrides,

@@ -55,15 +55,21 @@ import { ListingMemo } from '../../common/utils/listing-memo';
 import { isTransientDbError, isUniqueViolation } from '../../common/utils/db-errors';
 import { awaitNoOpenTransaction } from '../../common/utils/shared-connection';
 import { resolveFeatureFlags } from '../../config/feature-flags';
-import { IWhatsAppEngine, ChatSummary, ChatState } from '../../engine/interfaces/whatsapp-engine.interface';
+import {
+  IWhatsAppEngine,
+  ChatSummary,
+  ChatState,
+  type StoredChatMessageLookup,
+} from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { HookManager } from '../../core/hooks';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { resolveJidCandidates } from '../../engine/identity/jid-candidates';
-import { chatKind } from '../../engine/identity/wa-id';
+import { chatKind, parseWaId } from '../../engine/identity/wa-id';
 import { Message, MessageDirection } from '../message/entities/message.entity';
 import { ServerShuttingDownException, SessionStoppedException } from './session-engine-controls';
+import { phoneKey } from './message-mutation-guard';
 // Type-only: the module binds this class to PLUGIN_SESSION_PORT with a `useExisting` alias, which
 // TypeScript does not check, so `implements` is what keeps the two in step.
 import type { PluginSessionPort } from '../../core/plugins/plugin-host-ports';
@@ -1162,8 +1168,21 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
   /** See SessionEngineLifecycle.logout() for the full unlink/502 contract. */
   async logout(id: string): Promise<Session> {
+    // A start still waiting on its claim yields to the logout rather than relaunching the session it just
+    // took down. Not recorded as a stop: logout clears the phone, which keeps the session out of auto-start.
+    let request: StopRequest | undefined;
+    const issue = (): StopRequest => (request ??= this.requestStop(id, 'stop'));
+    const withdraw = (): void => {
+      if (request) this.withdrawStop(request);
+    };
+    if (this.engines.get(id)) issue();
     try {
-      const session = await this.engineLifecycle.logout(id);
+      const session = await this.engineLifecycle.logout(id, {
+        onReadFailed: withdraw,
+        onEngineFound: () => {
+          issue();
+        },
+      });
       // Torn down locally on the 200 path — hand the claim back the way stop() does.
       await this.releaseAfterTeardown(id);
       return session;
@@ -1171,8 +1190,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // The 502-incomplete path tears the engine down, so its claim must not survive the call. A 400
       // "not started" refusal changed nothing and keeps whatever claim there is: release() also
       // clears a LAPSED foreign claim, which would take a crashed node's session out of takeover.
+      if (error instanceof BadRequestException) withdraw();
       if (!(error instanceof BadRequestException)) await this.releaseAfterTeardown(id);
       throw error;
+    } finally {
+      if (request) this.endStop(id, request);
     }
   }
 
@@ -1424,6 +1446,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     if (session.status === SessionStatus.READY) {
       throw new BadRequestException('Session is already authenticated, no pairing needed');
     }
+    // On whatsapp-web.js a code requested for a number that is already linked can make WhatsApp revoke that
+    // device. The number is the caller's to choose, so a session this key may not touch could be logged out
+    // through this one; a number another session holds is refused. The session's own number is its to re-link.
+    // Baileys adds a companion device and showed no such effect, so two of its sessions may share a number.
+    if (this.pairingMayRevoke() && (await this.otherSessionHoldsNumber(id, phoneNumber))) {
+      throw new ConflictException(
+        'That number is linked to another session. Delete that session, or log it out while it runs, before pairing this one.',
+      );
+    }
 
     const pairingCode = await engine.requestPairingCode(phoneNumber);
     return { pairingCode, status: session.status };
@@ -1437,6 +1468,24 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       () => new BadRequestException('Session is not started. Call POST /sessions/:sessionId/start first.'),
     );
     await engine.cancelPairingCode();
+  }
+
+  /** Whether the engine in use is whatsapp-web.js, where a pairing request can revoke a linked device. */
+  private pairingMayRevoke(): boolean {
+    return (this.configService?.get<string>('engine.type') ?? 'whatsapp-web.js') === 'whatsapp-web.js';
+  }
+
+  /**
+   * Whether another session stores this number as its phone, whichever way the country writes its mobile
+   * marker digit (the spellings the stored phone and the typed number can differ by).
+   */
+  private async otherSessionHoldsNumber(id: string, phoneNumber: string): Promise<boolean> {
+    const key = phoneKey(phoneNumber);
+    const others = await this.sessionRepository.find({
+      where: { id: Not(id), phone: Not(IsNull()) },
+      select: { phone: true },
+    });
+    return others.some(other => other.phone !== null && phoneKey(other.phone) === key);
   }
 
   getEngine(id: string): IWhatsAppEngine | undefined {
@@ -1513,7 +1562,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.findOne(id);
     const engine = this.requireEngine(id);
     await engine.setOnlinePresence(available);
-    this.presence.setOwnIntent(id, available);
+    // A publish that settles after its engine was replaced must not leave a preference the replacement never had.
+    if (this.engines.isLive(id, engine)) this.presence.setOwnIntent(id, available);
   }
 
   /**
@@ -1534,7 +1584,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const engine = this.requireEngine(id);
 
     const authors = await this.groupAuthors(id, chatId, messageIds);
-    return engine.sendSeen(chatId, messageIds, authors).finally(() => this.chatListings.drop(id));
+    return engine
+      .sendSeen(chatId, messageIds, authors, this.storedLastMessage(id, chatId, { receivedOnly: true }))
+      .finally(() => this.chatListings.drop(id));
   }
 
   /**
@@ -1568,34 +1620,109 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.markUnread(chatId).finally(() => this.chatListings.drop(id));
+    return engine.markUnread(chatId, this.storedLastMessage(id, chatId)).finally(() => this.chatListings.drop(id));
+  }
+
+  /**
+   * The newest message the gateway stored for a chat, for an engine that keys chat writes to one and
+   * holds none for the chat itself (Baileys after a restart, #1891). The lookup runs only when the
+   * engine calls it, and covers every id form of the chat (the GET messages filter's rules).
+   *
+   * A received group message counts only with its sender, which the key needs; `receivedOnly` asks
+   * for the newest received message, the one a read receipt acknowledges.
+   */
+  private storedLastMessage(
+    sessionId: string,
+    chatId: string,
+    { receivedOnly = false }: { receivedOnly?: boolean } = {},
+  ): StoredChatMessageLookup {
+    return async () => {
+      const expanded = await resolveJidCandidates(chatId, {
+        resolveLid: lid => this.lidMappingStore.findPhoneForLid(lid),
+        lidsForPhone: phone => this.lidMappingStore.findLidsForPhone(phone),
+      });
+      const base = {
+        sessionId,
+        chatId: In([...new Set([chatId, ...expanded])]),
+        waMessageId: Not(IsNull()),
+        timestamp: Not(IsNull()),
+      };
+      const received = { ...base, direction: MessageDirection.INCOMING };
+      const where: FindOptionsWhere<Message>[] =
+        parseWaId(chatId).kind === 'group'
+          ? [
+              { ...received, author: Not(IsNull()) },
+              ...(receivedOnly ? [] : [{ ...base, direction: MessageDirection.OUTGOING }]),
+            ]
+          : [receivedOnly ? received : base];
+      const row = await this.messageRepository.findOne({
+        where,
+        order: { timestamp: 'DESC', createdAt: 'DESC' },
+        select: { id: true, waMessageId: true, chatId: true, direction: true, author: true, timestamp: true },
+      });
+      if (!row) return null;
+      // The lid the engine keys a lid-migrated chat by, read from the persisted mapping: the engine's
+      // own cache can lack it (#1901). A phone can map to more than one lid, so the lid the row is
+      // filed under wins, and a row filed under the phone takes the table's lid when it lists one. With
+      // two or more, for the chat or for the sender of a received group message, any one is a guess
+      // (the engine's cache would pick the oldest), so no write is keyed to the row at all.
+      const filed = parseWaId(row.chatId);
+      const lids = expanded.filter(candidate => parseWaId(candidate).kind === 'lid');
+      if (filed.kind !== 'lid' && lids.length > 1) return null;
+      const lid = filed.kind === 'lid' ? `${filed.userPart}@lid` : lids[0];
+      const sender =
+        parseWaId(chatId).kind === 'group' && row.direction === MessageDirection.INCOMING ? row.author : undefined;
+      const authorLids = sender ? await this.persistedLidsOf(sender) : [];
+      if (authorLids.length > 1) return null;
+      const authorLid = authorLids[0];
+      return {
+        id: row.waMessageId,
+        fromMe: row.direction === MessageDirection.OUTGOING,
+        ...(row.author ? { author: row.author } : {}),
+        timestamp: row.timestamp,
+        ...(lid ? { lid } : {}),
+        ...(authorLid ? { authorLid } : {}),
+      };
+    };
+  }
+
+  /** Every `<lid>@lid` the persisted mapping holds for a person (the lid itself for a lid). */
+  private async persistedLidsOf(jid: string): Promise<string[]> {
+    const parsed = parseWaId(jid);
+    if (parsed.kind === 'lid') return [`${parsed.userPart}@lid`];
+    if (parsed.kind !== 'user') return [];
+    return (await this.lidMappingStore.findLidsForPhone(parsed.userPart)).map(lid => `${lid}@lid`);
   }
 
   /**
    * Delete every message in a chat, keeping the chat itself. Resolves false when the engine could
-   * not act — an unknown chat, or on Baileys a chat with no known history to key the change to.
-   * On success the gateway's stored copies of the chat's messages are removed too.
+   * not act — an unknown chat, or on Baileys a chat with no message in memory or stored to key the
+   * change to. On success the gateway's stored copies of the chat's messages are removed too.
    */
   async clearChatMessages(id: string, chatId: string): Promise<boolean> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
     const cutoff = new Date();
-    const ok = await engine.clearChatMessages(chatId).finally(() => this.chatListings.drop(id));
+    const ok = await engine
+      .clearChatMessages(chatId, this.storedLastMessage(id, chatId))
+      .finally(() => this.chatListings.drop(id));
     if (ok) await this.purgeStoredChat(id, chatId, cutoff);
     return ok;
   }
 
   /**
-   * Archive or unarchive a chat. Resolves false when the engine could not act — on Baileys a chat
-   * with no known history has no last message to key the app-state modification to. That is a
-   * defined outcome, not an error, so it is reported as `success: false` rather than a 500.
+   * Archive or unarchive a chat. Resolves false when the engine could not act. Baileys keys the
+   * change to the chat's newest message in memory, else the newest stored one, else sends it
+   * without one for a chat the session knows, which WhatsApp applies too.
    */
   async archiveChat(id: string, chatId: string, archive: boolean): Promise<boolean> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.archiveChat(chatId, archive).finally(() => this.chatListings.drop(id));
+    return engine
+      .archiveChat(chatId, archive, this.storedLastMessage(id, chatId))
+      .finally(() => this.chatListings.drop(id));
   }
 
   /**
@@ -1627,7 +1754,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const engine = this.requireEngine(id);
 
     const cutoff = new Date();
-    const ok = await engine.deleteChat(chatId).finally(() => this.chatListings.drop(id));
+    const ok = await engine
+      .deleteChat(chatId, this.storedLastMessage(id, chatId))
+      .finally(() => this.chatListings.drop(id));
     if (ok) await this.purgeStoredChat(id, chatId, cutoff);
     return ok;
   }

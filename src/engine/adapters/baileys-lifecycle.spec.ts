@@ -263,6 +263,26 @@ describe('BaileysLifecycle proxy fetch dispatcher', () => {
       return { engine, resolve, authRequested, loadAuth };
     }
 
+    // Opening the auth state creates the session's directory, which a deleted session no longer has.
+    it('does not open the auth state when the session stops while the library loads', async () => {
+      const engine = lifecycle();
+      engine.sock = null;
+      let finishLibrary: (lib: typeof BaileysLib) => void = () => undefined;
+      jest.spyOn(engine, 'loadLib').mockReturnValueOnce(
+        new Promise<typeof BaileysLib>(resolve => {
+          finishLibrary = resolve;
+        }),
+      );
+      jest.mocked(useAtomicMultiFileAuthState).mockClear();
+      const init = engine.initialize();
+      await engine.destroy();
+      finishLibrary(BaileysLib);
+      await init;
+
+      expect(useAtomicMultiFileAuthState).not.toHaveBeenCalled();
+      expect(engine.sock).toBeNull();
+    });
+
     // The teardown closed the only dispatcher there was; a lookup after it would build one nothing
     // closes and send a stopped session's requests through its proxy.
     it('skips the version lookup when the session stops while its auth state loads', async () => {

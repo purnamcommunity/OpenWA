@@ -267,6 +267,41 @@ test('uninstalling a plugin reloads the catalog, whose installed flags it change
   }
 });
 
+// The mount prefetch can still be in flight when a later read starts; its older answer must not replace the newer one.
+test('a catalog read that finishes after a newer one does not replace it', async () => {
+  const { screen, fireEvent, waitFor, act } = rtl;
+  const entry = (updateAvailable: boolean) => ({
+    id: PLUGIN.id,
+    name: 'Greeter',
+    version: updateAvailable ? '2.0.0' : '1.0.0',
+    installed: true,
+    installedVersion: '1.0.0',
+    updateAvailable,
+    download: 'https://example.invalid/greeter.zip',
+  });
+  let releaseFirst!: () => void;
+  catalogReply = () =>
+    catalogReads === 1
+      ? new Promise(resolve => (releaseFirst = () => resolve(jsonResponse([entry(true)]))))
+      : Promise.resolve(jsonResponse([entry(false)]));
+  const realConfirm = window.confirm;
+  window.confirm = () => true;
+  try {
+    renderPlugins();
+    await waitFor(() => assert.equal(catalogReads, 1));
+    fireEvent.click(await screen.findByTitle('Uninstall'));
+    await waitFor(() => assert.equal(catalogReads, 2));
+    await screen.findByText('Plugin uninstalled');
+    await act(async () => {
+      releaseFirst();
+      await new Promise(resolve => setTimeout(resolve, 20));
+    });
+    assert.equal(document.querySelector('.plugin-update-chip') === null, true, 'the older read replaced the newer');
+  } finally {
+    window.confirm = realConfirm;
+  }
+});
+
 test('uploading a plugin .zip reloads the catalog, whose installed flags it changed', async () => {
   const { screen, fireEvent, waitFor } = rtl;
   renderPlugins();

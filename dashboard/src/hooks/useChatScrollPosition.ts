@@ -217,6 +217,26 @@ export function useChatScrollPosition(
   const mediaHeights = useRef(new WeakMap<Element, number>());
   // Media whose load arrived since the last frame, for the reading-position correction in onMediaLoad.
   const decodedMediaRef = useRef<Element[]>([]);
+  const mediaFramesRef = useRef(new Set<number>());
+  const mediaVisitRef = useRef(0);
+
+  // Each visit owns its frames and queue, including a return to the same chat.
+  const retireMediaFrames = useCallback(() => {
+    for (const frame of mediaFramesRef.current) cancelAnimationFrame(frame);
+    mediaFramesRef.current.clear();
+    decodedMediaRef.current = [];
+    mediaVisitRef.current += 1;
+  }, []);
+  const scheduleMediaFrame = useCallback((apply: () => void) => {
+    const visit = mediaVisitRef.current;
+    const frame = requestAnimationFrame(() => {
+      mediaFramesRef.current.delete(frame);
+      if (mediaVisitRef.current === visit) apply();
+    });
+    mediaFramesRef.current.add(frame);
+  }, []);
+
+  useEffect(() => () => retireMediaFrames(), [retireMediaFrames]);
 
   const writeScrollTop = useCallback((el: HTMLDivElement, top: number) => {
     el.scrollTop = top;
@@ -325,7 +345,10 @@ export function useChatScrollPosition(
     pendingRestoreRef.current = null;
     // Same for a page still in flight: its delta belongs to the thread being left. This effect is
     // declared before the height tracker, so the flag is gone before the tracker could act on it.
-    if (next !== prevChatIdRef.current) awaitingOlderPageRef.current = false;
+    if (next !== prevChatIdRef.current) {
+      awaitingOlderPageRef.current = false;
+      retireMediaFrames();
+    }
 
     const decision = decideRestoreTarget(next, isLoaded, next !== null ? scrollMap.current.get(next)?.top : undefined);
     // A message the reader sent while this chat loaded opens it at that message, the way a send in a loaded chat
@@ -350,7 +373,7 @@ export function useChatScrollPosition(
 
     prevChatIdRef.current = next;
     loadedRef.current = isLoaded;
-  }, [activeChatId, isLoaded, followBottom, pinToBottom, writeScrollTop]);
+  }, [activeChatId, isLoaded, followBottom, pinToBottom, writeScrollTop, retireMediaFrames]);
 
   const onOlderMessagesRequested = useCallback(() => {
     const el = containerRef.current;
@@ -493,11 +516,14 @@ export function useChatScrollPosition(
       // write to a different thread, and save it under that thread's id. prevChatIdRef holds whichever chat is
       // actually on screen, set by the restore effect above.
       const onScreen = () => prevChatIdRef.current === activeChatId;
+      if (!onScreen()) return;
+      const media = event?.currentTarget ?? null;
+      if (media && (!containerRef.current?.contains(media) || !mediaHeights.current.has(media))) return;
       const pending = pendingRestoreRef.current;
       if (pending !== null) {
-        requestAnimationFrame(() => {
+        scheduleMediaFrame(() => {
           const cur = containerRef.current;
-          if (!cur || !onScreen() || pendingRestoreRef.current === null) return;
+          if (!cur || !onScreen() || pendingRestoreRef.current !== pending) return;
           writeScrollTop(cur, savedSpotTop(cur, pending));
           // What grew above the spot is absorbed by this write: a page still out is held from where it put the reader.
           if (awaitingOlderPageRef.current) onOlderMessagesRequested();
@@ -505,7 +531,7 @@ export function useChatScrollPosition(
         return;
       }
       if (pinnedRef.current) {
-        requestAnimationFrame(() => {
+        scheduleMediaFrame(() => {
           const cur = containerRef.current;
           if (cur && onScreen() && pinnedRef.current) followBottom(cur);
         });
@@ -513,20 +539,19 @@ export function useChatScrollPosition(
       }
       if (!containerRef.current) return;
       // Which element grew, and by how much, decides whether the reader moved at all.
-      const media = event?.currentTarget ?? null;
-      if (!media || !mediaHeights.current.has(media)) return;
+      if (!media) return;
       // Measured in the frame, top to bottom, each after the corrections above it: read when its load event fires,
       // an element can sit below another that grew in the same frame and was not corrected yet, and then reads as
       // below the reader by that growth.
       const decoded = decodedMediaRef.current;
       decoded.push(media);
       if (decoded.length > 1) return;
-      requestAnimationFrame(() => {
+      scheduleMediaFrame(() => {
         if (onScreen()) applyMediaGrowth();
         else decoded.length = 0;
       });
     },
-    [activeChatId, applyMediaGrowth, followBottom, onOlderMessagesRequested, writeScrollTop],
+    [activeChatId, applyMediaGrowth, followBottom, onOlderMessagesRequested, writeScrollTop, scheduleMediaFrame],
   );
 
   return { containerRef, onMessageAppended, onMediaLoad, measureMedia, onOlderMessagesRequested };

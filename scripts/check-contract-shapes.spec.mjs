@@ -112,7 +112,7 @@ test('comparePair flags a widened union and an enum mismatch at token level', ()
     count: { optional: false, token: 'number | null' },
   };
   const diffs = comparePair('Sample', hand, 'SampleDto', schemas.SampleDto, schemas);
-  assert.ok(diffs.some(d => d.includes('"direction": hand string, contract enum(incoming,outgoing)')));
+  assert.ok(diffs.some(d => d.includes('"direction": hand string, contract enum(["incoming","outgoing"])')));
   assert.ok(diffs.some(d => d.includes('"count": hand number|null, contract number')));
 });
 
@@ -154,7 +154,7 @@ test('parseObjectToken splits nested object tokens without losing members', () =
 
 test('handToken reduces enums, null unions and arrays deterministically', () => {
   const types = {};
-  assert.equal(handToken("'b' | 'a'", types), 'enum(a,b)'.replace(',', ','));
+  assert.equal(handToken("'b' | 'a'", types), 'enum(["a","b"])'.replace(',', ','));
   assert.equal(handToken('number | null', types), 'number|null');
   assert.equal(handToken('string[]', types), 'array<string>');
 });
@@ -200,7 +200,7 @@ test('parsePythonTypes: TypedDict totals, NotRequired, aliased Literal enums, in
   const types = parsePythonTypes(src);
   assert.equal(types.Session.id.optional, true, 'inherited total=False member stays optional');
   assert.equal(types.Session.name.optional, false);
-  assert.equal(types.Session.status.token, 'enum(created,ready)');
+  assert.equal(types.Session.status.token, 'enum(["created","ready"])');
   assert.equal(types.Session.lastError.optional, true);
   assert.equal(types.Session.lastError.token, 'string|null');
 });
@@ -237,7 +237,7 @@ test('parseGoTypes: omitempty optionality, pointer nullability, const-block enum
   // Member maps key by JSON tag (the wire name), not the Go identifier.
   const s = parseGoTypes([src]).Sample;
   assert.equal(s.name.optional, true);
-  assert.equal(s.kind.token, 'enum(one,two)');
+  assert.equal(s.kind.token, 'enum(["one","two"])');
   assert.equal(s.kind.optional, false);
   assert.equal(s.items.token, 'array<string>');
   assert.equal(s.items.optional, false, 'bare slice is a REQUIRED array');
@@ -261,7 +261,7 @@ test('parsePythonTypes: a Literal of bare numbers is an enum, not an unreadable 
   ].join('\n');
   // Members went unread before, so the field fell through to a non-simple token and comparePair
   // skipped it: the enum silently stopped being gated while the run stayed green.
-  assert.equal(parsePythonTypes(src).Post.font.token, 'enum(0,1,2,6,10)', 'sorted numerically, not 0,1,10,2,6');
+  assert.equal(parsePythonTypes(src).Post.font.token, 'enum([0,1,2,6,10])', 'sorted numerically, not 0,1,10,2,6');
 });
 
 test('parseGoTypes: a const block of bare numbers is an enum', () => {
@@ -278,7 +278,7 @@ test('parseGoTypes: a const block of bare numbers is an enum', () => {
     '\tWindow Window `json:"window"`',
     '}',
   ].join('\n');
-  assert.equal(parseGoTypes([src]).Sample.window.token, 'enum(86400,604800,2592000)');
+  assert.equal(parseGoTypes([src]).Sample.window.token, 'enum([86400,604800,2592000])');
 });
 
 test('parseJavaTypes: enum constants resolve to their wire values, annotated or bare', () => {
@@ -298,8 +298,8 @@ test('parseJavaTypes: enum constants resolve to their wire values, annotated or 
   const s = parseJavaTypes([src]).Sample;
   // Gson emits @SerializedName when present and the constant name otherwise; without this the
   // component resolved to the Java type name, which comparePair skips as non-simple.
-  assert.equal(s.scheme.token, 'enum(http,socks5)');
-  assert.equal(s.shades.token, 'array<enum(BLUE,RED)>');
+  assert.equal(s.scheme.token, 'enum(["http","socks5"])');
+  assert.equal(s.shades.token, 'array<enum(["BLUE","RED"])>');
 });
 
 test('parseJavaTypes: a bare UNKNOWN sentinel is not a wire member, an annotated "unknown" is', () => {
@@ -316,12 +316,12 @@ test('parseJavaTypes: a bare UNKNOWN sentinel is not a wire member, an annotated
     'public record Sample(Status status, Kind kind) {}',
   ].join('\n');
   const s = parseJavaTypes([src]).Sample;
-  assert.equal(s.status.token, 'enum(ready)');
-  assert.equal(s.kind.token, 'enum(chat,unknown)');
+  assert.equal(s.status.token, 'enum(["ready"])');
+  assert.equal(s.kind.token, 'enum(["chat","unknown"])');
 });
 
 test('isSimpleToken-gated diffing reaches inside an array of enum members', () => {
-  const hand = { events: { optional: false, token: 'array<enum(a,b)>' } };
+  const hand = { events: { optional: false, token: 'array<enum(["a","b"])>' } };
   const schema = {
     type: 'object',
     required: ['events'],
@@ -337,19 +337,19 @@ test('a nullable enum is compared on both sides, the null member of the contract
   // The token used to end in `|null`, which no comparison accepted, so such a field was never compared.
   const kind = { type: 'string', nullable: true, enum: ['a', 'b', null] };
   const schema = { type: 'object', required: ['kind'], properties: { kind } };
-  assert.equal(schemaToken(kind, {}), 'enum(a,b)|null');
-  assert.equal(handToken("'b' | 'a' | null", {}), 'enum(a,b)|null');
+  assert.equal(schemaToken(kind, {}), 'enum(["a","b"])|null');
+  assert.equal(handToken("'b' | 'a' | null", {}), 'enum(["a","b"])|null');
 
   const hand = { kind: { optional: false, token: "'a' | 'b' | null" } };
   assert.deepEqual(comparePair('Hand', hand, 'Dto', schema, {}), []);
   // A member the contract gained, and a null arm the hand lacks, are drift.
   const gained = { ...schema, properties: { kind: { ...kind, enum: ['a', 'b', 'c', null] } } };
   assert.deepEqual(comparePair('Hand', hand, 'Dto', gained, {}), [
-    '"kind": hand enum(a,b)|null, contract enum(a,b,c)|null',
+    '"kind": hand enum(["a","b"])|null, contract enum(["a","b","c"])|null',
   ]);
   const notNull = { kind: { optional: false, token: "'a' | 'b'" } };
   assert.deepEqual(comparePair('Hand', notNull, 'Dto', schema, {}), [
-    '"kind": hand enum(a,b), contract enum(a,b)|null',
+    '"kind": hand enum(["a","b"]), contract enum(["a","b"])|null',
   ]);
 });
 
@@ -375,8 +375,8 @@ test('parsePythonTypes: a nullable Literal or list keeps its closing bracket and
   // read as the unparseable `Literal["x", "y"` and the field was never compared.
   const tokens = Object.values(parsePythonTypes(src).Sample).map(v => v.token);
   assert.deepEqual(tokens, [
-    'enum(x,y)|null',
-    'enum(x,y)|null',
+    'enum(["x","y"])|null',
+    'enum(["x","y"])|null',
     'array<string>|null',
     'array<string>|null',
     'string|null',
@@ -764,3 +764,138 @@ test('the gate and its CLI cases give the same verdicts on a CRLF checkout', () 
   assert.equal(dashboardOnly.status, 1, dashboardOnly.output);
   assert.match(dashboardOnly.output, /BrandNewDto is sent or returned by the SDKs but no client compares it/);
 });
+
+test('enum comparison preserves number, string and boolean wire kinds in every client parser', () => {
+  const sample = {
+    typescript: (a, b) => parseHandTypes(`export interface Sample {\n  value: '${a}' | '${b}';\n}\n`).Sample,
+    python: (a, b) => parsePythonTypes(`class Sample(TypedDict):\n    value: Literal["${a}", "${b}"]\n`).Sample,
+    go: (a, b) =>
+      parseGoTypes([
+        `type Kind string\nconst (\n One Kind = "${a}"\n Two Kind = "${b}"\n)\ntype Sample struct {\n Value Kind \x60json:"value"\x60\n}\n`,
+      ]).Sample,
+    java: (a, b) =>
+      parseJavaTypes([
+        `public enum Kind {\n @SerializedName("${a}") ONE,\n @SerializedName("${b}") TWO\n}\npublic record Sample(Kind value) {}\n`,
+      ]).Sample,
+  };
+  for (const [language, parse] of Object.entries(sample)) {
+    for (const values of [
+      [0, 1],
+      [false, true],
+    ]) {
+      const hand = parse(...values.map(String));
+      const dto = members => ({
+        type: 'object',
+        required: ['value'],
+        properties: { value: { type: typeof members[0], enum: members } },
+      });
+      assert.deepEqual(comparePair('Sample', hand, 'Dto', dto(values.map(String)), {}, language !== 'java'), []);
+      assert.ok(comparePair('Sample', hand, 'Dto', dto(values), {}, language !== 'java').length > 0, language);
+      const arrayHand = {
+        value: {
+          ...hand.value,
+          token: `array<${language === 'typescript' ? handToken(hand.value.token, {}) : hand.value.token}>`,
+        },
+      };
+      const arrayDto = {
+        type: 'object',
+        required: ['value'],
+        properties: { value: { type: 'array', items: { type: typeof values[0], enum: values } } },
+      };
+      assert.ok(
+        comparePair('Sample', arrayHand, 'Dto', arrayDto, {}, language !== 'java').length > 0,
+        `${language} array`,
+      );
+    }
+  }
+});
+
+test('nullable enum comparisons retain kind and Java numeric loosening accepts only numeric members', () => {
+  const dto = value => ({ type: 'object', required: ['value'], properties: { value } });
+  const numeric = dto({ type: 'number', enum: [0, 1, null], nullable: true });
+  const strings = dto({ type: 'string', enum: ['0', '1', null], nullable: true });
+  const hand = { value: { optional: false, token: "'0' | '1' | null" } };
+  assert.deepEqual(comparePair('Sample', hand, 'Dto', strings, {}), []);
+  assert.ok(comparePair('Sample', hand, 'Dto', numeric, {}).length > 0);
+  const java = parseJavaTypes(['public record Sample(Integer value) {}']).Sample;
+  assert.deepEqual(comparePair('Sample', java, 'Dto', numeric, {}, false), []);
+  assert.ok(comparePair('Sample', java, 'Dto', strings, {}, false).length > 0);
+});
+
+test('TypeScript double-quoted numeric strings remain strings and JSON enum punctuation preserves later fields', () => {
+  const numeric = { type: 'object', required: ['value'], properties: { value: { type: 'number', enum: [0, 1] } } };
+  const hand = parseHandTypes('export interface Sample {\n  value: "0" | "1";\n}\n').Sample;
+  assert.ok(comparePair('Sample', hand, 'Dto', numeric, {}).length > 0);
+  const value = 'a),<"b';
+  const schema = {
+    type: 'object',
+    required: ['value', 'tail'],
+    properties: { value: { type: 'string', enum: [value] }, tail: { type: 'boolean' } },
+  };
+  const fields = parseObjectToken(schemaToken(schema, {}));
+  assert.deepEqual(Object.keys(fields), ['tail', 'value']);
+  assert.equal(fields.tail.token, 'boolean');
+});
+
+test('the CLI refuses numeric status fonts declared as strings in every typed SDK', () => {
+  const edit = (s, a, b) => {
+    assert.ok(s.includes(a));
+    return s.replace(a, b);
+  };
+  const cases = [
+    [
+      'sdk/javascript/src/types.ts',
+      s => edit(s, 'font?: 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10;', "font?: '0' | '1' | '2' | '6' | '7' | '8' | '9' | '10';"),
+    ],
+    [
+      'sdk/python/openwa/types.py',
+      s =>
+        edit(
+          s,
+          'StatusFont = Literal[0, 1, 2, 6, 7, 8, 9, 10]',
+          'StatusFont = Literal["0", "1", "2", "6", "7", "8", "9", "10"]',
+        ),
+    ],
+    [
+      'sdk/go/types_status.go',
+      s =>
+        edit(s, 'type StatusFont int', 'type StatusFont string').replace(
+          /(StatusFont\s*=\s*)(\d+)(\s*(?:\/\/[^\n]*)?\n)/g,
+          '$1"$2"$3',
+        ),
+    ],
+    [
+      `${javaModel}/SendTextStatusRequest.java`,
+      () => `package com.rmyndharis.openwa.model;
+import java.util.List;
+import com.google.gson.annotations.SerializedName;
+public record SendTextStatusRequest(String text, List<String> recipients, String backgroundColor, FixtureFont font) {
+  public enum FixtureFont {
+    @SerializedName("0") F0, @SerializedName("1") F1, @SerializedName("2") F2,
+    @SerializedName("6") F6, @SerializedName("7") F7, @SerializedName("8") F8,
+    @SerializedName("9") F9, @SerializedName("10") F10
+  }
+}
+`,
+    ],
+  ];
+  for (const [path, mutate] of cases) {
+    const result = runGateOnCopy({ sdk: { [path]: mutate } });
+    assert.equal(result.status, 1, `${path}: ${result.output}`);
+    assert.match(result.output, /SendTextStatusRequest/);
+    assert.match(result.output, /font/);
+  }
+});
+
+for (const [name, value] of [
+  ['empty', { type: 'number', enum: [] }],
+  ['null-only', { type: 'number', enum: [null], nullable: true }],
+]) {
+  test(`Java numeric relaxation refuses a ${name} enum`, () => {
+    const java = parseJavaTypes(['public record Sample(Integer value) {}']).Sample;
+    const schema = { type: 'object', required: ['value'], properties: { value } };
+    assert.ok(comparePair('Sample', java, 'Dto', schema, {}, false).length > 0);
+    const numeric = { ...schema, properties: { value: { type: 'number', enum: [0, 1] } } };
+    assert.deepEqual(comparePair('Sample', java, 'Dto', numeric, {}, false), []);
+  });
+}

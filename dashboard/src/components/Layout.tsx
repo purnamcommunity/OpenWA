@@ -18,8 +18,10 @@ import {
   Monitor,
   Menu,
   X,
-  ChevronLeft,
-  ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   Languages,
   UserCheck,
 } from 'lucide-react';
@@ -230,34 +232,41 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
               <span className="brand-name">{t('common.appName')}</span>
               <span className="brand-version">v{version}</span>
               {update && (
-                <a className="brand-update" href={update.url} target="_blank" rel="noopener noreferrer">
+                <a
+                  className="brand-update"
+                  href={update.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={t('common.updateAvailable', { version: update.latest })}
+                >
                   {t('common.updateAvailable', { version: update.latest })}
                 </a>
               )}
             </div>
           )}
-        </div>
-
-        {!isMobile && (
-          <button
-            className="collapse-toggle"
-            onClick={toggleCollapse}
-            title={isCollapsed ? t('common.expand') : t('common.collapse')}
-            aria-label={isCollapsed ? t('common.expand') : t('common.collapse')}
-          >
-            {isCollapsed ? (
-              isRtl ? (
-                <ChevronLeft size={16} />
+          {/* At the end of the header row, or under the logo on the collapsed rail. The icon is picked for the
+              reading direction, so the panel side follows the mirrored layout. */}
+          {!isMobile && (
+            <button
+              className="collapse-toggle"
+              onClick={toggleCollapse}
+              title={isCollapsed ? t('common.expand') : t('common.collapse')}
+              aria-label={isCollapsed ? t('common.expand') : t('common.collapse')}
+            >
+              {isCollapsed ? (
+                isRtl ? (
+                  <PanelRightOpen size={20} />
+                ) : (
+                  <PanelLeftOpen size={20} />
+                )
+              ) : isRtl ? (
+                <PanelRightClose size={20} />
               ) : (
-                <ChevronRight size={16} />
-              )
-            ) : isRtl ? (
-              <ChevronRight size={16} />
-            ) : (
-              <ChevronLeft size={16} />
-            )}
-          </button>
-        )}
+                <PanelLeftClose size={20} />
+              )}
+            </button>
+          )}
+        </div>
 
         <nav className="sidebar-nav">
           {navItems.map(({ to, icon: Icon, key }) => {

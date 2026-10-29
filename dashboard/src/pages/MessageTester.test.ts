@@ -366,22 +366,24 @@ test('the recipient list is parsed when it changes, not on every other keystroke
   await rtl.screen.findByRole('option', { name: /Main/ });
   rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Bulk' }));
 
-  // Count the line splits of the list. Swapped by hand: the test runner does not restore a symbol-keyed method.
+  // Count the phone normalization of the list: a textarea value read replaces other patterns in the same text.
   const list = '628111222333\n628222333444';
-  let parses = 0;
-  const split = RegExp.prototype[Symbol.split];
-  RegExp.prototype[Symbol.split] = function (this: RegExp, text: string, limit?: number) {
-    if (text === list) parses++;
-    return split.call(this, text, limit);
+  const fullWidth = /[\uFF01-\uFF5E]/g;
+  let normalizations = 0;
+  const replace = RegExp.prototype[Symbol.replace];
+  RegExp.prototype[Symbol.replace] = function (this: RegExp, text: string, replacement: unknown): string {
+    if (text === list && this.source === fullWidth.source && this.flags === fullWidth.flags) normalizations++;
+    return Reflect.apply(replace, this, [text, replacement]) as string;
   };
   try {
     type(container, '#mt-11', list);
-    const afterList = parses;
-    assert.ok(afterList >= 1, 'the list was not parsed');
+    assert.ok(rtl.screen.getByText(/Recipients: 2$/));
+    const afterList = normalizations;
+    assert.ok(afterList >= 1, 'the list was not normalized');
     for (const text of ['a', 'ab', 'abc']) type(container, '#mt-12', text);
-    assert.equal(parses, afterList);
+    assert.equal(normalizations, afterList);
   } finally {
-    RegExp.prototype[Symbol.split] = split;
+    RegExp.prototype[Symbol.replace] = replace;
   }
 });
 

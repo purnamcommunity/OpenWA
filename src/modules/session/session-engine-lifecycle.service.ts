@@ -469,8 +469,8 @@ export class SessionEngineLifecycle {
   }
 
   /** Delegate: SessionEngineControls.logout. */
-  logout(id: string): Promise<Session> {
-    return this.controls.logout(id);
+  logout(id: string, hooks?: StopHooks): Promise<Session> {
+    return this.controls.logout(id, hooks);
   }
 
   /** Delegate: SessionEngineControls.forceKill. */
@@ -706,7 +706,11 @@ export class SessionEngineLifecycle {
     // await, ownership is re-validated by object identity + the synchronous stop mark before the
     // adapter is allowed to initialize — a retired engine must never reach initialize() (which would
     // re-arm a torn-down adapter and open an untracked socket).
-    const initialStatusPromise = this.updateStatus(id, SessionStatus.INITIALIZING);
+    const initialStatusPromise = this.updateStatus(
+      id,
+      SessionStatus.INITIALIZING,
+      () => !this.closed && this.isLiveEngine(id, engine) && !this.stoppingSessions.has(id),
+    );
     this.pendingInitialStatuses.set(id, { engine, promise: initialStatusPromise });
     try {
       await initialStatusPromise;
@@ -791,13 +795,26 @@ export class SessionEngineLifecycle {
         // Do NOT port this reorder to delete()/stop()/forceKill(): there, engines.has(id) staying
         // TRUE for the duration of the teardown await is the sole deterministic block on a concurrent
         // start() (start() clears stoppingSessions rather than rejecting on it), so delete-first would
-        // open a start()-during-teardown orphan-engine window. Verified in the teardown-ordering audit.
+        // open a start()-during-teardown orphan-engine window.
         const wasLive = this.engines.deleteIfLive(id, engine);
+        const reconnectState = this.reconnectStates.get(id);
+        const reconnectAttempt = reconnectState?.started;
+        // The teardown below can outlast a stop, a start or a later reconnect attempt, whose engine and
+        // status this deadline must then leave alone.
+        const isCurrentTimeout = (): boolean =>
+          wasLive &&
+          !this.engines.has(id) &&
+          this.reconnectStates.get(id) === reconnectState &&
+          reconnectState?.started === reconnectAttempt;
         if (wasLive) this.sessionErrors.set(id, err.message);
         // Force-kill whatever got launched so a retry doesn't collide with an orphaned browser.
         // teardownEngineSafely is itself time-bound, so this can't wedge a second time.
         await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
-        if (wasLive) await this.updateStatus(id, SessionStatus.DISCONNECTED);
+        if (isCurrentTimeout()) {
+          await this.sessionRepository.update(id, { status: SessionStatus.DISCONNECTED });
+          // A replacement may reach READY while the database response is still pending.
+          if (isCurrentTimeout()) this.broadcaster.announce(id, SessionStatus.DISCONNECTED);
+        }
         // Map to a diagnostic 504 like the auth-timeout branch below, so a wedged init doesn't escape as a
         // bare 500 (#733 follow-up). This deadline covers EVERY cause and cannot tell them apart: the
         // auth-timeout below only fires once the page has LOADED (whatsapp-web.js navigates with
@@ -1405,7 +1422,10 @@ export class SessionEngineLifecycle {
       } finally {
         if (state.started === attempt) state.initInFlight = false;
       }
-      if (this.reconnectStates.get(id) !== state || state.started !== attempt) return;
+      if (this.reconnectStates.get(id) !== state || state.started !== attempt) {
+        await this.purgeAuthDirsIfDeleted(id);
+        return;
+      }
       // Init resolved, so a failure the engine reported meanwhile (a stuck-auth or readiness timer, an
       // auth failure) is real: apply it, unless a stop/delete/start already replaced this state.
       const parked = state.parkedFailure;
@@ -1431,6 +1451,11 @@ export class SessionEngineLifecycle {
           await this.fences.destroyWithEscalation(id, mine);
           this.engines.deleteIfLive(id, mine);
         }
+        // Nothing will re-register an engine for this episode now. A state left pending would keep the
+        // session counted as active: its lease renewed with no engine behind it, and its cap slot held.
+        if (!this.engines.has(id) && this.reconnectStates.get(id) === state && state.started === attempt) {
+          this.cancelReconnect(id);
+        }
         // Same start/delete window as start()'s post-init guard: this re-init re-created auth dirs
         // delete() had already purged — purge again so no credentials outlive the row.
         await this.purgeAuthDirsIfDeleted(id);
@@ -1444,7 +1469,10 @@ export class SessionEngineLifecycle {
       });
       // A delete (or delete + start) replaced this state while init ran: nothing here is ours any more,
       // and a later attempt in the same episode owns its initialization marker and parked failure too.
-      if (this.reconnectStates.get(id) !== state || state.started !== attempt) return;
+      if (this.reconnectStates.get(id) !== state || state.started !== attempt) {
+        await this.purgeAuthDirsIfDeleted(id);
+        return;
+      }
       const parked = state.parkedFailure;
       state.parkedFailure = undefined;
       // A failure only the operator can fix (re-scan, stale profile) stays terminal on a reconnect too.
@@ -1508,8 +1536,8 @@ export class SessionEngineLifecycle {
   // Deliberately NON-async: callers (initializeEngine's pending-initial-status fence above all)
   // must await the broadcaster's own promise object, keeping the exact settlement profile the
   // inline method had — an async wrapper would add adoption hops the retirement-race specs catch.
-  updateStatus(id: string, status: SessionStatus): Promise<void> {
-    return this.broadcaster.updateStatus(id, status);
+  updateStatus(id: string, status: SessionStatus, canAnnounce?: () => boolean): Promise<void> {
+    return this.broadcaster.updateStatus(id, status, canAnnounce);
   }
 
   /**

@@ -187,11 +187,12 @@ export function Templates() {
 
   const handleDelete = async () => {
     if (!selectedSessionId || !deleteTarget) return;
+    const draft = draftRef.current;
     try {
       await deleteMutation.mutateAsync({ sessionId: selectedSessionId, id: deleteTarget.id });
       toast.success(t('templates.toasts.deleted'));
-      if (editingTemplate?.id === deleteTarget.id) resetForm();
-      setDeleteTarget(null);
+      if (draftRef.current === draft && editingTemplate?.id === deleteTarget.id) resetForm();
+      setDeleteTarget(current => (current === deleteTarget ? null : current));
     } catch (err) {
       toast.error(
         t('templates.toasts.deleteFailed', {
@@ -341,7 +342,7 @@ export function Templates() {
                           className="icon-btn danger template-list-delete"
                           title={t('common.delete')}
                           aria-label={t('common.delete')}
-                          onClick={() => setDeleteTarget(template)}
+                          onClick={() => setDeleteTarget({ ...template })}
                           type="button"
                         >
                           <Trash2 size={14} />
@@ -375,7 +376,7 @@ export function Templates() {
                   <button
                     className="icon-btn danger"
                     title={t('common.delete')}
-                    onClick={() => setDeleteTarget(editingTemplate)}
+                    onClick={() => setDeleteTarget({ ...editingTemplate })}
                     type="button"
                   >
                     <Trash2 size={16} />

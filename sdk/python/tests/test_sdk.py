@@ -152,6 +152,62 @@ class TestClientCore:
             client.sessions.list()
         assert len(calls) == 1  # the redirect target was never requested
 
+    @pytest.mark.parametrize("binary", [False, True])
+    @pytest.mark.parametrize(
+        ("status", "ok"), [(100, False), (101, False), (199, False), (200, True), (204, True), (299, True), (300, False)]
+    )
+    def test_only_a_2xx_response_is_a_success(self, binary: bool, status: int, ok: bool) -> None:
+        # A custom transport can hand back a final informational status; it is no more usable than a 3xx.
+        def handler(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(status, content=b"" if status == 204 else b'{"status": "ok"}')
+
+        with OpenWAClient(base_url="http://localhost", api_key="k", transport=httpx.MockTransport(handler)) as client:
+            call = (lambda: client.messages.media("s", "c", "m")) if binary else client.health.check
+            if ok:
+                call()
+            else:
+                with pytest.raises(OpenWAApiError) as caught:
+                    call()
+                assert caught.value.status == status
+
+    @pytest.mark.parametrize("binary", [False, True])
+    def test_a_retry_after_too_long_to_parse_keeps_the_api_error(self, binary: bool) -> None:
+        import sys
+
+        limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+        if limit == 0:
+            pytest.skip("this interpreter has no limit on integer string conversion")
+        headers = {"Retry-After": "9" * (limit + 1)}
+        transport = httpx.MockTransport(
+            lambda _: httpx.Response(429, json={"statusCode": 429, "message": "slow down"}, headers=headers)
+        )
+        with OpenWAClient(base_url="http://localhost", api_key="k", transport=transport) as client:
+            with pytest.raises(OpenWARateLimitError) as caught:
+                client.messages.media("s", "c", "m") if binary else client.health.check()
+        assert caught.value.status == 429
+        assert caught.value.retry_after_seconds is None
+
+    def test_errors_survive_pickle_and_copy(self) -> None:
+        # Worker pools (multiprocessing, concurrent.futures) carry a raised exception across processes.
+        import copy
+        import pickle
+
+        err = OpenWAApiError.from_response(
+            429,
+            '{"statusCode": 429, "message": "slow", "error": "Too Many Requests", "code": "SEND_PACING_LIMITED"}',
+            "POST /x",
+            headers={"Retry-After": "7"},
+        )
+        for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
+            assert type(clone) is OpenWARateLimitError
+            assert str(clone) == str(err)
+            assert (clone.status, clone.body, clone.error_kind, clone.code) == (429, err.body, "Too Many Requests", err.code)
+            assert clone.retry_after_seconds == 7
+            assert clone.headers == {"Retry-After": "7"}
+        timeout = pickle.loads(pickle.dumps(OpenWATimeoutError(30.0)))
+        assert str(timeout) == "Request timed out after 30.0s"
+        assert timeout.timeout == 30.0
+
     def test_strips_trailing_slash(self):
         backend = MockBackend().on("GET", "/api/sessions", body=[])
         client = OpenWAClient(base_url="http://localhost:2785/", api_key="k", transport=backend.as_transport())
@@ -826,6 +882,13 @@ class TestGroups:
         client.groups.revoke_invite_code("s", "g")
         assert "/revoke" in backend.calls[-1].url
 
+    def test_set_member_label(self):
+        backend = MockBackend().on("PUT", "/member-label", body={"success": True})
+        make_client(backend).groups.set_member_label("s", "g@g.us", "Site A")
+        assert backend.last_call.method == "PUT"
+        assert backend.last_call.url == "http://localhost:2785/api/sessions/s/groups/g@g.us/member-label"
+        assert backend.last_call.body == {"label": "Site A"}
+
 
     def test_join_group(self):
         backend = MockBackend().on("POST", "/groups/join", body={"success": True, "groupId": "g1@g.us"})
@@ -1339,6 +1402,7 @@ class TestSearch:
         })
         make_client(backend).search.search({
             "q": "invoice",
+            "match": "contains",
             "sessionId": "s1",
             "chatId": "628123@c.us",
             "direction": "incoming",
@@ -1352,6 +1416,7 @@ class TestSearch:
         url = backend.last_call.url
         assert url.startswith("http://localhost:2785/api/search?")
         assert "q=invoice" in url
+        assert "match=contains" in url
         assert "sessionId=s1" in url
         assert "chatId=628123%40c.us" in url  # @ percent-encoded in query
         assert "direction=incoming" in url

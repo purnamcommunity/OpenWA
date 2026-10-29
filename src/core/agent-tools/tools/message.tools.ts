@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { isMediaUrl, MEDIA_URL_MESSAGE } from '../../../common/media/media-url';
 import { ApiKeyRole } from '../../../modules/auth/entities/api-key.entity';
+import { stripBase64DataUri } from '../../../modules/message/media-cap.util';
 import type { MessageService } from '../../../modules/message/message.service';
 import {
   CHAT_ID_MAX_LENGTH,
@@ -19,7 +20,7 @@ import {
   LOCATION_TEXT_MAX_LENGTH,
   REACTION_EMOJI_MAX_LENGTH,
 } from '../../../modules/message/dto/message-actions.dto';
-import { chatIdSchema } from '../chat-id-schema';
+import { chatIdSchema, chatJidSchema } from '../chat-id-schema';
 import { defineTool, type AnyToolDescriptor } from '../tool-descriptor';
 
 const sessionId = z.string().min(1).describe('Session UUID (the session id, not the name)');
@@ -37,12 +38,17 @@ const quotedMessageIdSchema = z
       'the serialized message id, Baileys the raw key id of a message it has already stored.',
   );
 
+const mediaUrl = (label: string) => z.string().optional().describe(`${label} URL (http/https)`);
+
 /**
  * The same media url rule as the REST routes: both engines fetch only a string that starts with
  * http(s):// and decode anything else as base64, so any other value would go out as garbage bytes.
+ * It is checked with the whole body, as the REST DTO does: base64 that holds data wins, so a url left
+ * next to it (often an empty string from an agent filling every optional field) is neither fetched nor
+ * an error.
  */
-const mediaUrl = (label: string) =>
-  z.string().refine(isMediaUrl, { error: MEDIA_URL_MESSAGE }).optional().describe(`${label} URL (http/https)`);
+const hasValidMediaUrl = (input: { url?: string; base64?: string }): boolean =>
+  !!stripBase64DataUri(input.base64) || input.url === undefined || isMediaUrl(input.url);
 
 /**
  * Mirrors the REST `mentions` field. The element rule and both caps come from the DTO rather than
@@ -128,8 +134,8 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
         includeMedia: z.boolean().optional().describe('Download media as base64 (slower)'),
         deep: z.boolean().optional().describe('Raise limit ceiling to 2000 for reaching further back in history'),
       }),
-      handler: input =>
-        message.getChatHistory(input.sessionId, input.chatId, input.limit, input.includeMedia, input.deep),
+      handler: (input, _apiKey, _chatScope, signal) =>
+        message.getChatHistory(input.sessionId, input.chatId, input.limit, input.includeMedia, input.deep, signal),
     }),
     defineTool({
       name: 'MessageGetReactions',
@@ -155,7 +161,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID (e.g. 628123456789@c.us or groupId@g.us)'),
+        chatId: chatJidSchema.describe('Chat JID (e.g. 628123456789@c.us or groupId@g.us)'),
         text: z.string().min(1).max(MESSAGE_TEXT_MAX_LENGTH).describe('Text message content'),
         linkPreview: z
           .boolean()
@@ -185,17 +191,19 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
       sessionScoped: true,
-      inputSchema: z.object({
-        sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
-        url: mediaUrl('Image'),
-        base64: z.string().optional().describe('Base64-encoded image data'),
-        mimetype: z.string().optional().describe('MIME type (required when using base64)'),
-        filename: z.string().max(255).optional(),
-        caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
-        quotedMessageId: quotedMessageIdSchema,
-        mentions: mentionsSchema,
-      }),
+      inputSchema: z
+        .object({
+          sessionId,
+          chatId: chatJidSchema.describe('Chat JID'),
+          url: mediaUrl('Image'),
+          base64: z.string().optional().describe('Base64-encoded image data'),
+          mimetype: z.string().optional().describe('MIME type (required when using base64)'),
+          filename: z.string().max(255).optional(),
+          caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
+          quotedMessageId: quotedMessageIdSchema,
+          mentions: mentionsSchema,
+        })
+        .refine(hasValidMediaUrl, { error: MEDIA_URL_MESSAGE, path: ['url'] }),
       handler: input =>
         message.sendImage(input.sessionId, {
           chatId: input.chatId,
@@ -215,17 +223,19 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
       sessionScoped: true,
-      inputSchema: z.object({
-        sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
-        url: mediaUrl('Video'),
-        base64: z.string().optional().describe('Base64-encoded video data'),
-        mimetype: z.string().optional().describe('MIME type (required when using base64)'),
-        filename: z.string().max(255).optional(),
-        caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
-        quotedMessageId: quotedMessageIdSchema,
-        mentions: mentionsSchema,
-      }),
+      inputSchema: z
+        .object({
+          sessionId,
+          chatId: chatJidSchema.describe('Chat JID'),
+          url: mediaUrl('Video'),
+          base64: z.string().optional().describe('Base64-encoded video data'),
+          mimetype: z.string().optional().describe('MIME type (required when using base64)'),
+          filename: z.string().max(255).optional(),
+          caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
+          quotedMessageId: quotedMessageIdSchema,
+          mentions: mentionsSchema,
+        })
+        .refine(hasValidMediaUrl, { error: MEDIA_URL_MESSAGE, path: ['url'] }),
       handler: input =>
         message.sendVideo(input.sessionId, {
           chatId: input.chatId,
@@ -245,18 +255,20 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
       sessionScoped: true,
-      inputSchema: z.object({
-        sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
-        url: mediaUrl('Audio'),
-        base64: z.string().optional().describe('Base64-encoded audio data'),
-        mimetype: z.string().optional().describe('MIME type (required when using base64)'),
-        filename: z.string().max(255).optional(),
-        caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
-        ptt: z.boolean().optional().describe('Send as a WhatsApp voice note (PTT)'),
-        quotedMessageId: quotedMessageIdSchema,
-        mentions: mentionsSchema,
-      }),
+      inputSchema: z
+        .object({
+          sessionId,
+          chatId: chatJidSchema.describe('Chat JID'),
+          url: mediaUrl('Audio'),
+          base64: z.string().optional().describe('Base64-encoded audio data'),
+          mimetype: z.string().optional().describe('MIME type (required when using base64)'),
+          filename: z.string().max(255).optional(),
+          caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
+          ptt: z.boolean().optional().describe('Send as a WhatsApp voice note (PTT)'),
+          quotedMessageId: quotedMessageIdSchema,
+          mentions: mentionsSchema,
+        })
+        .refine(hasValidMediaUrl, { error: MEDIA_URL_MESSAGE, path: ['url'] }),
       handler: input =>
         message.sendAudio(input.sessionId, {
           chatId: input.chatId,
@@ -277,17 +289,19 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
       sessionScoped: true,
-      inputSchema: z.object({
-        sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
-        url: mediaUrl('Document'),
-        base64: z.string().optional().describe('Base64-encoded document data'),
-        mimetype: z.string().optional().describe('MIME type (required when using base64)'),
-        filename: z.string().max(255).optional(),
-        caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
-        quotedMessageId: quotedMessageIdSchema,
-        mentions: mentionsSchema,
-      }),
+      inputSchema: z
+        .object({
+          sessionId,
+          chatId: chatJidSchema.describe('Chat JID'),
+          url: mediaUrl('Document'),
+          base64: z.string().optional().describe('Base64-encoded document data'),
+          mimetype: z.string().optional().describe('MIME type (required when using base64)'),
+          filename: z.string().max(255).optional(),
+          caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
+          quotedMessageId: quotedMessageIdSchema,
+          mentions: mentionsSchema,
+        })
+        .refine(hasValidMediaUrl, { error: MEDIA_URL_MESSAGE, path: ['url'] }),
       handler: input =>
         message.sendDocument(input.sessionId, {
           chatId: input.chatId,
@@ -309,7 +323,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
+        chatId: chatJidSchema.describe('Chat JID'),
         latitude: z.number().min(-90).max(90).describe('Latitude coordinate'),
         longitude: z.number().min(-180).max(180).describe('Longitude coordinate'),
         description: z.string().max(LOCATION_TEXT_MAX_LENGTH).optional().describe('Location label/description'),
@@ -335,7 +349,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
+        chatId: chatJidSchema.describe('Chat JID'),
         contactName: z.string().min(1).max(CONTACT_NAME_MAX_LENGTH).describe('Display name of the contact to share'),
         contactNumber: z
           .string()
@@ -359,17 +373,19 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
       sessionScoped: true,
-      inputSchema: z.object({
-        sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
-        url: mediaUrl('Sticker'),
-        base64: z.string().optional().describe('Base64-encoded sticker data'),
-        mimetype: z.string().optional().describe('MIME type (required when using base64)'),
-        filename: z.string().max(255).optional(),
-        caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
-        quotedMessageId: quotedMessageIdSchema,
-        mentions: mentionsSchema,
-      }),
+      inputSchema: z
+        .object({
+          sessionId,
+          chatId: chatJidSchema.describe('Chat JID'),
+          url: mediaUrl('Sticker'),
+          base64: z.string().optional().describe('Base64-encoded sticker data'),
+          mimetype: z.string().optional().describe('MIME type (required when using base64)'),
+          filename: z.string().max(255).optional(),
+          caption: z.string().max(MEDIA_CAPTION_MAX_LENGTH).optional(),
+          quotedMessageId: quotedMessageIdSchema,
+          mentions: mentionsSchema,
+        })
+        .refine(hasValidMediaUrl, { error: MEDIA_URL_MESSAGE, path: ['url'] }),
       handler: input =>
         message.sendSticker(input.sessionId, {
           chatId: input.chatId,
@@ -392,7 +408,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
+        chatId: chatJidSchema.describe('Chat JID'),
         templateId: z.string().optional().describe('Template UUID'),
         templateName: z.string().optional().describe('Template name slug'),
         vars: z
@@ -420,7 +436,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
+        chatId: chatJidSchema.describe('Chat JID'),
         quotedMessageId: z.string().min(1).describe('ID of the message to quote/reply to'),
         text: z.string().min(1).max(MESSAGE_TEXT_MAX_LENGTH).describe('Reply text content'),
         mentions: mentionsSchema,
@@ -442,8 +458,8 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        fromChatId: chatIdSchema.describe('Source chat JID'),
-        toChatId: chatIdSchema.describe('Destination chat JID'),
+        fromChatId: chatJidSchema.describe('Source chat JID'),
+        toChatId: chatJidSchema.describe('Destination chat JID'),
         messageId: z.string().min(1).describe('ID of the message to forward'),
       }),
       handler: input =>
@@ -463,7 +479,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID containing the message'),
+        chatId: chatJidSchema.describe('Chat JID containing the message'),
         messageId: z.string().min(1).describe('ID of the message to react to'),
         emoji: z
           .string()

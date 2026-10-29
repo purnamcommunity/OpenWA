@@ -881,6 +881,14 @@ export interface BaileysContextContent {
   templateButtonReplyMessage?: BaileysContextCarrier | null;
   listResponseMessage?: BaileysContextCarrier | null;
   interactiveResponseMessage?: BaileysContextCarrier | null;
+  /** Content types that carry a `contextInfo` of their own and have no extractor beyond it. */
+  contactMessage?: BaileysContextCarrier | null;
+  contactsArrayMessage?: BaileysContextCarrier | null;
+  liveLocationMessage?: BaileysContextCarrier | null;
+  pollCreationMessage?: BaileysContextCarrier | null;
+  pollCreationMessageV2?: BaileysContextCarrier | null;
+  pollCreationMessageV3?: BaileysContextCarrier | null;
+  pollCreationMessageV5?: BaileysContextCarrier | null;
   /** A poll wrapper; the poll inside it carries the `contextInfo`. */
   pollCreationMessageV4?: { message?: object | null } | null;
 }
@@ -923,16 +931,16 @@ export function extractBaileysContext(content: BaileysContextContent): BaileysMe
   // A text status's styling rides on the extended-text content (proto backgroundArgb/font) —
   // surface it so the store/viewer can render the story the way it was posted.
   const extText = content.extendedTextMessage;
-  const contextInfo = subForContext?.contextInfo;
-  // WhatsApp stamps the timer on every message in a disappearing chat, a product, poll, contact card, live
-  // location, order or event included, so any content node answers when the carriers above have none.
-  // A V4 poll's node is one level down, inside its wrapper.
+  // A reply can be a poll, contact card, live location, order or event as well, and WhatsApp stamps the
+  // timer on every message in a disappearing chat, so any content node answers when the carriers above
+  // have none. A V4 poll's node is one level down, inside its wrapper.
+  const contexts = Object.values(content)
+    .concat(Object.values(content.pollCreationMessageV4?.message ?? {}))
+    .map(node => (node as BaileysContextCarrier | null | undefined)?.contextInfo);
+  const contextInfo = subForContext?.contextInfo ?? contexts.find(info => info != null);
   const expiration =
     contextInfo?.expiration ??
-    Object.values(content)
-      .concat(Object.values(content.pollCreationMessageV4?.message ?? {}))
-      .map(node => (node as BaileysContextCarrier | null | undefined)?.contextInfo?.expiration)
-      .find((e): e is number => typeof e === 'number' && e > 0);
+    contexts.map(info => info?.expiration).find((e): e is number => typeof e === 'number' && e > 0);
 
   const context: BaileysMessageContext = {
     ephemeralDuration: expiration ?? undefined,

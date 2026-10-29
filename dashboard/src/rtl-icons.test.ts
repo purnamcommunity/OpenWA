@@ -5,14 +5,15 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { ArrowLeft, ArrowRight, CornerUpLeft, CornerUpRight, LogIn, LogOut, Send } from 'lucide-react';
+import { ArrowLeft, ArrowRight, CornerUpLeft, CornerUpRight, LogIn, LogOut, PanelRight, Send } from 'lucide-react';
 import ts from 'typescript';
 
 // A glyph that points along the reading direction (back, send, reply, sign out) has to flip with it:
 // under <html dir="rtl"> the back arrow of a single pane chat still pointed left, away from the list it
 // returns to, and the paper plane still pointed at the text it was sent from. lucide-react marks each
-// icon with a `lucide-<name>` class, which index.css uses to mirror them in one place. (The sidebar
-// chevron is swapped by Layout.tsx instead and is not part of this rule.)
+// icon with a `lucide-<name>` class, which index.css uses to mirror them in one place. A panel icon points at the
+// side its panel opens on, the inline end for the chat page's contact panel, so it flips too. (The sidebar's panel
+// icons are swapped by Layout.tsx instead and are not part of this rule.)
 
 const SRC = dirname(fileURLToPath(import.meta.url));
 const DIRECTIONAL = {
@@ -22,6 +23,7 @@ const DIRECTIONAL = {
   CornerUpRight,
   LogIn,
   LogOut,
+  PanelRight,
   Send,
 } as const;
 const kebab = (name: string): string => name.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();

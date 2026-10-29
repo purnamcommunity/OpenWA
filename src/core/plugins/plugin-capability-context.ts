@@ -224,6 +224,7 @@ export class PluginCapabilityContext {
           plugin.sessionConfig,
           hookSession.getStore()?.sessionId,
           plugin.manifest.sessionScoped !== false,
+          plugin.manifest,
         );
       },
       hookManager: this.hookManager,

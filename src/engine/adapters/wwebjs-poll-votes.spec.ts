@@ -1,4 +1,4 @@
-import { mapWwebjsPollVote, mapWwebjsPollVoteEvent, normalizePollVoteTimestamp } from './wwebjs-poll-votes';
+import { mapWwebjsPollVote, normalizePollVoteTimestamp } from './wwebjs-poll-votes';
 
 /**
  * The mapping between whatsapp-web.js's `PollVote` and the neutral one. The library's own typings
@@ -65,44 +65,5 @@ describe('normalizePollVoteTimestamp', () => {
     expect(normalizePollVoteTimestamp(undefined, 1_700_000_500_000)).toBe(1_700_000_500);
     expect(normalizePollVoteTimestamp(0, 1_700_000_500_000)).toBe(1_700_000_500);
     expect(normalizePollVoteTimestamp(Number.NaN, 1_700_000_500_000)).toBe(1_700_000_500);
-  });
-});
-
-describe('mapWwebjsPollVoteEvent', () => {
-  const base = {
-    voter: { _serialized: '628123456789@c.us' },
-    selectedOptions: [{ name: 'Beach', localId: 1 }],
-    interractedAtTs: 1_700_000_000_000,
-    parentMessage: { id: { _serialized: 'POLL1' }, from: '12036@g.us' },
-    parentMsgKey: { _serialized: 'POLL1', remote: { _serialized: '12036@g.us' } },
-  };
-
-  it('names the poll and the chat it lives in', () => {
-    expect(mapWwebjsPollVoteEvent(base)).toEqual({
-      voterId: '628123456789@c.us',
-      selectedOptions: ['Beach'],
-      timestamp: 1_700_000_000,
-      messageId: 'POLL1',
-      chatId: '12036@g.us',
-    });
-  });
-
-  it('falls back to the parent key when WA Web did not resolve the poll message', () => {
-    // `parentMessage` is null whenever the poll creation is not in the local store — the key is
-    // the only id present on every vote.
-    const event = mapWwebjsPollVoteEvent({ ...base, parentMessage: null });
-    expect(event?.messageId).toBe('POLL1');
-    expect(event?.chatId).toBe('12036@g.us');
-  });
-
-  it('returns null when no poll can be identified', () => {
-    // An event with a blank messageId would be applied to whatever an empty id happens to match.
-    expect(mapWwebjsPollVoteEvent({ ...base, parentMessage: null, parentMsgKey: null })).toBeNull();
-  });
-
-  it('returns null when the chat cannot be identified', () => {
-    expect(
-      mapWwebjsPollVoteEvent({ ...base, parentMessage: { id: { _serialized: 'POLL1' } }, parentMsgKey: null }),
-    ).toBeNull();
   });
 });

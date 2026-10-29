@@ -438,7 +438,8 @@ describe('ChatStateStoreService under a seeded interleaving of loads and writes'
     else process.env[ENV] = orig;
   });
 
-  const FIELDS: ChatStateField[] = ['muteEndTime', 'archived', 'pinned'];
+  // The ops below never mark a deletion, so the model leaves that field out.
+  const FIELDS: Exclude<ChatStateField, 'deletedAt'>[] = ['muteEndTime', 'archived', 'pinned'];
   const SESSIONS = ['s1', 's2'];
   const CHATS = ['a@s.whatsapp.net', 'b@s.whatsapp.net', 'c@g.us'];
   type Patch = { muteEndTime?: number | null; archived?: boolean; pinned?: boolean };

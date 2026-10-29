@@ -6,11 +6,12 @@ import { createLogger } from '../../common/services/logger.service';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 import { KeyedMutationQueue } from '../../common/utils/keyed-mutation-queue';
 
-export type ChatStateField = 'muteEndTime' | 'archived' | 'pinned';
-const FIELDS: ChatStateField[] = ['muteEndTime', 'archived', 'pinned'];
+export type ChatStateField = 'muteEndTime' | 'archived' | 'pinned' | 'deletedAt';
+const FIELDS: ChatStateField[] = ['muteEndTime', 'archived', 'pinned', 'deletedAt'];
 
 /**
  * Durable chat app-state Baileys cannot re-deliver on reconnect. `muteEndTime` is canonical epoch ms.
+ * `deletedAt` is the epoch ms WhatsApp deleted the chat, null (or absent) when it was not.
  * `updatedAt` (epoch ms) is when the row last changed, when known; it is read, never written by a patch.
  * `observed` lists the fields the row has seen a value for, the others holding their default; undefined
  * on a row written before the list was kept, which counts its set fields as seen. Like `updatedAt`, a
@@ -20,6 +21,7 @@ export type ChatStateValue = {
   muteEndTime: number | null;
   archived: boolean;
   pinned: boolean;
+  deletedAt?: number | null;
   updatedAt?: number;
   observed?: ChatStateField[];
 };
@@ -58,19 +60,23 @@ export interface ChatStateStore {
   reload(): Promise<void>;
   /** Forget every chat state of one session (an unlink: the next account to link it starts clean). */
   clearSession(sessionId: string): Promise<void>;
-  /** Forget the named chats of one session (a deleted chat: one a later message re-creates starts clean). */
+  /** Forget the named chats of one session (a deleted chat a later message re-creates: it starts clean). */
   forget(sessionId: string, chatIds: string[]): Promise<void>;
   /** Re-read one session's rows from the table (a start: another node may have written them since). */
   refreshSession(sessionId: string): Promise<void>;
 }
 
-const DEFAULT_STATE: ChatStateValue = { muteEndTime: null, archived: false, pinned: false };
+const DEFAULT_STATE: ChatStateValue = { muteEndTime: null, archived: false, pinned: false, deletedAt: null };
+
+/** The field's value, an absent `deletedAt` (a row or patch from before it was kept) read as its default. */
+const valueOf = (v: Partial<ChatStateValue>, field: ChatStateField) => v[field] ?? DEFAULT_STATE[field];
 
 function fromRow(row: ChatState): ChatStateValue {
   return {
     muteEndTime: row.muteEndTime,
     archived: row.archived,
     pinned: row.pinned,
+    deletedAt: row.deletedAt ?? null,
     updatedAt: row.updatedAt?.getTime(),
     observed: row.observed == null ? undefined : (row.observed.split(',').filter(Boolean) as ChatStateField[]),
   };
@@ -86,7 +92,7 @@ function fromRow(row: ChatState): ChatStateValue {
  * set value on a twin row.
  */
 const saw = (v: ChatStateValue, field: ChatStateField): boolean =>
-  v.observed ? v.observed.includes(field) : v[field] !== DEFAULT_STATE[field];
+  v.observed ? v.observed.includes(field) : valueOf(v, field) !== DEFAULT_STATE[field];
 
 /**
  * One chat's rows under several spellings, merged field by field: each field comes from the newest row
@@ -447,7 +453,8 @@ export class ChatStateStoreService implements ChatStateStore, OnModuleInit {
     if (!existing) {
       // A patch that may not create a row and only restates defaults has nothing to write for a chat
       // with no row; the table and the absent set answer that without a query where they can.
-      const restatesDefaults = !create && FIELDS.every(f => !Object.hasOwn(patch, f) || patch[f] === DEFAULT_STATE[f]);
+      const restatesDefaults =
+        !create && FIELDS.every(f => !Object.hasOwn(patch, f) || valueOf(patch, f) === DEFAULT_STATE[f]);
       if (restatesDefaults && (this.completeSessions.has(sessionId) || this.absent.has(k))) return true;
       let row: ChatState | null;
       try {
@@ -474,10 +481,7 @@ export class ChatStateStoreService implements ChatStateStore, OnModuleInit {
     const observed = FIELDS.filter(f => saw(existingRow, f) || Object.hasOwn(patch, f));
     const next: ChatStateValue = { ...existing, ...patch, updatedAt: existing.updatedAt, observed };
     if (
-      existing.muteEndTime === next.muteEndTime &&
-      existing.archived === next.archived &&
-      existing.pinned === next.pinned &&
-      FIELDS.every(f => saw(existingRow, f) === observed.includes(f))
+      FIELDS.every(f => valueOf(existingRow, f) === valueOf(next, f) && saw(existingRow, f) === observed.includes(f))
     ) {
       this.index(k, next); // warm the cache even on a no-op so the next read is a hit
       return true; // nothing changed against the current state; skip the write that would just churn updatedAt
@@ -486,7 +490,14 @@ export class ChatStateStoreService implements ChatStateStore, OnModuleInit {
     next.updatedAt = at.getTime();
     this.bumpWriteSeq(sessionId);
     this.index(k, next);
-    return this.persist(sessionId, chatId, next, at);
+    const persisted = await this.persist(sessionId, chatId, next, at);
+    if (!persisted) {
+      // The value was never stored, so a later patch equal to it must not be read as a no-op, nor a fold
+      // delete its twins on the strength of it: the next write reads the table again.
+      this.states.delete(k);
+      this.completeSessions.delete(sessionId);
+    }
+    return persisted;
   }
 
   private async persist(

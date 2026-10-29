@@ -331,6 +331,10 @@ export class BaileysLifecycle {
       }
     }
     const b = await this.loadLib();
+    // The first load of the library takes a while; a stop meanwhile must not have the auth dir created for it.
+    if (this.intentionalClose) {
+      return;
+    }
     const { state, saveCreds } = await useAtomicMultiFileAuthState(this.host.authPath, b, this.host.logger);
     // A teardown during those loads already closed the dispatcher: the lookup would build a new one
     // that nothing closes and send the stopped session's requests through its proxy. One during the

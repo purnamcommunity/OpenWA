@@ -5,6 +5,7 @@ import { Repository } from 'typeorm';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { AuditService } from '../audit/audit.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
+import { sessionScopeKey } from '../../core/plugins/plugin-activation';
 import { Session } from '../session/entities/session.entity';
 import { PluginInstanceService } from './plugin-instance.service';
 import { PluginInstance } from './entities/plugin-instance.entity';
@@ -114,15 +115,14 @@ export class ScopeBindingService implements OnApplicationBootstrap {
   async resyncAfterImport(
     previous: ReadonlyArray<{ pluginId: string; sessionScope: string | null; enabled: boolean }>,
   ): Promise<void> {
-    const scopeKey = (scope: string | null): string => (!scope || scope === '*' ? '*' : scope);
     const bound = new Set(
       (await this.instances.listAll())
         .filter(row => row.enabled)
-        .map(row => `${row.pluginId}\u0000${scopeKey(row.sessionScope)}`),
+        .map(row => `${row.pluginId}\u0000${sessionScopeKey(row.sessionScope)}`),
     );
     const retired = new Map<string, { pluginId: string; sessionScope: string | null }>();
     for (const row of previous) {
-      const key = `${row.pluginId}\u0000${scopeKey(row.sessionScope)}`;
+      const key = `${row.pluginId}\u0000${sessionScopeKey(row.sessionScope)}`;
       if (row.enabled && !bound.has(key)) retired.set(key, row);
     }
     for (const { pluginId, sessionScope } of retired.values()) {

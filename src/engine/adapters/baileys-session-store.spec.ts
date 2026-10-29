@@ -50,7 +50,7 @@ class FakeChatStateStore implements ChatStateStore {
     const found = twins.filter(t => this.rows.has(this.key(s, t)));
     if (!found.length) return this.remember(s, c, patch, create);
     const merged = mergeTwinStates([c, ...found].flatMap(t => this.get(s, t) ?? []));
-    const fields: ChatStateField[] = ['muteEndTime', 'archived', 'pinned'];
+    const fields: ChatStateField[] = ['muteEndTime', 'archived', 'pinned', 'deletedAt'];
     const base = merged
       ? Object.fromEntries(fields.filter(f => !merged.observed || merged.observed.includes(f)).map(f => [f, merged[f]]))
       : {};
@@ -905,7 +905,7 @@ describe('BaileysSessionStore', () => {
       expect(store.listChats()[0].lastMessage).toBe('edited');
     });
 
-    it('removes a deleted chat, its preview and its chat state under every spelling', () => {
+    it('removes a deleted chat and its preview under every spelling, and resets and marks its chat state', () => {
       const fake = new FakeChatStateStore();
       const s = new BaileysSessionStore(undefined, 'sess-1', fake);
       s.upsertChats([{ id: LID, name: 'Alice', pinned: 7 }]);
@@ -917,10 +917,15 @@ describe('BaileysSessionStore', () => {
       expect(s.listChats()).toEqual([expect.objectContaining({ id: '120363@g.us' })]);
       expect(s.lastMessage('628111@c.us')).toBeNull();
       expect(s.lastInboundMessage('628111@c.us')).toBeNull();
-      expect(fake.rows.size).toBe(0);
-      // A later message re-creates the chat without the pin the deleted one carried.
-      s.upsertChats([{ id: LID }]);
+      expect([...fake.rows.keys()]).toEqual([`sess-1\u0000${PHONE}`]);
+      expect(fake.get('sess-1', PHONE)).toMatchObject({ pinned: false, deletedAt: expect.any(Number) as number });
+      expect(s.chatDeletedAt(LID)).toBe(fake.get('sess-1', PHONE)?.deletedAt);
+      // A later message re-creates the chat without the pin the deleted one carried, and the mark goes.
+      const later = Math.ceil(Date.now() / 1000) + 60;
+      s.recordMessage(msg(LID, 'NEW', later));
       expect(s.listChats().find(c => c.id === LID)).toEqual(expect.objectContaining({ pinned: false }));
+      expect(fake.rows.size).toBe(0);
+      expect(s.chatDeletedAt('628111@c.us')).toBeNull();
     });
 
     it('finds the lid twin through the persisted table as well', () => {
@@ -1165,7 +1170,8 @@ describe('BaileysSessionStore', () => {
       expect(s.listChats()[0]).toMatchObject({ archived: true, pinned: true, muted: true });
       fake.rows.set(K(LID), { muteEndTime: null, archived: true, pinned: true });
       s.removeChats([PHONE]);
-      expect(fake.rows.size).toBe(0);
+      expect([...fake.rows.keys()]).toEqual([K(PHONE)]);
+      expect(fake.get(SID, PHONE)).toMatchObject({ archived: false, pinned: false, muteEndTime: null });
       expect(s.listChats()).toEqual([]);
     });
 
@@ -1191,22 +1197,26 @@ describe('BaileysSessionStore', () => {
     it.each([
       ['the lid, with the state under the phone', LID, PHONE],
       ['the phone, with the state under the lid', PHONE, LID],
-    ])('forgets a deleted chat named by %s when only the mapping table pairs them', async (_label, deleted, row) => {
-      fake.rows.set(K(row), { muteEndTime: null, archived: false, pinned: true });
-      const lidStore = {
-        getCached: jest.fn(() => undefined),
-        resolveLid: jest.fn(() => null),
-        lidsForPhone: jest.fn(() => []),
-        findPhoneForLid: jest.fn((jid: string) => Promise.resolve(jid.startsWith('484848') ? '628111' : null)),
-        findLidsForPhone: jest.fn((phone: string) => Promise.resolve(phone === '628111' ? ['484848'] : [])),
-        remember: jest.fn(() => Promise.resolve(true)),
-      };
-      const s = new BaileysSessionStore(lidStore, SID, fake);
-      s.removeChats([deleted]);
-      await flush();
-      expect(fake.rows.size).toBe(0);
-      expect(s.listChats()).toEqual([]);
-    });
+    ])(
+      'marks a deleted chat named by %s and forgets the twin only the mapping table pairs',
+      async (_label, deleted, row) => {
+        fake.rows.set(K(row), { muteEndTime: null, archived: false, pinned: true });
+        const lidStore = {
+          getCached: jest.fn(() => undefined),
+          resolveLid: jest.fn(() => null),
+          lidsForPhone: jest.fn(() => []),
+          findPhoneForLid: jest.fn((jid: string) => Promise.resolve(jid.startsWith('484848') ? '628111' : null)),
+          findLidsForPhone: jest.fn((phone: string) => Promise.resolve(phone === '628111' ? ['484848'] : [])),
+          remember: jest.fn(() => Promise.resolve(true)),
+        };
+        const s = new BaileysSessionStore(lidStore, SID, fake);
+        s.removeChats([deleted]);
+        await flush();
+        expect([...fake.rows.keys()]).toEqual([K(deleted)]);
+        expect(fake.get(SID, deleted)?.deletedAt).toEqual(expect.any(Number));
+        expect(s.listChats()).toEqual([]);
+      },
+    );
 
     it('finds the lid through the persisted mapping table as well', () => {
       fake.rows.set(K(LID), { muteEndTime: null, archived: true, pinned: false });
@@ -1295,12 +1305,72 @@ describe('BaileysSessionStore', () => {
       expect(s.listChats().map(c => c.id)).toEqual(['628111@c.us', '628222@c.us', '999@lid', '120363@g.us']);
     });
 
-    it('forgets the folded row when the chat is deleted under its lid', () => {
+    it('resets and marks the folded row when the chat is deleted under its lid', () => {
       const s = newStore();
       s.upsertChats([{ id: PHONE, pinned: 2 }]);
       s.addLidMappings([{ lid: LID, pn: PHONE }]);
       s.removeChats([LID]);
+      expect([...fake.rows.keys()]).toEqual([K(PHONE)]);
+      expect(fake.get(SID, PHONE)).toMatchObject({ pinned: false, deletedAt: expect.any(Number) as number });
+    });
+
+    it('marks each of several chats deleted at once with only its own twin rows folded in', () => {
+      const OTHER = '628222@s.whatsapp.net';
+      const OTHER_LID = '515151@lid';
+      const s = newStore();
+      s.addLidMappings([
+        { lid: LID, pn: PHONE },
+        { lid: OTHER_LID, pn: OTHER },
+      ]);
+      fake.rows.set(K(LID), { muteEndTime: null, archived: true, pinned: false });
+      fake.rows.set(K(OTHER_LID), { muteEndTime: -1, archived: false, pinned: false });
+      const fold = jest.spyOn(fake, 'fold');
+      s.removeChats([PHONE, OTHER]);
+      expect(fold.mock.calls.map(([, key, twins]) => [key, [...twins].sort()])).toEqual([
+        [PHONE, [LID]],
+        [OTHER, [OTHER_LID]],
+      ]);
+      expect([...fake.rows.keys()].sort()).toEqual([K(PHONE), K(OTHER)]);
+      expect(s.chatDeletedAt('628222@c.us')).toEqual(expect.any(Number));
+    });
+
+    it('takes no update for a deleted chat until one dated after the deletion re-creates it', () => {
+      const s = newStore();
+      s.upsertChats([{ id: PHONE, pinned: 2 }]);
+      s.removeChats([PHONE]);
+      // Baileys applies an own write locally, and a resync can bring a change from before the deletion.
+      s.upsertChats([
+        { id: PHONE, archived: true },
+        { id: PHONE, conversationTimestamp: 100, unreadCount: 1 },
+      ]);
+      expect(fake.get(SID, PHONE)).toMatchObject({ archived: false, deletedAt: expect.any(Number) as number });
+      expect(s.listChats()).toEqual([]);
+      // The update a new message brings can arrive before the message itself.
+      const later = Math.ceil(Date.now() / 1000) + 60;
+      s.upsertChats([{ id: PHONE, conversationTimestamp: later, unreadCount: 1 }]);
       expect(fake.rows.size).toBe(0);
+      expect(s.listChats()).toEqual([
+        expect.objectContaining({ id: '628111@c.us', unreadCount: 1, timestamp: later, archived: false }),
+      ]);
+    });
+
+    it('lists a deleted chat a newer message re-creates under any spelling, and clears its mark under the lid', () => {
+      const s = newStore();
+      // Deleted while its lid was not yet mapped, so the mark sits under the lid.
+      s.removeChats([LID]);
+      expect([...fake.rows.keys()]).toEqual([K(LID)]);
+      // A mapping only this session holds is not read for every message, so this message leaves the mark.
+      s.addLidMappings([{ lid: LID, pn: PHONE }]);
+      const later = Math.ceil(Date.now() / 1000) + 60;
+      s.recordMessage({ key: { remoteJid: PHONE, fromMe: false, id: 'NEW' }, messageTimestamp: later });
+      expect([...fake.rows.keys()]).toEqual([K(LID)]);
+      // The newer message still dates the chat after the deletion.
+      expect(s.listChats()).toEqual([expect.objectContaining({ id: '628111@c.us', timestamp: later })]);
+      expect(s.chatDeletedAt('628111@c.us')).toBe(fake.get(SID, LID)?.deletedAt);
+      // One under the lid, now filed under the phone, still reads the mark the lid row holds.
+      s.recordMessage({ key: { remoteJid: LID, fromMe: false, id: 'NEXT' }, messageTimestamp: later + 1 });
+      expect(fake.rows.size).toBe(0);
+      expect(s.chatDeletedAt('628111@c.us')).toBeNull();
     });
 
     it('lists a chat with a persisted state after a restart, before its next message', () => {

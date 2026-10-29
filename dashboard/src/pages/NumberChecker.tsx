@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   UserCheck,
@@ -27,6 +27,7 @@ import { useRole } from '../hooks/useRole';
 import { batchStopMessage, useNumberCheck, type CheckResultItem } from '../hooks/useNumberCheck';
 import { escapeCsvCell } from '../utils/csv';
 import { normalizePhoneText } from '../utils/phone';
+import { keepsSameKey } from '../utils/authLifecycle';
 import './NumberChecker.css';
 
 // Every lookup is an outbound WhatsApp query that counts against the gateway's per-IP limit on this route
@@ -75,6 +76,14 @@ export function NumberChecker() {
   // The session a running bulk run is bound to. Both selects are locked meanwhile, so they keep showing it even if
   // the chosen session leaves the ready list and returns during the run, and a single check goes to it too.
   const shownSession = isCheckingBatch ? run.session : currentSession;
+  const singleRun = useRef(0);
+  useEffect(() => {
+    singleRun.current += 1;
+    setIsCheckingSingle(false);
+    return () => {
+      singleRun.current += 1;
+    };
+  }, [shownSession]);
   const [batchFilter, setBatchFilter] = useState<'all' | 'registered' | 'unregistered' | 'failed'>('all');
 
   // Opt-in: the +91 rewrite would turn any other country's 10-digit or 0-prefixed number into an Indian one.
@@ -117,7 +126,7 @@ export function NumberChecker() {
   // Batch parsing statistics
   const batchParsedStats = useMemo(() => {
     const lines = normalizePhoneText(batchInput)
-      .split(/[\n,;\u060C\u061B]+/)
+      .split(/[\n,;\t\u060C\u061B]+/)
       .map(n => n.trim())
       .filter(n => n.length > 0);
 
@@ -171,9 +180,13 @@ export function NumberChecker() {
       return;
     }
 
+    const request = ++singleRun.current;
+    const sameKey = keepsSameKey();
+    const isCurrent = () => singleRun.current === request && sameKey();
     setIsCheckingSingle(true);
     try {
       const res = await contactApi.checkNumber(shownSession, formatted);
+      if (!isCurrent()) return;
       let avatar: string | null = null;
       if (res.exists && res.whatsappId) {
         try {
@@ -184,6 +197,7 @@ export function NumberChecker() {
         }
       }
 
+      if (!isCurrent()) return;
       const item: CheckResultItem = {
         ...res,
         status: res.exists ? 'registered' : 'unregistered',
@@ -195,12 +209,13 @@ export function NumberChecker() {
       setSingleResult(item);
       setRecentChecks(prev => [item, ...prev.filter(p => p.number !== item.number).slice(0, 9)]);
     } catch (err) {
+      if (!isCurrent()) return;
       toast.error(
         t('numberChecker.toast.checkFailed'),
         err instanceof Error ? err.message : t('numberChecker.toast.unknownError'),
       );
     } finally {
-      setIsCheckingSingle(false);
+      if (singleRun.current === request) setIsCheckingSingle(false);
     }
   };
 

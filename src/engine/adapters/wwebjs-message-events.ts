@@ -6,10 +6,10 @@ import {
   type RevokedMessage,
   type ReactionEvent,
   type EditedMessage,
+  type PollVoteEvent,
 } from '../interfaces/whatsapp-engine.interface';
 import { readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
 import { buildEditedMessage, buildIncomingMessageBase, mapContactFields } from './message-mapper';
-import { mapWwebjsPollVoteEvent, type RawWwebjsPollVote } from './wwebjs-poll-votes';
 import { extractWwebjsCall, plannedInboundDownload, wwebjsAckToDeliveryStatus } from './wwebjs-messaging';
 import { admitInboundSafely, inboundMediaTimeoutMs, withInboundDownloadTimeout } from './inbound-media-cap';
 import { type WwebjsEngineHost } from './wwebjs-host';
@@ -53,7 +53,7 @@ interface Change {
 const NOT_KEPT: Processing = { handOver: () => true, end: () => undefined };
 
 /**
- * Message-domain client events (message, message_create, ack, revoke, reaction, edit) extracted
+ * Message-domain client events (message, message_create, ack, revoke, reaction, edit, vote) extracted
  * from the adapter's event wiring: pure mapping from wwebjs payloads to neutral events fired
  * through the engine callbacks. Connection-state events (qr/authenticated/ready/disconnected/
  * auth_failure) stay in the lifecycle module (./wwebjs-lifecycle) — they drive the lifecycle
@@ -379,19 +379,41 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
 
   client.on('vote_update', vote => {
     try {
-      // wwebjs builds this structure from the WA Web vote table — the same table its own
-      // `getPollVotes` read is served from, so a live vote and a later read agree by construction.
-      // The mapping is shared with that read (./wwebjs-poll-votes) rather than repeated here.
-      const event = mapWwebjsPollVoteEvent(vote);
-      if (!event) {
-        // Dropped rather than forwarded with a blank id: a vote naming neither a voter nor a poll
-        // cannot replace anything, and applying it to whatever an empty id matches is worse than
-        // losing it. The warning is the signal that the payload shape moved.
-        host.logger.warn('Dropping a poll vote with no readable voter or poll', {
-          messageId: (vote as unknown as RawWwebjsPollVote).parentMsgKey?._serialized,
+      // `PollVote` assigns its keys straight through, like `Reaction`: `voter` is the raw sender Wid
+      // (typed as a string upstream) and `parentMsgKey` (untyped upstream) the raw MsgKey of the poll,
+      // so both are read with `readWid` (#747). `parentMessage` is built from the poll creation message
+      // when WhatsApp Web holds it, and from nothing otherwise, so its fields may all be undefined; the
+      // poll id and chat then come from `parentMsgKey`.
+      const raw = vote as typeof vote & {
+        voter: SerializedWid | string;
+        parentMsgKey?: SerializedWid & { remote?: SerializedWid | string };
+      };
+      const poll = vote.parentMessage as Partial<Message> | undefined;
+      const pollId = poll?.id as unknown as SerializedWid | undefined;
+      // Without the creation message whatsapp-web.js keeps only the local option ids, which no route
+      // of this API takes, so an option it could not name is left out. A selection with no nameable
+      // option is no report of what was chosen, and `[]` means a cleared vote, so it is skipped.
+      const selectedOptions = (vote.selectedOptions ?? [])
+        .map(option => option.name)
+        .filter((name): name is string => typeof name === 'string');
+      if ((vote.selectedOptions?.length ?? 0) > 0 && selectedOptions.length === 0) {
+        host.logger.debug('Ignoring a poll vote whose options WhatsApp Web cannot name', {
+          pollMessageId: readWid(pollId) ?? readWid(raw.parentMsgKey),
         });
         return;
       }
+      // Sender clock, in milliseconds. Without it a re-delivered vote gets a fresh stamp and so a fresh key.
+      const interactedAtMs = Math.floor(Number(vote.interractedAtTs) || Date.now());
+      const event: PollVoteEvent = {
+        pollMessageId: readWid(pollId) ?? readWid(raw.parentMsgKey) ?? '',
+        // Direction flag, as Message._getChatId (see message_revoke_everyone).
+        chatId: (poll?.from ? (poll.fromMe ? poll.to : poll.from) : readWid(raw.parentMsgKey?.remote)) ?? '',
+        voterId: readWid(raw.voter) ?? '',
+        selectedOptions,
+        ...(poll?.pollName ? { pollName: poll.pollName } : {}),
+        timestamp: Math.floor(interactedAtMs / 1000),
+        timestampMs: interactedAtMs,
+      };
       host.getCallbacks().onPollVote?.(event);
     } catch (error) {
       host.logger.error('Error processing vote_update', String(error));

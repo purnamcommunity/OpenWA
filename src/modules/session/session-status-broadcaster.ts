@@ -39,13 +39,18 @@ export class SessionStatusBroadcaster {
     this.logger = deps.logger;
   }
 
-  async updateStatus(id: string, status: SessionStatus): Promise<void> {
+  /**
+   * `canAnnounce`, when given, is asked once the write has settled: a caller whose engine can retire
+   * while the write is in flight keeps a late reply from announcing a status that is no longer current.
+   */
+  async updateStatus(id: string, status: SessionStatus, canAnnounce?: () => boolean): Promise<void> {
     await this.sessionRepository.update(id, { status });
     this.logger.debug(`Session status updated to ${status}`, {
       sessionId: id,
       status,
       action: 'status_update',
     });
+    if (canAnnounce?.() === false) return;
     this.announce(id, status);
   }
 

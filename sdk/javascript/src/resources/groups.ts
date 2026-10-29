@@ -140,6 +140,18 @@ export class GroupsResource {
     });
   }
 
+  /**
+   * Set this account's member label in the group (empty string clears it). Baileys only; whatsapp-web.js
+   * answers 501. A 200 means the label message was handed to WhatsApp; it cannot be read back.
+   */
+  setMemberLabel(sessionId: string, groupId: string, label: string): Promise<SuccessResult> {
+    return this.client.request<SuccessResult>({
+      method: 'PUT',
+      path: `/api/sessions/${encodeSegment(sessionId)}/groups/${encodeSegment(groupId)}/member-label`,
+      body: { label },
+    });
+  }
+
   /** Get the group settings (announce / locked / ephemeral timer / member-add mode). */
   getGroupSettings(sessionId: string, groupId: string): Promise<GroupSettingsResponse> {
     return this.client.request<GroupSettingsResponse>({

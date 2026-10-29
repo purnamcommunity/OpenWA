@@ -1350,7 +1350,7 @@
             }
           },
           "409": {
-            "description": "A credential teardown for the same session name is still in flight (e.g. a prior logout that owns destructive cleanup). Retryable — the body carries `code: SESSION_NAME_TEARDOWN_PENDING`; wait for it to settle and retry. No destructive side effect runs before this refusal. Also returned when another node currently holds this session's engine: only the owner may start it, and the claim is refused before any engine is launched, so no second connection to the account is opened. Also returned, with no `code`, when a stop, a force-kill that found a running engine to kill, or a data import (`stopOrphans`) of this session began or finished while the start was waiting, or a delete of it was still running: the start yields and launches nothing. After a stop or force-kill, a new POST /start clears it and starts the session; after a delete, or an import that removed the session, the retry answers 404.",
+            "description": "A credential teardown for the same session name is still in flight (e.g. a prior logout that owns destructive cleanup). Retryable — the body carries `code: SESSION_NAME_TEARDOWN_PENDING`; wait for it to settle and retry. No destructive side effect runs before this refusal. Also returned when another node currently holds this session's engine: only the owner may start it, and the claim is refused before any engine is launched, so no second connection to the account is opened. Also returned, with no `code`, when a stop, a logout or force-kill that found a running engine, or a data import (`stopOrphans`) of this session began or finished while the start was waiting, or a delete of it was still running: the start yields and launches nothing. After a stop or force-kill, a new POST /start clears it and starts the session; after a delete, or an import that removed the session, the retry answers 404.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1731,7 +1731,7 @@
     },
     "/api/sessions/{sessionId}/pairing-code": {
       "post": {
-        "description": "On the whatsapp-web.js engine, only request a code for a number you are prepared to re-link. A request for a number that already has a linked session has been observed to end with WhatsApp revoking that device: the linked session logs out, its credentials are deleted and it falls back to `qr_ready`. Nothing refuses such a request, because the guards check the session state and never the number. Baileys was not affected in the same tests. Link by QR when a session of that number must stay up.",
+        "description": "On the whatsapp-web.js engine, only request a code for a number you are prepared to re-link. A request for a number that already has a linked session has been observed to end with WhatsApp revoking that device: the linked session logs out, its credentials are deleted and it falls back to `qr_ready`. On that engine a number that is the stored phone of another session of this gateway (the Brazilian, Mexican and Argentine mobile spellings of one number count as the same) is refused with `409` and WhatsApp is not asked; the gateway cannot see a link made on another gateway or only on the phone. Baileys was not affected in the same tests and accepts the request: its sessions are companion devices and may share a number. Link by QR when a session of that number must stay up.",
         "operationId": "SessionController_requestPairingCode",
         "parameters": [
           {
@@ -1806,7 +1806,7 @@
             }
           },
           "409": {
-            "description": "The session is not waiting to be linked: the engine is still connecting, or reconnecting after a drop, so the request never reached WhatsApp. Wait for `status` to read `qr_ready` and retry. Once a code has been accepted the session moves through `authenticating` and `initializing` to `ready` and answers this until then; wait for `ready` in that case. A session that reads `ready` is already linked and answers `400` instead. One window answers this while the session still reads `qr_ready`: on the Baileys engine a socket that has begun closing stops accepting a pairing request before the status catches up, which on a silently dropped connection takes until the WebSocket's close timeout (30 s); retry, and the status follows shortly.",
+            "description": "The session is not waiting to be linked: the engine is still connecting, or reconnecting after a drop, so the request never reached WhatsApp. Wait for `status` to read `qr_ready` and retry. Once a code has been accepted the session moves through `authenticating` and `initializing` to `ready` and answers this until then; wait for `ready` in that case. A session that reads `ready` is already linked and answers `400` instead. One window answers this while the session still reads `qr_ready`: on the Baileys engine a socket that has begun closing stops accepting a pairing request before the status catches up, which on a silently dropped connection takes until the WebSocket's close timeout (30 s); retry, and the status follows shortly. On whatsapp-web.js also answered, with nothing sent to WhatsApp, when the requested number is the stored phone of another session of this gateway: delete that session, or log it out while it runs, first.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2247,7 +2247,7 @@
         },
         "responses": {
           "200": {
-            "description": "Returns `{ success }`. `false` means the engine declined to act: the Baileys engine sends the read receipt against the newest message the chat received, so a chat it has received no message in (one holding only the account's own sends included) is reported as declined rather than marked read. The whatsapp-web.js engine reads the chat from the page and needs no local history.",
+            "description": "Returns `{ success }`. `false` means the engine declined to act: the Baileys engine sends the read receipt against the newest message the chat received that it holds in memory, else the newest received one the gateway stored, so a chat with neither (one holding only the account's own sends included) is reported as declined rather than marked read. The whatsapp-web.js engine reads the chat from the page and needs no local history.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2652,7 +2652,7 @@
         },
         "responses": {
           "200": {
-            "description": "Chat marked as unread successfully",
+            "description": "Returns `{ success }`. `false` means the engine declined to act. The Baileys engine keys the mark to the chat's newest message in memory, else the newest stored one, else sends it without one for a chat the session knows; an id it knows no chat for answers `false`, and so does an archived chat with no known message, which the phone leaves unmarked without one.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2754,7 +2754,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Returns `{ success }`. `false` means the engine declined to act — an unknown chat, or on the Baileys engine a chat with no known history, since the change is keyed to its last message.",
+            "description": "Returns `{ success }`. `false` means the engine declined to act — an unknown chat, or on the Baileys engine a chat with no message in memory or stored, since the clear is keyed to its last message.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2856,7 +2856,7 @@
         },
         "responses": {
           "200": {
-            "description": "Returns `{ success }`. `false` means the engine declined to act — on the Baileys engine a chat with no known history cannot be archived, since the change is keyed to its last message.",
+            "description": "Returns `{ success }`. `false` means the engine declined to act. The Baileys engine keys the change to the chat's newest message in memory, else the newest stored one, else sends it without one, which WhatsApp applies as well, for a chat the session knows; an id it knows no chat for answers `false`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3163,7 +3163,7 @@
         },
         "responses": {
           "200": {
-            "description": "Chat deleted successfully",
+            "description": "Returns `{ success }`. `false` means the engine declined to act: an unknown chat, or on the Baileys engine a chat with no message in memory or stored, since the delete is keyed to its last message.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8790,7 +8790,7 @@
             }
           },
           "400": {
-            "description": "Rejected before anything was written: an invalid or unknown field, an unknown engine type, a value with a line break or one that cannot be stored, a configuration that would not boot in production, or a media storage path the app cannot write to.",
+            "description": "Rejected before anything was written: an invalid or unknown field, an unknown engine type, a value with a line break or one that cannot be stored, a configuration that would not boot in production or that the boot environment validation rejects, or a media storage path the app cannot write to.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9315,7 +9315,7 @@
     },
     "/api/sessions/{sessionId}/contacts/profile-pictures": {
       "get": {
-        "description": "One request for a whole chat sidebar — avoids the burst of parallel single fetches that would exhaust the per-IP throttle. Engine lookups run 5 at a time; per-id failures return null.",
+        "description": "Resolve a chat sidebar in one request to avoid bursts of per-contact HTTP calls. Engine lookups run 5 at a time; per-id failures return null. After a lookup times out, later chunks are skipped and their ids are absent from the response.",
         "operationId": "ContactController_getProfilePictures",
         "parameters": [
           {
@@ -11717,6 +11717,128 @@
           }
         },
         "summary": "Change group description",
+        "tags": [
+          "groups"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/groups/{groupId}/member-label": {
+      "put": {
+        "description": "Sets the per-group label WhatsApp shows beside this account's name in the group; an empty string clears it. Baileys only: whatsapp-web.js has no member-label setter and answers 501.",
+        "operationId": "GroupController_setMemberLabel",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "groupId",
+            "required": true,
+            "in": "path",
+            "description": "Group ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GroupMemberLabelDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The label message was handed to WhatsApp. Baileys sends it to the group as a protocol message with no per-request confirmation, and group metadata does not carry the label, so it cannot be read back.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupAckResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body failed validation (`label` missing, not a string, or longer than 30 UTF-16 code units), the id does not name a group, or the session is not started (no engine is running for it).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The API key is missing, unknown, revoked, or expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "WhatsApp refused the group lookup the label message depends on, for example because the account is no longer a member of the group. Also returned when the API key's role, session or chat scope, or IP allow-list does not allow this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such group — the id is unknown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The session is not connected: an engine exists for it but is not `ready`, meaning disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it, and for those few seconds the answer is a `409` naming the reload; retry shortly.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Not supported by the active engine: whatsapp-web.js has no member-label setter, so this is Baileys-only.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "WhatsApp did not answer within the request budget. The label may or may not have been sent; the gateway stopped waiting for the send to finish. On Baileys, also answered when WhatsApp rate-limits or times out the request (code 429 or 408); retry after a pause.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Set this account's member label in a group",
         "tags": [
           "groups"
         ]
@@ -16335,7 +16457,7 @@
             }
           },
           "503": {
-            "description": "Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly. The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
+            "description": "Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly. It also answers 503 once the gateway is shutting down. The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -16427,7 +16549,7 @@
             }
           },
           "503": {
-            "description": "Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly. The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
+            "description": "Conversion is disabled, the ffmpeg binary is not runnable, or the conversion queue is saturated — retry shortly. It also answers 503 once the gateway is shutting down. The session routes its `url` fetches through an egress proxy, and the fetch failed or timed out before any response arrived, so the request was not carried out. The proxy or the target behind it may be at fault; the gateway cannot tell which. Retryable, but a `503` that persists while the proxy works points at the `url`. Without a session proxy the same failure answers `400`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -18876,9 +18998,22 @@
             "name": "q",
             "required": true,
             "in": "query",
-            "description": "Search term (required, non-empty, at most 1000 characters and 32 words)",
+            "description": "Search term (required, non-empty, at most 1000 characters and 32 words, no NUL character)",
             "schema": {
               "maxLength": 1000,
+              "type": "string"
+            }
+          },
+          {
+            "name": "match",
+            "required": false,
+            "in": "query",
+            "description": "word (default): whole words. contains: any part of a word, ignoring case and accents; ranks the 1000 most recently stored matches by match quality; needs SEARCH_CONTAINS_ENABLED=true, a term of 3 or more characters and at most 64 characters in all its terms",
+            "schema": {
+              "enum": [
+                "word",
+                "contains"
+              ],
               "type": "string"
             }
           },
@@ -18987,7 +19122,7 @@
             }
           },
           "400": {
-            "description": "Empty or whitespace-only \"q\", or one over 1000 characters or 32 words",
+            "description": "Empty or whitespace-only \"q\", or one over 1000 characters or 32 words or holding a NUL character; an unknown \"match\"; or a \"match=contains\" query with no term of 3 or more characters (on PostgreSQL, 3 letters or digits in a row) or with more than 64 characters in its terms",
             "content": {
               "application/json": {
                 "schema": {
@@ -19017,7 +19152,7 @@
             }
           },
           "501": {
-            "description": "No search provider configured",
+            "description": "No search provider configured, or the built-in provider lacks the index the requested match mode needs (for \"match=contains\": SEARCH_CONTAINS_ENABLED=true and a finished index build, and on PostgreSQL the pg_trgm and unaccent extensions)",
             "content": {
               "application/json": {
                 "schema": {
@@ -19057,7 +19192,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API\n\n**Gateway-wide responses.** Three statuses are returned by middleware before routing, so any operation can emit them:\n\n- `415 Unsupported Media Type` — the request body carries a `Content-Encoding` other than `identity`. The aggregate in-flight body cap counts wire bytes, so a compressed body would be admitted on its compressed size and then inflated past the memory it is meant to bound. Send the body uncompressed.\n- `413 Payload Too Large`: the declared `Content-Length` is more than the gateway could hold in flight for this caller even when idle. The body is not read; retrying it unchanged cannot succeed.\n- `503 Service Unavailable` with `Retry-After` — the gateway already has too much request body data in flight (the body is not read; retry after the given delay), or, without `Retry-After`, shutdown teardown has begun: every route except `/api/health` and `/api/health/*` then answers it with `Connection: close`.\n\nEvery operation that takes an API key can also answer `429 Too Many Requests` (the per-IP rate-limit windows; with send pacing on, a send can also be refused with `code: SEND_PACING_LIMITED` and `retryAfterSeconds`) and `500 Internal Server Error` (an unexpected failure, or `code: ENGINE_PAGE_ERROR` when WhatsApp Web threw inside the page during a whatsapp-web.js send or status post). Error bodies follow the `ErrorResponse` schema.",
-    "version": "0.25.0",
+    "version": "0.26.0",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -20574,7 +20709,6 @@
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
-                "message.poll_vote",
                 "message.edited",
                 "status.received",
                 "session.status",
@@ -20585,6 +20719,7 @@
                 "session.restriction",
                 "presence.update",
                 "event.response",
+                "poll.vote",
                 "group.join",
                 "group.leave",
                 "group.update",
@@ -20673,7 +20808,6 @@
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
-                "message.poll_vote",
                 "message.edited",
                 "status.received",
                 "session.status",
@@ -20684,6 +20818,7 @@
                 "session.restriction",
                 "presence.update",
                 "event.response",
+                "poll.vote",
                 "group.join",
                 "group.leave",
                 "group.update",
@@ -20775,7 +20910,6 @@
                 "message.failed",
                 "message.revoked",
                 "message.reaction",
-                "message.poll_vote",
                 "message.edited",
                 "status.received",
                 "session.status",
@@ -20786,6 +20920,7 @@
                 "session.restriction",
                 "presence.update",
                 "event.response",
+                "poll.vote",
                 "group.join",
                 "group.leave",
                 "group.update",
@@ -23506,7 +23641,7 @@
           },
           "database": {
             "type": "string",
-            "description": "Database name, or the SQLite file path.",
+            "description": "Database name under PostgreSQL; empty under SQLite.",
             "example": "openwa"
           },
           "schema": {
@@ -24550,7 +24685,7 @@
         "properties": {
           "pictures": {
             "type": "object",
-            "description": "Map of the requested contact ids to their picture URL. An id resolves to null when the contact has no picture, hides it, or its individual lookup failed — a per-id failure does not fail the batch. Ids beyond the first 50 are not looked up and are absent from the map.",
+            "description": "Map of the requested contact ids to their picture URL. An id resolves to null when the contact has no picture, hides it, or its lookup failed. Ids beyond the first 50, and ids skipped after a lookup timed out, are absent from the map: ask for them again.",
             "example": {
               "628123456789@c.us": "https://pps.whatsapp.net/v/t61.24694-24/12345_678_910_n.jpg"
             },
@@ -25124,6 +25259,20 @@
         },
         "required": [
           "description"
+        ]
+      },
+      "GroupMemberLabelDto": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "This account's label in the group, shown beside its name (may be empty to clear it). Counted in UTF-16 code units, so an emoji outside the Basic Multilingual Plane takes two of the 30.",
+            "maxLength": 30,
+            "example": "Site A Management"
+          }
+        },
+        "required": [
+          "label"
         ]
       },
       "GroupPictureResponseDto": {

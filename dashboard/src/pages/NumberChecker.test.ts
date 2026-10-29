@@ -149,7 +149,7 @@ afterEach(() => {
 test('NumberChecker: renders single check form and tabs', () => {
   const { getByText, getByPlaceholderText } = renderComponent();
   assert.ok(getByText('Check Single Account'));
-  assert.ok(getByPlaceholderText('e.g. 919876543210 or 6281234567890 (with country code)'));
+  assert.ok(getByPlaceholderText('e.g. 919876543210 or 6281234567890'));
 });
 
 test('NumberChecker: switches to bulk / batch tab when clicked', () => {
@@ -390,6 +390,18 @@ test('NumberChecker: bulk parsing also splits on the Arabic comma and semicolon'
   });
 
   assert.match(rtl.screen.getByText(/unique numbers parsed/).textContent ?? '', /\b3 unique numbers parsed$/);
+});
+
+// A spreadsheet copied into the box separates its columns with tabs, so an index column stays a column of its own.
+test('NumberChecker: a bulk list copied from a spreadsheet keeps each column apart', async () => {
+  const lookups = stubLookups(registered);
+  renderComponent();
+  const textarea = await openBulkTab();
+  rtl.fireEvent.change(textarea, { target: { value: '1\t+62 812 3456 7890\n2\t+62 813 4567 8901' } });
+  assert.match(rtl.screen.getByText(/unique numbers parsed/).textContent ?? '', /\b2 unique numbers parsed$/);
+  startBatch();
+  await rtl.screen.findByText('Completed checking 2 numbers.', {}, { timeout: 3000 });
+  assert.deepEqual(lookups, ['6281234567890', '6281345678901']);
 });
 
 test('NumberChecker: numbers and ids are isolated as left-to-right, so a right-to-left page keeps them in order', async () => {
@@ -1218,6 +1230,23 @@ for (const status of [400, 409, 429, 502, 503]) {
   });
 }
 
+// The route is closed to the key as a whole (a key limited to chats reaches no number check), so every later number
+// would be refused alike and each refusal is a failed-authentication row in the gateway's audit log.
+test('NumberChecker: HTTP 403 on the first lookup stops the batch before the second', async () => {
+  const lookups = stubLookups(() => jsonResponse({ message: 'API key is restricted to selected chats' }, 403));
+  const { container } = renderComponent();
+  const textarea = await openBulkTab();
+  rtl.fireEvent.change(textarea, { target: { value: '911111111111\n912222222222' } });
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: /Start Batch Check/i }));
+
+  await rtl.screen.findByText('Batch stopped', { selector: 'strong' });
+  const notice = container.querySelector('.nc-batch-stopped')?.textContent ?? '';
+  assert.match(notice, /The gateway refused a lookup \(HTTP 403\)/);
+  assert.match(notice, /Stopped at number 1 of 2; 1 number was not sent/);
+  assert.deepEqual(lookups, ['911111111111']);
+  assert.equal(rtl.screen.queryByText(/Completed checking/), null);
+});
+
 test('NumberChecker: a lookup that gets no answer at all stops the batch before the second', async () => {
   const lookups: string[] = [];
   globalThis.fetch = ((input: RequestInfo | URL) => {
@@ -1361,4 +1390,260 @@ test('NumberChecker: Copy works where navigator.clipboard does not exist', async
   await rtl.screen.findByRole('button', { name: /Copied/ });
   assert.equal(copy.mock.callCount(), 1);
   assert.deepEqual(copy.mock.calls[0].arguments, ['copy']);
+});
+
+function heldSingleResponse() {
+  let release!: (response: Response) => void;
+  const promise = new Promise<Response>(resolve => (release = resolve));
+  return { promise, release };
+}
+
+async function finishSingleResponse(pending: ReturnType<typeof heldSingleResponse>, response: Response) {
+  await rtl.act(async () => {
+    pending.release(response);
+    await pending.promise;
+    await new Promise<void>(resolve => setImmediate(resolve));
+  });
+}
+
+async function startSingleLookup(number = '6581234567') {
+  await rtl.screen.findByRole('option', { name: /Primary Session/ });
+  rtl.fireEvent.change(rtl.screen.getByPlaceholderText(/9876543210/), { target: { value: number } });
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Check' }));
+}
+
+const SINGLE_KEY_A = 'dummy-single-key-a';
+const SINGLE_KEY_B = 'dummy-single-key-b';
+type SingleRetirement = 'route' | 'key-change' | 'logout-login';
+
+async function retireSingleLookup(reason: SingleRetirement) {
+  if (reason === 'route') {
+    rtl.fireEvent.click(rtl.screen.getByText('Leave'));
+    await rtl.screen.findByText('Elsewhere');
+  } else if (reason === 'key-change') {
+    sessionStorage.setItem('openwa_api_key', SINGLE_KEY_B);
+  } else {
+    sessionStorage.removeItem('openwa_api_key');
+    rtl.cleanup();
+    sessionStorage.setItem('openwa_api_key', SINGLE_KEY_B);
+    renderRoutes();
+    await rtl.screen.findByRole('option', { name: /Primary Session/ });
+  }
+}
+
+for (const reason of ['route', 'key-change', 'logout-login'] as const) {
+  for (const answer of ['registered', 'missing', 'failure'] as const) {
+    test(`NumberChecker: a single lookup retired by ${reason} ignores its late ${answer} response`, async () => {
+      const pending = heldSingleResponse();
+      const checks: { path: string; key: string | null }[] = [];
+      const pictures: { path: string; key: string | null }[] = [];
+      globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        const key = new Headers(init?.headers).get('X-API-Key');
+        if (path.includes('/contacts/check/')) {
+          checks.push({ path, key });
+          return pending.promise;
+        }
+        if (path.includes('/profile-picture')) {
+          pictures.push({ path, key });
+          return Promise.resolve(jsonResponse({ url: 'https://avatar.invalid/retired.png' }));
+        }
+        return defaultFetch(input, init);
+      }) as typeof fetch;
+      sessionStorage.setItem('openwa_api_key', SINGLE_KEY_A);
+      renderRoutes();
+      await startSingleLookup();
+      assert.deepEqual(checks, [
+        {
+          path: '/api/sessions/test-session-1/contacts/check/6581234567',
+          key: SINGLE_KEY_A,
+        },
+      ]);
+      await retireSingleLookup(reason);
+      const response =
+        answer === 'failure'
+          ? jsonResponse({ message: 'Retired single lookup failed' }, 503)
+          : jsonResponse({
+              number: '6581234567',
+              exists: answer === 'registered',
+              whatsappId: answer === 'registered' ? '6581234567@c.us' : null,
+            });
+      await finishSingleResponse(pending, response);
+
+      assert.deepEqual(pictures, [], 'a retired lookup dispatched an optional profile request');
+      assert.equal(document.querySelector('.nc-result-card') === null, true, 'a retired lookup published a result');
+      assert.equal(
+        document.querySelector('.nc-history-table tbody tr') === null,
+        true,
+        'a retired lookup added recent history',
+      );
+      assert.equal(document.querySelector('.toast') === null, true, 'a retired lookup published a toast');
+      if (reason === 'route') {
+        rtl.fireEvent.click(rtl.screen.getByText('Return'));
+        await rtl.screen.findByRole('option', { name: /Primary Session/ });
+        assert.equal(document.querySelector('.nc-result-card') === null, true);
+      }
+    });
+  }
+
+  for (const answer of ['avatar', 'failure'] as const) {
+    test(`NumberChecker: a profile lookup retired by ${reason} ignores its late ${answer} response`, async () => {
+      const pending = heldSingleResponse();
+      const pictures: { path: string; key: string | null }[] = [];
+      globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path.includes('/contacts/check/')) return Promise.resolve(registered('6581234567'));
+        if (path.includes('/profile-picture')) {
+          pictures.push({ path, key: new Headers(init?.headers).get('X-API-Key') });
+          return pending.promise;
+        }
+        return defaultFetch(input, init);
+      }) as typeof fetch;
+      sessionStorage.setItem('openwa_api_key', SINGLE_KEY_A);
+      renderRoutes();
+      await startSingleLookup();
+      await rtl.waitFor(() =>
+        assert.deepEqual(pictures, [
+          {
+            path: '/api/sessions/test-session-1/contacts/6581234567%40c.us/profile-picture',
+            key: SINGLE_KEY_A,
+          },
+        ]),
+      );
+      await retireSingleLookup(reason);
+      await finishSingleResponse(
+        pending,
+        answer === 'avatar'
+          ? jsonResponse({ url: 'https://avatar.invalid/retired.png' })
+          : jsonResponse({ message: 'Retired profile lookup failed' }, 500),
+      );
+
+      assert.equal(pictures.length, 1);
+      assert.equal(
+        document.querySelector('.nc-result-card') === null,
+        true,
+        'a retired profile lookup published a result',
+      );
+      assert.equal(
+        document.querySelector('.nc-history-table tbody tr') === null,
+        true,
+        'a retired profile lookup added history',
+      );
+      assert.equal(document.querySelector('.toast') === null, true, 'a retired profile lookup published a toast');
+    });
+  }
+}
+
+for (const answer of ['avatar', 'no-avatar', 'profile-failure', 'missing'] as const) {
+  test(`NumberChecker: an active single lookup keeps its ${answer} result`, async () => {
+    const pictures: { path: string; key: string | null }[] = [];
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.includes('/contacts/check/')) {
+        return Promise.resolve(
+          answer === 'missing'
+            ? jsonResponse({ number: '6581234567', exists: false, whatsappId: null })
+            : registered('6581234567'),
+        );
+      }
+      if (path.includes('/profile-picture')) {
+        pictures.push({ path, key: new Headers(init?.headers).get('X-API-Key') });
+        return Promise.resolve(
+          answer === 'profile-failure'
+            ? jsonResponse({ message: 'Optional avatar unavailable' }, 500)
+            : jsonResponse({ url: answer === 'avatar' ? 'https://avatar.invalid/current.png' : null }),
+        );
+      }
+      return defaultFetch(input, init);
+    }) as typeof fetch;
+    sessionStorage.setItem('openwa_api_key', SINGLE_KEY_A);
+    renderComponent();
+    await startSingleLookup();
+    await rtl.screen.findByText(answer === 'missing' ? 'Not Registered' : 'Registered on WhatsApp', {
+      selector: '.nc-status-badge',
+    });
+    assert.equal(document.querySelector('.nc-result-phone')?.textContent, '+6581234567');
+    assert.equal(
+      document.querySelector('.nc-avatar')?.getAttribute('src') ?? null,
+      answer === 'avatar' ? 'https://avatar.invalid/current.png' : null,
+    );
+    assert.deepEqual(
+      pictures,
+      answer === 'missing'
+        ? []
+        : [
+            {
+              path: '/api/sessions/test-session-1/contacts/6581234567%40c.us/profile-picture',
+              key: SINGLE_KEY_A,
+            },
+          ],
+    );
+    assert.equal(document.querySelector('.toast') === null, true);
+    assert.equal((rtl.screen.getByRole('button', { name: 'Check' }) as HTMLButtonElement).disabled, false);
+  });
+}
+
+test('NumberChecker: an active single lookup reports a failure and permits retry', async () => {
+  let fail = true;
+  const pictures: string[] = [];
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (path.includes('/contacts/check/')) {
+      return Promise.resolve(
+        fail
+          ? jsonResponse({ message: 'Current single lookup failed' }, 503)
+          : jsonResponse({ number: '6581234567', exists: false, whatsappId: null }),
+      );
+    }
+    if (path.includes('/profile-picture')) pictures.push(path);
+    return defaultFetch(input, init);
+  }) as typeof fetch;
+  renderComponent();
+  await startSingleLookup();
+  await rtl.screen.findByText('Current single lookup failed');
+  assert.equal(document.querySelector('.nc-result-card') === null, true);
+  assert.equal((rtl.screen.getByRole('button', { name: 'Check' }) as HTMLButtonElement).disabled, false);
+  fail = false;
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Check' }));
+  await rtl.screen.findByText('Not Registered', { selector: '.nc-status-badge' });
+  assert.deepEqual(pictures, []);
+});
+
+test('NumberChecker: single lookup history keeps ten recent distinct numbers', async () => {
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (path.includes('/contacts/check/')) {
+      return Promise.resolve(
+        jsonResponse({ number: path.split('/contacts/check/')[1], exists: false, whatsappId: null }),
+      );
+    }
+    return defaultFetch(input, init);
+  }) as typeof fetch;
+  renderComponent();
+  const numbers = Array.from({ length: 11 }, (_, i) => `65812345${String(i).padStart(2, '0')}`);
+  for (const number of numbers) {
+    await startSingleLookup(number);
+    await rtl.waitFor(() => assert.equal(document.querySelector('.nc-result-phone')?.textContent, `+${number}`));
+  }
+  const history = () =>
+    [...document.querySelectorAll('.nc-history-table tbody tr')].map(row => row.children[0].textContent);
+  assert.deepEqual(
+    history(),
+    numbers
+      .slice(1)
+      .reverse()
+      .map(number => `+${number}`),
+  );
+  await startSingleLookup(numbers[4]);
+  await rtl.waitFor(() => assert.equal(document.querySelector('.nc-result-phone')?.textContent, `+${numbers[4]}`));
+  assert.deepEqual(
+    history(),
+    [
+      numbers[4],
+      ...numbers
+        .slice(1)
+        .reverse()
+        .filter(number => number !== numbers[4]),
+    ].map(number => `+${number}`),
+  );
 });

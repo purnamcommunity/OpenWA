@@ -47,6 +47,8 @@ export function Dashboard() {
   const messagesToday = overview ? overview.messages.today.sent + overview.messages.today.received : unavailable;
   const totalMessages = overview ? overview.messages.sent + overview.messages.received : unavailable;
   const loading = loadingSessions;
+  // Statistics that are unread or refused do not mean no session is connected: the list says which are.
+  const readyCount = stats?.ready ?? sessions.filter(session => session.status === 'ready').length;
   // Only a read that never succeeded replaces the page: a failed background refetch keeps its cached
   // data (as the webhook card below does), so the last good view stays on screen.
   const error = sessionsNeverLoaded
@@ -72,7 +74,7 @@ export function Dashboard() {
       // it overstates what an operator reads as "connected". READY is the only status where the
       // session can actually send and receive.
       label: t('dashboard.stats.activeSessions'),
-      value: stats?.ready ?? 0,
+      value: readyCount,
       icon: MessageSquare,
       detail: stats ? t('dashboard.stats.sessionsDetail', { running: stats.active, total: stats.total }) : undefined,
     },
@@ -96,6 +98,7 @@ export function Dashboard() {
     return (
       <div className="dashboard" style={{ padding: '2rem' }}>
         <div
+          role="alert"
           style={{
             background: 'rgba(239, 68, 68, 0.12)',
             padding: '1rem',
@@ -115,8 +118,8 @@ export function Dashboard() {
         title={t('dashboard.title')}
         subtitle={t('dashboard.subtitle')}
         badge={
-          <span className={`status-badge ${stats && stats.ready > 0 ? 'connected' : 'disconnected'}`}>
-            {stats && stats.ready > 0 ? t('common.connected') : t('common.disconnected')}
+          <span className={`status-badge ${readyCount > 0 ? 'connected' : 'disconnected'}`}>
+            {readyCount > 0 ? t('common.connected') : t('common.disconnected')}
           </span>
         }
       />
@@ -145,7 +148,7 @@ export function Dashboard() {
         <div className="section-header">
           <h2>{t('dashboard.sessionsOverview')}</h2>
           <span className="section-subtitle">
-            {t('dashboard.showingSessions', { shown: sessions.length, total: stats?.total ?? 0 })}
+            {t('dashboard.showingSessions', { shown: sessions.length, total: stats?.total ?? sessions.length })}
           </span>
         </div>
 

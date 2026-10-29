@@ -1636,6 +1636,31 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     expect((await lidRepo.findOneByOrFail({ lid: '111' })).isReported).toBe(false);
   });
 
+  // The mark of a deleted chat outlives a restart because the stored messages it guards do, and a
+  // restore brings both back.
+  it('restores the deletion mark of a chat state, and reads an archive taken without one as none', async () => {
+    await seedSession('s1');
+    const repo = ds.getRepository(ChatState);
+    await repo.save([
+      repo.create({ sessionId: 's1', chatId: '628111@s.whatsapp.net', deletedAt: 1790000000000 }),
+      repo.create({ sessionId: 's1', chatId: '120363@g.us', pinned: true }),
+    ]);
+
+    const dump = await controller.exportData();
+    await repo.clear();
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(await repo.findOneByOrFail({ chatId: '628111@s.whatsapp.net' })).toMatchObject({ deletedAt: 1790000000000 });
+    expect(await repo.findOneByOrFail({ chatId: '120363@g.us' })).toMatchObject({ pinned: true, deletedAt: null });
+
+    const states = (dump.tables as unknown as { chatStates: { deletedAt?: number | null }[] }).chatStates;
+    for (const state of states) delete state.deletedAt;
+    const legacy = await controller.importData({ tables: dump.tables });
+    expect(legacy.warnings).toEqual([]);
+    expect((await repo.findOneByOrFail({ chatId: '628111@s.whatsapp.net' })).deletedAt).toBeNull();
+  });
+
   // Restoring ONTO the instance that produced the archive is the rollback flow, and it is the one the
   // outbox broke. The table carries no FK to sessions, so the sessions DELETE never reached it, and
   // UNIQUE(webhookId, idempotencyKey) then collided on every row until the all-or-nothing gate rolled
@@ -2069,6 +2094,30 @@ describe('InfraDataController audit trail — import emits only on a committed r
     const actions = (audit.logInfo.mock.calls as Array<[AuditAction, unknown]>).map(c => c[0]);
     expect(actions).toContain(AuditAction.INFRA_DATA_EXPORTED);
     expect(actions).toContain(AuditAction.INFRA_DATA_IMPORTED);
+  });
+
+  it('records each orphan session it stops, even when the restore is then rolled back', async () => {
+    await seedSession('s1');
+    const audit = { logInfo: jest.fn().mockResolvedValue(null) };
+    const sessionService = {
+      getActiveSessionIds: () => ['ghost'],
+      stopOrphanEngines: jest.fn().mockResolvedValue({ stopped: ['ghost'], notRunning: [], failed: [] }),
+    };
+    const controller = new InfraDataController(
+      new InfraDataService(cfg as never, ds, audit as never, sessionService as never),
+    );
+    const dump = await controller.exportData();
+    // A repeated primary key fails its insert inside the transaction, which rolls the restore back.
+    dump.tables.sessions = [dump.tables.sessions[0], dump.tables.sessions[0]];
+
+    const res = await controller.importData({ tables: dump.tables, stopOrphans: true });
+
+    expect(res.imported).toBe(false);
+    const calls = audit.logInfo.mock.calls as Array<[AuditAction, { sessionId?: string; metadata?: unknown }]>;
+    expect(calls.filter(([action]) => action === AuditAction.INFRA_DATA_IMPORTED)).toEqual([]);
+    expect(calls.filter(([action]) => action === AuditAction.SESSION_STOPPED)).toEqual([
+      [AuditAction.SESSION_STOPPED, { sessionId: 'ghost', metadata: { via: 'infra_import_data' } }],
+    ]);
   });
 
   it('does NOT emit INFRA_DATA_IMPORTED when an empty backup is refused (no data changed)', async () => {

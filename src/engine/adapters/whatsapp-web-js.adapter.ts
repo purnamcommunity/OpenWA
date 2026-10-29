@@ -63,7 +63,7 @@ import { WwebjsChats } from './wwebjs-chats';
 import { WwebjsCatalog } from './wwebjs-catalog';
 import { registerWwebjsGroupEvents } from './wwebjs-group-events';
 import { WwebjsOnboardingWatcher } from './wwebjs-onboarding';
-import { WwebjsLifecycle } from './wwebjs-lifecycle';
+import { PAGE_RELOADING_MESSAGE, WwebjsLifecycle } from './wwebjs-lifecycle';
 import { WwebjsReadyReconcile } from './wwebjs-reconcile';
 import { WwebjsStuckAuth } from './wwebjs-stuck-auth';
 import { WwebjsCalls } from './wwebjs-calls';
@@ -898,6 +898,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine, EngineSyncStateRep
     return this.groups.setGroupEphemeral(groupId, durationSec);
   }
 
+  setGroupMemberLabel(groupId: string, label: string): Promise<void> {
+    return this.groups.setGroupMemberLabel(groupId, label);
+  }
+
   getGroupMembershipRequests(groupId: string): Promise<GroupMembershipRequest[]> {
     return this.groups.getGroupMembershipRequests(groupId);
   }
@@ -1020,9 +1024,7 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine, EngineSyncStateRep
     // breaker for its 15-minute cooldown). Answer the same retryable 409 the pre-READY states get,
     // naming the reload so the operator can tell this state from a plain disconnect (#1081).
     if (this.lifecycle.isInNavigationReinjectWindow()) {
-      throw new EngineNotReadyError(
-        'WhatsApp Web is reloading its page and the session is re-injecting. Retry in a few seconds.',
-      );
+      throw new EngineNotReadyError(PAGE_RELOADING_MESSAGE);
     }
   }
 

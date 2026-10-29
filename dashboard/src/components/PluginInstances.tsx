@@ -10,6 +10,7 @@ import {
   useDeleteInstanceMutation,
 } from '../hooks/queries';
 import { isValidInstanceId, isValidInstanceSecret, parseEditScope, parseInstanceConfig } from '../utils/instanceForm';
+import { captionLength } from '../utils/bulkMedia';
 import { copyToClipboard } from '../utils/clipboard';
 import { Modal } from './Modal';
 import { useToast } from '../hooks/useToast';
@@ -61,7 +62,10 @@ export function PluginInstances({ pluginId }: { pluginId: string }) {
       return;
     }
     if (!isValidInstanceSecret(form.secret)) {
-      setFormError(t('plugins.instances.errors.invalidSecret'));
+      const count = captionLength(form.secret.trim());
+      setFormError(
+        count > 512 ? t('common.fieldTooLong', { max: 512, count }) : t('plugins.instances.errors.invalidSecret'),
+      );
       return;
     }
     try {

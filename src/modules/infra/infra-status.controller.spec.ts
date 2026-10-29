@@ -318,6 +318,12 @@ describe('InfraStatusController.getStatus envPinned', () => {
     expect((await buildController().getStatus()).envPinned).toEqual(['DATABASE_HOST', 'REDIS_HOST', 'S3_ENDPOINT']);
   });
 
+  it('reports a Redis TLS pin beside the built-in selection', async () => {
+    recordPinnedEnvKeys({ REDIS_TLS: 'true' });
+
+    expect((await buildController().getStatus()).envPinned).toEqual(['REDIS_TLS']);
+  });
+
   it('reports an empty list when nothing above data/.env.generated supplies a selection key', async () => {
     recordPinnedEnvKeys({});
 
@@ -626,5 +632,60 @@ describe('InfraStatusController.getStatus running bundled containers', () => {
       false,
       false,
     ]);
+  });
+});
+
+describe('InfraStatusController unavailable Docker inventory', () => {
+  let previousHost: string | undefined;
+  beforeEach(() => {
+    previousHost = process.env.REDIS_HOST;
+    process.env.REDIS_HOST = 'redis';
+    recordPinnedEnvKeys({});
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue('REDIS_BUILTIN=true\n');
+  });
+  afterEach(() => {
+    if (previousHost === undefined) delete process.env.REDIS_HOST;
+    else process.env.REDIS_HOST = previousHost;
+    recordPinnedEnvKeys({});
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+  });
+
+  it('distinguishes an unavailable inventory from an observed empty list and later recovery', async () => {
+    const running = { database: false, cache: 'openwa', storage: false };
+    const inventory = jest
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        database: false,
+        cache: false,
+        storage: false,
+      })
+      .mockResolvedValueOnce(running);
+    const config = {
+      get: (key: string, fallback?: unknown) =>
+        key === 'redis.host' ? 'redis' : key === 'engine.type' ? 'baileys' : fallback,
+    };
+    const database = { isInitialized: true, query: jest.fn().mockResolvedValue([]) };
+    const controller = new InfraStatusController(
+      config as never,
+      database as never,
+      database as never,
+      {} as never,
+      { isDockerAvailable: () => true, getRunningBuiltinServices: inventory } as never,
+      { isAvailable: jest.fn().mockResolvedValue(false) } as never,
+      {} as never,
+    );
+    const unavailable = await controller.getStatus();
+    const empty = await controller.getStatus();
+    const recovered = await controller.getStatus();
+
+    expect(unavailable.redis.builtIn).toBe(true);
+    expect(unavailable.redis).not.toHaveProperty('running');
+    expect(empty.redis.builtIn).toBe(false);
+    expect(empty.redis.running).toBe(false);
+    expect(recovered.redis.builtIn).toBe(true);
+    expect(recovered.redis.running).toBe(true);
   });
 });

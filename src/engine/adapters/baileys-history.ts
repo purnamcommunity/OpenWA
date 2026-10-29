@@ -9,6 +9,7 @@ import {
   extractBaileysButtonReply,
   extractBaileysButtons,
   extractBaileysCommerce,
+  extractBaileysContext,
   extractBaileysPoll,
   isBaileysCatalogShare,
   keyParticipant,
@@ -32,7 +33,7 @@ export interface BaileysHistoryHost {
   /** Lazily loaded @whiskeysockets/baileys module (ESM-only; loaded on first connect, not at boot). */
   loadLib(): Promise<typeof BaileysLib>;
   /** Seed the chat's last-message preview + sort time from a history/live message. */
-  recordMessage(msg: WAMessage, type?: MessageType): void;
+  recordMessage(msg: WAMessage, type?: MessageType, order?: number): void;
   recordMessageEdit(chatId: string, messageId: string, text: string, type?: MessageType): void;
   applyHistoryRevoke(target: WAMessageKey, envelope: WAMessageKey): Promise<WAMessageKey | undefined>;
   upsertContacts(records: Partial<BaileysContact>[]): void;
@@ -158,7 +159,8 @@ export class BaileysHistory {
         if (incoming.type === 'revoked') continue;
         const original = targets.get(incoming.id)!;
         const deleted = revokedKeys.has(JSON.stringify([incoming.id, incoming.chatId, incoming.fromMe]));
-        this.host.recordMessage(original, deleted ? 'revoked' : incoming.type);
+        // History has no observed order: equal-time messages keep the first one met, and give way to a live one.
+        this.host.recordMessage(original, deleted ? 'revoked' : incoming.type, 0);
       }
       for (const m of revoked) {
         this.host.recordMessageEdit(m.chatId, m.id, '', 'revoked');
@@ -315,6 +317,7 @@ export class BaileysHistory {
       return null;
     }
     const body = extractBaileysBody(content);
+    const context = extractBaileysContext(content);
     const commerce = extractBaileysCommerce(content, contentType);
     const button = extractBaileysButtonReply(content, contentType);
     const buttons = extractBaileysButtons(content, contentType);
@@ -336,6 +339,8 @@ export class BaileysHistory {
         poll: extractBaileysPoll(content),
         button,
         buttons,
+        quotedMessage: context.quotedMessage,
+        mentionedJids: context.mentionedJids,
         isCatalogShare: isBaileysCatalogShare(content),
         // Populate the disappearing-messages timer using the same extraction the live path and the
         // session-store cache share (`msg.ephemeralDuration` primary, `contextInfo.expiration` fallback),

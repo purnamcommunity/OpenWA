@@ -1,5 +1,5 @@
 import { Module, DynamicModule, Type } from '@nestjs/common';
-import { ServeStaticModule } from '@nestjs/serve-static';
+import { ServeStaticModule, ServeStaticModuleOptions } from '@nestjs/serve-static';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -92,29 +92,29 @@ export const DASHBOARD_DIST = path.resolve(__dirname, '..', 'dashboard', 'dist')
 export const dashboardServingEnabled = process.env.SERVE_DASHBOARD !== 'false';
 export const dashboardBuildPresent = fs.existsSync(path.join(DASHBOARD_DIST, 'index.html'));
 
+// Everything but the root, exported so the e2e suite boots these options and not a copy of them.
+export const DASHBOARD_STATIC_OPTIONS: Omit<ServeStaticModuleOptions, 'rootPath'> = {
+  // No `exclude`: the module's error handler rewrites every error raised on an excluded path into
+  // 404 "Cannot <method> <url>", which hid the body parsers' 413 and 400 under /api, /socket.io and
+  // /mcp. Nest answers unknown routes there on its own now that the fallback below is off.
+  // Disable this module's OWN catch-all SPA fallback. configure-app.ts already serves dashboard
+  // documents (it injects the per-response CSP nonce, which is why it must own them), and
+  // that handler is correctly narrow: it skips /assets and only answers extensionless paths
+  // or explicit text/html navigations. The built-in fallback here is not narrow — it answers
+  // EVERY unmatched GET with index.html, so a mistyped `<script src>` came back 200 HTML and
+  // the browser reported a JavaScript parse error instead of the real 404, hiding broken
+  // builds behind a confusing symptom. It is also outright broken when the install path
+  // contains a dot-segment (~/.openwa, a checkout under ~/.cache): it sends the index by
+  // ABSOLUTE path and Express's `send` refuses dot-segments, 404ing every client-side route.
+  // Turning it off fixes both, and makes behaviour identical on either path shape.
+  // ServeStaticModule has no explicit off switch, so this is a renderPath literal that no
+  // real request can match.
+  renderPath: '/__openwa_spa_fallback_owned_by_main_ts__',
+};
+
 const serveStaticModules: Array<Type | DynamicModule> = [];
 if (dashboardServingEnabled && dashboardBuildPresent) {
-  serveStaticModules.push(
-    ServeStaticModule.forRoot({
-      rootPath: DASHBOARD_DIST,
-      // Let Nest own these so unknown API/socket routes return real 404s/JSON rather
-      // than the SPA index.html fallback (Express 5 / path-to-regexp v8 wildcard syntax).
-      exclude: ['/api/{*splat}', '/socket.io/{*splat}', '/mcp', '/mcp/{*splat}'],
-      // Disable this module's OWN catch-all SPA fallback. configure-app.ts already serves dashboard
-      // documents (it injects the per-response CSP nonce, which is why it must own them), and
-      // that handler is correctly narrow: it skips /assets and only answers extensionless paths
-      // or explicit text/html navigations. The built-in fallback here is not narrow — it answers
-      // EVERY unmatched GET with index.html, so a mistyped `<script src>` came back 200 HTML and
-      // the browser reported a JavaScript parse error instead of the real 404, hiding broken
-      // builds behind a confusing symptom. It is also outright broken when the install path
-      // contains a dot-segment (~/.openwa, a checkout under ~/.cache): it sends the index by
-      // ABSOLUTE path and Express's `send` refuses dot-segments, 404ing every client-side route.
-      // Turning it off fixes both, and makes behaviour identical on either path shape.
-      // ServeStaticModule has no explicit off switch, so this is a renderPath literal that no
-      // real request can match.
-      renderPath: '/__openwa_spa_fallback_owned_by_main_ts__',
-    }),
-  );
+  serveStaticModules.push(ServeStaticModule.forRoot({ rootPath: DASHBOARD_DIST, ...DASHBOARD_STATIC_OPTIONS }));
 }
 
 @Module({

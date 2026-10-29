@@ -3,6 +3,7 @@ import { DataSource, DataSourceOptions } from 'typeorm';
 import { createLogger } from '../common/services/logger.service';
 import { assertDataConnectionUtc, postgresUtcExtra } from './postgres-utc';
 import { DeduplicateTerminalWebhookFailures1787200000000 } from './migrations/1787200000000-DeduplicateTerminalWebhookFailures';
+import { repairSqliteMessageFts } from './sqlite-message-fts';
 
 const logger = createLogger('PgBootMigrations');
 
@@ -68,6 +69,12 @@ export async function createBootDataSource(
         await runner.release();
       }
       await dataSource.synchronize();
+      // synchronize rebuilds `messages` without its rowids, so the index it kept can now name other messages.
+      // Never fail boot over the index: if this repair fails, the search provider's own start-up check re-indexes
+      // what it finds orphaned, and the next boot repairs the rest.
+      await repairSqliteMessageFts(dataSource).catch((error: unknown) =>
+        logger.error(`Failed to repair the SQLite message full-text index: ${String(error)}`),
+      );
       return dataSource;
     } catch (error) {
       if (dataSource.isInitialized) await dataSource.destroy().catch(() => undefined);
@@ -85,9 +92,13 @@ export async function createBootDataSource(
   // DataSource itself never starts them unsynchronized inside initialize(). The UTC pin is merged in
   // at the same point, because this is the one place the runtime postgres data connection is built
   // (the migration CLI's own data source carries it directly).
-  const build = (extra: Record<string, unknown> | undefined): DataSource =>
-    createDataSource({ ...options, migrationsRun: false, extra: { ...extra, ...postgresUtcExtra() } });
-  const runtimeExtra = options.extra as Record<string, unknown> | undefined;
+  const build = (extra: ClientConfig | undefined): DataSource =>
+    createDataSource({
+      ...options,
+      migrationsRun: false,
+      extra: { ...extra, ...postgresUtcExtra(extra?.connectionTimeoutMillis) },
+    });
+  const runtimeExtra = options.extra as ClientConfig | undefined;
 
   // statement_timeout bounds live runtime queries, and pg sends it in the startup packet, so every
   // statement on a pool built with it inherits the limit. A backfill or index build over a large

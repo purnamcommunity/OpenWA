@@ -30,6 +30,8 @@ export interface FfmpegRunOptions {
   timeoutMs: number;
   /** Ceiling on the produced bytes. */
   maxOutputBytes: number;
+  /** Cancellation checked immediately before a process can be started. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -266,6 +268,7 @@ function execute(args: string[], options: FfmpegRunOptions): Promise<void> {
     // filename with a space or a quote is data rather than syntax.
     // `detached` puts the child at the head of its own process group, so the timeout can kill
     // everything under it (see below).
+    options.signal?.throwIfAborted();
     const child = spawn(options.ffmpegPath, args, {
       stdio: ['ignore', 'ignore', 'pipe'],
       detached: true,

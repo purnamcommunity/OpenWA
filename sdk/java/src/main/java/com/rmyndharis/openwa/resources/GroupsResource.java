@@ -6,6 +6,7 @@ import com.rmyndharis.openwa.OpenWAClient;
 import com.rmyndharis.openwa.http.HttpMethod;
 import com.rmyndharis.openwa.model.CreateGroupRequest;
 import com.rmyndharis.openwa.model.GroupDescriptionRequest;
+import com.rmyndharis.openwa.model.GroupMemberLabelRequest;
 import com.rmyndharis.openwa.model.GroupInfo;
 import com.rmyndharis.openwa.model.GroupJoinInfo;
 import com.rmyndharis.openwa.model.GroupMembershipRequest;
@@ -146,6 +147,20 @@ public final class GroupsResource {
             "/api/sessions/" + encodeSegment(sessionId) + "/groups/" + encodeSegment(groupId) + "/description",
             null,
             new GroupDescriptionRequest(description),
+            SuccessResult.class);
+    }
+
+    /**
+     * Set this account's member label in the group (empty string clears it). Baileys only;
+     * whatsapp-web.js answers 501. A 200 means the label message was handed to WhatsApp; it cannot
+     * be read back.
+     */
+    public SuccessResult setMemberLabel(String sessionId, String groupId, String label) {
+        return client.request(
+            HttpMethod.PUT,
+            "/api/sessions/" + encodeSegment(sessionId) + "/groups/" + encodeSegment(groupId) + "/member-label",
+            null,
+            new GroupMemberLabelRequest(label),
             SuccessResult.class);
     }
 

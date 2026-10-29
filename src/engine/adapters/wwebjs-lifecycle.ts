@@ -72,6 +72,29 @@ export function isProtocolTimeout(error: unknown): boolean {
   return PROTOCOL_TIMEOUT_PATTERN.test(error instanceof Error ? error.message : String(error));
 }
 
+/** What a request answers 409 while WhatsApp Web reloads its page, whichever side of the window stamp it lands. */
+export const PAGE_RELOADING_MESSAGE =
+  'WhatsApp Web is reloading its page and the session is re-injecting. Retry in a few seconds.';
+
+/**
+ * Whether a page call was cut short by the page navigating away under it (WhatsApp Web reloading). Puppeteer
+ * rewrites its three CDP shapes of this into 'Execution context was destroyed, most likely because of a
+ * navigation.', and a call that lands on the new document before WhatsApp Web has booted dies on the missing
+ * `window.require`. The page is alive and re-injecting, so unlike a death this is not reported, and a retry
+ * a few seconds later succeeds. Not an HttpException, and not a failure captured inside the page, whose text
+ * quotes WhatsApp Web and says nothing about our page. A page that stays without `window.require` is not
+ * hidden by this answer: it is not reported here, but the liveness probe fails outside the re-inject window
+ * and the watchdog reconnects. Left unread, the same message became a false 404 or 400 at the catches that
+ * fold a failed lookup into "not found", or a bare 500.
+ */
+export function isNavigationError(error: unknown): boolean {
+  if (error instanceof HttpException) {
+    return false;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return !message.startsWith(CAPTURED_PAGE_ERROR_PREFIX) && isNavigationShapedInitRejection(message);
+}
+
 /**
  * The start of a send failure that scripts/patch-wwebjs-send-error.js captured inside the page, where
  * it summarises a thrown value puppeteer would otherwise hand over as `t: t`. The patcher builds the
@@ -270,6 +293,8 @@ export class WwebjsLifecycle {
   private linkedFromQr = false;
   /** Chat/history sync progress of the READY client (./wwebjs-sync-progress). */
   private readonly syncTracker: WwebjsSyncTracker;
+  /** Counts the navigations stamped, so a probe can tell that one landed while it was waiting. */
+  private navigationCount = 0;
   /** The WhatsApp Web build this init asked whatsapp-web.js to pin, undefined when it asked for none.
    *  Compared against the build the page reports at READY (./wwebjs-running-build). */
   private requestedWebVersion: string | undefined;
@@ -810,6 +835,7 @@ export class WwebjsLifecycle {
       // lastLoggedOut is a runtime field the wwjs typings do not declare (same loose-cast pattern as
       // the pupBrowser/pupPage handles above).
       if ((this.client as unknown as { lastLoggedOut?: boolean } | null)?.lastLoggedOut) return;
+      this.navigationCount++;
       const now = Date.now();
       if (this.navigationEpisodeStartedAt === 0) this.navigationEpisodeStartedAt = now;
       this.lastMainFrameNavigationAt = now;
@@ -1332,6 +1358,7 @@ export class WwebjsLifecycle {
     // dead on the first tick, and hid a page that really had died.
     const probeable = this.status === EngineStatus.READY || this.status === EngineStatus.ACTION_REQUIRED;
     if (!probeable || !this.client) return false;
+    const navigationsBefore = this.navigationCount;
 
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -1345,8 +1372,9 @@ export class WwebjsLifecycle {
       if (state === WAState.CONNECTED) {
         // Observed recovery closes the navigation episode. Without this, an episode whose re-inject
         // died silently (no 'ready' re-emit, but WA Web's socket back up) would keep a stale episode
-        // anchor forever, denying the grace to every LATER navigation via the episode cap.
-        this.clearNavigationReinjectWindow();
+        // anchor forever, denying the grace to every LATER navigation via the episode cap. Only an episode
+        // this answer can speak for: a navigation stamped while getState() was pending is a newer one.
+        if (navigationsBefore === this.navigationCount) this.clearNavigationReinjectWindow();
         return true;
       }
       return this.isInNavigationReinjectWindow();

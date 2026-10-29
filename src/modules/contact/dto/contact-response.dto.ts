@@ -69,8 +69,8 @@ export class ProfilePicturesResponseDto {
   @ApiProperty({
     description:
       'Map of the requested contact ids to their picture URL. An id resolves to null when the ' +
-      'contact has no picture, hides it, or its individual lookup failed — a per-id failure does ' +
-      'not fail the batch. Ids beyond the first 50 are not looked up and are absent from the map.',
+      'contact has no picture, hides it, or its lookup failed. Ids beyond the first 50, and ids skipped ' +
+      'after a lookup timed out, are absent from the map: ask for them again.',
     example: { '628123456789@c.us': 'https://pps.whatsapp.net/v/t61.24694-24/12345_678_910_n.jpg' },
     additionalProperties: { type: 'string', nullable: true },
   })

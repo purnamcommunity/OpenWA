@@ -778,7 +778,7 @@ describe('IngressReconcilerService.sweep', () => {
     );
     const redrive = new RedriveService(failures, events, { enqueue } as unknown as IngressEnqueueService);
 
-    const res = await redrive.redriveInstance('plug', 'inst', null);
+    const res = await redrive.redriveInstance('plug', 'inst', 'sess-1');
 
     expect(res.redriven).toBe(1);
     expect((await stored(id)).dispatchState).toBe('dispatched');
@@ -786,6 +786,36 @@ describe('IngressReconcilerService.sweep', () => {
     const stats = await service.sweep(OPTS);
     expect(stats.scanned).toBe(0);
     expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('redrives, on a real database, only the rows written under the current all-sessions binding', async () => {
+    const dead = (deliveryId: string, sessionId: string | null) =>
+      failures.save(
+        failures.create({
+          direction: 'inbound',
+          pluginId: 'plug',
+          instanceId: 'inst',
+          sessionId,
+          deliveryId,
+          attempts: 0,
+          lastError: 'failed',
+          payload: { route: 'chatwoot', ingress: { headers: {}, query: {}, body: '{}', rawBody: '{}' } },
+          redriven: false,
+        }),
+      );
+    await dead('d-none', null);
+    await dead('d-star', '*');
+    await dead('d-old', 'sess-old');
+    const redrive = new RedriveService(failures, events, { enqueue } as unknown as IngressEnqueueService);
+
+    const res = await redrive.redriveInstance('plug', 'inst', null);
+
+    expect(res).toMatchObject({ redriven: 2, remaining: 0 });
+    expect((enqueue.mock.calls as Array<[{ deliveryId: string }]>).map(call => call[0].deliveryId).sort()).toEqual([
+      'd-none',
+      'd-star',
+    ]);
+    expect(await failures.count({ where: { sessionId: 'sess-old', redriven: false } })).toBe(1);
   });
 
   it('skips a row whose instance was disabled after persist, and replays it once re-enabled', async () => {

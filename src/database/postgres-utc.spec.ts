@@ -1,5 +1,5 @@
 import * as net from 'net';
-import { defaults as pgDefaults, Pool, types as pgTypes } from 'pg';
+import { ClientBase, defaults as pgDefaults, Pool, types as pgTypes } from 'pg';
 import { DataSource } from 'typeorm';
 import { assertDataConnectionUtc, parseTimestampAsUtc, postgresUtcExtra, utcTimestampTypes } from './postgres-utc';
 import { buildPostgresDataSourceOptions } from './data-source';
@@ -46,8 +46,8 @@ interface FakeServer {
   close: () => Promise<void>;
 }
 
-/** Accepts a connection, then either cuts the socket or refuses the first statement it receives. */
-const startFakeServer = async (onFirstQuery: 'cut' | 'refuse'): Promise<FakeServer> => {
+/** Accepts a connection, then cuts the socket, refuses the first statement it receives or never answers it. */
+const startFakeServer = async (onFirstQuery: 'cut' | 'refuse' | 'silent'): Promise<FakeServer> => {
   const sockets = new Set<net.Socket>();
   const queries: string[] = [];
   const server = net.createServer(socket => {
@@ -60,6 +60,7 @@ const startFakeServer = async (onFirstQuery: 'cut' | 'refuse'): Promise<FakeServ
         return;
       }
       queries.push(chunk.subarray(5, chunk.length - 1).toString('utf8'));
+      if (onFirstQuery === 'silent') return;
       if (onFirstQuery === 'cut') socket.destroy();
       else socket.write(Buffer.concat([errorResponse('SET TIME ZONE is not supported'), READY_FOR_QUERY]));
     });
@@ -69,12 +70,22 @@ const startFakeServer = async (onFirstQuery: 'cut' | 'refuse'): Promise<FakeServ
     port: (server.address() as net.AddressInfo).port,
     queries,
     openSockets: () => sockets.size,
-    close: () => new Promise<void>(resolve => server.close(() => resolve())),
+    close: () => {
+      for (const socket of sockets) socket.destroy();
+      return new Promise<void>(resolve => server.close(() => resolve()));
+    },
   };
 };
 
-/** One acquire against a fake server, with the process's own uncaught-exception handlers stood aside. */
-const acquireThrough = async (fake: FakeServer): Promise<{ rejection?: string; uncaught: Error[] }> => {
+/**
+ * One acquire against a fake server, with the process's own uncaught-exception handlers stood aside. An
+ * acquire still pending after twice the connect budget is reported as a rejection of its own, so a hang
+ * fails the assertion instead of the suite.
+ */
+const acquireThrough = async (
+  fake: FakeServer,
+  connectionTimeoutMillis = 5000,
+): Promise<{ rejection?: string; uncaught: Error[]; socketsOnRejection: number }> => {
   const uncaught: Error[] = [];
   const installed = process.listeners('uncaughtException');
   process.removeAllListeners('uncaughtException');
@@ -85,23 +96,33 @@ const acquireThrough = async (fake: FakeServer): Promise<{ rejection?: string; u
     port: fake.port,
     user: 'openwa',
     database: 'openwa',
-    connectionTimeoutMillis: 5000,
-    ...postgresUtcExtra(),
+    connectionTimeoutMillis,
+    ...postgresUtcExtra(connectionTimeoutMillis),
   });
   pool.on('error', () => undefined);
   let rejection: string | undefined;
+  let deadline: NodeJS.Timeout | undefined;
   try {
-    (await pool.connect()).release();
+    await Promise.race([
+      pool.connect().then(client => client.release()),
+      new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error('acquire still pending')), connectionTimeoutMillis * 2);
+      }),
+    ]);
   } catch (error) {
     rejection = (error as Error).message;
+  } finally {
+    clearTimeout(deadline);
   }
   // An unhandled 'error' event lands a turn after the acquire settles.
   await new Promise(resolve => setTimeout(resolve, 100));
+  const socketsOnRejection = fake.openSockets();
 
   process.removeAllListeners('uncaughtException');
   for (const listener of installed) process.on('uncaughtException', listener as never);
-  await pool.end().catch(() => undefined);
-  return { rejection, uncaught };
+  // A client stuck in its connect hook is never released, so pool.end() would wait for it forever.
+  await Promise.race([pool.end().catch(() => undefined), new Promise(resolve => setTimeout(resolve, 500))]);
+  return { rejection, uncaught, socketsOnRejection };
 };
 
 describe('postgres UTC pin', () => {
@@ -202,6 +223,35 @@ describe('postgres UTC pin', () => {
       expect(uncaught).toEqual([]);
       expect(fake.openSockets()).toBe(0);
       await fake.close();
+    });
+
+    it('rejects the acquire, and closes the connection, when the server never answers the pin', async () => {
+      // A database or pooler that accepts the connection and then goes quiet. pg-pool stops its connect
+      // timer before it calls the hook, so without a bound of its own the acquire (and a boot waiting on
+      // it) never ends.
+      const fake = await startFakeServer('silent');
+      const { rejection, uncaught, socketsOnRejection } = await acquireThrough(fake, 250);
+
+      expect(fake.queries).toEqual(["SET TIME ZONE 'UTC'"]);
+      expect(rejection).toMatch(/Query read timeout/);
+      expect(socketsOnRejection).toBe(0);
+      expect(uncaught).toEqual([]);
+      await fake.close();
+    });
+
+    it.each([undefined, 0, -1, NaN, Infinity])('bounds the pin with the default budget for %s', async value => {
+      const query = jest.fn().mockResolvedValue({});
+      await postgresUtcExtra(value).onConnect({ query } as unknown as ClientBase);
+      expect(query).toHaveBeenCalledWith({ text: "SET TIME ZONE 'UTC'", query_timeout: 10000 });
+    });
+
+    it('bounds the pin with the connection budget the data source was given', async () => {
+      const query = jest.fn().mockResolvedValue({});
+      const extra = buildPostgresDataSourceOptions({ DATABASE_CONNECTION_TIMEOUT_MS: '2500' }).extra as {
+        onConnect: (client: ClientBase) => Promise<unknown>;
+      };
+      await extra.onConnect({ query } as unknown as ClientBase);
+      expect(query).toHaveBeenCalledWith({ text: "SET TIME ZONE 'UTC'", query_timeout: 2500 });
     });
   });
 

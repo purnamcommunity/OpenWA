@@ -643,6 +643,14 @@ export class InfraDataService {
       const result = await this.sessionService.stopOrphanEngines(orphanedEngines);
       stoppedOrphanEngines = result.stopped;
       failedOrphanEngines = result.failed;
+      // The teardown cannot be rolled back, and the import's own audit row is written only for a committed
+      // restore, so each stopped session is recorded here: a refused or failed restore would leave no trace.
+      for (const sessionId of result.stopped) {
+        await this.auditService?.logInfo(AuditAction.SESSION_STOPPED, {
+          sessionId,
+          metadata: { via: 'infra_import_data' },
+        });
+      }
       if (failedOrphanEngines.length > 0) {
         // Teardown failed for at least one orphan. The Map entry is removed regardless (see
         // stopOrphanEngines), so the engine no longer holds a concurrency slot — but its underlying
@@ -808,10 +816,16 @@ export class InfraDataService {
         // `.catch(() => {})` here could otherwise silently commit a MERGED (not replaced) restore on
         // SQLite, violating the endpoint's "replaces existing data" contract.
         const clearTable = async (table: string, where = ''): Promise<void> => {
+          // Asked first on PostgreSQL: a statement that names a missing relation aborts the whole transaction even
+          // when its error is caught, and every later statement then fails with 25P02.
+          if (isPostgres && !(await queryRunner.hasTable(table))) {
+            this.logger.debug('Skipped clearing a table that does not exist during import', { table });
+            return;
+          }
           try {
             await queryRunner.query(`DELETE FROM ${table}${where}`);
           } catch (err) {
-            if (!isMissingTableError(err)) throw err;
+            if (isPostgres || !isMissingTableError(err)) throw err;
             this.logger.debug('Skipped clearing a table that does not exist during import', { table });
           }
         };

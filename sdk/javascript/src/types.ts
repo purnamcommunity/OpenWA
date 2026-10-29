@@ -866,7 +866,7 @@ export interface ProfilePictureResponse {
   url: string | null;
 }
 
-/** Batch profile-picture lookup: a map of contact id → picture URL (null when the lookup failed). */
+/** Batch profile-picture lookup: a map of contact id → picture URL (null when the lookup failed). An id skipped after a lookup timed out is absent from the map; ask for it again. */
 export interface ProfilePicturesResponse {
   pictures: Record<string, string | null>;
 }
@@ -952,6 +952,11 @@ export interface GroupDescriptionRequest {
   description: string;
 }
 
+export interface GroupMemberLabelRequest {
+  /** At most 30 UTF-16 code units (an astral emoji counts as two). May be empty to clear. */
+  label: string;
+}
+
 export interface InviteCodeResponse {
   inviteCode: string;
   inviteLink: string;
@@ -1023,7 +1028,6 @@ export type WebhookEvent =
   | 'message.failed'
   | 'message.revoked'
   | 'message.reaction'
-  | 'message.poll_vote'
   | 'message.edited'
   | 'session.status'
   | 'session.qr'
@@ -1033,6 +1037,7 @@ export type WebhookEvent =
   | 'session.restriction'
   | 'presence.update'
   | 'event.response'
+  | 'poll.vote'
   | 'call.accepted'
   | 'call.rejected'
   | 'call.missed'
@@ -1260,9 +1265,8 @@ export interface SubscribePresenceRequest {
 export interface MarkChatReadRequest extends MarkChatRequest {
   /**
    * Specific message IDs to acknowledge. Baileys acknowledges individual messages, so without this
-   * only the newest received message the engine still holds in memory gets a receipt: a burst
-   * leaves its earlier messages unread forever, and a restarted session has no message to
-   * acknowledge at all.
+   * only the newest received message gets a receipt (the one the engine holds in memory, else the
+   * newest received one the gateway stored): a burst leaves its earlier messages unread forever.
    * Callers that persist inbound message IDs should send them here. Ignored by whatsapp-web.js,
    * whose own sendSeen is chat-level. At most 100 per request; an empty array is rejected.
    */
@@ -1543,6 +1547,13 @@ export interface SendProductRequest {
 
 // ── Search ────────────────────────────────────────────────────────
 
+/**
+ * How `q` matches: `word` (the server default) matches whole words; `contains` matches any part of a
+ * word, ignoring case and accents, and needs at least one term of 3+ characters and a server with
+ * `SEARCH_CONTAINS_ENABLED=true` (501 otherwise).
+ */
+export type SearchMatch = 'word' | 'contains';
+
 /** Query parameters for `GET /search`. Only `q` is required; all filters are optional. */
 export interface SearchParams {
   /**
@@ -1550,6 +1561,8 @@ export interface SearchParams {
    * characters and 32 words, punctuation included; the server answers 400 above either.
    */
   q: string;
+  /** Match mode; the server defaults to `word`. */
+  match?: SearchMatch;
   /** Restrict to a single session. */
   sessionId?: string;
   /** Restrict to a single chat id. */

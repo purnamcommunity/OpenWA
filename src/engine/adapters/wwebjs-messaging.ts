@@ -420,6 +420,9 @@ export class WwebjsMessaging {
   // Unbounded Map, bounded in practice by distinct recipients per session; add an LRU only if a
   // session ever addresses a truly unbounded set of fresh numbers.
   private readonly resolvedSendIds = new Map<string, string>();
+  // The `<phone>@c.us` keys of the cache above whose `@lid` the mapping store has not taken (its write failed):
+  // the next send reports the pair again, so a failed write costs one more write, not a fresh probe.
+  private readonly unreportedLids = new Set<string>();
 
   /**
    * Resolve an individual (`@c.us`) recipient to the id whatsapp-web.js will accept. WhatsApp has
@@ -437,26 +440,37 @@ export class WwebjsMessaging {
     }
     const cached = this.resolvedSendIds.get(chatId);
     if (cached) {
+      if (this.unreportedLids.delete(chatId)) this.reportLid(chatId, cached);
       return cached;
     }
     try {
       const wid = await this.host.getNumberId(chatId);
       if (wid) {
         this.resolvedSendIds.set(chatId, wid);
-        if (wid.endsWith('@lid')) {
-          // Persist the learned phone -> lid so the message read-path (resolveJidCandidates) can
-          // bridge this contact's `@c.us` and `@lid` rows on a pure whatsapp-web.js deployment
-          // (#583 R3). Fire-and-forget: resolution (and the send) must never block/fail on the write.
-          void this.host.config.lidMappingStore
-            ?.remember(userPart(wid), userPart(chatId), this.host.config.sessionId)
-            ?.catch(() => {});
-        }
+        if (wid.endsWith('@lid')) this.reportLid(chatId, wid);
         return wid;
       }
       return chatId;
     } catch {
       return chatId;
     }
+  }
+
+  /**
+   * Persist a learned phone -> lid so the message read-path (resolveJidCandidates) can bridge this contact's
+   * `@c.us` and `@lid` rows on a pure whatsapp-web.js deployment (#583 R3). Fire-and-forget: resolution (and
+   * the send) must never block/fail on the write. A write the store reports failed (it resolves false, or
+   * rejects) is marked for the next send, unless a newer resolution has replaced this one meanwhile.
+   */
+  private reportLid(chatId: string, wid: string): void {
+    const failed = (): void => {
+      if (this.resolvedSendIds.get(chatId) === wid) this.unreportedLids.add(chatId);
+    };
+    void this.host.config.lidMappingStore
+      ?.remember(userPart(wid), userPart(chatId), this.host.config.sessionId)
+      ?.then(stored => {
+        if (stored === false) failed();
+      }, failed);
   }
 
   /**
@@ -521,6 +535,7 @@ export class WwebjsMessaging {
         throw toCapturedPageError(err);
       }
       this.resolvedSendIds.delete(chatId);
+      this.unreportedLids.delete(chatId);
       const fresh = await this.resolveSendId(chatId);
       // Same gap as above, and before the comparison: a lookup that failed because the session went away
       // answers the unresolved id, which would read as an unreachable recipient.
@@ -894,6 +909,9 @@ export class WwebjsMessaging {
       if (!message) {
         throw new MessageNotFoundError(messageId, chatId);
       }
+      // The message acts through the client that read it, which the host's check on getClient never sees
+      // again: a teardown that landed in the lookup is the retryable 409, not a write on a closing page.
+      this.host.ensureReady();
       await (message as MessageWithReactions).react(emoji);
     });
     this.host.logger.debug('Reacted to message', { messageId, emoji: emoji || '(removed)' });
@@ -1190,6 +1208,7 @@ export class WwebjsMessaging {
       if (!message) {
         throw new MessageNotFoundError(messageId, chatId);
       }
+      this.host.ensureReady();
       await message.delete(forEveryone);
     });
     this.host.logger.debug('Deleted message', { chatId, messageId, forEveryone });
@@ -1213,6 +1232,7 @@ export class WwebjsMessaging {
       if (!message) {
         throw new MessageNotFoundError(messageId, chatId);
       }
+      this.host.ensureReady();
       // An edit REPLACES the content, so tags are re-applied rather than preserved: omitting mentions
       // drops whatever the original carried. Options omitted entirely when none were asked for.
       return mentions?.length ? message.edit(body, { mentions }) : message.edit(body);
@@ -1236,6 +1256,9 @@ export class WwebjsMessaging {
    *
    * As with those sites, chatId is NOT lid-resolved: the pin acts on the found message's own key,
    * so resolving would only risk missing a message stored under the pre-migration @c.us chat.
+   *
+   * Readiness is checked again before the message is returned: it acts through the client that read it, so
+   * a teardown that landed in the lookup would otherwise reach a closing page.
    */
   private async findInFetchWindow(chatId: string, messageId: string): Promise<Message> {
     const chat = await this.client().getChatById(chatId);
@@ -1245,6 +1268,7 @@ export class WwebjsMessaging {
     const messages = await chat.fetchMessages({ limit: 100 });
     const message = messages.find(m => m.id._serialized === messageId || m.id.id === messageId);
     if (!message) throw new MessageNotFoundError(messageId, chatId);
+    this.host.ensureReady();
     return message;
   }
 

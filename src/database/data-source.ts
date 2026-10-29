@@ -83,6 +83,7 @@ const sqliteDataSourceOptions: DataSourceOptions = {
 export function buildPostgresDataSourceOptions(env: NodeJS.ProcessEnv = process.env): DataSourceOptions {
   const schema = env.POSTGRES_SCHEMA || 'public';
   const useCustomSearchPath = schema !== 'public';
+  const connectionTimeoutMillis = parseInt(env.DATABASE_CONNECTION_TIMEOUT_MS || '10000', 10);
   return {
     type: 'postgres',
     schema,
@@ -104,12 +105,12 @@ export function buildPostgresDataSourceOptions(env: NodeJS.ProcessEnv = process.
     extra: {
       // Same UTC pin the runtime data connection carries (pg-boot-migrations.ts): a migration that
       // rewrites a timestamp column must mean the same thing as the app that wrote it.
-      ...postgresUtcExtra(),
+      ...postgresUtcExtra(connectionTimeoutMillis),
       max: parseInt(env.DATABASE_POOL_SIZE || '10', 10),
       // Pool resilience only. NO statement_timeout here: this connection runs migrations, and a
       // long CREATE INDEX / backfill must not be aborted mid-flight.
       idleTimeoutMillis: parseInt(env.DATABASE_IDLE_TIMEOUT_MS || '30000', 10),
-      connectionTimeoutMillis: parseInt(env.DATABASE_CONNECTION_TIMEOUT_MS || '10000', 10),
+      connectionTimeoutMillis,
       // Only set for a non-public schema (see above).
       ...(useCustomSearchPath ? { options: `-c search_path=${schema},public` } : {}),
     },

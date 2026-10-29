@@ -50,13 +50,7 @@ export interface IngressDeps {
       pluginId: string;
       providerDeliveryId: string;
       route: string;
-      payload: {
-        headers: Record<string, string>;
-        query: Record<string, string>;
-        body: string;
-        rawBody: string;
-        method?: string;
-      };
+      payload: IngressJobData['payload'] & { method?: string };
       payloadHash: string;
       sessionId: string | null;
     }): Promise<boolean>;
@@ -238,6 +232,9 @@ export class IngressService {
     // A shared-secret route carries the instance secret itself in its declared header, and an hmac
     // route's declared header carries a signature that is only useful to re-send the same body.
     const payload = {
+      // Every authenticating scheme has passed by here; a `none` route authenticates nothing. Recorded now
+      // because a plugin update can change the scheme before a queued or replayed delivery runs.
+      admission: { verified: route.signature.scheme !== 'none' },
       headers: redactSensitiveHeaders(
         req.headers,
         route.signature.scheme === 'shared-secret' || route.signature.scheme === 'hmac-sha256'
@@ -344,8 +341,15 @@ export function extractConversationId(
   if (spec.jsonPointer) {
     try {
       let node: unknown = JSON.parse(rawBody);
-      for (const seg of spec.jsonPointer.split('/').filter(Boolean)) {
-        node = (node as Record<string, unknown>)?.[seg];
+      // RFC 6901: an empty token is a key, `~1` and `~0` stand for `/` and `~`, and an array takes only an
+      // index. A pointer written without its leading slash keeps resolving as it did.
+      const path = spec.jsonPointer.startsWith('/') ? spec.jsonPointer.slice(1) : spec.jsonPointer;
+      for (const token of path.split('/')) {
+        if (/~(?:[^01]|$)/.test(token)) return undefined;
+        const key = token.replace(/~1/g, '/').replace(/~0/g, '~');
+        if (node === null || typeof node !== 'object' || !Object.hasOwn(node, key)) return undefined;
+        if (Array.isArray(node) && !/^(0|[1-9][0-9]*)$/.test(key)) return undefined;
+        node = (node as Record<string, unknown>)[key];
       }
       // Only a scalar is a usable conversation key — an object/array would stringify to junk.
       if (typeof node === 'string') return node;
@@ -372,6 +376,7 @@ const SENSITIVE_INGRESS_HEADERS = new Set([
   'x-signature',
   'x-signature-ed25519',
   'x-webhook-signature',
+  'webhook-signature',
 ]);
 
 export function redactSensitiveHeaders(

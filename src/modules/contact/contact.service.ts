@@ -93,9 +93,11 @@ export class ContactService {
   /**
    * Batch-resolve profile picture URLs for a list of contact ids (the dashboard's chat-list avatars
    * — one HTTP call instead of N, so the per-IP throttle isn't exhausted by a sidebar full of
-   * parallel fetches). Engine lookups run 5 at a time with a per-id deadline; a per-id failure or
-   * timeout yields null for that id (hidden/no picture), never aborts the batch. The exception is
-   * EngineNotReadyError: it describes the session, not the id, so it fails the whole request with
+   * parallel fetches). Engine lookups run 5 at a time with a per-id deadline. A timeout yields null
+   * for that id and ends the walk: the ids of the later chunks are left out of the answer, like those
+   * past the cap, so a caller asks for them again instead of reading null as "no picture", and
+   * unfinished lookups never overlap new engine work. Ordinary per-id failures yield null and the
+   * batch continues. EngineNotReadyError describes the session, not the id, so it fails the whole request with
    * 409 after the current chunk and the remaining chunks are not started. Answering 200 with every
    * avatar null would be cached by the dashboard as "no pictures". Ids beyond
    * PROFILE_PICTURES_MAX_IDS are ignored.
@@ -108,15 +110,16 @@ export class ContactService {
     let notReady: EngineNotReadyError | undefined;
     for (let i = 0; i < capped.length; i += CHUNK) {
       const chunk = capped.slice(i, i + CHUNK);
+      let timedOut = false;
       const results = await Promise.all(
         chunk.map((id): Promise<readonly [string, string | null]> => {
           // Per-id deadline: a hanging lookup (bad/unreachable id) resolves null instead of
           // stalling the whole batch; the timer is cleared the moment the engine settles.
           return new Promise<readonly [string, string | null]>(resolve => {
-            const timer = setTimeout(
-              () => resolve([id, null] as const),
-              ContactService.PROFILE_PICTURE_LOOKUP_TIMEOUT_MS,
-            );
+            const timer = setTimeout(() => {
+              timedOut = true;
+              resolve([id, null] as const);
+            }, ContactService.PROFILE_PICTURE_LOOKUP_TIMEOUT_MS);
             engine.getProfilePicture(id).then(
               url => {
                 clearTimeout(timer);
@@ -135,6 +138,7 @@ export class ContactService {
       for (const [id, url] of results) {
         pictures[id] = url;
       }
+      if (timedOut) break;
     }
     return pictures;
   }
@@ -230,8 +234,10 @@ export class ContactService {
 
   upsertContact(sessionId: string, contactId: string, firstName: string, lastName?: string) {
     this.assertAddressable(contactId);
+    // The DTO lets a JSON null through as "no last name". The engines default an omitted one to '' (a default
+    // parameter ignores null), so null would otherwise reach the page-side save as a value.
     return this.getEngine(sessionId)
-      .upsertContact(this.toAddressableId(contactId), firstName, lastName)
+      .upsertContact(this.toAddressableId(contactId), firstName, lastName ?? undefined)
       .finally(() => this.listings.drop(sessionId));
   }
 

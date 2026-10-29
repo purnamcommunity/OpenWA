@@ -103,6 +103,7 @@ function resetFetchCalls(): void {
   startGate = null;
   startResult = null;
   createFailure = null;
+  proxyPatchFails = false;
   stopFailure = null;
   forceKillFailure = null;
   confirmGate = null;
@@ -140,6 +141,7 @@ let startFailure: { status: number; message: string; leaves?: Partial<Session> }
 let startResult: { answer: Partial<Session>; leaves?: Partial<Session> } | null = null;
 // When set, the next POST /api/sessions answers with this error. Spent by that one create.
 let createFailure: { status: number; message: string } | null = null;
+let proxyPatchFails = false;
 // When set, POST .../stop answers with this error.
 let stopFailure: { status: number; message: string } | null = null;
 // When set, POST .../force-kill answers with this status and body.
@@ -255,6 +257,10 @@ function installFetchStub(): void {
       if (method === 'GET' && proxyGetFails) return Promise.resolve(jsonResponse({ message: 'boom' }, 500));
       if (method === 'GET') return Promise.resolve(jsonResponse({ ...sessionProxy }));
       if (method === 'PATCH') {
+        if (proxyPatchFails) {
+          const answer = jsonResponse({ message: 'Proxy write refused' }, 500);
+          return proxyPatchGate ? proxyPatchGate.then(() => answer) : Promise.resolve(answer);
+        }
         const payload = body as { proxyUrl?: string | null } | undefined;
         if (payload?.proxyUrl === null) {
           sessionProxy = { enabled: false, proxyType: null, proxyHost: null, hasCredentials: false };
@@ -748,6 +754,99 @@ test('the pairing phone field leaves a composition in progress alone and reads i
   // Outside a composition the text is read at once, as before.
   fireEvent.input(phoneInput, { target: { value: fullwidth('628123456789') } });
   assert.equal(phoneInput.value, '628123456789');
+});
+
+async function openPairingPhoneField() {
+  const { screen, fireEvent, within } = rtl;
+  resetFetchCalls();
+  renderSessions();
+  await screen.findByText('new-device');
+  const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
+  fireEvent.click(within(qrCard).getByRole('button', { name: 'Show QR' }));
+  await screen.findByAltText('QR');
+  fireEvent.click(screen.getByRole('tab', { name: 'Link with Phone Number' }));
+  return {
+    phoneInput: screen.getByLabelText('Phone Number') as HTMLInputElement,
+    generate: screen.getByRole('button', { name: 'Generate Pairing Code' }) as HTMLButtonElement,
+  };
+}
+
+const pairingCodeRequests = () => fetchCalls.filter(c => c.path.endsWith('/pairing-code'));
+
+// A native maxLength counts the separators of a pasted number and cuts it before the page reads it: "+62 812-3456-7890"
+// is 17 characters but 12 digits. And cutting a number of more than 15 digits would leave a valid-looking one nobody
+// typed, so it is kept whole, refused in the field, and no pairing code is requested for it.
+test('the pairing phone field keeps a formatted paste whole and refuses one of more than 15 digits', async () => {
+  const { screen, fireEvent } = rtl;
+  const { phoneInput, generate } = await openPairingPhoneField();
+
+  assert.equal(phoneInput.hasAttribute('maxlength'), false, 'a native maxLength cuts a pasted formatted number');
+  fireEvent.change(phoneInput, { target: { value: '+62 812-3456-7890' } });
+  assert.equal(phoneInput.value, '6281234567890');
+  assert.equal(generate.disabled, false);
+  assert.equal(phoneInput.getAttribute('aria-invalid'), null);
+  assert.equal(screen.queryByText(/Enter a valid phone number/) === null, true);
+
+  const tooLong = '1234567890123456789';
+  fireEvent.change(phoneInput, { target: { value: tooLong } });
+  assert.equal(phoneInput.value, tooLong, 'the paste was cut to a number nobody typed');
+  assert.equal(phoneInput.getAttribute('aria-invalid'), 'true');
+  const error = screen.getByText(/Enter a valid phone number/);
+  assert.equal(phoneInput.getAttribute('aria-describedby'), error.id);
+  assert.equal(generate.disabled, true);
+
+  fireEvent.keyDown(phoneInput, { key: 'Enter' });
+  assert.equal(pairingCodeRequests().length, 0, 'a pairing code was requested for a number of more than 15 digits');
+
+  fireEvent.change(phoneInput, { target: { value: '6281234567890' } });
+  assert.equal(phoneInput.getAttribute('aria-invalid'), null);
+  assert.equal(screen.queryByText(/Enter a valid phone number/) === null, true);
+  assert.equal(generate.disabled, false);
+});
+
+// Joining the digit groups of text around a number makes a valid-looking one nobody typed: "Order 12 call +62 ..." and
+// "... ext. 12" both hold 15 digits. Only digits and the usual formatting are read; anything else is kept and refused.
+test('the pairing phone field accepts formatted numbers whole and refuses text with other characters', async () => {
+  const { screen, fireEvent } = rtl;
+  const { phoneInput, generate } = await openPairingPhoneField();
+
+  const accepted: Array<[string, string]> = [
+    ['+62 812-3456-7890', '6281234567890'],
+    ['(021) 555 0100', '0215550100'],
+    ['+62\u00a0812.3456.7890', '6281234567890'],
+    ['  +1 (555) 123-4567 ', '15551234567'],
+    ['(+62) 812-3456-7890', '6281234567890'],
+    ['(+1) 5551234567', '15551234567'],
+  ];
+  for (const [pasted, digits] of accepted) {
+    fireEvent.change(phoneInput, { target: { value: pasted } });
+    assert.equal(phoneInput.value, digits, `${pasted} was not read whole`);
+    assert.equal(phoneInput.getAttribute('aria-invalid'), null, `${pasted} was refused`);
+    assert.equal(generate.disabled, false, `${pasted} left Generate disabled`);
+  }
+
+  const refused = [
+    'Order 12 call +62 812-3456-7890',
+    '+62 812-3456-7890 ext. 12',
+    '62812abc3456',
+    '+62 812 +3456 7890',
+    '(+62) +812-3456-7890',
+  ];
+  for (const pasted of refused) {
+    fireEvent.change(phoneInput, { target: { value: pasted } });
+    assert.equal(phoneInput.value, pasted, `${pasted} was rewritten to a number nobody typed`);
+    assert.equal(phoneInput.getAttribute('aria-invalid'), 'true', `${pasted} was not marked invalid`);
+    assert.equal(screen.getAllByText(/Enter a valid phone number/).length, 1, `${pasted} showed no single error`);
+    assert.equal(generate.disabled, true, `${pasted} left Generate enabled`);
+    fireEvent.keyDown(phoneInput, { key: 'Enter' });
+    assert.equal(pairingCodeRequests().length, 0, `a pairing code was requested for ${pasted}`);
+  }
+
+  // Cleaning the text up makes it a number again.
+  fireEvent.change(phoneInput, { target: { value: '+62 812-3456-7890' } });
+  assert.equal(phoneInput.value, '6281234567890');
+  assert.equal(phoneInput.getAttribute('aria-invalid'), null);
+  assert.equal(generate.disabled, false);
 });
 
 // Nothing server-side refuses a pairing code for a number linked elsewhere, so the panel has to say
@@ -2198,4 +2297,103 @@ test('a key refused the wildcard room joins each listed session instead', async 
   for (const frame of feedFrames().slice(1)) {
     assert.deepEqual((frame as { events: string[] }).events, SESSION_FEED_EVENTS);
   }
+});
+
+function pendingResponse() {
+  let release!: () => void;
+  const promise = new Promise<void>(resolve => (release = resolve));
+  return { promise, release };
+}
+
+async function finishResponse(pending: ReturnType<typeof pendingResponse>) {
+  await rtl.act(async () => {
+    pending.release();
+    await pending.promise;
+    await new Promise<void>(resolve => setImmediate(resolve));
+  });
+}
+
+async function openProxyEditor(name = 'new-device') {
+  const card = (await rtl.screen.findByText(name)).closest('.session-card') as HTMLElement;
+  rtl.fireEvent.click(rtl.within(card).getByRole('button', { name: 'Proxy' }));
+  const dialog = await rtl.screen.findByRole('dialog');
+  await rtl.within(dialog).findByRole('checkbox');
+  return dialog;
+}
+
+function setProxyDraft(dialog: HTMLElement, url: string) {
+  const form = rtl.within(dialog);
+  if (!(form.getByRole('checkbox') as HTMLInputElement).checked) rtl.fireEvent.click(form.getByRole('checkbox'));
+  rtl.fireEvent.change(form.getByLabelText('Proxy URL'), { target: { value: url } });
+}
+
+test('an earlier proxy save preserves the draft in a reopened editor for the same session', async () => {
+  resetFetchCalls();
+  const first = pendingResponse();
+  proxyPatchGate = first.promise;
+  renderSessions();
+  let dialog = await openProxyEditor();
+  setProxyDraft(dialog, 'http://first.invalid:8080');
+  rtl.fireEvent.click(rtl.within(dialog).getByRole('button', { name: 'Save' }));
+  await rtl.waitFor(() => assert.ok(findFetchCall('PATCH', '/api/sessions/sess-qr-1/proxy')));
+  rtl.fireEvent.click(rtl.within(dialog).getByRole('button', { name: 'Cancel' }));
+  dialog = await openProxyEditor();
+  setProxyDraft(dialog, 'http://replacement.invalid:8080');
+  await finishResponse(first);
+
+  assert.equal(rtl.screen.queryByRole('dialog') === dialog, true, 'the earlier save dismissed the reopened editor');
+  assert.equal(
+    (rtl.within(dialog).getByLabelText('Proxy URL') as HTMLInputElement).value,
+    'http://replacement.invalid:8080',
+  );
+  assert.equal((rtl.within(dialog).getByLabelText('Proxy URL') as HTMLInputElement).disabled, false);
+});
+
+for (const firstFails of [false, true]) {
+  test(`an earlier proxy ${firstFails ? 'failure' : 'success'} cannot unlock a second save in the same session editor`, async () => {
+    resetFetchCalls();
+    const first = pendingResponse();
+    const second = pendingResponse();
+    proxyPatchGate = first.promise;
+    proxyPatchFails = firstFails;
+    renderSessions();
+    let dialog = await openProxyEditor();
+    setProxyDraft(dialog, 'http://first.invalid:8080');
+    rtl.fireEvent.click(rtl.within(dialog).getByRole('button', { name: 'Save' }));
+    await rtl.waitFor(() => assert.equal(fetchCalls.filter(c => c.method === 'PATCH').length, 1));
+    rtl.fireEvent.click(rtl.within(dialog).getByRole('button', { name: 'Cancel' }));
+    dialog = await openProxyEditor();
+    setProxyDraft(dialog, 'http://second.invalid:8080');
+    proxyPatchGate = second.promise;
+    proxyPatchFails = false;
+    rtl.fireEvent.click(rtl.within(dialog).getByRole('button', { name: 'Save' }));
+    await rtl.waitFor(() => assert.equal(fetchCalls.filter(c => c.method === 'PATCH').length, 2));
+    try {
+      await finishResponse(first);
+      assert.equal(rtl.screen.queryByRole('dialog') === dialog, true, 'the earlier save dismissed the pending editor');
+      const input = rtl.within(dialog).getByLabelText('Proxy URL') as HTMLInputElement;
+      assert.equal(input.value, 'http://second.invalid:8080');
+      assert.equal(input.disabled, true, 'the earlier completion unlocked the newer pending save');
+      assert.equal((rtl.within(dialog).getByRole('checkbox') as HTMLInputElement).disabled, true);
+    } finally {
+      await finishResponse(second);
+    }
+    assert.equal(rtl.screen.queryByRole('dialog') === null, true, 'the current successful save must still close');
+  });
+}
+
+test('a failed proxy save preserves its current draft and allows retry', async () => {
+  resetFetchCalls();
+  proxyPatchFails = true;
+  renderSessions();
+  const dialog = await openProxyEditor();
+  setProxyDraft(dialog, 'http://retry.invalid:8080');
+  rtl.fireEvent.click(rtl.within(dialog).getByRole('button', { name: 'Save' }));
+  await rtl.screen.findByText('Proxy write refused');
+  assert.equal(rtl.screen.queryByRole('dialog') === dialog, true);
+  assert.equal((rtl.within(dialog).getByLabelText('Proxy URL') as HTMLInputElement).value, 'http://retry.invalid:8080');
+  assert.equal((rtl.within(dialog).getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled, false);
+  proxyPatchFails = false;
+  rtl.fireEvent.click(rtl.within(dialog).getByRole('button', { name: 'Save' }));
+  await rtl.waitFor(() => assert.equal(rtl.screen.queryByRole('dialog') === null, true));
 });

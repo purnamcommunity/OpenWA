@@ -63,6 +63,8 @@ export const utcTimestampTypes = {
 };
 
 const SET_SESSION_UTC = "SET TIME ZONE 'UTC'";
+/** The pin's budget when no connect timeout is configured, or when it is 0 (the pool's timer off). */
+const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
 
 /**
  * Pin a pooled session to UTC, through pg-pool's own connect hook.
@@ -82,9 +84,14 @@ const SET_SESSION_UTC = "SET TIME ZONE 'UTC'";
  *
  * `connectionTimeoutMillis` does NOT cover this statement: pg-pool clears that timer once the socket
  * is connected, before it invokes the hook, so a server that accepts the connection and then never
- * answers holds the acquire until the statement's own failure. Nothing else in the pool bounds it.
+ * answers would hold the acquire, and a boot waiting on it, for good. The statement therefore carries its
+ * own `query_timeout`: its rejection makes the pool end the client, and no other statement is limited by it.
  */
-const pinSessionToUtc = (client: ClientBase): Promise<unknown> => client.query(SET_SESSION_UTC);
+const pinSessionToUtc = (client: ClientBase, timeoutMs = DEFAULT_CONNECTION_TIMEOUT_MS): Promise<unknown> => {
+  // Held in a variable: @types/pg omits `query_timeout`, which the driver reads, so a literal fails the excess check.
+  const query = { text: SET_SESSION_UTC, query_timeout: timeoutMs };
+  return client.query(query);
+};
 
 /**
  * The `extra` block that pins a postgres data connection to UTC, for both entry points (the runtime
@@ -95,9 +102,20 @@ const pinSessionToUtc = (client: ClientBase): Promise<unknown> => client.query(S
  * form. Setting it here keeps it next to the two halves it belongs with, and ahead of any connection
  * built from the returned block.
  */
-export function postgresUtcExtra(): { types: typeof utcTimestampTypes; onConnect: typeof pinSessionToUtc } {
+export function postgresUtcExtra(connectionTimeoutMillis?: number): {
+  types: typeof utcTimestampTypes;
+  onConnect: (client: ClientBase) => Promise<unknown>;
+} {
   pgDefaults.parseInputDatesAsUTC = true;
-  return { types: utcTimestampTypes, onConnect: pinSessionToUtc };
+  const timeoutMs =
+    connectionTimeoutMillis && Number.isFinite(connectionTimeoutMillis) && connectionTimeoutMillis > 0
+      ? connectionTimeoutMillis
+      : DEFAULT_CONNECTION_TIMEOUT_MS;
+  return {
+    types: utcTimestampTypes,
+    onConnect:
+      timeoutMs === DEFAULT_CONNECTION_TIMEOUT_MS ? pinSessionToUtc : client => pinSessionToUtc(client, timeoutMs),
+  };
 }
 
 /**

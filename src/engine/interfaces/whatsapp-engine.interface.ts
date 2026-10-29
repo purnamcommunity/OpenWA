@@ -816,11 +816,32 @@ export interface PollVote {
   timestamp: number;
 }
 
-/** A {@link PollVote} plus the poll it belongs to, as delivered live through `onPollVote`. */
-export interface PollVoteEvent extends PollVote {
-  /** The poll-creation message this vote is cast on. */
-  messageId: string;
+/**
+ * A voter's current selection on a poll (the native poll sent with `send-poll` or from the phone).
+ * WhatsApp sends the whole selection each time a voter changes it, so the latest `timestamp` per
+ * `voterId` is the current state, and an empty `selectedOptions` means the voter cleared their vote.
+ */
+export interface PollVoteEvent {
+  /** Id of the poll creation message the vote belongs to. */
+  pollMessageId: string;
+  /** Neutral id of the chat the poll was posted in. */
   chatId: string;
+  /** Neutral id of the voter (the account itself when it voted from its phone). */
+  voterId: string;
+  /**
+   * The option texts now selected, exactly as they appear on the poll (the same strings `vote-poll`
+   * takes). An option the engine could not name is left out.
+   */
+  selectedOptions: string[];
+  /** The poll's question, when the creation message is available to read it from. */
+  pollName?: string;
+  /** Unix seconds the voter changed the selection (sender clock). */
+  timestamp: number;
+  /**
+   * The same instant in Unix milliseconds. Two changes of one voter within a second share `timestamp`, so
+   * this is what orders them and tells them apart.
+   */
+  timestampMs: number;
 }
 
 /**
@@ -1080,18 +1101,18 @@ export interface EngineEventCallbacks {
    */
   onMessageRevoked?: (message: RevokedMessage, actor?: { fromMe: boolean }) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
-  /**
-   * Fired when someone selects or deselects options on a poll. Each event carries that voter's
-   * whole current selection (see {@link PollVote}), so consumers replace what they hold for the
-   * voter rather than adding to it.
-   */
-  onPollVote?: (event: PollVoteEvent) => void;
   onMessageEdited?: (message: EditedMessage) => void;
   /**
    * Fired for each RSVP to a WhatsApp event (consumers emit `event.response`). Baileys only: it
    * decrypts the RSVP itself from the stored event creation message. whatsapp-web.js never fires it.
    */
   onEventResponse?: (event: EventResponseEvent) => void;
+  /**
+   * Fired each time a voter changes their selection on a poll (consumers emit `poll.vote`). Each event
+   * carries that voter's whole current selection, so consumers replace what they hold for the voter
+   * rather than adding to it. whatsapp-web.js only: Baileys never fires it.
+   */
+  onPollVote?: (event: PollVoteEvent) => void;
   /**
    * Fired on group membership changes (join/leave), group metadata updates
    * (subject/description/announce/locked), and pending join requests. The `kind` selects the
@@ -1585,6 +1606,13 @@ export interface GroupCapability {
   setGroupEphemeral(groupId: string, durationSec: number): Promise<void>;
 
   /**
+   * Set this account's own member label in the group (the per-group tag shown beside its name); an empty
+   * string clears it. Resolves once the label message is handed to WhatsApp: it travels as a group
+   * protocol message with no per-request confirmation, and group metadata does not carry the label back.
+   */
+  setGroupMemberLabel(groupId: string, label: string): Promise<void>;
+
+  /**
    * Pending join requests for a group with join-approval turned on. Admin-only on both engines;
    * a non-admin's read is refused by the engine and surfaced as-is.
    */
@@ -1808,33 +1836,78 @@ export interface CatalogCapability {
 }
 
 /**
+ * The newest message the gateway stored for a chat (the `messages` table), in the shape an engine
+ * that keys chat writes to a message needs to rebuild that message's key.
+ */
+export interface StoredChatMessage {
+  /** The WhatsApp message id. */
+  id: string;
+  fromMe: boolean;
+  /** The sender of a group message that is not from me, as stored (neutral dialect); absent otherwise. */
+  author?: string;
+  /** Epoch seconds. */
+  timestamp: number;
+  /**
+   * The `<lid>@lid` of a 1:1 chat, and of `author`, as the persisted lid mapping holds them. Read from
+   * the table rather than an in-memory cache, which can lack a mapping; absent when none is known.
+   */
+  lid?: string;
+  authorLid?: string;
+}
+
+/**
+ * Reads the newest stored message of the chat a write is for, across the chat's id forms. Engines
+ * call it only when they know no message of the chat themselves, so a lookup costs nothing when it is
+ * not needed; it resolves null when the gateway stored none.
+ */
+export type StoredChatMessageLookup = () => Promise<StoredChatMessage | null>;
+
+/**
  * Chat-list management: enumeration and per-chat flags (seen, unread, archive, pin, mute,
  * clear). These operate on the chat itself; pinning a message INSIDE a chat is
  * MessageOperationsCapability.pinMessage.
+ *
+ * Baileys keys sendSeen, markUnread, archiveChat, clearChatMessages and deleteChat to a message of the
+ * chat, and holds the chat's messages only in memory since its session started. `stored` is the
+ * gateway's fallback for a chat with no message since then; whatsapp-web.js needs none and ignores it.
  */
 export interface ChatCapability {
   getChats(): Promise<ChatSummary[]>;
 
   /**
    * `messageIds` names exactly which messages to acknowledge. Engines that acknowledge per
-   * message (Baileys) need it to mark a burst, or anything at all after a restart; engines with a
-   * chat-level receipt (whatsapp-web.js) ignore it.
+   * message (Baileys) need it to mark a burst; without it they acknowledge the newest received
+   * message they know, else the newest received one `stored` finds. Engines with a chat-level
+   * receipt (whatsapp-web.js) ignore both.
    *
    * `authors` maps a message id to who posted it, for a group: a receipt names its sender, and an id the
    * engine never kept (history backfill) has no key to read it from. An id with neither is not acknowledged.
    */
-  sendSeen(chatId: string, messageIds?: string[], authors?: ReadonlyMap<string, string>): Promise<boolean>;
-
-  markUnread(chatId: string): Promise<boolean>;
-
-  deleteChat(chatId: string): Promise<boolean>;
+  sendSeen(
+    chatId: string,
+    messageIds?: string[],
+    authors?: ReadonlyMap<string, string>,
+    stored?: StoredChatMessageLookup,
+  ): Promise<boolean>;
 
   /**
-   * Archive or unarchive a chat. Resolves false when the engine cannot act — on Baileys the
-   * archive is an app-state modification keyed to the chat's last message, so a chat with no known
-   * history cannot be archived at all. Same shape as deleteChat/markUnread, which share that limit.
+   * Resolves false when the engine cannot act. On Baileys an archived chat needs a known message to
+   * key the mark to; a chat that is not archived is marked without one if the session knows it.
    */
-  archiveChat(chatId: string, archive: boolean): Promise<boolean>;
+  markUnread(chatId: string, stored?: StoredChatMessageLookup): Promise<boolean>;
+
+  /**
+   * Resolves false when the engine cannot act — on Baileys a chat with no known message at all, since
+   * the delete removes the messages up to the one it is keyed to and guessing that is not safe.
+   */
+  deleteChat(chatId: string, stored?: StoredChatMessageLookup): Promise<boolean>;
+
+  /**
+   * Archive or unarchive a chat. Baileys keys the change to a known message of the chat and sends it
+   * without one when none is known, which WhatsApp applies as well, but only for a chat the session
+   * knows (a chat record, a persisted state row or a stored message); otherwise it resolves false.
+   */
+  archiveChat(chatId: string, archive: boolean, stored?: StoredChatMessageLookup): Promise<boolean>;
 
   /**
    * Pin or unpin a chat at the top of the chat list. Chat-level — distinct from `pinMessage`, which
@@ -1861,18 +1934,18 @@ export interface ChatCapability {
    * Getting this backwards is silent — the send still answers 200 and the mute simply never applies,
    * or lands tens of thousands of years out and reads as permanent.
    *
-   * Unlike archiveChat/clearChatMessages/deleteChat this has no "engine declined" outcome: the
-   * Baileys `mute` app-state modification carries no `lastMessages`, so a chat with no known
-   * history mutes like any other. That is why it resolves void rather than boolean.
+   * Unlike clearChatMessages/deleteChat this has no "engine declined" outcome: the Baileys `mute`
+   * app-state modification carries no `lastMessages`, so a chat with no known history mutes like
+   * any other. That is why it resolves void rather than boolean.
    */
   muteChat(chatId: string, muteUntil: number | null): Promise<void>;
 
   /**
    * Delete every message in a chat while keeping the chat itself in the list. Resolves false when
-   * the engine cannot act — an unknown chat on whatsapp-web.js, or (as with archiveChat) a chat
-   * with no known history on Baileys, whose clear is keyed to the last message.
+   * the engine cannot act — an unknown chat on whatsapp-web.js, or (as with deleteChat) a chat with
+   * no known message at all on Baileys, whose clear is keyed to the last message.
    */
-  clearChatMessages(chatId: string): Promise<boolean>;
+  clearChatMessages(chatId: string, stored?: StoredChatMessageLookup): Promise<boolean>;
 }
 
 /**

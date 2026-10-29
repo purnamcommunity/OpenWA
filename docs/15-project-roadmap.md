@@ -739,8 +739,11 @@ flowchart TB
     T --> D
     D --> E[boot-smoke: run the image on amd64 + arm64]
     D --> F[image-scan: Trivy, CRITICAL/HIGH, fixable only]
+    D --> R[release-tags: drop X.Y and latest when a newer release holds them]
     E --> G[promote: apply X.Y.Z, X.Y, latest to GHCR + Docker Hub]
     F --> G
+    R --> G
+    R --> I
     G --> H[verify-published: resolve every ref anonymously]
     H --> I[GitHub Release, notes from the CHANGELOG section]
 ```
@@ -753,6 +756,14 @@ GitHub Release is gated on all of it.
 
 A tag with any `-` suffix (for example `-rc.1`, `-beta.1`, `-alpha.1`) is a prerelease: it skips the
 mutable `X.Y` and `latest` channels and is flagged prerelease on GitHub.
+
+For a stable tag, `release-tags` reads which release `X.Y` and `latest` serve on each registry and leaves
+a channel alone when it already serves a newer one, so releasing a patch to an older line or re-running an
+old tag never moves a channel backwards; the exact `X.Y.Z` tag is still applied. A channel it cannot read
+fails the release rather than counting as absent; only the registry's own "manifest unknown" answer does.
+`verify-published` then expects only the tags `release-tags` selected. `release-tags` also decides whether
+the GitHub Release is marked Latest: only when this release took every `latest` channel, never for a
+prerelease or a patch to an older line.
 
 ### When a gate fails
 

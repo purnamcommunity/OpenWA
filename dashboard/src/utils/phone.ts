@@ -19,3 +19,11 @@ export function normalizePhoneText(text: string): string {
     .replace(/\p{Cf}/gu, '')
     .replace(/(?![0-9])\p{Nd}/gu, asciiDigit);
 }
+
+// The digits of a search query that reads as a phone number: digits, with the spaces, plus sign, parentheses, hyphens
+// and dots a number is written with. Any other query gives none, so it matches names only: "Shop 2" names something,
+// and its 2 is no reason to list every number that holds one.
+export function phoneQueryDigits(query: string): string {
+  const text = normalizePhoneText(query).trim();
+  return /^[\d\s+().-]+$/.test(text) ? text.replace(/\D/g, '') : '';
+}

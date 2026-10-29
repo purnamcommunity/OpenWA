@@ -67,9 +67,9 @@ MessageType = Literal[
 ]
 WebhookEvent = Literal[
     "message.received", "message.sent", "message.ack", "message.receipt", "message.failed", "message.revoked",
-    "message.reaction", "message.poll_vote", "message.edited", "session.status", "session.qr", "session.authenticated",
+    "message.reaction", "message.edited", "session.status", "session.qr", "session.authenticated",
     "session.disconnected", "session.reconnect_loop", "session.restriction", "presence.update",
-    "event.response", "group.join", "group.leave", "group.update", "group.join_request",
+    "event.response", "poll.vote", "group.join", "group.leave", "group.update", "group.join_request",
     "call.received", "status.received",
     "call.accepted", "call.rejected", "call.missed",
     "*",
@@ -79,7 +79,7 @@ WebhookDeliveryEvent = Literal[
     "message.received", "message.sent", "message.ack", "message.receipt", "message.failed", "message.revoked",
     "message.reaction", "message.edited", "session.status", "session.qr", "session.authenticated",
     "session.disconnected", "session.reconnect_loop", "session.restriction", "presence.update",
-    "event.response", "group.join", "group.leave", "group.update", "group.join_request",
+    "event.response", "poll.vote", "group.join", "group.leave", "group.update", "group.join_request",
     "call.received", "status.received",
     "call.accepted", "call.rejected", "call.missed",
 ]
@@ -850,7 +850,7 @@ class ProfilePictureResponse(TypedDict):
 
 
 class ProfilePicturesResponse(TypedDict):
-    # Map of contact id → picture URL (None when the lookup failed).
+    # Map of contact id → picture URL (None when the lookup failed). An id skipped after a lookup timed out is absent from the map; ask for it again.
     pictures: dict[str, str | None]
 
 
@@ -1163,9 +1163,9 @@ class MarkChatReadRequest(TypedDict):
     # Body for mark_read.
     chatId: Jid
     # Messages to acknowledge (at most 100; an empty list is refused). Baileys acknowledges
-    # individual messages, so without this only the newest received message the engine still
-    # holds in memory gets a receipt. Ignored by whatsapp-web.js, whose own sendSeen is
-    # chat-level.
+    # individual messages, so without this only the newest received message gets a receipt:
+    # the one the engine holds in memory, else the newest received one the gateway stored.
+    # Ignored by whatsapp-web.js, whose own sendSeen is chat-level.
     messageIds: NotRequired[list[str]]
 
 
@@ -1552,9 +1552,13 @@ class _SearchQueryRequired(TypedDict):
     q: str
 
 
+# `match` is "word" (the server default: whole words) or "contains" (any part
+# of a word, ignoring case and accents; needs a term of 3+ characters, and a
+# server with SEARCH_CONTAINS_ENABLED=true, else 501).
 _SearchQueryOptional = TypedDict(
     "_SearchQueryOptional",
     {
+        "match": Literal["word", "contains"],
         "sessionId": str,
         "chatId": Jid,
         "direction": MessageDirection,

@@ -72,6 +72,18 @@ async function submitAndReadError(): Promise<string> {
   return message;
 }
 
+// The only feedback a failed sign-in gives is this message, so it has to reach a screen reader and name the field it
+// is about.
+test('a refused sign-in is announced and tied to the key field', async () => {
+  reply = () => new Response('', { status: 401 });
+  await submitAndReadError();
+  const alert = rtl.screen.getByRole('alert');
+  assert.equal(alert.textContent, 'Invalid API key');
+  const input = rtl.screen.getByLabelText('API Key');
+  assert.equal(input.getAttribute('aria-invalid'), 'true');
+  assert.equal(input.getAttribute('aria-describedby'), alert.id);
+});
+
 test('a proxy error page while the gateway is down is a connection error, not an invalid key', async () => {
   reply = () => new Response('<html>502 Bad Gateway</html>', { status: 502, headers: { 'Content-Type': 'text/html' } });
   assert.equal(await submitAndReadError(), 'Unable to connect to server. Please try again.');

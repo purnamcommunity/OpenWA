@@ -623,7 +623,7 @@ describe('a job that can mint a publish credential pins global npm installs and 
       env: {
         REPO: '${{ github.repository }}',
         REF_NAME: '${{ github.ref_name }}',
-        TAGS: '${{ needs.docker.outputs.tags }}',
+        TAGS: '${{ needs.release-tags.outputs.tags }}',
         EXPECTED_DIGEST: '${{ needs.docker.outputs.digest }}',
       },
       // The echoed messages carry an em dash; a line is compared as written, so it is named here too.
@@ -679,7 +679,7 @@ describe('a job that can mint a publish credential pins global npm installs and 
         jobKeys: ['name', 'runs-on', 'timeout-minutes', 'permissions', 'needs', 'steps'],
         permissions: { packages: 'write', 'id-token': 'write', attestations: 'write' },
         runsOn: 'ubuntu-latest',
-        needs: ['docker', 'boot-smoke', 'image-scan'],
+        needs: ['docker', 'boot-smoke', 'image-scan', 'release-tags'],
         timeout: 15,
         steps: IMAGE_PROMOTE,
         ...flatten(IMAGE_PROMOTE),
@@ -1217,7 +1217,7 @@ describe('a job that can mint a publish credential pins global npm installs and 
       ...lookalikes,
       ...strayBlanks,
       ['a step', w => void steps(w).push({ run: SCRIPT }), [`promote: ${SCRIPT}`]],
-      ...placing('promote', ['docker', 'boot-smoke', 'image-scan']),
+      ...placing('promote', ['docker', 'boot-smoke', 'image-scan', 'release-tags']),
       ...commented('set -euo pipefail').map(([where, text]): [string, Edit, string[]] => [
         `an expression in a comment ${where}`,
         w => swap(tag(w), 'set -euo pipefail', text),

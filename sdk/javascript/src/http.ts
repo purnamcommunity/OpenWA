@@ -67,16 +67,20 @@ export function encodeSegment(segment: string | number): string {
 
 /** Build a URL with serialized query params, omitting `undefined`/`null` values. */
 export function buildUrl(baseUrl: string, path: string, query?: object): string {
-  const url = `${baseUrl.replace(/\/$/, '')}${path}`;
-  if (!query) return url;
+  const base = baseUrl.replace(/\/$/, '');
+  if (!query) return `${base}${path}`;
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
     if (value === undefined || value === null) continue;
     params.append(key, String(value));
   }
   const qs = params.toString();
-  // A raw path may already carry a query string; extend it rather than start a second one.
-  return qs ? `${url}${path.includes('?') ? '&' : '?'}${qs}` : url;
+  if (!qs) return `${base}${path}`;
+  // A raw path may already carry a query string; extend it rather than start a second one. The values go
+  // ahead of any fragment, since fetch drops everything after a '#' and the server would never see them.
+  const hash = path.indexOf('#');
+  const head = hash === -1 ? path : path.slice(0, hash);
+  return `${base}${head}${head.includes('?') ? '&' : '?'}${qs}${hash === -1 ? '' : path.slice(hash)}`;
 }
 
 /**

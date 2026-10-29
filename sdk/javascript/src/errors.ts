@@ -35,7 +35,8 @@ export class OpenWAApiError extends OpenWAError {
   readonly code?: string;
   /**
    * Seconds to wait before retrying: the body's `retryAfterSeconds` when present, else the
-   * `Retry-After` response header (seconds or an HTTP date). Undefined when neither is sent.
+   * `Retry-After` response header (seconds or an HTTP date). Undefined when neither is sent. A longer
+   * wait is reported as 2147483 (about 24.8 days), the most `setTimeout` accepts once multiplied by 1000.
    */
   readonly retryAfterSeconds?: number;
   /** The response headers, when the error came from a response. */
@@ -180,14 +181,24 @@ export function classifyApiError(
  * date, clamped at 0.
  */
 function retryAfterSeconds(fromBody: unknown, header: string | null | undefined): number | undefined {
-  if (typeof fromBody === 'number' && Number.isFinite(fromBody) && fromBody >= 0) return Math.ceil(fromBody);
+  if (typeof fromBody === 'number' && Number.isFinite(fromBody) && fromBody >= 0) {
+    return capSeconds(Math.ceil(fromBody));
+  }
   const value = header?.trim();
   if (!value) return undefined;
-  if (/^\d+$/.test(value)) return Number(value);
+  // A digit string past Number's range reads as Infinity, which the cap brings back to the ceiling.
+  if (/^\d+$/.test(value)) return capSeconds(Number(value));
   // Date.parse also accepts '-5' or '1.5' as a past date, which would read as "retry now".
   if (!/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value)) return undefined;
   const at = Date.parse(value);
-  return Number.isNaN(at) ? undefined : Math.max(0, Math.ceil((at - Date.now()) / 1000));
+  return Number.isNaN(at) ? undefined : capSeconds(Math.max(0, Math.ceil((at - Date.now()) / 1000)));
+}
+
+/** setTimeout fires at once for a delay over 2^31-1 ms, so a longer wait would turn `seconds * 1000` into a retry now. */
+const MAX_RETRY_AFTER_SECONDS = 2_147_483;
+
+function capSeconds(seconds: number): number {
+  return Math.min(seconds, MAX_RETRY_AFTER_SECONDS);
 }
 
 /**

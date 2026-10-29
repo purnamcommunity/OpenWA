@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Loader2 } from 'lucide-react';
 import { Modal } from '../Modal';
 import type { Chat } from '../../services/api';
+import { chatTitle } from '../../utils/formatPhone';
 
 export type MuteDuration = '8h' | '1w' | 'always';
 
@@ -26,7 +27,7 @@ export function MuteChatDialog({
     <Modal
       open
       onClose={onClose}
-      title={t('chats.rowActions.muteTitle', { name: chat.name || chat.id.split('@')[0] })}
+      title={t('chats.rowActions.muteTitle', { name: chatTitle(chat) })}
       className="confirm-modal"
       closeLabel={t('common.close')}
       footer={

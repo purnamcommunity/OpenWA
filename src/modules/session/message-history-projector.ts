@@ -8,6 +8,7 @@ import { resolveFeatureFlags } from '../../config/feature-flags';
 import { IncomingMessage } from '../../engine/interfaces/whatsapp-engine.interface';
 import { LoggerService } from '../../common/services/logger.service';
 import { resolveMessageRetentionCutoff } from '../message/message-retention.service';
+import { captureSessionWrites } from '../../common/utils/session-write-scope';
 
 /**
  * Persist pre-connection history without live dispatch. Stored revocations also notify plugin indexes
@@ -103,12 +104,18 @@ export async function persistHistoryMessages(
       // Insert-or-ignore: a live onMessage insert can land between the `seen` SELECT above and this
       // write, colliding on UNIQUE(sessionId, waMessageId). orIgnore skips the collision instead of
       // throwing and aborting the whole batch (history is best-effort, persist-never-dispatch).
-      await messageRepository
-        .createQueryBuilder()
-        .insert()
-        .values(rows as unknown as QueryDeepPartialEntity<Message>[])
-        .orIgnore()
-        .execute();
+      // In the session's write scope, so a delete drains this insert instead of racing the row it adds.
+      const writes = captureSessionWrites(messageRepository.manager?.connection ?? messageRepository, id);
+      await writes
+        .write(() =>
+          messageRepository
+            .createQueryBuilder()
+            .insert()
+            .values(rows as unknown as QueryDeepPartialEntity<Message>[])
+            .orIgnore()
+            .execute(),
+        )
+        .finally(() => writes.close());
       inserted += rows.length;
     }
     // Insert the tombstone before clearing an existing row: concurrent content inserts then either

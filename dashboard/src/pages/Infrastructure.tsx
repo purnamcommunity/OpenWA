@@ -72,12 +72,8 @@ const nextBootHost = (profile: string, config: SavedConfig): string =>
 function writtenHost(profile: string, sent: SaveConfigPayload): string | undefined {
   if (profile === 'postgres') return sent.database?.type === 'sqlite' ? '' : sent.database?.host;
   if (profile === 'minio') return sent.storage?.type === 'local' ? '' : sent.storage?.s3Endpoint;
-  // A built-in Redis switched off is dropped with its host unless the queue or the cache still uses it, which keeps its
-  // profile. The one case the page cannot see is CACHE_ENABLED true in the saved file beside an environment value that
-  // turns it off: the host stays. An external host is kept as sent; one on the bundled name is dropped only once
-  // nothing uses Redis, which the cache may, so the page does not ask to stop that container.
-  const redis = sent.redis;
-  return redis?.builtIn && redis.enabled === false ? '' : redis?.host;
+  // Consumer pins and the retained cache profile decide whether Redis is unused below.
+  return sent.redis?.host;
 }
 
 export function Infrastructure() {
@@ -186,15 +182,33 @@ export function Infrastructure() {
       )
         .filter(([profile, up, host]) => up && host !== undefined && !namesBundledContainer(profile, host))
         .map(([profile]): string => profile);
-      // The server never stops a container the next boot still reaches: the host the environment pins, else the one in
-      // the file this save wrote. A pinned host is the one the page loaded; the saved one the page reads back, or takes
-      // from what the save sent when that read fails. It asks for (and names) only the containers neither reaches, and
-      // none whose host it cannot tell, so the dialog lists what the server stops. The form is seeded once, so the
-      // refetch keeps any edit in progress.
+      // The server keeps a container only while the next boot both uses its datastore and dials its host: the host the
+      // environment pins, else the one in the file this save wrote. A pinned host is the one the page loaded; the saved
+      // one the page reads back, or takes from what the save sent when that read fails. It asks for (and names) the
+      // containers whose datastore is switched off, then those neither host reaches, and none whose host it cannot
+      // tell, so the dialog lists what the server stops. The form is seeded once, so the refetch keeps any edit in
+      // progress.
       const saved = await queryClient
         .fetchQuery({ queryKey: ['infra', 'config'], queryFn: infraApi.getConfig, staleTime: 0 })
         .catch(() => undefined);
+      const redisEnabled = infraStatus?.envPinned?.includes('REDIS_ENABLED')
+        ? infraStatus.redis.enabled
+        : (saved?.redis.enabled ?? sent.redis?.enabled);
+      const queueEnabled = infraStatus?.envPinned?.includes('QUEUE_ENABLED')
+        ? infraStatus.queue.enabled
+        : (saved?.queue.enabled ?? sent.queue?.enabled);
       const toStop = [...running, ...pinnedAway].filter(profile => {
+        // An inactive datastore never dials its pinned host. A retained Redis profile may still serve the cache.
+        const unused =
+          profile === 'postgres'
+            ? dbType !== 'postgres'
+            : profile === 'minio'
+              ? storageType !== 's3'
+              : sent.redis?.builtIn === true &&
+                redisEnabled === false &&
+                queueEnabled === false &&
+                !profiles.includes('redis');
+        if (unused) return true;
         const config = pinned(HOST_KEY[profile]) ?? saved;
         const host = config ? nextBootHost(profile, config) : writtenHost(profile, sent);
         return host !== undefined && !namesBundledContainer(profile, host);
@@ -738,6 +752,8 @@ export function Infrastructure() {
               )}
               {pinNote('REDIS_HOST')}
               {flagPinNote('REDIS_BUILTIN', 'redis')}
+              {pinNote('REDIS_TLS')}
+              {pinNote('REDIS_USERNAME')}
               {configForm.redisConfig.builtIn && builtInDetailNotes('redis')}
 
               {!configForm.redisConfig.builtIn && (

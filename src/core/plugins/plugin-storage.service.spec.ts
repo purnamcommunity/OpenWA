@@ -105,6 +105,27 @@ describe('PluginStorageService sandboxed per-plugin storage containment', () => 
     expect(jsonFiles).toHaveLength(2);
   });
 
+  it("does not let a key spelled like another key's encoded filename read or delete that key", async () => {
+    // 'foo' is stored as key-Zm9v.json. The literal key 'key-Zm9v' has its own encoded file; its legacy
+    // fallback (<key>.json) is that same path, which belongs to 'foo'.
+    await storage.set('foo', { kept: true });
+
+    expect(await storage.get('key-Zm9v')).toBeNull();
+    await storage.delete('key-Zm9v');
+
+    expect(await storage.get('foo')).toEqual({ kept: true });
+    expect(await storage.list()).toEqual(['foo']);
+  });
+
+  it('does not list a canonical encoded filename whose key get and set would refuse', async () => {
+    const pluginDataDir = path.join(dataDir, 'plugins', pluginId);
+    await storage.set('real', { ok: true });
+    const encoded = (key: string): string => `key-${Buffer.from(key).toString('base64url')}.json`;
+    for (const key of ['', '../escape']) fs.writeFileSync(path.join(pluginDataDir, encoded(key)), '{}');
+
+    expect(await storage.list()).toEqual(['real']);
+  });
+
   it('deletes a legacy plain-key file', async () => {
     const pluginDataDir = path.join(dataDir, 'plugins', pluginId);
     fs.writeFileSync(path.join(pluginDataDir, 'legacy.json'), JSON.stringify({ old: true }));
@@ -213,6 +234,18 @@ describe('PluginStorageService.deletePluginData (uninstall storage cleanup)', ()
 
   it('is a no-op for a plugin with no storage dir', () => {
     expect(() => service.deletePluginData('never-stored')).not.toThrow();
+  });
+
+  it('throws when the storage dir cannot be removed, so the caller does not report it gone', async () => {
+    await service.createPluginStorage('stuck-plg').set('token', { secret: 'abc' });
+    const rm = jest.spyOn(fs, 'rmSync').mockImplementationOnce(() => {
+      throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' });
+    });
+
+    expect(() => service.deletePluginData('stuck-plg')).toThrow('EBUSY');
+
+    rm.mockRestore();
+    expect(fs.existsSync(path.join(dataDir, 'plugins', 'stuck-plg'))).toBe(true);
   });
 
   it('refuses a traversal id that resolves outside the storage root', () => {

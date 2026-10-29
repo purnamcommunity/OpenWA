@@ -1,10 +1,10 @@
 import { Optional } from '@nestjs/common';
 import { InjectQueue, OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
-import { DelayedError, Job, Queue } from 'bullmq';
+import { DelayedError, Job, Queue, RATE_LIMIT_ERROR } from 'bullmq';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { QUEUE_NAMES } from '../queue-names';
-import { workerConnectionOptions, ingressWorkerConcurrency } from '../redis-connection';
+import { workerConnectionOptions, ingressWorkerConcurrency, producerReady } from '../redis-connection';
 import { closeWorkerIfStarted, MAX_WORKER_CLOSE_WAIT_MS, startedWorker } from './close-worker';
 import { IntegrationDeliveryFailure } from '../../integration/entities/integration-delivery-failure.entity';
 import { IngressEvent } from '../../integration/entities/ingress-event.entity';
@@ -36,7 +36,14 @@ export interface IngressJobData {
   // pointer. Undefined when the route declares no pointer — the per-conversation ordering lock then
   // serializes per instance instead (see orderingKeyFor in ../../integration/ordering-lock).
   providerConversationId?: string;
-  payload: { headers: Record<string, string>; query: Record<string, string>; body: string; rawBody: string };
+  payload: {
+    headers: Record<string, string>;
+    query: Record<string, string>;
+    body: string;
+    rawBody: string;
+    // The host's verdict when it accepted the request; see IngressEvent.payload.
+    admission?: { verified: boolean };
+  };
 }
 
 // The KeyedAsyncLock wrapping dispatch below guarantees no two dispatches for the SAME conversation
@@ -131,6 +138,12 @@ export class IngressProcessor extends WorkerHost {
 
       if (isFinalAttempt) await this.deadLetterOrRequeue(job, job.attemptsMade + 1, errorMessage);
 
+      // BullMQ reads an error with exactly this text as a rate limit, moves the job back to wait without
+      // counting the attempt and runs it again: here a hot loop that never reaches the final attempt, or on
+      // it writes a dead letter on every run. A handler may relay such text from elsewhere.
+      if (errorMessage === RATE_LIMIT_ERROR) {
+        throw new Error(`Ingress dispatch failed: ${errorMessage}`, { cause: err });
+      }
       // Re-throw to trigger BullMQ's exponential backoff / retry.
       throw err;
     }
@@ -183,7 +196,9 @@ export class IngressProcessor extends WorkerHost {
    */
   @OnWorkerEvent('failed')
   async onWorkerFailed(job: Job<IngressJobData> | undefined, error: Error): Promise<void> {
-    if (!job || error.message !== STALL_EXHAUSTION_MESSAGE) return;
+    // The sentinel text alone is not proof: a failed attempt whose error reads the same is retried and is not
+    // this. BullMQ marks a job it fails for stalling by storing the reason as its deferred failure.
+    if (!job || job.deferredFailure !== STALL_EXHAUSTION_MESSAGE || error.message !== STALL_EXHAUSTION_MESSAGE) return;
     const d = job.data;
     this.logger.error('Ingress job failed after stalling beyond the recovery limit', error.message, {
       pluginId: d.pluginId,
@@ -216,6 +231,9 @@ export class IngressProcessor extends WorkerHost {
       try {
         const [first, second] = requeuedJobIds(String(job.id).replace(REQUEUED_JOB_ID, ''));
         const jobId = String(job.id) === first ? second : first;
+        // The producer queue holds its calls until its first connect, which the worker's own connection does not
+        // wait for; bounded, so the recovery gives up instead of waiting on a Redis that never answered it.
+        await producerReady(this.ingressQueue);
         await this.ingressQueue.remove(jobId);
         await this.ingressQueue.add(job.name, d, {
           jobId,

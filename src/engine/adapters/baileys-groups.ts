@@ -554,6 +554,17 @@ export class BaileysGroups {
     );
   }
 
+  /**
+   * Not an IQ: `updateMemberLabel` relays a GROUP_MEMBER_LABEL_CHANGE protocol message to the group and
+   * resolves with its message id once sent, so a 4xx here is the group lookup the relay depends on.
+   */
+  async setGroupMemberLabel(groupId: string, label: string): Promise<void> {
+    this.host.ensureReady();
+    await this.groupWrite(groupId, 'Setting the member label', () =>
+      this.confirmed(this.sock().updateMemberLabel(groupId, label), 'the member label change'),
+    );
+  }
+
   async getGroupMembershipRequests(groupId: string): Promise<GroupMembershipRequest[]> {
     this.host.ensureReady();
     const raw = await this.groupWrite(groupId, 'Listing the membership requests', () =>

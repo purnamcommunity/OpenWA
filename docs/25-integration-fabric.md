@@ -54,6 +54,10 @@ correctness properties (its own pending map, a bounded timeout, and a drain in t
 come for free. A timeout resolves `504` and a mid-dispatch crash resolves `502`; the ingress job treats
 either as a failed delivery and retries or dead-letters it.
 
+The status a handler returns is not read on this path. Only a handler that throws, a timeout or a worker
+crash fails a delivery, so a handler that wants a retry has to throw; returning `{ status: 500 }` completes
+the job.
+
 ## 25.3 Architecture
 
 ```mermaid
@@ -123,7 +127,17 @@ Alongside this async pipeline, a route may additionally declare a `response` con
   into the plugin's **base** config with last-write-wins merging, so a sparse wildcard instance
   inherits keys a sibling projected, and hook dispatch resolves config without per-instance
   scoping. Run one enabled wildcard instance per plugin, or scope instances concretely, until the
-  projection is re-keyed per instance. Capability calls are not confined to the dispatching instance's
+  projection is re-keyed per instance. The base configuration is also the layer under every instance
+  and per-session override. An instance or override that points a `net.allowConfigHosts` key at another
+  origin than the layer beneath does not inherit that layer's `secret` fields and must bring its own; one
+  that keeps the same origin, or sets no host key, inherits them. A host key that holds no text counts as
+  another origin, and a write that moves a host key to another origin than the stored layer is bound to (its own
+  host key, or the host of the layer beneath it when it names none) gets no stored secret back for the mask, so
+  the secret has to be sent with it. An instance row loses its own secrets while a per-session override
+  has moved a host key the row leaves unset away from the base config, and a config `PATCH` of an instance
+  whose plugin is not loaded answers `409`. A plugin that reaches its destination
+  through a key outside `net.allowConfigHosts` (for example under `net.allow: ['*']`) is not covered, so
+  keep such a secret on the instance that uses it. Capability calls are not confined to the dispatching instance's
   scope either: separating tenants across instances of one plugin relies on the handler using the
   delivery's `sessionId`.
 - **`conversation.send` capability** — a normalized outbound send authored by the plugin and translated
@@ -253,11 +267,22 @@ a background task instead of awaiting it in the handler. The budget is short bec
 deployment answers the provider only after the inline dispatch, and providers abandon a request within a
 few seconds.
 
+A queued, retried, reconciled or redriven delivery runs with what was decided when it was accepted: the
+verification verdict (a delivery stored before the verdict was recorded reads the route as it stands) and
+the session its instance was bound to. If the instance has been disabled or deleted, or bound to another
+session, by the time the delivery runs, the attempt fails and follows the retry and dead-letter path. A
+redrive covers only the rows written under the instance's current session binding; rows of an earlier
+binding stay in the dead-letter table.
+
 A job waiting on that lock still holds one of the `INGRESS_WORKER_CONCURRENCY` worker slots (default
 10). A burst on one lane larger than that fills every slot with same-lane waiters, and events for other
 conversations and instances queue behind the burst until it drains. Size `INGRESS_WORKER_CONCURRENCY`
 above the largest burst you expect on a single lane, and declare a `conversationId` pointer on the
-route so the lane is one conversation; without it the lane is the whole instance.
+route so the lane is one conversation; without it the lane is the whole instance. A `jsonPointer` reads
+the body by RFC 6901 tokens: `~1` stands for a slash and `~0` for a tilde in a key, an empty token names
+an empty key (so a trailing or doubled slash looks for that key), and an array takes only a plain index.
+A pointer that finds no string, number or boolean leaves the delivery on the per-instance lane; one
+written without its leading slash resolves as it always did.
 
 Persist-before-acknowledge alone is not delivery: a crash between the persist and the enqueue, or a
 fire-and-forget enqueue on a `response` route whose outcome is never recorded, would strand the row

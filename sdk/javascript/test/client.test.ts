@@ -161,6 +161,21 @@ describe('OpenWAClient', () => {
     expect(t.lastCall!.url).toBe('http://localhost:2785/api/sessions?limit=5&name=x');
   });
 
+  it('puts query params before the fragment of a raw path', async () => {
+    const cases: Array<[string, string]> = [
+      ['/api/sessions#tab', '/api/sessions?name=x#tab'],
+      ['/api/sessions?limit=5#tab', '/api/sessions?limit=5&name=x#tab'],
+      ['/api/sessions#tab?fake=1', '/api/sessions?name=x#tab?fake=1'],
+      ['/api/sessions#', '/api/sessions?name=x#'],
+    ];
+    for (const [path, expected] of cases) {
+      const t = new MockTransport().passthrough({ status: 200, body: [] });
+      await client(t).request({ method: 'GET', path, query: { name: 'x' } });
+      expect(t.lastCall!.url).toBe(`http://localhost:2785${expected}`);
+      expect(new URL(t.lastCall!.url).searchParams.get('name')).toBe('x');
+    }
+  });
+
   it('maps a 404 to OpenWANotFoundError with parsed body', async () => {
     const t = new MockTransport().on('GET', '/api/sessions/missing', {
       status: 404,
@@ -323,6 +338,21 @@ describe('OpenWAClient', () => {
     // Only whole seconds or an HTTP date count; Date.parse would read '-5' or '1.5' as a past date.
     for (const bad of ['soon', '-5', '1.5', 'Tue 5']) {
       expect((await fail({ status: 503, headers: { 'Retry-After': bad } })).retryAfterSeconds).toBeUndefined();
+    }
+
+    // A wait is capped at 2147483 seconds, the longest a caller can pass to setTimeout (times 1000) without
+    // it firing at once, whether it comes from the header, an HTTP date or the body.
+    const ceiling = 2147483;
+    for (const huge of ['9999999999', '1'.repeat(25), '9'.repeat(400), '2147484']) {
+      expect((await fail({ status: 503, headers: { 'Retry-After': huge } })).retryAfterSeconds).toBe(ceiling);
+    }
+    expect((await fail({ status: 503, headers: { 'Retry-After': '2147483' } })).retryAfterSeconds).toBe(ceiling);
+    expect((await fail({ status: 503, headers: { 'Retry-After': '86400' } })).retryAfterSeconds).toBe(86400);
+    const farDate = await fail({ status: 503, headers: { 'Retry-After': 'Fri, 31 Dec 9999 23:59:59 GMT' } });
+    expect(farDate.retryAfterSeconds).toBe(ceiling);
+    for (const retryAfterSeconds of [1e300, 9999999999, 2147483.5]) {
+      const err = await fail({ status: 429, body: { statusCode: 429, message: 'x', retryAfterSeconds } });
+      expect(err.retryAfterSeconds).toBe(ceiling);
     }
 
     const logout = await fail({

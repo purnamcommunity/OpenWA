@@ -1586,3 +1586,147 @@ test('a chat left right after a correction for an image above the reader reopens
     restore();
   }
 });
+
+function queuedMediaFrames() {
+  const original = { raf: globalThis.requestAnimationFrame, cancel: globalThis.cancelAnimationFrame };
+  let nextId = 0;
+  const pending = new Map<number, FrameRequestCallback>();
+  const canceled = new Set<number>();
+  const ran: number[] = [];
+  globalThis.requestAnimationFrame = callback => {
+    const id = ++nextId;
+    pending.set(id, callback);
+    return id;
+  };
+  globalThis.cancelAnimationFrame = id => {
+    pending.delete(id);
+    canceled.add(id);
+  };
+  return {
+    pending,
+    canceled,
+    ran,
+    flush() {
+      for (const id of [...pending.keys()]) {
+        if (!pending.has(id)) continue;
+        const callback = pending.get(id)!;
+        pending.delete(id);
+        assert.equal(canceled.has(id), false);
+        ran.push(id);
+        callback(0);
+      }
+    },
+    restore() {
+      pending.clear();
+      globalThis.requestAnimationFrame = original.raf;
+      globalThis.cancelAnimationFrame = original.cancel;
+    },
+  };
+}
+
+test('a decode in the next chat is corrected when it arrives before the retired frame', () => {
+  rtl.cleanup();
+  const frames = queuedMediaFrames();
+  const t: Thread = { rows: textRows('a', 46), top: 0 };
+  t.rows[10].img = 0;
+  const restore = installRows(t);
+  try {
+    const { rerender, container } = rtl.render(createElement(RowsProbe, { chatId: 'A', rows: t.rows }));
+    const el = rtl.screen.getByTestId('thread');
+    rtl.fireEvent.scroll(el);
+    readerScrollsTo(el, 1210);
+    t.rows[10].img = 300;
+    hook().onMediaLoad({ currentTarget: container.querySelector('img[data-img="a10"]') });
+    assert.equal(frames.pending.size, 1);
+
+    t.rows = textRows('b', 46);
+    t.rows[10].img = 0;
+    rerender(createElement(RowsProbe, { chatId: 'B', rows: t.rows }));
+    rtl.fireEvent.scroll(el);
+    readerScrollsTo(el, 1210);
+    assert.equal(el.scrollTop, 1210);
+    t.rows[10].img = 300;
+    hook().onMediaLoad({ currentTarget: container.querySelector('img[data-img="b10"]') });
+    frames.flush();
+    assert.equal(el.scrollTop, 1510);
+    frames.flush();
+    assert.equal(el.scrollTop, 1510);
+    assert.equal(
+      frames.ran.some(id => frames.canceled.has(id)),
+      false,
+    );
+  } finally {
+    rtl.cleanup();
+    restore();
+    frames.restore();
+  }
+});
+
+test('unmount cancels a pending media frame', () => {
+  rtl.cleanup();
+  const frames = queuedMediaFrames();
+  const t: Thread = { rows: textRows('a', 46), top: 0 };
+  t.rows[10].img = 0;
+  const restore = installRows(t);
+  try {
+    const { container, unmount } = rtl.render(createElement(RowsProbe, { chatId: 'A', rows: t.rows }));
+    const el = rtl.screen.getByTestId('thread');
+    rtl.fireEvent.scroll(el);
+    readerScrollsTo(el, 1210);
+    t.rows[10].img = 300;
+    hook().onMediaLoad({ currentTarget: container.querySelector('img[data-img="a10"]') });
+    assert.equal(frames.pending.size, 1);
+    unmount();
+    assert.equal(frames.pending.size, 0);
+    frames.flush();
+    assert.equal(frames.ran.length, 0);
+  } finally {
+    rtl.cleanup();
+    restore();
+    frames.restore();
+  }
+});
+
+test('returning to the same chat starts a new media-frame visit', () => {
+  rtl.cleanup();
+  const frames = queuedMediaFrames();
+  const t: Thread = { rows: textRows('a', 46), top: 0 };
+  t.rows[10].img = 0;
+  const restore = installRows(t);
+  try {
+    const { rerender, container } = rtl.render(createElement(RowsProbe, { chatId: 'A', rows: t.rows }));
+    const el = rtl.screen.getByTestId('thread');
+    rtl.fireEvent.scroll(el);
+    readerScrollsTo(el, 1210);
+    t.rows[10].img = 300;
+    hook().onMediaLoad({ currentTarget: container.querySelector('img[data-img="a10"]') });
+    const retired = [...frames.pending.keys()][0];
+    assert.ok(retired !== undefined);
+    const retiredLoad = hook().onMediaLoad;
+    const retiredMedia = container.querySelector('img[data-img="a10"]');
+    assert.ok(retiredMedia);
+    const rowsOfA = t.rows;
+    t.rows = textRows('b', 46);
+    rerender(createElement(RowsProbe, { chatId: 'B', rows: t.rows }));
+    rtl.fireEvent.scroll(el);
+    t.rows = rowsOfA.map((row, i) => (i === 10 ? { ...row, img: 0 } : row));
+    rerender(createElement(RowsProbe, { chatId: 'A', rows: t.rows }));
+    rtl.fireEvent.scroll(el);
+    readerScrollsTo(el, 1220);
+    assert.equal(retiredMedia.isConnected, false);
+    retiredLoad({ currentTarget: retiredMedia });
+    assert.equal(frames.pending.size, 0);
+    t.rows[10].img = 300;
+    hook().onMediaLoad({ currentTarget: container.querySelector('img[data-img="a10"]') });
+    assert.ok(frames.canceled.has(retired));
+    frames.flush();
+    assert.equal(frames.ran.includes(retired), false);
+    assert.equal(el.scrollTop, 1520);
+    frames.flush();
+    assert.equal(el.scrollTop, 1520);
+  } finally {
+    rtl.cleanup();
+    restore();
+    frames.restore();
+  }
+});

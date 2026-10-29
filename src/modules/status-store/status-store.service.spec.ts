@@ -108,6 +108,46 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     for (const close of closes) expect(close).toHaveBeenCalled();
   });
 
+  it('does not publish media or recreate a row removed while storage is pending', async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const put = storageService.putFile.bind(storageService);
+    let key = '';
+    const spy = jest.spyOn(storageService, 'putFile').mockImplementationOnce(async (file, bytes) => {
+      key = file;
+      await put(file, bytes);
+      entered();
+      await gate;
+    });
+    const pending = service.ingest('removed-status', {
+      waStatusId: 'pending-media',
+      contactJid: '628111@c.us',
+      type: 'image',
+      postedAt: Date.now(),
+      media: { mimetype: 'image/png', data: 'dGlueQ==', sizeBytes: 4 },
+    });
+    try {
+      await ready;
+      await repository.delete({ sessionId: 'removed-status' });
+    } finally {
+      release();
+    }
+    const result = await pending;
+    spy.mockRestore();
+    expect(result.created).toBe(false);
+    expect(result.row.mediaOmitted).toBe(true);
+    expect(result.row.mediaPath).toBeUndefined();
+    expect(await repository.countBy({ sessionId: 'removed-status' })).toBe(0);
+    expect(await service.getMedia('removed-status', 'pending-media')).toBeNull();
+    await expect(storageService.getFile(key)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('ingest writes a text row with expiresAt = postedAt + 24h, flagged as created', async () => {
     const postedAt = Date.now();
     const { row, created } = await service.ingest('sess', {

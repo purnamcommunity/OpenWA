@@ -13,6 +13,8 @@ import { Message, MessageDirection } from '../../modules/message/entities/messag
 import { MessageProjector } from '../../modules/session/message-projector.service';
 import { SessionLidResolver } from '../../modules/session/session-lid-resolver.service';
 import { ChatScopeService } from '../../modules/auth/chat-scope.service';
+import { ChatState } from './baileys-chat-state.entity';
+import { ChatStateStoreService } from './baileys-chat-state-store.service';
 
 jest.mock('../../common/media/load-remote-media', () => ({
   loadRemoteMediaBuffer: jest.fn(),
@@ -64,6 +66,8 @@ class FakeSock extends EventEmitter {
   public groupAcceptInvite = jest.fn();
   public groupSettingUpdate = jest.fn().mockResolvedValue(undefined);
   public groupToggleEphemeral = jest.fn().mockResolvedValue(undefined);
+  // Resolves with the relayed protocol message's id.
+  public updateMemberLabel = jest.fn().mockResolvedValue('3EB0LABEL');
   public groupGetInviteInfo = jest.fn();
   public groupMemberAddMode = jest.fn().mockResolvedValue(undefined);
   public profilePictureUrl = jest.fn();
@@ -207,6 +211,7 @@ import {
   IncomingCallEvent,
   IncomingMessage,
   InboundOutcome,
+  StoredChatMessage,
 } from '../interfaces/whatsapp-engine.interface';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
@@ -5847,6 +5852,12 @@ describe('BaileysAdapter group management', () => {
     ['revokeGroupInviteCode', (a: BaileysAdapter) => a.revokeGroupInviteCode('123-456@g.us'), 'groupRevokeInvite'],
     // Was the one group write with no refusal mapping: a refused leave answered an opaque 500.
     ['leaveGroup', (a: BaileysAdapter) => a.leaveGroup('123-456@g.us'), 'groupLeave'],
+    // A relayed message, not an IQ: the refusal is the group lookup the relay runs first.
+    [
+      'setGroupMemberLabel',
+      (a: BaileysAdapter) => a.setGroupMemberLabel('123-456@g.us', 'Site A'),
+      'updateMemberLabel',
+    ],
   ])('%s maps an admin-refused operation to EngineRefusedError (403)', async (_name, call, sockMethod) => {
     (fakeSock as unknown as Record<string, jest.Mock>)[sockMethod].mockRejectedValueOnce(
       Object.assign(new Error('not-authorized'), { data: 401 }),
@@ -5880,6 +5891,11 @@ describe('BaileysAdapter group management', () => {
       'groupMemberAddMode',
     ],
     ['setGroupEphemeral', (a: BaileysAdapter) => a.setGroupEphemeral('123-456@g.us', 86400), 'groupToggleEphemeral'],
+    [
+      'setGroupMemberLabel',
+      (a: BaileysAdapter) => a.setGroupMemberLabel('123-456@g.us', 'Site A'),
+      'updateMemberLabel',
+    ],
     ['getGroupInviteCode', (a: BaileysAdapter) => a.getGroupInviteCode('123-456@g.us'), 'groupInviteCode'],
     ['revokeGroupInviteCode', (a: BaileysAdapter) => a.revokeGroupInviteCode('123-456@g.us'), 'groupRevokeInvite'],
     ['leaveGroup', (a: BaileysAdapter) => a.leaveGroup('123-456@g.us'), 'groupLeave'],
@@ -6071,6 +6087,30 @@ describe('BaileysAdapter group management', () => {
     expect(fakeSock.groupToggleEphemeral).toHaveBeenCalledWith('123-456@g.us', 86400);
     await adapter.setGroupEphemeral('123-456@g.us', 0);
     expect(fakeSock.groupToggleEphemeral).toHaveBeenCalledWith('123-456@g.us', 0);
+  });
+
+  it('setGroupMemberLabel relays the label to the group jid (empty clears) and resolves void', async () => {
+    const adapter = await ready();
+    await expect(adapter.setGroupMemberLabel('123-456@g.us', 'Site A Management')).resolves.toBeUndefined();
+    expect(fakeSock.updateMemberLabel).toHaveBeenCalledWith('123-456@g.us', 'Site A Management');
+    await adapter.setGroupMemberLabel('123-456@g.us', '');
+    expect(fakeSock.updateMemberLabel).toHaveBeenLastCalledWith('123-456@g.us', '');
+  });
+
+  it.each([
+    [429, EngineThrottledError],
+    [408, EngineTransportError],
+  ])('setGroupMemberLabel maps WhatsApp code %i to a retryable 503', async (code, errorClass) => {
+    fakeSock.updateMemberLabel.mockRejectedValueOnce(Object.assign(new Error('throttled'), { data: code }));
+    const adapter = await ready();
+    await expect(adapter.setGroupMemberLabel('123-456@g.us', 'Site A')).rejects.toBeInstanceOf(errorClass);
+  });
+
+  it('setGroupMemberLabel lets a dead socket propagate rather than report a refusal', async () => {
+    const connectionClosed = new Boom('Connection Closed', { statusCode: 428 });
+    fakeSock.updateMemberLabel.mockRejectedValueOnce(connectionClosed);
+    const adapter = await ready();
+    await expect(adapter.setGroupMemberLabel('123-456@g.us', 'Site A')).rejects.toBe(connectionClosed);
   });
 
   it('getGroupInfo populates announce/locked/ephemeralSeconds from the metadata', async () => {
@@ -7758,12 +7798,18 @@ describe('BaileysAdapter sendSeen + markUnread + deleteChat', () => {
     );
   });
 
-  it('markUnread returns false when no last message is known', async () => {
+  // WhatsApp applies an unread mark with no range to a chat in the list (#1891), so a listed chat the
+  // session knows no message of is still marked; an id the account has no chat with is not.
+  it('markUnread marks a listed chat with no known message without a range, and declines an unknown id', async () => {
     const adapter = newAdapter();
     await adapter.initialize({});
     fakeSock.fire('connection.update', { connection: 'open' });
     expect(await adapter.markUnread('628999@s.whatsapp.net')).toBe(false);
     expect(fakeSock.chatModify).not.toHaveBeenCalled();
+
+    fakeSock.fire('chats.upsert', [{ id: '628999@s.whatsapp.net' }]);
+    expect(await adapter.markUnread('628999@s.whatsapp.net')).toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith({ markRead: false, lastMessages: [] }, '628999@s.whatsapp.net');
   });
 
   it('deleteChat revokes the chat via chatModify with the last message', async () => {
@@ -7985,14 +8031,18 @@ describe('BaileysAdapter sendSeen + markUnread + deleteChat', () => {
     );
   });
 
-  it('archiveChat returns false for a chat with no known history, rather than throwing', async () => {
-    // The app-state modification is keyed to the chat's last message; there is nothing to
-    // synthesize one from, so this is a defined outcome the endpoint reports as success:false.
+  // WhatsApp applies an archive with no range (#1891), so a listed chat with no known message is
+  // archived too. An unknown id is not: Baileys replays its own patch locally, which would list it.
+  it('archiveChat archives a listed chat with no known message without a range, and declines an unknown id', async () => {
     const adapter = newAdapter();
     await adapter.initialize({});
     fakeSock.fire('connection.update', { connection: 'open' });
     expect(await adapter.archiveChat('628999@s.whatsapp.net', true)).toBe(false);
     expect(fakeSock.chatModify).not.toHaveBeenCalled();
+
+    fakeSock.fire('chats.upsert', [{ id: '628999@s.whatsapp.net' }]);
+    expect(await adapter.archiveChat('628999@s.whatsapp.net', true)).toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith({ archive: true, lastMessages: [] }, '628999@s.whatsapp.net');
   });
 
   /**
@@ -8063,6 +8113,607 @@ describe('BaileysAdapter sendSeen + markUnread + deleteChat', () => {
       await new Promise(resolve => setImmediate(resolve));
       await adapter.archiveChat('120363@g.us', true);
       expect(fakeSock.chatModify).toHaveBeenCalledWith(expect.objectContaining({ archive: true }), '120363@g.us');
+    });
+  });
+});
+
+// #1891: the phone applies a chat write only when the patch index and the range key name the chat the
+// way it holds it, and a chat with no traffic since the session started is keyed to the gateway's
+// stored copy of its newest message. Each case below was checked against a phone.
+describe('BaileysAdapter chat writes keyed to a message (#1891)', () => {
+  beforeEach(() => {
+    fakeSock.user = { id: '628999:1@s.whatsapp.net', name: 'Me' };
+    fakeSock.resetEmitter();
+    jest.clearAllMocks();
+  });
+
+  // A lid counts as the chat's only once the engine reported its mapping, which the persisted table
+  // answers through findPhoneForLid; a `lid-mapping.update` alone fills the cache and no more.
+  const reported = (pairs: Record<string, string> = {}) => ({
+    getCached: jest.fn((): string | null | undefined => undefined),
+    resolveLid: jest.fn(() => null),
+    lidsForPhone: jest.fn((): string[] => []),
+    remember: jest.fn(() => Promise.resolve(true)),
+    rememberIfUnknown: jest.fn(() => Promise.resolve(true)),
+    findPhoneForLid: jest.fn((lid: string): Promise<string | null> => Promise.resolve(pairs[lid] ?? null)),
+  });
+  const ready = async (lidMappingStore?: ReturnType<typeof reported>): Promise<BaileysAdapter> => {
+    const adapter = lidMappingStore
+      ? new BaileysAdapter({
+          sessionId: 'sess-1',
+          dbSessionId: 'db-uuid-1',
+          authDir: './data/baileys',
+          messageStore: fakeStore,
+          lidMappingStore,
+        })
+      : newAdapter();
+    await adapter.initialize({});
+    fakeSock.fire('connection.update', { connection: 'open' });
+    return adapter;
+  };
+  const upsert = async (key: Record<string, unknown>, messageTimestamp = 1700000020): Promise<void> => {
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [{ key, message: { conversation: 'hi' }, messageTimestamp }],
+    });
+    await new Promise(r => setImmediate(r));
+  };
+  const lookup = (row: StoredChatMessage | null) => jest.fn(() => Promise.resolve(row));
+
+  it.each([
+    ['clearChatMessages', (a: BaileysAdapter) => a.clearChatMessages('628111@c.us')],
+    ['deleteChat', (a: BaileysAdapter) => a.deleteChat('628111@c.us')],
+    ['markUnread', (a: BaileysAdapter) => a.markUnread('628111@c.us')],
+    ['archiveChat', (a: BaileysAdapter) => a.archiveChat('628111@c.us', true)],
+  ])('%s indexes a phone-keyed chat by the lid its message is keyed by', async (_n, act) => {
+    const adapter = await ready(reported({ '484848@lid': '628111' }));
+    fakeSock.fire('lid-mapping.update', { lid: '484848@lid', pn: '628111@s.whatsapp.net' });
+    fakeSock.fire('chats.upsert', [{ id: '628111@s.whatsapp.net' }]);
+    await upsert({ remoteJid: '484848@lid', remoteJidAlt: '628111@s.whatsapp.net', fromMe: false, id: 'M1' });
+
+    await expect(act(adapter)).resolves.toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lastMessages: [{ key: { remoteJid: '484848@lid', fromMe: false, id: 'M1' }, messageTimestamp: 1700000020 }],
+      }),
+      '484848@lid',
+    );
+  });
+
+  it('keys an own group message without its participant, and a received one with its sender', async () => {
+    const adapter = await ready();
+    await upsert({ remoteJid: '120363@g.us', fromMe: true, id: 'OWN', participant: '777@lid' });
+    await adapter.clearChatMessages('120363@g.us');
+    expect(fakeSock.chatModify).toHaveBeenLastCalledWith(
+      {
+        clear: true,
+        lastMessages: [{ key: { remoteJid: '120363@g.us', fromMe: true, id: 'OWN' }, messageTimestamp: 1700000020 }],
+      },
+      '120363@g.us',
+    );
+
+    await upsert({ remoteJid: '120363@g.us', fromMe: false, id: 'IN', participant: '555@lid' }, 1700000030);
+    await adapter.clearChatMessages('120363@g.us');
+    expect(fakeSock.chatModify).toHaveBeenLastCalledWith(
+      {
+        clear: true,
+        lastMessages: [
+          {
+            key: { remoteJid: '120363@g.us', fromMe: false, id: 'IN', participant: '555@lid' },
+            messageTimestamp: 1700000030,
+          },
+        ],
+      },
+      '120363@g.us',
+    );
+  });
+
+  it('falls back to the stored message when the one in memory is a received group message without its sender', async () => {
+    const adapter = await ready();
+    await upsert({ remoteJid: '120363@g.us', fromMe: false, id: 'ANON' });
+    await expect(
+      adapter.clearChatMessages('120363@g.us', lookup({ id: 'S1', fromMe: true, timestamp: 1690000000 })),
+    ).resolves.toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith(
+      {
+        clear: true,
+        lastMessages: [{ key: { remoteJid: '120363@g.us', fromMe: true, id: 'S1' }, messageTimestamp: 1690000000 }],
+      },
+      '120363@g.us',
+    );
+  });
+
+  it('keys a chat with no message in memory to the stored one, and asks the store only then', async () => {
+    const adapter = await ready();
+    const stored = lookup({ id: 'S1', fromMe: false, timestamp: 1690000000 });
+    await expect(adapter.clearChatMessages('628111@c.us', stored)).resolves.toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith(
+      {
+        clear: true,
+        lastMessages: [
+          { key: { remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'S1' }, messageTimestamp: 1690000000 },
+        ],
+      },
+      '628111@s.whatsapp.net',
+    );
+
+    await upsert({ remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'M1' });
+    stored.mockClear();
+    await adapter.deleteChat('628111@c.us', stored);
+    expect(stored).not.toHaveBeenCalled();
+  });
+
+  it('keys a stored message by the lid of a lid-migrated chat, and a stored group message by its sender', async () => {
+    const adapter = await ready(reported({ '484848@lid': '628111' }));
+    fakeSock.fire('lid-mapping.update', { lid: '484848@lid', pn: '628111@s.whatsapp.net' });
+    await adapter.deleteChat('628111@c.us', lookup({ id: 'S1', fromMe: true, timestamp: 1690000000 }));
+    expect(fakeSock.chatModify).toHaveBeenLastCalledWith(
+      {
+        delete: true,
+        lastMessages: [{ key: { remoteJid: '484848@lid', fromMe: true, id: 'S1' }, messageTimestamp: 1690000000 }],
+      },
+      '484848@lid',
+    );
+
+    await adapter.markUnread(
+      '120363@g.us',
+      lookup({ id: 'G1', fromMe: false, author: '628222@c.us', timestamp: 1690000001 }),
+    );
+    expect(fakeSock.chatModify).toHaveBeenLastCalledWith(
+      {
+        markRead: false,
+        lastMessages: [
+          {
+            key: { remoteJid: '120363@g.us', fromMe: false, id: 'G1', participant: '628222@s.whatsapp.net' },
+            messageTimestamp: 1690000001,
+          },
+        ],
+      },
+      '120363@g.us',
+    );
+  });
+
+  it.each([
+    ['nothing stored', () => lookup(null)],
+    ['a lookup that fails', () => jest.fn(() => Promise.reject(new Error('db down')))],
+  ])(
+    'with %s, clear and delete decline, and archive goes out without a range only for a listed chat',
+    async (_n, make) => {
+      const adapter = await ready();
+      await expect(adapter.clearChatMessages('628111@c.us', make())).resolves.toBe(false);
+      await expect(adapter.deleteChat('628111@c.us', make())).resolves.toBe(false);
+      await expect(adapter.archiveChat('628111@c.us', false, make())).resolves.toBe(false);
+      await expect(adapter.markUnread('628111@c.us', make())).resolves.toBe(false);
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+
+      fakeSock.fire('chats.upsert', [{ id: '628111@s.whatsapp.net' }]);
+      await expect(adapter.clearChatMessages('628111@c.us', make())).resolves.toBe(false);
+      await expect(adapter.archiveChat('628111@c.us', false, make())).resolves.toBe(true);
+      expect(fakeSock.chatModify).toHaveBeenCalledWith({ archive: false, lastMessages: [] }, '628111@s.whatsapp.net');
+    },
+  );
+
+  it('archives a chat known only by a stored message without a range, and the store makes the chat known', async () => {
+    const adapter = await ready();
+    // A stored received group message without its sender gives no usable key, but the chat exists.
+    const stored = lookup({ id: 'G1', fromMe: false, timestamp: 1690000000 });
+    await expect(adapter.archiveChat('120363@g.us', true, stored)).resolves.toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith({ archive: true, lastMessages: [] }, '120363@g.us');
+  });
+
+  it('keys a stored message by the lid the stored row brings when the session cache holds no mapping', async () => {
+    const adapter = await ready(reported({ '484848@lid': '628111' }));
+    await adapter.clearChatMessages(
+      '628111@c.us',
+      lookup({ id: 'S1', fromMe: false, timestamp: 1690000000, lid: '484848@lid' }),
+    );
+    expect(fakeSock.chatModify).toHaveBeenLastCalledWith(
+      {
+        clear: true,
+        lastMessages: [{ key: { remoteJid: '484848@lid', fromMe: false, id: 'S1' }, messageTimestamp: 1690000000 }],
+      },
+      '484848@lid',
+    );
+
+    await adapter.clearChatMessages(
+      '120363@g.us',
+      lookup({ id: 'G1', fromMe: false, author: '628222@c.us', authorLid: '555@lid', timestamp: 1690000001 }),
+    );
+    expect(fakeSock.chatModify).toHaveBeenLastCalledWith(
+      {
+        clear: true,
+        lastMessages: [
+          {
+            key: { remoteJid: '120363@g.us', fromMe: false, id: 'G1', participant: '555@lid' },
+            messageTimestamp: 1690000001,
+          },
+        ],
+      },
+      '120363@g.us',
+    );
+  });
+
+  it('keys a message held in memory under the jid it arrived with, even when a lid is known for the chat', async () => {
+    const adapter = await ready();
+    fakeSock.fire('lid-mapping.update', { lid: '484848@lid', pn: '628111@s.whatsapp.net' });
+    fakeSock.fire('chats.upsert', [{ id: '628111@s.whatsapp.net' }]);
+    await upsert({ remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'PN1' });
+    await adapter.clearChatMessages('628111@c.us');
+    expect(fakeSock.chatModify).toHaveBeenLastCalledWith(
+      {
+        clear: true,
+        lastMessages: [
+          { key: { remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'PN1' }, messageTimestamp: 1700000020 },
+        ],
+      },
+      '628111@s.whatsapp.net',
+    );
+
+    await upsert({ remoteJid: '120363@g.us', fromMe: false, id: 'GPN', participant: '628222@s.whatsapp.net' });
+    await adapter.clearChatMessages('120363@g.us');
+    expect(fakeSock.chatModify).toHaveBeenLastCalledWith(
+      {
+        clear: true,
+        lastMessages: [
+          {
+            key: { remoteJid: '120363@g.us', fromMe: false, id: 'GPN', participant: '628222@s.whatsapp.net' },
+            messageTimestamp: 1700000020,
+          },
+        ],
+      },
+      '120363@g.us',
+    );
+  });
+
+  it('marks an archived chat unread only with a known message, since the phone ignores it without one', async () => {
+    const adapter = await ready();
+    fakeSock.fire('chats.upsert', [{ id: '628111@s.whatsapp.net', archived: true }]);
+    await expect(adapter.markUnread('628111@c.us', lookup(null))).resolves.toBe(false);
+    expect(fakeSock.chatModify).not.toHaveBeenCalled();
+
+    await expect(
+      adapter.markUnread('628111@c.us', lookup({ id: 'S1', fromMe: true, timestamp: 1690000000 })),
+    ).resolves.toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith(
+      {
+        markRead: false,
+        lastMessages: [
+          { key: { remoteJid: '628111@s.whatsapp.net', fromMe: true, id: 'S1' }, messageTimestamp: 1690000000 },
+        ],
+      },
+      '628111@s.whatsapp.net',
+    );
+  });
+
+  it('acknowledges the newest stored received message when memory holds none, never an own one', async () => {
+    const adapter = await ready();
+    await expect(
+      adapter.sendSeen('628111@c.us', undefined, undefined, lookup({ id: 'S1', fromMe: false, timestamp: 1690000000 })),
+    ).resolves.toBe(true);
+    expect(fakeSock.readMessages).toHaveBeenCalledWith([
+      { remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'S1' },
+    ]);
+
+    fakeSock.readMessages.mockClear();
+    await expect(
+      adapter.sendSeen('628111@c.us', undefined, undefined, lookup({ id: 'S2', fromMe: true, timestamp: 1690000001 })),
+    ).resolves.toBe(false);
+    expect(fakeSock.readMessages).not.toHaveBeenCalled();
+  });
+
+  it('uses neither the message in memory nor the stored one when its key does not belong to the chat', async () => {
+    const adapter = await ready(reported());
+    fakeSock.fire('lid-mapping.update', { lid: '484848@lid', pn: '628111@s.whatsapp.net' });
+    fakeSock.fire('chats.upsert', [{ id: '628111@s.whatsapp.net' }]);
+    await upsert({ remoteJid: '484848@lid', fromMe: false, id: 'M1' });
+    const stored = lookup({ id: 'S1', fromMe: false, timestamp: 1690000000, lid: '484848@lid' });
+
+    await expect(adapter.clearChatMessages('628111@c.us', stored)).resolves.toBe(false);
+    await expect(adapter.deleteChat('628111@c.us', stored)).resolves.toBe(false);
+    expect(stored).toHaveBeenCalled();
+    await expect(adapter.sendSeen('628111@c.us', undefined, undefined, stored)).resolves.toBe(false);
+    expect(fakeSock.chatModify).not.toHaveBeenCalled();
+    expect(fakeSock.readMessages).not.toHaveBeenCalled();
+  });
+
+  it('keys a write to the stored message when the one in memory does not belong to the chat', async () => {
+    const adapter = await ready(reported({ '777@lid': '628111' }));
+    fakeSock.fire('lid-mapping.update', { lid: '484848@lid', pn: '628111@s.whatsapp.net' });
+    fakeSock.fire('chats.upsert', [{ id: '628111@s.whatsapp.net' }]);
+    await upsert({ remoteJid: '484848@lid', fromMe: false, id: 'M1' });
+
+    await expect(
+      adapter.clearChatMessages(
+        '628111@c.us',
+        lookup({ id: 'S1', fromMe: false, timestamp: 1690000000, lid: '777@lid' }),
+      ),
+    ).resolves.toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith(
+      {
+        clear: true,
+        lastMessages: [{ key: { remoteJid: '777@lid', fromMe: false, id: 'S1' }, messageTimestamp: 1690000000 }],
+      },
+      '777@lid',
+    );
+  });
+
+  // The stored lookup normalizes the id and finds the chat's rows, but the patch would be indexed by the
+  // id as written, which names no chat on the phone.
+  it.each(['120363@G.US', '628111', ' 628111@c.us', '628111:5@s.whatsapp.net', '484848@hosted.lid'])(
+    'keys no write to a stored message or to none for %j, which is not how the engine keys a chat',
+    async chatId => {
+      const adapter = await ready();
+      fakeSock.fire('chats.upsert', [{ id: '120363@g.us' }, { id: '628111@s.whatsapp.net' }]);
+      const stored = lookup({ id: 'S1', fromMe: true, author: '628222@c.us', timestamp: 1690000000 });
+
+      await expect(adapter.clearChatMessages(chatId, stored)).resolves.toBe(false);
+      await expect(adapter.deleteChat(chatId, stored)).resolves.toBe(false);
+      await expect(adapter.archiveChat(chatId, true, stored)).resolves.toBe(false);
+      await expect(adapter.markUnread(chatId, stored)).resolves.toBe(false);
+      await expect(
+        adapter.sendSeen(chatId, undefined, undefined, lookup({ id: 'S2', fromMe: false, timestamp: 1690000001 })),
+      ).resolves.toBe(false);
+      expect(stored).not.toHaveBeenCalled();
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+      expect(fakeSock.readMessages).not.toHaveBeenCalled();
+    },
+  );
+
+  it('still keys a write to the message in memory for a phone id spelled in upper case', async () => {
+    const adapter = await ready();
+    await upsert({ remoteJid: '628111@s.whatsapp.net', fromMe: true, id: 'OWN' });
+    const stored = lookup(null);
+
+    await expect(adapter.clearChatMessages('628111@C.US', stored)).resolves.toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith(
+      {
+        clear: true,
+        lastMessages: [
+          { key: { remoteJid: '628111@s.whatsapp.net', fromMe: true, id: 'OWN' }, messageTimestamp: 1700000020 },
+        ],
+      },
+      '628111@s.whatsapp.net',
+    );
+    expect(stored).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['archiveChat', (a: BaileysAdapter) => a.archiveChat('628111@c.us', true, lookup(null)), { archive: true }],
+    ['markUnread', (a: BaileysAdapter) => a.markUnread('628111@c.us', lookup(null)), { markRead: false }],
+  ])('%s without a range answers false when the chat jid does not belong to the chat', async (_n, act, change) => {
+    const declined = await ready(reported());
+    fakeSock.fire('lid-mapping.update', { lid: '484848@lid', pn: '628111@s.whatsapp.net' });
+    fakeSock.fire('chats.upsert', [{ id: '484848@lid' }]);
+    await expect(act(declined)).resolves.toBe(false);
+    expect(fakeSock.chatModify).not.toHaveBeenCalled();
+
+    const confirmed = await ready(reported({ '484848@lid': '628111' }));
+    fakeSock.fire('lid-mapping.update', { lid: '484848@lid', pn: '628111@s.whatsapp.net' });
+    fakeSock.fire('chats.upsert', [{ id: '484848@lid' }]);
+    await expect(act(confirmed)).resolves.toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith({ ...change, lastMessages: [] }, '484848@lid');
+  });
+
+  // A new engine holds no chat record, so a chat it has not heard from since is known by its persisted state
+  // alone, filed under the lid or the phone it was learned under, whichever form the caller writes it with.
+  describe('for a chat listed under its other spelling', () => {
+    const stateRow = (key: string, archived: boolean) => ({
+      get: jest.fn((_s: string, chatId: string) =>
+        chatId === key ? { muteEndTime: null, archived, pinned: false } : undefined,
+      ),
+      chatIds: jest.fn(() => [key]),
+      remember: jest.fn().mockResolvedValue(undefined),
+      fold: jest.fn().mockResolvedValue(undefined),
+      reload: jest.fn().mockResolvedValue(undefined),
+      clearSession: jest.fn().mockResolvedValue(undefined),
+      forget: jest.fn().mockResolvedValue(undefined),
+      refreshSession: jest.fn().mockResolvedValue(undefined),
+    });
+    const linked = async (
+      chatStateStore: ReturnType<typeof stateRow>,
+      lidMappingStore: ReturnType<typeof reported>,
+    ): Promise<BaileysAdapter> => {
+      const adapter = new BaileysAdapter({
+        sessionId: 'sess-1',
+        dbSessionId: 'db-uuid-1',
+        authDir: './data/baileys',
+        messageStore: fakeStore,
+        lidMappingStore,
+        chatStateStore,
+      });
+      await adapter.initialize({});
+      fakeSock.fire('connection.update', { connection: 'open' });
+      fakeSock.fire('lid-mapping.update', { lid: '484848@lid', pn: '628111@s.whatsapp.net' });
+      return adapter;
+    };
+
+    it('archives it without a range when the caller names its lid', async () => {
+      const adapter = await linked(stateRow('628111@s.whatsapp.net', false), reported());
+      await expect(adapter.archiveChat('484848@lid', true, lookup(null))).resolves.toBe(true);
+      expect(fakeSock.chatModify).toHaveBeenCalledWith({ archive: true, lastMessages: [] }, '484848@lid');
+    });
+
+    it('does not mark it unread without a range when it is archived under its lid and the caller names its phone', async () => {
+      const adapter = await linked(stateRow('484848@lid', true), reported());
+      // Filed under a lid the engine never reported for the phone, the stored message keys no range.
+      const stored = lookup({ id: 'S1', fromMe: false, timestamp: 1690000000, lid: '484848@lid' });
+      await expect(adapter.markUnread('628111@c.us', stored)).resolves.toBe(false);
+      expect(stored).toHaveBeenCalled();
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+    });
+  });
+
+  // WhatsApp keeps nothing of a deleted chat while the gateway keeps its stored messages, and Baileys applies an own
+  // patch locally: a write keyed to a message from before the deletion came back as an update of the chat, which
+  // listed the deleted chat again, for good once the update had created a state row.
+  describe('for a chat deleted on WhatsApp', () => {
+    const PHONE = '628111@s.whatsapp.net';
+    const LID = '484848@lid';
+    let db: DataSource;
+    const newStore = () => new ChatStateStoreService(db.getRepository(ChatState));
+    const now = () => Math.floor(Date.now() / 1000);
+    // The store writes behind the events that feed it.
+    const settle = async () => {
+      for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r));
+    };
+
+    beforeEach(async () => {
+      db = new DataSource({ type: 'better-sqlite3', database: ':memory:', entities: [ChatState], synchronize: true });
+      await db.initialize();
+      // Baileys applies its own app-state patch as a chat update (emitOwnEvents).
+      fakeSock.chatModify.mockImplementation((change: Record<string, unknown>, jid: string) => {
+        if ('archive' in change) fakeSock.fire('chats.update', [{ id: jid, archived: change.archive }]);
+        if ('markRead' in change) fakeSock.fire('chats.update', [{ id: jid, unreadCount: -1 }]);
+        if ('delete' in change) fakeSock.fire('chats.delete', [jid]);
+        return Promise.resolve();
+      });
+    });
+    afterEach(async () => {
+      fakeSock.chatModify.mockReset().mockResolvedValue(undefined);
+      await db.destroy();
+    });
+
+    const started = async (
+      chatStateStore: ChatStateStoreService,
+      lidMappingStore?: ReturnType<typeof reported>,
+    ): Promise<BaileysAdapter> => {
+      await chatStateStore.reload();
+      const adapter = new BaileysAdapter({
+        sessionId: 'sess-1',
+        dbSessionId: 'db-uuid-1',
+        authDir: './data/baileys',
+        messageStore: fakeStore,
+        chatStateStore,
+        ...(lidMappingStore ? { lidMappingStore } : {}),
+      });
+      await adapter.initialize({});
+      fakeSock.fire('connection.update', { connection: 'open' });
+      return adapter;
+    };
+    const deletedOnPhone = async (id = PHONE, lidMappingStore?: ReturnType<typeof reported>) => {
+      const adapter = await started(newStore(), lidMappingStore);
+      fakeSock.fire('chats.upsert', [{ id, pinned: 3 }]);
+      fakeSock.fire('chats.delete', [id]);
+      await settle();
+      return adapter;
+    };
+    const before = () => lookup({ id: 'S1', fromMe: false, timestamp: 1690000000 });
+
+    it('keys no write to a stored message from before the deletion, and the chat stays unlisted', async () => {
+      const adapter = await deletedOnPhone();
+      await expect(adapter.archiveChat('628111@c.us', true, before())).resolves.toBe(false);
+      await expect(adapter.markUnread('628111@c.us', before())).resolves.toBe(false);
+      await expect(adapter.clearChatMessages('628111@c.us', before())).resolves.toBe(false);
+      await expect(adapter.deleteChat('628111@c.us', before())).resolves.toBe(false);
+      await expect(adapter.sendSeen('628111@c.us', undefined, undefined, before())).resolves.toBe(false);
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+      expect(fakeSock.readMessages).not.toHaveBeenCalled();
+      await settle();
+      expect(await adapter.getChats()).toEqual([]);
+    });
+
+    it('still keys no write to it after a restart, and a state update the phone sends lists nothing', async () => {
+      await deletedOnPhone();
+      const adapter = await started(newStore());
+      await expect(adapter.archiveChat('628111@c.us', true, before())).resolves.toBe(false);
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+      // An archive made before the deletion can be synced after it: the delete's collection resyncs first.
+      fakeSock.fire('chats.update', [{ id: PHONE, archived: true }]);
+      await settle();
+      expect(await adapter.getChats()).toEqual([]);
+      expect(await (await started(newStore())).getChats()).toEqual([]);
+    });
+
+    it('does not take a message from before the deletion delivered after it as the chat coming back', async () => {
+      const adapter = await deletedOnPhone();
+      // A reconnect can deliver a message the phone had before the chat was deleted after the deletion.
+      await upsert({ remoteJid: PHONE, fromMe: false, id: 'OLD' }, 1700000020);
+      fakeSock.fire('chats.update', [{ id: PHONE, conversationTimestamp: 1700000020, unreadCount: 1 }]);
+      await settle();
+      expect(await adapter.getChats()).toEqual([]);
+      await expect(adapter.archiveChat('628111@c.us', true, lookup(null))).resolves.toBe(false);
+      await expect(adapter.sendSeen('628111@c.us', undefined, undefined, lookup(null))).resolves.toBe(false);
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+      expect(fakeSock.readMessages).not.toHaveBeenCalled();
+    });
+
+    it('lists and writes to the chat a later message re-creates, without the state of the deleted one', async () => {
+      const adapter = await deletedOnPhone();
+      // Synced after the deletion, from before it, and still to be dropped once the chat is new again.
+      fakeSock.fire('chats.update', [{ id: PHONE, muteEndTime: -1 }]);
+      const at = now() + 60;
+      await upsert({ remoteJid: PHONE, fromMe: false, id: 'NEW' }, at);
+      await settle();
+      expect(await adapter.getChats()).toEqual([
+        expect.objectContaining({ id: '628111@c.us', muted: false, pinned: false, archived: false }),
+      ]);
+      await expect(adapter.archiveChat('628111@c.us', true, before())).resolves.toBe(true);
+      expect(fakeSock.chatModify).toHaveBeenCalledWith(
+        {
+          archive: true,
+          lastMessages: [{ key: { remoteJid: PHONE, fromMe: false, id: 'NEW' }, messageTimestamp: at }],
+        },
+        PHONE,
+      );
+      await settle();
+      // The archive outlives a restart, as for any chat.
+      expect(await (await started(newStore())).getChats()).toEqual([
+        expect.objectContaining({ id: '628111@c.us', archived: true }),
+      ]);
+    });
+
+    it('keys a write to a stored message from after the deletion', async () => {
+      const adapter = await deletedOnPhone();
+      const at = now() + 60;
+      await expect(
+        adapter.clearChatMessages('628111@c.us', lookup({ id: 'S2', fromMe: true, timestamp: at })),
+      ).resolves.toBe(true);
+      expect(fakeSock.chatModify).toHaveBeenCalledWith(
+        { clear: true, lastMessages: [{ key: { remoteJid: PHONE, fromMe: true, id: 'S2' }, messageTimestamp: at }] },
+        PHONE,
+      );
+    });
+
+    it.each([
+      ['its lid', LID],
+      ['its phone', PHONE],
+    ])('keys no write for a lid-keyed chat deleted under %s to a stored message from before', async (_n, id) => {
+      const mappings = reported({ [LID]: '628111' });
+      const adapter = await started(newStore(), mappings);
+      fakeSock.fire('lid-mapping.update', { lid: LID, pn: PHONE });
+      fakeSock.fire('chats.upsert', [{ id: LID }]);
+      fakeSock.fire('chats.delete', [id]);
+      await settle();
+      const stored = lookup({ id: 'S1', fromMe: false, timestamp: 1690000000, lid: LID });
+      for (const chatId of ['628111@c.us', LID]) {
+        await expect(adapter.archiveChat(chatId, true, stored)).resolves.toBe(false);
+        await expect(adapter.sendSeen(chatId, undefined, undefined, stored)).resolves.toBe(false);
+      }
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+      expect(await adapter.getChats()).toEqual([]);
+    });
+
+    it('keys no write for a group deleted after leaving it to a stored message from before', async () => {
+      const adapter = await deletedOnPhone('120363@g.us');
+      const stored = lookup({ id: 'G1', fromMe: false, author: '628222@c.us', timestamp: 1690000000 });
+      await expect(adapter.markUnread('120363@g.us', stored)).resolves.toBe(false);
+      // A received message without its sender keys nothing but used to show the chat exists.
+      const anonymous = lookup({ id: 'G2', fromMe: false, timestamp: 1690000000 });
+      await expect(adapter.archiveChat('120363@g.us', true, anonymous)).resolves.toBe(false);
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+      expect(await adapter.getChats()).toEqual([]);
+    });
+
+    it('lets a chat deleted through the API come back with its next message', async () => {
+      const adapter = await started(newStore());
+      await upsert({ remoteJid: PHONE, fromMe: false, id: 'M1' }, now() - 60);
+      // Baileys replays the delete as chats.delete, as it does a phone's.
+      await expect(adapter.deleteChat('628111@c.us')).resolves.toBe(true);
+      await settle();
+      expect(await adapter.getChats()).toEqual([]);
+      await upsert({ remoteJid: PHONE, fromMe: true, id: 'M2' }, now() + 60);
+      await settle();
+      expect(await adapter.getChats()).toEqual([expect.objectContaining({ id: '628111@c.us' })]);
     });
   });
 });

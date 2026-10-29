@@ -46,6 +46,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { writeFileAtomic } = require('./atomic-write');
 
 const DEFAULT_WWJS = path.join(__dirname, '..', 'node_modules', 'whatsapp-web.js');
 const CONTACT_PATH = path.join('src', 'structures', 'Contact.js');
@@ -181,7 +182,7 @@ function applyBlockPatches({ wwjsDir = DEFAULT_WWJS } = {}) {
   }
 
   if (applied.length > 0) {
-    fs.writeFileSync(contactFile, source);
+    writeFileAtomic(contactFile, source);
   }
   return { applied, skipped };
 }

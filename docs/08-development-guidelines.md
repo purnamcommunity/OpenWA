@@ -919,7 +919,7 @@ const sessions = await sessionRepo
 ### Caching Strategy
 
 Memoize a hot, expensive read in-process with a TTL, as `StatsService` does for its aggregate
-responses (`STATS_CACHE_TTL_MS`, default 30000; `0` disables the memo). `CacheService` is an optional
+responses (`STATS_CACHE_TTL_MS`, default 30000; `0` disables the memo). Each finished computation also drops the entries that have expired, including those of deleted sessions nobody asks for again. `CacheService` is an optional
 Redis client that stores no values and only answers `isAvailable()` for the infra status probe, so no
 request path reads from it (see [3.13.3 Cache Service](./03-system-architecture.md#3133-cache-service)).
 

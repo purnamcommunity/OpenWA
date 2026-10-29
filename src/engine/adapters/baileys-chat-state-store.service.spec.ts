@@ -748,6 +748,39 @@ describe('ChatStateStoreService', () => {
       expect([...repo.rows.keys()]).toEqual([KEY('s', PHONE)]);
     });
 
+    it('resets the twin rows under a deletion mark, which outlives a restart', async () => {
+      const repo = makeRepo([
+        { sessionId: 's', chatId: LID, pinned: true, observed: 'pinned', updatedAt: new Date(1000) },
+      ]);
+      const svc = svcWith(repo);
+      await svc.fold('s', PHONE, [LID], { muteEndTime: null, archived: false, pinned: false, deletedAt: 5000 });
+      expect([...repo.rows.keys()]).toEqual([KEY('s', PHONE)]);
+      const restarted = svcWith(repo);
+      await restarted.reload();
+      expect(restarted.get('s', PHONE)).toMatchObject({ pinned: false, deletedAt: 5000 });
+    });
+
+    it('keeps the mark of an older twin row that a newer one never saw, on a read and a fold', async () => {
+      const marked = 'muteEndTime,archived,pinned,deletedAt';
+      const repo = makeRepo([
+        { sessionId: 's', chatId: PHONE, pinned: true, observed: 'pinned', updatedAt: new Date(2000) },
+        { sessionId: 's', chatId: LID, deletedAt: 5000, observed: marked, updatedAt: new Date(1000) },
+      ]);
+      const svc = svcWith(repo);
+      await svc.reload();
+      expect(mergeTwinStates([svc.get('s', PHONE)!, svc.get('s', LID)!])).toMatchObject({
+        pinned: true,
+        deletedAt: 5000,
+      });
+      await svc.fold('s', PHONE, [LID], { archived: true });
+      expect([...repo.rows.keys()]).toEqual([KEY('s', PHONE)]);
+      expect(repo.rows.get(KEY('s', PHONE))).toMatchObject({ pinned: true, archived: true, deletedAt: 5000 });
+    });
+
+    it('reads a row written before the mark was kept as having seen no deletion', () => {
+      expect(mergeTwinStates([{ muteEndTime: null, archived: true, pinned: false }])?.observed).toEqual(['archived']);
+    });
+
     it('neither a listing nor a later change brings back the older mute of a cached lid row', async () => {
       const repo = coldNewerPhone();
       const svc = svcWith(repo);

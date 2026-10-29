@@ -57,6 +57,10 @@ class OpenWAApiError(OpenWAError):
         header = next((v for k, v in (headers or {}).items() if k.lower() == "retry-after"), None)
         self.retry_after_seconds = _retry_after_seconds(fields.get("retryAfterSeconds"), header)
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Exception pickles only `args` (the message), which cannot rebuild an error that needs a status.
+        return (_rebuild_api_error, (type(self), self.args[0], self.status, self.body, self.error_kind, self.headers))
+
     @classmethod
     def from_response(
         cls,
@@ -160,6 +164,10 @@ class OpenWATimeoutError(OpenWAError):
         super().__init__(f"Request timed out after {timeout}s")
         self.timeout = timeout
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # `args` holds the formatted message, which would be formatted again on the way back.
+        return (type(self), (self.timeout,))
+
 
 def classify(
     status: int, message: str, body: Any, error_kind: str | None, *, headers: Mapping[str, str] | None = None
@@ -177,6 +185,17 @@ def classify(
     return cls(message, status, body, error_kind, headers=headers)
 
 
+def _rebuild_api_error(
+    cls: type[OpenWAApiError],
+    message: str,
+    status: int,
+    body: Any,
+    error_kind: str | None,
+    headers: Mapping[str, str] | None,
+) -> OpenWAApiError:
+    return cls(message, status, body, error_kind, headers=headers)
+
+
 def _retry_after_seconds(from_body: Any, header: str | None) -> int | None:
     """The body's ``retryAfterSeconds`` wins: send pacing puts its wait (possibly hours) only there,
     and a header added by a proxy must not shorten it. Otherwise read ``Retry-After`` as seconds or
@@ -187,7 +206,11 @@ def _retry_after_seconds(from_body: Any, header: str | None) -> int | None:
     if not value:
         return None
     if value.isascii() and value.isdigit():
-        return int(value)
+        try:
+            return int(value)
+        except ValueError:
+            # Past the interpreter's integer string limit: unparseable, like a malformed date below.
+            return None
     try:
         at = parsedate_to_datetime(value)
     except (TypeError, ValueError, OverflowError):

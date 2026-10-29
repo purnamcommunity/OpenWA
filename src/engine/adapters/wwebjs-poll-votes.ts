@@ -1,4 +1,4 @@
-import { type PollVote, type PollVoteEvent } from '../interfaces/whatsapp-engine.interface';
+import { type PollVote } from '../interfaces/whatsapp-engine.interface';
 import { type SerializedWid, readWid } from '../types/whatsapp-web-js.types';
 
 /**
@@ -10,15 +10,11 @@ import { type SerializedWid, readWid } from '../types/whatsapp-web-js.types';
  *  - `selectedOptions[].name` is documented as a string, but is `undefined` whenever the vote's
  *    local option id is not found on the parent message — the "temporary failsafe" branch in
  *    `PollVote._patch`.
- *  - `parentMsgKey` is not declared at all, yet is the only id present on every vote: the
- *    `parentMessage` beside it is `null` when WA Web could not resolve the poll locally.
  */
 export interface RawWwebjsPollVote {
   voter?: SerializedWid | string;
   selectedOptions?: { name?: string; localId?: number }[];
   interractedAtTs?: number;
-  parentMessage?: { id?: SerializedWid; from?: string; to?: string } | null;
-  parentMsgKey?: (SerializedWid & { remote?: SerializedWid | string }) | null;
 }
 
 /**
@@ -51,23 +47,4 @@ export function mapWwebjsPollVote(raw: RawWwebjsPollVote): PollVote | null {
       .filter((name): name is string => typeof name === 'string'),
     timestamp: normalizePollVoteTimestamp(raw.interractedAtTs),
   };
-}
-
-/**
- * Map a raw vote to the live {@link PollVoteEvent}, which additionally needs the poll it belongs
- * to. Returns null when that poll cannot be identified: an event whose `messageId` is empty
- * addresses no poll, and a consumer would apply it to whatever a blank id happens to match.
- *
- * The chat is read from the parent key's `remote` (the conversation the poll lives in) with the
- * parent message as the fallback, since `parentMessage` is null whenever WA Web had not resolved
- * the poll creation locally.
- */
-export function mapWwebjsPollVoteEvent(raw: RawWwebjsPollVote): PollVoteEvent | null {
-  const vote = mapWwebjsPollVote(raw);
-  if (!vote) return null;
-  const messageId = readWid(raw.parentMessage?.id) ?? readWid(raw.parentMsgKey);
-  if (!messageId) return null;
-  const chatId = readWid(raw.parentMsgKey?.remote) ?? raw.parentMessage?.from ?? raw.parentMessage?.to;
-  if (!chatId) return null;
-  return { ...vote, messageId, chatId };
 }

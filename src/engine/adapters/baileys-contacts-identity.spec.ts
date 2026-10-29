@@ -145,6 +145,7 @@ describe.each(['persisted', 'fresh', 'library'] as const)('Chat identity prepare
       toEngineJid: (jid: string) => jid,
       lastMessage: () => ({ key, jid: '111@lid', timestamp: 1 }),
       lastInboundMessage: () => ({ key, timestamp: 1 }),
+      chatDeletedAt: () => null,
       findContact: () => ({ id: '111@lid', number: '628111', isWAContact: true }),
     } as unknown as BaileysContactsHost;
     const contacts = new BaileysContacts(host);

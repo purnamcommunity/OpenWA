@@ -2866,4 +2866,33 @@ fi
 pass "(at) the environment, ./.env and the defaults still decide where the restore writes"
 
 echo ""
+echo "==> (au) a file the restore writes is never put on a directory it refills from the archive"
+# A copy onto a directory goes into it, under the file's own name, through any link the archive left there under
+# that name. Both ways out of the data dir that the strict-descendant rule above does not see: a path from the
+# archive that is the key file and the sessions dir at once, and a sessions dir that is a file the restore writes
+# at a fixed name after the trees, such as .env.generated and database.sql.
+# The restores above that succeeded left their safety snapshots; at_refused looks for a new one.
+find "${AT:?}" -name '*.pre-restore-*' -prune -exec rm -rf {} +
+at_archive same 'SESSION_DATA_PATH=./data/shared\nBOOTSTRAP_KEY_FILE=./data/shared\n' .api-key "$AT/victim/precious.txt"
+at_refused "au: key file on the refilled sessions" \
+  "BOOTSTRAP_KEY_FILE from the archive's .env.generated puts the BOOTSTRAP_KEY_FILE target on the SESSION_DATA_PATH directory" \
+  "$AT/same.tar.gz"
+at_archive generated 'SESSION_DATA_PATH=./data/.env.generated\n' .env.generated "$AT/victim/precious.txt"
+at_refused "au: sessions on the generated configuration" \
+  "SESSION_DATA_PATH from the archive's .env.generated puts the .env.generated target on the SESSION_DATA_PATH directory" \
+  "$AT/generated.tar.gz"
+at_archive dump 'SESSION_DATA_PATH=./data/database.sql\n' database.sql "$AT/victim/precious.txt"
+rm -rf "${AT:?}/stage" && mkdir -p "$AT/stage"
+tar -xzf "$AT/dump.tar.gz" -C "$AT/stage"
+printf 'select 1;\n' >"$AT/stage/database.sql"
+tar -czf "$AT/dump.tar.gz" -C "$AT/stage" .
+at_refused "au: sessions on the PostgreSQL dump" \
+  "SESSION_DATA_PATH from the archive's .env.generated puts the database.sql target on the SESSION_DATA_PATH directory" \
+  "$AT/dump.tar.gz"
+if [ "$(cat "$AT/victim/precious.txt")" != "at-precious" ]; then
+  fail "(au) a refused restore wrote through a link the archive planted"
+fi
+pass "(au) a file written after the trees cannot land on a directory the archive's configuration names"
+
+echo ""
 echo "All smoke tests passed!"

@@ -3,6 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { writeFileAtomic } = require('./atomic-write');
 
 const DEFAULT_WWJS = path.join(__dirname, '..', 'node_modules', 'whatsapp-web.js');
 const REPLACEMENTS = [
@@ -26,7 +27,7 @@ function applyPatch(wwjsDir = DEFAULT_WWJS) {
     throw new Error('unsupported Client.js shape; recheck Puppeteer browser teardown compatibility');
   }
   for (const [before, after] of REPLACEMENTS) source = source.replace(before, after);
-  fs.writeFileSync(file, source);
+  writeFileAtomic(file, source);
   return { skipped: false };
 }
 

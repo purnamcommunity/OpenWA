@@ -1,3 +1,5 @@
+import { namesBundledContainer } from '../modules/docker/bundled-host';
+
 export interface CorsPolicy {
   /** Explicit origin allowlist (empty when none / wildcard blocked). */
   origins: string[];
@@ -185,18 +187,6 @@ export function isNodeEnvUnset(nodeEnv?: string): boolean {
   return !nodeEnv?.trim();
 }
 
-/** A built-in S3 endpoint is the bundled MinIO (host `minio`). An unset endpoint means the standard
- * AWS regional endpoint, so it is external and its credentials must never be exempted. */
-function isInternalS3Endpoint(endpoint?: string): boolean {
-  const e = endpoint?.trim();
-  if (!e) return false;
-  try {
-    return new URL(e).hostname === 'minio';
-  } catch {
-    return false;
-  }
-}
-
 export interface SecretCheckEnv {
   nodeEnv?: string;
   databaseType?: string;
@@ -257,11 +247,11 @@ export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
   // flag AND an internal host: a host-pinned EXTERNAL datastore (even with the built-in flag set) is
   // reachable, so its weak credential is still enforced.
   const dbHost = env.databaseHost?.trim();
-  const dbExempt = env.postgresBuiltIn === 'true' && (!dbHost || dbHost === 'postgres');
+  const dbExempt = env.postgresBuiltIn === 'true' && (!dbHost || namesBundledContainer('postgres', dbHost));
   if (env.databaseType === 'postgres' && !dbExempt && isWeak(env.databasePassword)) {
     problems.push('DATABASE_PASSWORD');
   }
-  const s3Exempt = env.minioBuiltIn === 'true' && isInternalS3Endpoint(env.s3Endpoint);
+  const s3Exempt = env.minioBuiltIn === 'true' && namesBundledContainer('minio', env.s3Endpoint);
   if (env.storageType === 's3' && !s3Exempt) {
     // Name the canonical variables even when the value came from the legacy S3_ACCESS_KEY /
     // S3_SECRET_KEY fallback: they are what the docs and .env.example tell an operator to set.

@@ -6,7 +6,12 @@ import { PluginCapabilityPermission, PluginContext, PluginInstance, PluginStatus
 import { PluginStorageService } from './plugin-storage.service';
 import { PluginHostServices } from './plugin-host-services';
 import { PluginCapabilityContext } from './plugin-capability-context';
-import { isPluginActiveForSession, resolveInstanceConfig, resolvePluginConfig } from './plugin-activation';
+import {
+  isPluginActiveForSession,
+  resolveInstanceConfig,
+  resolvePluginConfig,
+  sessionScopeKey,
+} from './plugin-activation';
 import { PluginWorkerHost } from './sandbox/plugin-worker-host';
 import { dispatchCapabilityVerb } from './sandbox/capability-router';
 import { PluginLogLevel } from './sandbox/protocol';
@@ -196,8 +201,10 @@ export class PluginSandboxBridge {
     const route = plugin?.manifest.ingress?.find(candidate => candidate.route === d.route);
     // Reaching dispatch means every authenticating scheme already passed host verification. A route
     // explicitly configured with scheme:none is unauthenticated and must never be labelled verified.
-    // Missing/hot-swapped route metadata fails closed.
-    const verified = route ? route.signature.scheme !== 'none' : false;
+    // The verdict is the one recorded at admission: a plugin update can change the route's scheme while
+    // a delivery waits, and it must not relabel a payload nobody authenticated. A delivery admitted before
+    // the verdict was recorded reads the route as it stands. Missing/hot-swapped route metadata fails closed.
+    const verified = !!route && (d.payload.admission?.verified ?? route.signature.scheme !== 'none');
     const instance = await this.hostServices.getPluginInstancePort().resolve(d.pluginId, d.instanceId);
     // The live door and the reconciler refuse an unknown or disabled instance; a queued job, a retry,
     // the inline fallback and a redrive all land here instead, so the same rule is enforced once more.
@@ -206,6 +213,11 @@ export class PluginSandboxBridge {
     // Throwing hands the job to the normal retry/dead-letter path.
     if (!instance || instance.enabled === false) {
       throw new Error('instance ' + d.instanceId + ' of plugin ' + d.pluginId + ' is disabled or deleted');
+    }
+    // The job carries the session the instance acted on at admission. Rebound since, the delivery would
+    // reach the handler under that session with the new session's config, so it is refused instead.
+    if (sessionScopeKey(instance.sessionScope) !== sessionScopeKey(d.sessionId)) {
+      throw new Error('instance ' + d.instanceId + ' of plugin ' + d.pluginId + ' was rebound since this delivery');
     }
     // Three layers, most specific last: the base ('*') config, then the operator's per-session
     // override from PUT /plugins/:id/sessions/:sessionId/config, then THIS instance's own config.
@@ -240,9 +252,12 @@ export class PluginSandboxBridge {
                 plugin.sessionConfig,
                 instance?.sessionScope ?? undefined,
                 plugin.manifest.sessionScoped !== false,
+                plugin.manifest,
               )
             : plugin.config,
           instance?.config,
+          plugin.manifest,
+          plugin.config,
         )
       : undefined;
     const result = await host.dispatchWebhook({
@@ -518,6 +533,7 @@ export class PluginSandboxBridge {
                 plugin.sessionConfig,
                 hookCtx.sessionId,
                 plugin.manifest.sessionScoped !== false,
+                plugin.manifest,
               ),
               // The chain this dispatch belongs to, so a capability the handler calls is guarded
               // against re-firing any event of it (not only this one) once it returns to the host.

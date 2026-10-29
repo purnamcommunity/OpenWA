@@ -24,7 +24,7 @@ export interface MutationSource {
  * is written with in one spelling and without in the other. A send stores the chat id as its caller wrote
  * it, so the stored form and the one the engine reports can differ in either direction.
  */
-function phoneKey(local: string): string {
+export function phoneKey(local: string): string {
   return local
     .replace(/\D/g, '')
     .replace(/^55(\d{2})9(\d{8})$/, '55$1$2')

@@ -105,6 +105,10 @@ test('a chat marked unread (count -1) shows an unread badge without a number', (
       ['3', t('chats.unreadBadge', { count: 3 })],
     ],
   );
+  // A label on an element with no role is not announced: each badge is an image named by it, as the pin and mute are.
+  for (const name of [t('chats.markedUnread'), t('chats.unreadBadge', { count: 3 })]) {
+    assert.equal(rtl.screen.queryAllByRole('img', { name }).length, 1, `${name} is not announced`);
+  }
 });
 
 test('a quick filter that leaves no chat says so, while an empty account still reads as having none', () => {

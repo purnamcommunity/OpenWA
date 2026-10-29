@@ -19,7 +19,6 @@ export class ConvertMediaDto {
   @ValidateIf((dto: ConvertMediaDto) => dto.base64 === undefined || dto.url !== undefined)
   @ToStrictString()
   @IsString()
-  @IsNotEmpty()
   // Same rule as every send DTO: base64 wins when it holds data, so a url next to it is not fetched.
   @IsMediaUrl<ConvertMediaDto>({ ignoreWhen: o => !!stripBase64DataUri(o.base64) })
   url?: string;

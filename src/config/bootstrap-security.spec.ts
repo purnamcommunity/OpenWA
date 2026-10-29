@@ -304,6 +304,74 @@ describe('assertNoDefaultSecretsInProduction', () => {
     ).not.toThrow();
   });
 
+  // The same aliases the rest of the app resolves to the bundled container: its network alias or its
+  // container name, in any letter case, with or without the trailing dot of an absolute DNS name.
+  it.each(['Postgres', 'postgres.', 'openwa-postgres', ' OPENWA-POSTGRES. '])(
+    'exempts the built-in Postgres default for the bundled host %s',
+    databaseHost => {
+      const env = {
+        nodeEnv: 'production',
+        databaseType: 'postgres',
+        databasePassword: 'openwa',
+        postgresBuiltIn: 'true',
+        databaseHost,
+      };
+      expect(() => assertNoDefaultSecretsInProduction(env)).not.toThrow();
+      expect(() => assertNoDefaultSecretsInProduction({ ...env, postgresBuiltIn: 'false' })).toThrow(
+        /DATABASE_PASSWORD/,
+      );
+    },
+  );
+
+  it.each(['http://minio.:9000', 'http://openwa-minio:9000', 'https://OPENWA-MINIO.:9000'])(
+    'exempts the built-in MinIO defaults for the bundled endpoint %s',
+    s3Endpoint => {
+      const env = {
+        nodeEnv: 'production',
+        storageType: 's3',
+        s3AccessKey: 'minioadmin',
+        s3SecretKey: 'minioadmin',
+        minioBuiltIn: 'true',
+        s3Endpoint,
+      };
+      expect(() => assertNoDefaultSecretsInProduction(env)).not.toThrow();
+      expect(() => assertNoDefaultSecretsInProduction({ ...env, minioBuiltIn: 'false' })).toThrow(
+        /S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY/,
+      );
+    },
+  );
+
+  it.each(['postgres.example.invalid', 'evil-postgres', 'openwa-postgres-evil'])(
+    'still refuses the default Postgres password for the external host %s',
+    databaseHost => {
+      expect(() =>
+        assertNoDefaultSecretsInProduction({
+          nodeEnv: 'production',
+          databaseType: 'postgres',
+          databasePassword: 'openwa',
+          postgresBuiltIn: 'true',
+          databaseHost,
+        }),
+      ).toThrow(/DATABASE_PASSWORD/);
+    },
+  );
+
+  it.each(['http://minio.example.invalid:9000', 'http://evil-minio:9000', 'http://openwa-minio-evil:9000'])(
+    'still refuses the default S3 credentials for the external endpoint %s',
+    s3Endpoint => {
+      expect(() =>
+        assertNoDefaultSecretsInProduction({
+          nodeEnv: 'production',
+          storageType: 's3',
+          s3AccessKey: 'minioadmin',
+          s3SecretKey: 'minioadmin',
+          minioBuiltIn: 'true',
+          s3Endpoint,
+        }),
+      ).toThrow(/S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY/);
+    },
+  );
+
   it('refuses prod with default MinIO/S3 credentials', () => {
     expect(() =>
       assertNoDefaultSecretsInProduction({

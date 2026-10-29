@@ -30,6 +30,7 @@ import {
 import { MarkChatReadDto } from '../../../modules/session/dto/mark-chat-read.dto';
 import { MarkChatUnreadDto } from '../../../modules/session/dto/mark-chat-unread.dto';
 import { SubscribePresenceDto } from '../../../modules/session/dto/presence.dto';
+import { SendChatStateDto } from '../../../modules/session/dto/send-chat-state.dto';
 import { z } from 'zod';
 import type { AnyToolDescriptor } from '../tool-descriptor';
 import { allAgentTools } from '.';
@@ -283,10 +284,11 @@ describe('agent-tool chat ids are capped as the REST bodies cap them', () => {
  */
 describe('MCP tool chat ids take the shape the REST bodies require', () => {
   const tools = allAgentTools({} as never);
-  const CASES: Array<[string, new () => object]> = [
-    ['SessionSubscribePresence', SubscribePresenceDto],
-    ['SessionMarkChatRead', MarkChatReadDto],
-    ['SessionMarkChatUnread', MarkChatUnreadDto],
+  const CASES: Array<[string, new () => object, Record<string, unknown>]> = [
+    ['SessionSubscribePresence', SubscribePresenceDto, {}],
+    ['SessionMarkChatRead', MarkChatReadDto, {}],
+    ['SessionMarkChatUnread', MarkChatUnreadDto, {}],
+    ['SessionSendChatState', SendChatStateDto, { state: 'typing' }],
   ];
   const WELL_FORMED = ['628123@c.us', '120363@g.us', '1234@s.whatsapp.net', '9876@lid'];
   const MALFORMED = [
@@ -301,11 +303,11 @@ describe('MCP tool chat ids take the shape the REST bodies require', () => {
     '628123@c.us@g.us',
   ];
 
-  it.each(CASES)('%s accepts and rejects the same chat ids as its REST body', async (name, dtoClass) => {
+  it.each(CASES)('%s accepts and rejects the same chat ids as its REST body', async (name, dtoClass, extra) => {
     const tool = tools.find(t => t.name === name)!;
     for (const chatId of [...WELL_FORMED, ...MALFORMED]) {
-      const toolAccepts = tool.inputSchema.safeParse({ sessionId: 's1', chatId }).success;
-      const errors = await validate(plainToInstance(dtoClass, { chatId }, PIPE_TRANSFORM_OPTS));
+      const toolAccepts = tool.inputSchema.safeParse({ sessionId: 's1', chatId, ...extra }).success;
+      const errors = await validate(plainToInstance(dtoClass, { chatId, ...extra }, PIPE_TRANSFORM_OPTS));
       const restAccepts = !errors.some(e => e.property === 'chatId');
       expect({ chatId, toolAccepts }).toEqual({ chatId, toolAccepts: restAccepts });
       expect(restAccepts).toBe(WELL_FORMED.includes(chatId));

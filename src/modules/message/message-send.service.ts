@@ -1006,7 +1006,7 @@ export class MessageSendService {
       const maxMs = simulateTypingMaxMs;
       const planned = Math.min(maxMs, 500 + text.length * 45);
       const jittered = Math.round(planned * (0.85 + Math.random() * 0.3)); // ±15% so it isn't metronomic
-      await new Promise(resolve => setTimeout(resolve, jittered));
+      await new Promise(resolve => setTimeout(resolve, Math.min(maxMs, jittered)));
     } catch (error) {
       this.logger.warn(`simulateTyping skipped: ${error instanceof Error ? error.message : String(error)}`);
     }

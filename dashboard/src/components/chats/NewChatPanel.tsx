@@ -7,7 +7,7 @@ import { formatPhoneForDisplay, isolateNumber } from '../../utils/formatPhone';
 import { useRole } from '../../hooks/useRole';
 import { useToast } from '../../hooks/useToast';
 import ChatAvatar from './ChatAvatar';
-import { normalizePhoneText } from '../../utils/phone';
+import { normalizePhoneText, phoneQueryDigits } from '../../utils/phone';
 
 type Mode = 'chat' | 'group';
 
@@ -118,7 +118,7 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
   }, [contactsQuery.data]);
 
   const normalizedQuery = query.trim().toLowerCase();
-  const queryDigits = normalizePhoneText(query).replace(/\D/g, '');
+  const queryDigits = phoneQueryDigits(query);
   const visibleContacts = normalizedQuery
     ? contacts.filter(
         c =>
@@ -350,7 +350,7 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
                     : onOpenChat(draftChat(c.id, c.name || '', 'individual'), sessionId)
                 }
               >
-                <ChatAvatar kind="individual" />
+                <ChatAvatar chatId={c.id} kind="individual" />
                 <span className="chat-item-info">
                   <span className="chat-item-name">{label}</span>
                   {phone && phone !== label && (

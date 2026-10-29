@@ -1,4 +1,5 @@
-import { DelayedError } from 'bullmq';
+import { DelayedError, Job, Worker } from 'bullmq';
+import { EventEmitter } from 'node:events';
 import { MAX_WORKER_CLOSE_WAIT_MS } from './close-worker';
 import { IngressProcessor } from './ingress.processor';
 
@@ -78,7 +79,11 @@ describe('IngressProcessor', () => {
       dispatchWebhookForInstance: jest.fn().mockRejectedValue(new Error('boom')),
     };
     const failures = { save: jest.fn().mockRejectedValue(new Error('db down')), count: jest.fn().mockResolvedValue(0) };
-    const queue = { add: jest.fn().mockResolvedValue(undefined), remove: jest.fn().mockResolvedValue(1) };
+    const queue = {
+      waitUntilReady: jest.fn().mockResolvedValue(undefined),
+      add: jest.fn().mockResolvedValue(undefined),
+      remove: jest.fn().mockResolvedValue(1),
+    };
     const proc = new IngressProcessor(
       loader as never,
       failures as never,
@@ -114,6 +119,59 @@ describe('IngressProcessor', () => {
     };
     expect(await requeueFrom('ing-abc-requeued-1')).toBe('ing-abc-requeued-2');
     expect(await requeueFrom('ing-abc-requeued-2')).toBe('ing-abc-requeued-1');
+  });
+
+  it.each(['final attempt', 'stalled event'])('bounds re-queue readiness after a %s', async mode => {
+    const original = process.env.REDIS_CONNECT_TIMEOUT_MS;
+    process.env.REDIS_CONNECT_TIMEOUT_MS = '100';
+    jest.useFakeTimers();
+    try {
+      const ready = new Promise<void>(() => undefined);
+      const queue = {
+        waitUntilReady: () => ready,
+        remove: jest.fn(() => ready.then(() => 1)),
+        add: jest.fn(),
+      };
+      const proc = new IngressProcessor(
+        {
+          isRestorePending: () => false,
+          dispatchWebhookForInstance: jest.fn().mockRejectedValue(new Error('boom')),
+        } as never,
+        {
+          save: jest.fn().mockRejectedValue(new Error('db down')),
+        } as never,
+        { execute: jest.fn().mockResolvedValue({ continue: true }) } as never,
+        queue as never,
+        {} as never,
+      );
+      const failed = job({
+        id: 'ing-abc',
+        name: 'ingress',
+        attemptsMade: 2,
+        ...(mode === 'stalled event' ? { deferredFailure: 'job stalled more than allowable limit' } : {}),
+      });
+      let outcome: string | undefined;
+      const pending =
+        mode === 'final attempt'
+          ? proc.process(failed)
+          : proc.onWorkerFailed(failed, new Error('job stalled more than allowable limit'));
+      void pending.then(
+        () => (outcome = 'resolved'),
+        (error: Error) => (outcome = error.message),
+      );
+
+      await jest.advanceTimersByTimeAsync(99);
+      expect(outcome).toBeUndefined();
+      await jest.advanceTimersByTimeAsync(1);
+
+      expect(outcome).toBe(mode === 'final attempt' ? 'boom' : 'resolved');
+      expect(queue.remove).not.toHaveBeenCalled();
+      expect(queue.add).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+      if (original === undefined) delete process.env.REDIS_CONNECT_TIMEOUT_MS;
+      else process.env.REDIS_CONNECT_TIMEOUT_MS = original;
+    }
   });
 
   // The original job of a re-queued delivery stays 'failed', which the reconciler reads as dead-lettered:
@@ -190,6 +248,88 @@ describe('IngressProcessor', () => {
     await expect(proc.process(job({ attemptsMade: 0, opts: { attempts: 3 } }))).rejects.toThrow('boom');
     expect(failures.save).not.toHaveBeenCalled();
     expect(hooks.execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'bullmq:rateLimitExceeded',
+    'bullmq:movedToDelayed',
+    'bullmq:movedToWait',
+    'bullmq:movedToWaitingChildren',
+    'bullmq:unrecoverable',
+  ])('uses bounded retries for ordinary dispatch error text %s', async message => {
+    const rows: Array<{ lastError: string; attempts: number }> = [];
+    const proc = new IngressProcessor(
+      {
+        isRestorePending: () => false,
+        dispatchWebhookForInstance: jest.fn().mockRejectedValue(new Error(message)),
+      } as never,
+      { save: (row: { lastError: string; attempts: number }) => Promise.resolve(rows.push(row)) } as never,
+      { execute: jest.fn().mockResolvedValue({ continue: true }) } as never,
+      {} as never,
+      {} as never,
+    );
+    let retries = 0;
+    let terminal = 0;
+    let rateLimited = 0;
+    const backend = {
+      closing: false,
+      retryJob: () => {
+        retries++;
+        return Promise.resolve();
+      },
+      moveToFailed: () => {
+        terminal++;
+        return Promise.resolve({ finishedOn: 1 });
+      },
+      moveJobFromActiveToWait: () => {
+        rateLimited++;
+        return Promise.resolve(0);
+      },
+    };
+    const queue = {
+      name: 'ingress',
+      qualifiedName: 'bull:ingress',
+      opts: {},
+      toKey: (key: string) => key,
+      trace: (_kind: unknown, _operation: unknown, _name: unknown, callback: () => unknown) => callback(),
+      waitUntilReady: jest.fn().mockResolvedValue(undefined),
+      backend,
+    };
+    const nativeJob = Job.fromJSON(
+      queue as never,
+      {
+        id: 'ing-retry',
+        name: 'ingress',
+        data: JSON.stringify((job() as { data: unknown }).data),
+        opts: { attempts: 3 },
+      } as never,
+    );
+    const worker = Object.assign(Object.create(Worker.prototype) as object, {
+      name: 'ingress',
+      opts: {},
+      backend,
+      lockManager: { trackJob: () => undefined, untrackJob: () => undefined },
+      trace: queue.trace,
+      retryIfFailed: (run: () => Promise<unknown>) => run(),
+      callProcessJob: (value: Parameters<IngressProcessor['process']>[0]) => proc.process(value),
+    }) as unknown as Worker;
+    EventEmitter.call(worker);
+    const recorded: Promise<void>[] = [];
+    worker.on('failed', (failed, error) => {
+      recorded.push(proc.onWorkerFailed(failed as never, error));
+    });
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await worker.processJob(nativeJob, 'token', () => false);
+      await Promise.all(recorded);
+    }
+
+    expect(nativeJob.attemptsMade).toBe(3);
+    expect(retries).toBe(2);
+    expect(terminal).toBe(1);
+    expect(rateLimited).toBe(0);
+    expect(recorded).toHaveLength(3);
+    expect(rows).toEqual([expect.objectContaining({ attempts: 3, lastError: message })]);
   });
 
   it('serializes two jobs for the same conversation and parallelizes different ones', async () => {
@@ -269,17 +409,23 @@ describe('IngressProcessor', () => {
 // 'failed'. The ingress row already retired its payload on 'queued', so the DLQ row is the only copy.
 describe('IngressProcessor stall exhaustion (worker failed event)', () => {
   const STALLED = new Error('job stalled more than allowable limit');
+  // What BullMQ hands the 'failed' listener for a job it failed for stalling: the reason is its deferred failure.
+  const stalledJob = (overrides = {}) => job({ deferredFailure: STALLED.message, ...overrides });
   const setup = () => {
     const failures = { save: jest.fn().mockResolvedValue(undefined), count: jest.fn().mockResolvedValue(0) };
     const hooks = { execute: jest.fn().mockResolvedValue({ continue: true }) };
-    const queue = { add: jest.fn().mockResolvedValue(undefined), remove: jest.fn().mockResolvedValue(0) };
+    const queue = {
+      waitUntilReady: jest.fn().mockResolvedValue(undefined),
+      add: jest.fn().mockResolvedValue(undefined),
+      remove: jest.fn().mockResolvedValue(0),
+    };
     const proc = new IngressProcessor({} as never, failures as never, hooks as never, queue as never, {} as never);
     return { proc, failures, hooks, queue };
   };
 
   it('records one inbound DLQ row with the full payload and fires ingress:error', async () => {
     const { proc, failures, hooks } = setup();
-    await proc.onWorkerFailed(job({ attemptsMade: 1 }), STALLED);
+    await proc.onWorkerFailed(stalledJob({ attemptsMade: 1 }), STALLED);
     expect(failures.save).toHaveBeenCalledTimes(1);
     expect(failures.save).toHaveBeenCalledWith({
       direction: 'inbound',
@@ -304,6 +450,70 @@ describe('IngressProcessor stall exhaustion (worker failed event)', () => {
     );
   });
 
+  it('does not dead-letter an ordinary error with the stall message before a successful retry', async () => {
+    const failures = { save: jest.fn().mockResolvedValue(undefined) };
+    const hooks = { execute: jest.fn().mockResolvedValue({ continue: true }) };
+    const dispatch = jest.fn().mockRejectedValueOnce(STALLED).mockResolvedValue(undefined);
+    const proc = new IngressProcessor(
+      { isRestorePending: () => false, dispatchWebhookForInstance: dispatch } as never,
+      failures as never,
+      hooks as never,
+      {} as never,
+      {} as never,
+    );
+    await expect(proc.process(job())).rejects.toBe(STALLED);
+    await proc.onWorkerFailed(job({ attemptsMade: 1 }), STALLED);
+    await expect(proc.process(job({ attemptsMade: 1 }))).resolves.toBeUndefined();
+
+    expect(failures.save).not.toHaveBeenCalled();
+    expect(hooks.execute).not.toHaveBeenCalled();
+  });
+
+  it('records the native failed event after BullMQ preserves its deferred stall failure', async () => {
+    const { proc, failures } = setup();
+    const queue = {
+      name: 'ingress',
+      qualifiedName: 'bull:ingress',
+      opts: {},
+      toKey: (key: string) => key,
+      trace: (_kind: unknown, _operation: unknown, _name: unknown, callback: () => unknown) => callback(),
+      backend: { moveToFailed: jest.fn().mockResolvedValue({ finishedOn: 1 }) },
+    };
+    const nativeJob = Job.fromJSON(
+      queue as never,
+      {
+        id: 'ing-stalled',
+        name: 'ingress',
+        data: JSON.stringify((job() as { data: unknown }).data),
+        opts: { attempts: 3 },
+        deferredFailure: STALLED.message,
+      } as never,
+    );
+    const dispatch = jest.fn();
+    const worker = Object.assign(Object.create(Worker.prototype) as object, {
+      name: 'ingress',
+      opts: {},
+      backend: { closing: false },
+      lockManager: { trackJob: () => undefined, untrackJob: () => undefined },
+      trace: queue.trace,
+      retryIfFailed: (run: () => Promise<unknown>) => run(),
+      callProcessJob: dispatch,
+    }) as unknown as Worker;
+    EventEmitter.call(worker);
+    let recorded = Promise.resolve();
+    worker.on('failed', (failed, error) => {
+      recorded = proc.onWorkerFailed(failed as never, error);
+    });
+
+    await worker.processJob(nativeJob, 'token', () => false);
+    await recorded;
+
+    expect(nativeJob.deferredFailure).toBe(STALLED.message);
+    expect(nativeJob.attemptsMade).toBe(1);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(failures.save).toHaveBeenCalledTimes(1);
+  });
+
   it('ignores any other failure (process() already recorded it) and a pruned job', async () => {
     const { proc, failures, hooks } = setup();
     await proc.onWorkerFailed(job({ attemptsMade: 3 }), new Error('boom'));
@@ -315,7 +525,7 @@ describe('IngressProcessor stall exhaustion (worker failed event)', () => {
   it('re-queues instead of rejecting when the DLQ write fails (an event listener must not reject)', async () => {
     const { proc, failures, queue } = setup();
     failures.save.mockRejectedValue(new Error('db down'));
-    await expect(proc.onWorkerFailed(job({ id: 'ing-abc', name: 'ingress' }), STALLED)).resolves.toBeUndefined();
+    await expect(proc.onWorkerFailed(stalledJob({ id: 'ing-abc', name: 'ingress' }), STALLED)).resolves.toBeUndefined();
     expect(queue.add).toHaveBeenCalledTimes(1);
   });
 
@@ -323,7 +533,7 @@ describe('IngressProcessor stall exhaustion (worker failed event)', () => {
     const { proc, failures, queue } = setup();
     failures.save.mockRejectedValue(new Error('db down'));
     queue.add.mockRejectedValue(new Error('redis down'));
-    await expect(proc.onWorkerFailed(job({ id: 'ing-abc', name: 'ingress' }), STALLED)).resolves.toBeUndefined();
+    await expect(proc.onWorkerFailed(stalledJob({ id: 'ing-abc', name: 'ingress' }), STALLED)).resolves.toBeUndefined();
   });
 });
 

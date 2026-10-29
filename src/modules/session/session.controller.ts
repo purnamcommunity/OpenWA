@@ -326,7 +326,7 @@ export class SessionController {
       'effect runs before this refusal. Also returned when another node currently holds this ' +
       "session's engine: only the owner may start it, and the claim is refused before any engine " +
       'is launched, so no second connection to the account is opened. Also returned, with no `code`, ' +
-      'when a stop, a force-kill that found a running engine to kill, or a data import (`stopOrphans`) ' +
+      'when a stop, a logout or force-kill that found a running engine, or a data import (`stopOrphans`) ' +
       'of this session began or finished while the start was waiting, or a delete of it was still ' +
       'running: the start yields and launches nothing. After a stop or force-kill, a new POST /start ' +
       'clears it and starts the session; after a delete, or an import that removed the session, the ' +
@@ -516,14 +516,23 @@ export class SessionController {
       'On the whatsapp-web.js engine, only request a code for a number you are prepared to re-link. A request ' +
       'for a number that already has a linked session has been observed to end with WhatsApp revoking that ' +
       'device: the linked session logs out, its credentials are deleted and it falls back to `qr_ready`. ' +
-      'Nothing refuses such a request, because the guards check the session state and never the number. ' +
-      'Baileys was not affected in the same tests. Link by QR when a session of that number must stay up.',
+      'On that engine a number that is the stored phone of another session of this gateway (the Brazilian, ' +
+      'Mexican and Argentine mobile spellings of one number count as the same) is refused with `409` and WhatsApp ' +
+      'is not asked; the gateway cannot see a link made on another gateway or only on the phone. ' +
+      'Baileys was not affected in the same tests and accepts the request: its sessions are companion devices ' +
+      'and may share a number. Link by QR when a session of that number must stay up.',
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({ status: 201, description: 'Pairing code generated', type: PairingCodeResponseDto })
   @ApiResponse({ status: 400, description: 'Session not started or already authenticated' })
   @ApiResponse({ status: 404, description: 'Session not found' })
-  @ApiResponse({ status: 409, description: PAIRING_NOT_READY_409 })
+  @ApiResponse({
+    status: 409,
+    description:
+      PAIRING_NOT_READY_409 +
+      ' On whatsapp-web.js also answered, with nothing sent to WhatsApp, when the requested number is the stored ' +
+      'phone of another session of this gateway: delete that session, or log it out while it runs, first.',
+  })
   @ApiResponse({ status: 503, description: PAIRING_TRANSPORT_503 })
   async requestPairingCode(
     @Param('sessionId', ParseUUIDPipe) id: string,
@@ -621,10 +630,10 @@ export class SessionController {
     status: 200,
     description:
       'Returns `{ success }`. `false` means the engine declined to act: the Baileys engine sends the ' +
-      'read receipt against the newest message the chat received, so a chat it has received no ' +
-      "message in (one holding only the account's own sends included) is reported as declined " +
-      'rather than marked read. The whatsapp-web.js engine reads the chat from the page and needs no ' +
-      'local history.',
+      'read receipt against the newest message the chat received that it holds in memory, else the ' +
+      'newest received one the gateway stored, so a chat with neither (one holding only the ' +
+      "account's own sends included) is reported as declined rather than marked read. The " +
+      'whatsapp-web.js engine reads the chat from the page and needs no local history.',
     type: SessionActionResponseDto,
   })
   @ApiResponse({ status: 400, description: 'Session not ready' })
@@ -764,7 +773,15 @@ export class SessionController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Mark a chat as unread' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
-  @ApiResponse({ status: 200, description: 'Chat marked as unread successfully', type: SessionActionResponseDto })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Returns `{ success }`. `false` means the engine declined to act. The Baileys engine keys the mark ' +
+      "to the chat's newest message in memory, else the newest stored one, else sends it without one for a " +
+      'chat the session knows; an id it knows no chat for answers `false`, and so does an archived chat ' +
+      'with no known message, which the phone leaves unmarked without one.',
+    type: SessionActionResponseDto,
+  })
   @ApiResponse({ status: 400, description: 'Session not ready' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   @ApiResponse({
@@ -798,7 +815,8 @@ export class SessionController {
     status: 200,
     description:
       'Returns `{ success }`. `false` means the engine declined to act — an unknown chat, or on the ' +
-      'Baileys engine a chat with no known history, since the change is keyed to its last message.',
+      'Baileys engine a chat with no message in memory or stored, since the clear is keyed to its ' +
+      'last message.',
     type: SessionActionResponseDto,
   })
   @ApiResponse({ status: 400, description: 'Session not ready' })
@@ -827,8 +845,10 @@ export class SessionController {
   @ApiResponse({
     status: 200,
     description:
-      'Returns `{ success }`. `false` means the engine declined to act — on the Baileys engine a ' +
-      'chat with no known history cannot be archived, since the change is keyed to its last message.',
+      'Returns `{ success }`. `false` means the engine declined to act. The Baileys engine keys the ' +
+      "change to the chat's newest message in memory, else the newest stored one, else sends it " +
+      'without one, which WhatsApp applies as well, for a chat the session knows; an id it knows no ' +
+      'chat for answers `false`.',
     type: SessionActionResponseDto,
   })
   @ApiResponse({ status: 400, description: 'Session not ready' })
@@ -931,7 +951,14 @@ export class SessionController {
       'media, search entries) and emits `message:deleted` for each. Changes made on the phone are not mirrored.',
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
-  @ApiResponse({ status: 200, description: 'Chat deleted successfully', type: SessionActionResponseDto })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Returns `{ success }`. `false` means the engine declined to act: an unknown chat, or on the ' +
+      'Baileys engine a chat with no message in memory or stored, since the delete is keyed to its ' +
+      'last message.',
+    type: SessionActionResponseDto,
+  })
   @ApiResponse({ status: 400, description: 'Session not ready' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   @ApiResponse({

@@ -53,6 +53,8 @@ $client = new Client([
 
 The SDK `timeout` (30 seconds by default) applies to every request, including those sent through an injected client, and overrides that client's own `timeout`. On Guzzle 8 it is also sent as `read_timeout`, the idle bound of Guzzle's stream handler (the one in use when ext-curl is missing, or when you inject a `StreamHandler`), so it replaces a `read_timeout` set on the injected client, and `0` removes that bound. The SDK has no separate idle-timeout setting: a stricter idle bound means a lower `timeout`, which also limits the whole call except on Guzzle 7's stream handler, where it bounds each wait instead (see [Errors](#errors)). cURL handlers ignore `read_timeout`, and Guzzle 7 leaves the injected client's value alone.
 
+Responses are buffered even when an injected client sets `stream` to `true`, so JSON, binary and error bodies share the same read-failure handling.
+
 The optional `defaultHeaders` map accepts strings, scalar values, null, and non-empty lists of those values. Numbers, booleans, and null are converted to text. An empty list is rejected by header name before any request is sent because Guzzle 8 cannot represent a header with zero values. Use `''` for an empty header value.
 
 ## Messaging
@@ -148,8 +150,10 @@ monorepo — Composer needs `composer.json` at a repository root and does not
 support subdirectories. Two workflows keep that mirror correct:
 
 - [`split-php-sdk.yml`](../../.github/workflows/split-php-sdk.yml) syncs the
-  mirror's `main` on every push that touches `sdk/php/**`, which is what
-  Packagist's `dev-main` follows.
+  mirror's `main` on every push to `main` that touches `sdk/php/**`, which is
+  what Packagist's `dev-main` follows. A run started from another branch
+  mirrors nothing, and a run whose `sdk/php` content is no longer that of the
+  current `main` leaves the mirror to the newer run.
 - [`php-sdk-release.yml`](../../.github/workflows/php-sdk-release.yml) cuts a
   versioned release by pushing a **tag** to the mirror. Packagist derives
   versions from that repository's tags, so a tag in this monorepo alone

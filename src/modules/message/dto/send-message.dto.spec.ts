@@ -385,7 +385,7 @@ describe('string fields refuse a boolean or an object', () => {
     expect(contact.contactNumber).toBe('628999888777');
     expect(await validate(contact, GLOBAL_VALIDATION_OPTIONS)).toHaveLength(0);
 
-    expect(await validateDto(SendTextMessageDto, { chatId: 628123456789, text: 5 })).toHaveLength(0);
+    expect(await validateDto(SendTextMessageDto, { chatId: 'g@g.us', text: 5 })).toHaveLength(0);
   });
 
   it('still takes the same values spelled as strings', async () => {

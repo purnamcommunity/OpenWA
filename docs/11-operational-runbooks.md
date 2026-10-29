@@ -664,7 +664,7 @@ curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 ```
 
 > Restoring `sessions/` is required, not optional, when the rollback crosses a browser major upgrade (on
-> amd64, 0.23.5 moved Chrome for Testing from 146 to 153 and the release after 0.25.0 moves it to 156; arm64
+> amd64, 0.23.5 moved Chrome for Testing from 146 to 153 and 0.26.0 moves it to 156; arm64
 > runs the chromium Debian shipped when each image was built), and the backup must predate the first start
 > on the newer image; a daily backup taken after the upgrade does not qualify. An older Chrome silently
 > deletes the IndexedDB of a profile a newer Chrome has opened, which is where whatsapp-web.js keeps the
@@ -804,8 +804,9 @@ OPENWA_DATA_DIR=/srv/openwa/data \
 > replaces the target's and is the one the restored app reads. A path that copy names has to stay in
 > the data directory unless it is the default (a leftover `./uploads` included): the restore stops,
 > naming the key and before it copies anything, at one that leads elsewhere, whether outside the
-> directory, through `..`, a link or a link that does not resolve, or inside or around another
-> directory it refills from the archive. Set that key in the environment or `./.env` to restore
+> directory, through `..`, a link or a link that does not resolve, inside or around another
+> directory it refills from the archive, or at the path of a file it writes after the directories
+> (the admin key file, `.env.generated`, `database.sql`). Set that key in the environment or `./.env` to restore
 > there. A relative `./data/...` path in `./.env` or `.env.generated`, such as the
 > `PLUGINS_DIR=./data/plugins` that `.env.example` sets or the `STORAGE_LOCAL_PATH=./data/media` the
 > app writes on first run, names a path in the app's data directory and is read under

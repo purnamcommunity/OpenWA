@@ -109,12 +109,13 @@ mounted for any admin key.
 ```
 /                  → Dashboard (overview + charts)
 /sessions          → Sessions (create / start / stop / QR / delete)
-/chats             → Chats (Chats / Channels / Status tabs, quick filters and an Archived view on
-                     Chats; chat list + message thread live via WebSocket; thread pages older
-                     history in on scroll-up; per-chat menu (pin, mute, archive, mark unread,
-                     block, leave group; clear and delete on whatsapp-web.js only) [operator];
-                     group info dialog; new chat / new group [operator]; read-only channel feed
-                     on whatsapp-web.js)
+/chats             → Chats (full height, no page header; session switcher listing every session;
+                     Chats / Channels / Status tabs, quick filters and an Archived view on Chats;
+                     chat list + message thread live via WebSocket; thread pages older history in
+                     on scroll-up; per-chat menu (pin, mute, archive, mark unread, block, leave
+                     group, clear, delete) [operator]; contact info
+                     panel and group info dialog; new chat / new group [operator]; read-only
+                     channel feed on whatsapp-web.js)
 /number-checker    → Number Checker (single and bulk check of whether numbers are on WhatsApp) [operator]
 /webhooks          → Webhooks (per-session webhook endpoints)
 /templates         → Message Templates
@@ -128,7 +129,9 @@ mounted for any admin key.
 
 > There is **no Settings page** and no `/sessions/:id`, `/sessions/:id/chat`, or `/webhooks/:id`
 > route. Theme (light/dark/system) is a one-click toggle in the sidebar footer (`Layout.tsx`),
-> persisted client-side by the `useTheme` hook.
+> persisted client-side by the `useTheme` hook. The button that collapses the sidebar to its icon rail
+> sits in the sidebar header, beside the logo, and under the logo once collapsed; its panel icon is
+> mirrored for right-to-left languages.
 
 ## 17.3 Wireframes
 
@@ -408,7 +411,7 @@ components take their classes from `pages/Chats.css`, and `MediaLightbox` adds t
 | `CustomSelect`               | `components/CustomSelect.tsx`        | Keyboard-navigable select replacement (type-ahead, arrow keys) used by Sessions / Logs / Login                                         |
 | `DashboardCharts`            | `components/DashboardCharts.tsx`     | `recharts`-based message-volume / activity charts on the Dashboard                                                                     |
 | `FilterBuilder`              | `components/FilterBuilder.tsx`       | Visual condition builder for webhook event filters                                                                                     |
-| `GlobalSearch`               | `components/GlobalSearch.tsx`        | Debounced message-search box in the Chats header, with all-sessions / current-session scope                                            |
+| `GlobalSearch`               | `components/GlobalSearch.tsx`        | Debounced message search behind a toggle in the Chats sidebar header, with all-sessions / current-session scope                        |
 | `PluginInstances`            | `components/PluginInstances.tsx`     | Per-plugin instance list: create / edit / delete and secret regeneration                                                               |
 | `ErrorBoundary`              | `components/ErrorBoundary.tsx`       | Top-level React error boundary wrapping the whole app                                                                                  |
 | `GithubIcon`                 | `components/GithubIcon.tsx`          | Inline brand SVG                                                                                                                       |
@@ -418,18 +421,19 @@ components take their classes from `pages/Chats.css`, and `MediaLightbox` adds t
 | `NumberCheckProvider`        | `components/NumberCheckProvider.tsx` | Holds the Number Checker's bulk run and its rows above the routes, so leaving the page does not stop a run; read with `useNumberCheck` |
 
 Chat-specific pieces live one level down in `components/chats/`: `MessageBody` (WhatsApp text
-formatting + link detection), `ChatThread` (bubble list, including inbound Baileys prompt buttons
-that call `POST /sessions/:id/messages/click-button`), and `MediaLightbox` (the media viewer, built
-on `yet-another-react-lightbox`). The rest of the room is split the same way: `ChatSidebar`,
-`NewChatPanel` (new chat, and new group on Baileys), `ChatRowMenu` (a chat row's actions;
-`chatActionItems` lists them for the row and for the room's menu alike), `GroupInfoDialog` (a group's
-name, picture, description and participants), `ChatDialogs` (mute and save-contact dialogs),
-`ChatComposer`, `ChatAvatar`, `KindIcon`, `StatusComposeModal` and `StatusMedia`. Prompt choices
-arrive on live `message.received` as top-level `buttons` and are also stored in message
-`metadata.buttons` so a reload can re-render them. Clicking still requires the prompt to be in the
-engine store; an evicted prompt 404s. A read-only key sees the choices disabled and gets no reply,
-react or delete actions, the same as the disabled composer, no New chat button, and of a chat's
-actions only a group's info.
+formatting + link detection), `ChatThread` (bubble list with day separators, including inbound
+Baileys prompt buttons that call `POST /sessions/:id/messages/click-button`), and `MediaLightbox`
+(the media viewer, built on `yet-another-react-lightbox`). The rest of the room is split the same
+way: `ChatSidebar`, `SessionPicker` (the session switcher in the sidebar header), `NewChatPanel`
+(new chat, and new group on Baileys), `ChatRowMenu` (a chat row's actions; `chatActionItems` lists
+them for the row and for the room's menu alike), `GroupInfoDialog` (a group's name, picture,
+description and participants), `ChatDialogs` (mute and save-contact dialogs), `ChatComposer`,
+`ChatAvatar`, `KindIcon`, `StatusComposeModal` and `StatusMedia`. Prompt choices arrive on live
+`message.received` as top-level `buttons` and are also stored in message `metadata.buttons` so a
+reload can re-render them. Clicking still requires the prompt to be in the engine store; an evicted
+prompt 404s. A read-only key sees the choices disabled and gets no reply, react or delete actions,
+the same as the disabled composer, no message search, no New chat button, and of a chat's actions
+only its contact or group info.
 
 The message thread is paged. `useChatMessages` is a `useInfiniteQuery` whose cursor is the number
 of DB rows fetched so far, not the length of the rendered list — the thread also carries engine
@@ -489,9 +493,12 @@ Three pages keep a server list in local state instead of the query cache:
   own row writes and socket pushes, so an older answer never overwrites a newer row. After each read
   it applies, it invalidates the `['sessions']` key prefix so the Dashboard and per-session views
   refetch.
-- **Chats** (`Chats.tsx`) reads the ready sessions directly on mount, and again when a search hit
-  names a session that list lacks, and keeps the chat list in local state that socket pushes, sends,
-  marking a chat read and the chat actions (pin, mute, archive, rename) update.
+- **Chats** (`Chats.tsx`) reads the sessions directly on mount, and again when a search hit names a
+  session that list lacks. The session switcher lists all of them, but only a ready one can be
+  selected; it follows `session.status` pushes through the same live session feed the Sessions page
+  joins (`utils/sessionFeedSubscription`), so a session that connects or drops changes in place. The
+  page keeps the chat list in local state that socket pushes, sends, marking a chat read and the chat
+  actions (pin, mute, archive, rename) update.
 - **Plugins** (`Plugins.tsx`) keeps the catalog in local state. It prefetches it silently on mount
   so installed cards can show an update chip, fetches it again when the Catalog tab opens with an
   empty list, and reloads it after any install, update or uninstall.
@@ -709,7 +716,10 @@ export function useTheme() {
 
 The actual colors live in `src/App.css` as variables keyed off `[data-theme]` —
 e.g. `:root { --bg-light: #f8fafc; } [data-theme='dark'] { --bg-light: #0f172a; }` — so
-switching mode is a single attribute write with no re-render of the tree.
+switching mode is a single attribute write with no re-render of the tree. The Chats page adds its
+own chat palette (bubbles, wallpaper, avatar tones) as variables scoped to the page in
+`pages/Chats.css`, keyed off the same `data-theme` attribute and `prefers-color-scheme`, so it
+follows the mode too.
 
 ## 17.8 Build & Deployment
 
@@ -773,9 +783,10 @@ How it fits together:
 - `npm run build:all` builds the API (`dist/`) **and** the dashboard (`dashboard/dist/`). The root
   `Dockerfile` does this in its builder stage and copies `dashboard/dist` into the runtime image.
 - `ServeStaticModule` is registered conditionally in `src/app.module.ts`: it only activates when
-  `dashboard/dist/index.html` exists, serves it with SPA fallback, and `exclude`s `/api` and
-  `/socket.io` so those keep returning real API/WebSocket responses. Opt out with
-  `SERVE_DASHBOARD=false`.
+  `dashboard/dist/index.html` exists and serves the built assets. Its own SPA fallback is off:
+  `configure-app.ts` answers the dashboard documents, with the per-response CSP nonce, for GET paths
+  outside `/api`, `/socket.io`, `/mcp` and `/assets`, so those keep returning real API/WebSocket
+  responses and the body parsers' own 413 and 400. Opt out with `SERVE_DASHBOARD=false`.
 - Run it directly with `npm run prod` (build + serve) or `node dist/main` against a prebuilt image.
 
 In development the build is absent, so serve-static stays inert and the Vite dev server (port

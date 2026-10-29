@@ -59,6 +59,14 @@ describe('GroupsResource — exact paths and bodies', () => {
     expect(t.lastCall!.url).toContain('/invite-code/revoke');
   });
 
+  it('setMemberLabel PUTs the label to the group', async () => {
+    const t = new MockTransport().on('PUT', /\/member-label$/, { body: { success: true } });
+    await client(t).groups.setMemberLabel('s', 'g@g.us', 'Site A');
+    expect(t.lastCall!.method).toBe('PUT');
+    expect(t.lastCall!.url).toContain('/api/sessions/s/groups/g@g.us/member-label');
+    expect(t.lastCall!.body).toEqual({ label: 'Site A' });
+  });
+
   it('membership requests — list, approve, reject', async () => {
     const t = new MockTransport()
       .on('GET', /\/membership-requests$/, { body: [{ participantId: 'a@c.us', method: 'invite_link' }] })
@@ -538,6 +546,14 @@ describe('SearchResource — exact path and query forwarding', () => {
     const c = client(t);
     await c.search.search({ q: 'term', chatId: '628@c.us', direction: 'incoming' });
     expect(t.lastCall!.url).toBe('http://x/api/search?q=term&chatId=628%40c.us&direction=incoming');
+  });
+
+  it('forwards the match mode', async () => {
+    const t = new MockTransport().on('GET', /\/search$/, {
+      body: { hits: [], total: 0, tookMs: 1, provider: 'builtin-fts' },
+    });
+    await client(t).search.search({ q: 'voic', match: 'contains' });
+    expect(t.lastCall!.url).toBe('http://x/api/search?q=voic&match=contains');
   });
 });
 

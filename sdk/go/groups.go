@@ -141,6 +141,19 @@ func (s *GroupsService) SetDescription(ctx context.Context, sessionID, groupID, 
 	return &out, nil
 }
 
+// SetMemberLabel sets this account's member label in the group; an empty label clears it.
+// Baileys only: whatsapp-web.js answers 501. A 200 means the label message was handed to
+// WhatsApp; it cannot be read back.
+func (s *GroupsService) SetMemberLabel(ctx context.Context, sessionID, groupID, label string) (*SuccessResult, error) {
+	var out SuccessResult
+	body := map[string]string{"label": label}
+	err := s.client.do(ctx, "PUT", s.base(sessionID)+"/"+pathEscape(groupID)+"/member-label", nil, body, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Leave leaves a group.
 func (s *GroupsService) Leave(ctx context.Context, sessionID, groupID string) (*SuccessResult, error) {
 	var out SuccessResult

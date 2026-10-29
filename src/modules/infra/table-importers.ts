@@ -342,7 +342,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
   defineTableImporter({
     key: 'chatStates',
     label: 'chat state',
-    sql: `INSERT INTO chat_states ("sessionId", "chatId", "muteEndTime", archived, pinned, observed, "updatedAt") VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    sql: `INSERT INTO chat_states ("sessionId", "chatId", "muteEndTime", archived, pinned, observed, "deletedAt", "updatedAt") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     id: (cs: ChatStateRow) => `${cs.sessionId}/${cs.chatId}`,
     map: (cs: ChatStateRow) => [
       cs.sessionId,
@@ -351,6 +351,7 @@ export const TABLE_IMPORTERS: AnyTableImporter[] = [
       cs.archived,
       cs.pinned,
       cs.observed ?? null,
+      cs.deletedAt ?? null,
       cs.updatedAt,
     ],
   }),

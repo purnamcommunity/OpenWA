@@ -50,6 +50,7 @@ import {
   StatusResult,
   ChatSummary,
   StatusPostOptions,
+  StoredChatMessageLookup,
 } from '../interfaces/whatsapp-engine.interface';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
@@ -151,7 +152,8 @@ export class BaileysAdapter implements IWhatsAppEngine {
       toUnixSeconds,
       inboundLimiter: this.inboundLimiter,
       recordKeyLidMappings: key => this.sessionStore.recordKeyLidMappings(key),
-      recordMessage: (msg, type) => this.sessionStore.recordMessage(msg, type),
+      recordMessage: (msg, type, order?: number) => this.sessionStore.recordMessage(msg, type, order),
+      nextMessageOrder: () => this.sessionStore.nextMessageOrder(),
       recordMessageEdit: (chatId, messageId, text, type) =>
         this.sessionStore.recordMessageEdit(chatId, messageId, text, type),
       putStoredMessage: msg => this.config.messageStore?.put(this.config.dbSessionId, msg),
@@ -197,6 +199,9 @@ export class BaileysAdapter implements IWhatsAppEngine {
       listChats: () => this.sessionStore.listChats(),
       lastMessage: chatId => this.sessionStore.lastMessage(chatId),
       lastInboundMessage: chatId => this.sessionStore.lastInboundMessage(chatId),
+      lidOf: jid => this.sessionStore.lidOf(jid),
+      chatTwins: jid => this.sessionStore.chatTwins(jid),
+      chatDeletedAt: chatId => this.sessionStore.chatDeletedAt(chatId),
       upsertContacts: records => this.sessionStore.upsertContacts(records),
       upsertChats: records => this.sessionStore.upsertChats(records),
       removeChats: ids => this.sessionStore.removeChats(ids),
@@ -487,6 +492,10 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.groups.setGroupEphemeral(groupId, durationSec);
   }
 
+  async setGroupMemberLabel(groupId: string, label: string): Promise<void> {
+    return this.groups.setGroupMemberLabel(groupId, label);
+  }
+
   async getGroupMembershipRequests(groupId: string): Promise<GroupMembershipRequest[]> {
     return this.groups.getGroupMembershipRequests(groupId);
   }
@@ -566,16 +575,21 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.messaging.subscribeToPresence(chatId);
   }
 
-  async sendSeen(chatId: string, messageIds?: string[], authors?: ReadonlyMap<string, string>): Promise<boolean> {
-    return this.contacts.sendSeen(chatId, messageIds, authors);
+  async sendSeen(
+    chatId: string,
+    messageIds?: string[],
+    authors?: ReadonlyMap<string, string>,
+    stored?: StoredChatMessageLookup,
+  ): Promise<boolean> {
+    return this.contacts.sendSeen(chatId, messageIds, authors, stored);
   }
 
-  async markUnread(chatId: string): Promise<boolean> {
-    return this.contacts.markUnread(chatId);
+  async markUnread(chatId: string, stored?: StoredChatMessageLookup): Promise<boolean> {
+    return this.contacts.markUnread(chatId, stored);
   }
 
-  async deleteChat(chatId: string): Promise<boolean> {
-    return this.contacts.deleteChat(chatId);
+  async deleteChat(chatId: string, stored?: StoredChatMessageLookup): Promise<boolean> {
+    return this.contacts.deleteChat(chatId, stored);
   }
 
   async muteChat(chatId: string, muteUntil: number | null): Promise<void> {
@@ -586,12 +600,12 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.contacts.pinChat(chatId, pin);
   }
 
-  async archiveChat(chatId: string, archive: boolean): Promise<boolean> {
-    return this.contacts.archiveChat(chatId, archive);
+  async archiveChat(chatId: string, archive: boolean, stored?: StoredChatMessageLookup): Promise<boolean> {
+    return this.contacts.archiveChat(chatId, archive, stored);
   }
 
-  async clearChatMessages(chatId: string): Promise<boolean> {
-    return this.contacts.clearChatMessages(chatId);
+  async clearChatMessages(chatId: string, stored?: StoredChatMessageLookup): Promise<boolean> {
+    return this.contacts.clearChatMessages(chatId, stored);
   }
 
   // ----- Gated: unsupported on Baileys (reasons inline) -----

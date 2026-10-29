@@ -219,7 +219,7 @@ export class WwebjsChannels {
     const channels = await this.withPage('getChannelMessages', () =>
       (this.client() as unknown as BusinessClient).getChannels(),
     );
-    const channel = channels?.find(c => (typeof c.id === 'object' ? c.id._serialized : c.id) === channelId);
+    const channel = channels?.find(c => readWid(c.id) === channelId);
     if (!channel) {
       throw new ChannelNotFoundError(channelId);
     }

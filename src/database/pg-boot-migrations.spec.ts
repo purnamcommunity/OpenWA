@@ -378,6 +378,20 @@ describe('createBootDataSource (postgres boot migrations)', () => {
     expect(config.ssl).toBe(ssl);
   });
 
+  it('bounds the UTC pin of the migration and the runtime pool with that connect timeout', async () => {
+    const { deps } = makeFakes();
+
+    await createBootDataSource({ ...PG_OPTIONS, extra: { connectionTimeoutMillis: 2500 } }, deps);
+
+    const built = (deps.createDataSource as jest.Mock<DataSource, [DataSourceOptions]>).mock.calls;
+    expect(built).toHaveLength(2);
+    for (const [options] of built) {
+      const query = jest.fn().mockResolvedValue({});
+      await (options.extra as { onConnect: (client: never) => Promise<unknown> }).onConnect({ query } as never);
+      expect(query).toHaveBeenCalledWith({ text: "SET TIME ZONE 'UTC'", query_timeout: 2500 });
+    }
+  });
+
   it('falls back to the real DataSource and pg Client constructors when no deps are injected', async () => {
     // The production path. Only the spots that would touch the outside world are stubbed — the
     // DataSource lifecycle methods (initialize would open a pool) and the pg Client constructor

@@ -150,6 +150,15 @@ describePostgres('InfraDataController.importData (postgres)', () => {
     expect(await mappings.findOneBy({ lid: '111' })).toMatchObject({ phone: '628111', isReported: false });
   });
 
+  // A bigint column the export reads back as a string.
+  it('restores the deletion mark of a chat state', async () => {
+    const states = ds.getRepository(ChatState);
+    await states.insert([{ sessionId: 's1', chatId: '628111@s.whatsapp.net', deletedAt: 1790000000000 }]);
+    const dump = await controller.exportData();
+    await expect(controller.importData(dump as never)).resolves.toMatchObject({ imported: true, warnings: [] });
+    expect(await states.findOneBy({ chatId: '628111@s.whatsapp.net' })).toMatchObject({ deletedAt: 1790000000000 });
+  });
+
   // The runtime pool cancels a statement that outlives statement_timeout (30 s by default), and the
   // clears of a replace-all import scale with the live tables, not with the archive. A slow trigger on
   // messages stands in for a table that has grown large: with the pool's timeout lowered below it, the

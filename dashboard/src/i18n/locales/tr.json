@@ -213,6 +213,9 @@
       "read": "Okundu",
       "failed": "Başarısız"
     },
+    "today": "Bugün",
+    "switchSession": "Oturum değiştir",
+    "searchMessages": "Mesajlarda ara",
     "clearSearch": "Aramayı temizle",
     "filters": {
       "label": "Sohbetleri filtrele",
@@ -223,11 +226,13 @@
       "unknown": "Bilinmeyen"
     },
     "noFilterResults": "Bu filtreyle eşleşen sohbet yok",
+    "contactInfo": "Kişi bilgisi",
     "moreActions": "Diğer işlemler",
     "copyChatId": "Sohbet kimliğini kopyala",
     "chatIdCopied": "Sohbet kimliği kopyalandı",
     "copyFailed": "Panoya kopyalanamadı",
     "closeChat": "Sohbeti kapat",
+    "phone": "Telefon numarası",
     "chatId": "Sohbet kimliği",
     "newChat": {
       "title": "Yeni sohbet",
@@ -252,6 +257,12 @@
       "created": "\"{{name}}\" grubu oluşturuldu",
       "createFailed": "Grup oluşturulamadı",
       "removeParticipant": "{{name}} kaldır"
+    },
+    "sessionPicker": {
+      "searchPlaceholder": "Oturum ara...",
+      "noMatch": "Eşleşen oturum yok",
+      "addTitle": "Başka bir numara bağla",
+      "addHint": "Bir oturum oluşturun ve QR koduyla bağlayın"
     },
     "group": {
       "info": "Grup bilgisi",
@@ -663,7 +674,6 @@
       "message.revoked": "Bir mesaj herkesten silindiğinde",
       "message.reaction": "Bir tepki eklendiğinde, değiştirildiğinde veya kaldırıldığında",
       "message.edited": "Bir mesaj düzenlendiğinde",
-      "message.poll_vote": "Biri bir ankette oy verdiğinde veya oyunu değiştirdiğinde",
       "session.status": "Bir oturumun durumu değiştiğinde",
       "session.qr": "QR kodu oluşturulduğunda",
       "session.authenticated": "Bir oturum eşlendiğinde ve hazır olduğunda",
@@ -672,6 +682,7 @@
       "session.restriction": "WhatsApp hesabı kısıtladığında veya bir kısıtlamayı kaldırdığında",
       "presence.update": "Abone olunan bir sohbet çevrimiçi olduğunda, yazdığında veya çevrimdışı olduğunda",
       "event.response": "Bir davetli bir WhatsApp etkinliğine yanıt verdiğinde (katılıyor, katılmıyor, belki)",
+      "poll.vote": "Biri bir ankette seçenek işaretlediğinde veya kaldırdığında (whatsapp-web.js)",
       "group.join": "Katılımcılar bir gruba katıldığında veya eklendiğinde",
       "group.leave": "Katılımcılar bir gruptan ayrıldığında veya çıkarıldığında",
       "group.update": "Bir grubun adı, açıklaması veya ayarları değiştiğinde",
@@ -1026,7 +1037,7 @@
     "single": {
       "title": "Tek Hesabı Kontrol Et",
       "phoneLabel": "Telefon Numarası",
-      "phonePlaceholder": "ör. 919876543210 veya 6281234567890 (ülke koduyla birlikte)",
+      "phonePlaceholder": "ör. 919876543210 veya 6281234567890",
       "check": "Kontrol Et",
       "checking": "Kontrol ediliyor...",
       "autoPrefix": "10 basamaklı numaraların başına otomatik olarak <strong>+91</strong> ekle (12 basamaklı numaralar olduğu gibi bırakılır)",

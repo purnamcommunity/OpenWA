@@ -1741,7 +1741,7 @@ const DETAIL_PINS = {
     'DATABASE_SSL',
     'DATABASE_SSL_REJECT_UNAUTHORIZED',
   ],
-  redis: ['REDIS_BUILTIN', 'REDIS_PORT', 'REDIS_PASSWORD', 'QUEUE_ENABLED'],
+  redis: ['REDIS_BUILTIN', 'REDIS_TLS', 'REDIS_USERNAME', 'REDIS_PORT', 'REDIS_PASSWORD', 'QUEUE_ENABLED'],
   storage: ['MINIO_BUILTIN', 'S3_BUCKET', 'S3_REGION', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY'],
 };
 
@@ -1808,7 +1808,7 @@ test('every setting a save writes names its variable beside its field when the e
       dbSchemaRow: ['POSTGRES_SCHEMA'],
       dbSsl: ['DATABASE_SSL'],
       dbSslVerify: ['DATABASE_SSL_REJECT_UNAUTHORIZED'],
-      redisBuiltIn: ['REDIS_BUILTIN'],
+      redisBuiltIn: ['REDIS_BUILTIN', 'REDIS_TLS', 'REDIS_USERNAME'],
       redisRow: ['REDIS_PORT', 'REDIS_PASSWORD'],
       queue: ['QUEUE_ENABLED'],
       storageBuiltIn: ['MINIO_BUILTIN'],
@@ -2437,6 +2437,32 @@ test('a built-in Redis whose switch the environment pins is not stopped when the
   assert.deepEqual(names, []);
   assert.deepEqual(body, { profiles: ['postgres', 'minio'], profilesToRemove: [] });
 });
+
+for (const key of ['REDIS_ENABLED', 'QUEUE_ENABLED'] as const) {
+  for (const enabled of [false, true]) {
+    test(`a pinned ${key} uses its running value ${enabled} when the saved read fails`, async () => {
+      resetFetchCalls();
+      overrides = {
+        status: {
+          ...RUNNING_BUNDLED,
+          envPinned: [key],
+          redis: { ...RUNNING_BUNDLED.redis, enabled: key === 'REDIS_ENABLED' ? enabled : false },
+          queue: { ...RUNNING_BUNDLED.queue, enabled: key === 'QUEUE_ENABLED' ? enabled : false },
+        },
+        saved: {
+          ...READBACK_SAVED,
+          redis: { ...READBACK_SAVED.redis, enabled: key === 'REDIS_ENABLED' ? !enabled : false },
+          queue: { enabled: key === 'QUEUE_ENABLED' ? !enabled : false },
+        },
+        savedAfterSaveFails: true,
+        saveProfiles: ['postgres', 'minio'],
+      };
+      const { names, body } = await saveAndRestart();
+      assert.deepEqual(names, enabled ? [] : ['openwa-redis']);
+      assert.deepEqual(body, { profiles: ['postgres', 'minio'], profilesToRemove: enabled ? [] : ['redis'] });
+    });
+  }
+}
 
 test('bundled containers the environment pins the hosts to are neither stopped nor named', async () => {
   const { screen, waitFor, fireEvent, within } = rtl;
@@ -3150,3 +3176,63 @@ test(
     assert.ok(within(dialog).getByText(failure), 'the failure that explains the restart is not shown');
   },
 );
+
+test('disabled database and storage are stopped beneath bundled host pins', async () => {
+  const { screen, waitFor, fireEvent, within } = rtl;
+  resetFetchCalls();
+  overrides = {
+    status: { ...RUNNING_BUNDLED, envPinned: ['DATABASE_HOST', 'S3_ENDPOINT'] },
+    saved: READBACK_SAVED,
+    savedAfterSave: {
+      ...READBACK_SAVED,
+      database: { ...READBACK_SAVED.database, type: 'sqlite', builtIn: false },
+      storage: { ...READBACK_SAVED.storage, type: 'local', builtIn: false },
+    },
+    saveProfiles: ['redis'],
+  };
+  const { container } = renderInfrastructure();
+  await screen.findByText('Database Configuration');
+  await awaitSeeded(container);
+  fireEvent.click(container.querySelectorAll<HTMLInputElement>('input[name="dbType"]')[0]);
+  fireEvent.click(container.querySelectorAll<HTMLInputElement>('input[name="storageType"]')[0]);
+  fireEvent.click(screen.getByRole('button', { name: 'Save Configuration' }));
+  const dialog = await screen.findByRole('dialog');
+  assert.deepEqual(stopNames(dialog), ['openwa-postgres', 'openwa-minio']);
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Restart Now' }));
+  await waitFor(() => assert.ok(findFetchCall('POST', '/api/infra/restart')));
+  assert.deepEqual(findFetchCall('POST', '/api/infra/restart')!.body, {
+    profiles: ['redis'],
+    profilesToRemove: ['postgres', 'minio'],
+  });
+});
+
+for (const cacheUsesRedis of [false, true]) {
+  test(`a disabled Redis beneath its bundled host pin keeps an active cache: ${cacheUsesRedis}`, async () => {
+    const { screen, waitFor, fireEvent, within } = rtl;
+    resetFetchCalls();
+    const profiles = ['postgres', 'minio', ...(cacheUsesRedis ? ['redis'] : [])];
+    overrides = {
+      status: { ...RUNNING_BUNDLED, envPinned: ['REDIS_HOST'] },
+      saved: { ...READBACK_SAVED, queue: { enabled: false } },
+      savedAfterSave: {
+        ...READBACK_SAVED,
+        redis: { ...READBACK_SAVED.redis, enabled: false },
+        queue: { enabled: false },
+      },
+      saveProfiles: profiles,
+    };
+    const { container } = renderInfrastructure();
+    await screen.findByText('Database Configuration');
+    await awaitSeeded(container);
+    fireEvent.click(toggleInput(container, 'Enable Redis'));
+    fireEvent.click(screen.getByRole('button', { name: 'Save Configuration' }));
+    const dialog = await screen.findByRole('dialog');
+    assert.deepEqual(stopNames(dialog), cacheUsesRedis ? [] : ['openwa-redis']);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Restart Now' }));
+    await waitFor(() => assert.ok(findFetchCall('POST', '/api/infra/restart')));
+    assert.deepEqual(findFetchCall('POST', '/api/infra/restart')!.body, {
+      profiles,
+      profilesToRemove: cacheUsesRedis ? [] : ['redis'],
+    });
+  });
+}

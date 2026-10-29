@@ -11,6 +11,8 @@ interface LastMessage {
   timestamp: number;
   text: string;
   type?: MessageType;
+  /** Where the message stands in the order this session observed them, which settles a tie in `timestamp`. */
+  order: number;
 }
 
 // Default per-map entry cap, matching the other per-session bounds (LID_MAPPING_CACHE_MAX,
@@ -199,7 +201,8 @@ export class BaileysSessionStore {
    * answering with the preview after an API reply sent nothing while the route reported success.
    * An evicted entry reads null, which the receipt path answers as "nothing known".
    */
-  private readonly lastInbound: LruMap<string, { key: WAMessageKey; timestamp: number }>;
+  private readonly lastInbound: LruMap<string, { key: WAMessageKey; timestamp: number; order: number }>;
+  private messageOrder = 0;
   private readonly lidToPn: LruMap<string, string>;
   /**
    * Per-chat disappearing-messages timer (seconds) learned from inbound messages (#473), the reliable
@@ -301,6 +304,12 @@ export class BaileysSessionStore {
       if (!r.id) {
         continue;
       }
+      // A chat WhatsApp deleted takes no update until a message re-creates it: Baileys applies an own
+      // write locally (a mute or pin is sent without a message), and a reconnect resyncs a deletion before
+      // an archive or pin made ahead of it. Kept, either would show on the chat a later message re-creates.
+      if (this.stillDeleted(r.id, this.toUnixSeconds(r.conversationTimestamp))) {
+        continue;
+      }
       const existing = this.chats.get(r.id) ?? { id: r.id };
       this.chats.set(r.id, { ...existing, ...r });
       this.persistChatState(r.id, r);
@@ -328,8 +337,9 @@ export class BaileysSessionStore {
    * Drop chats Baileys reports deleted (`chats.delete`: an API delete replayed locally, or one made on
    * the phone), with their preview and last inbound message, under every spelling: the id comes from
    * the app-state index, which need not be the twin the chat or its messages are keyed under. The
-   * persisted mute/archive/pin goes too: a chat a later message re-creates is a new chat on WhatsApp,
-   * and the row would otherwise lay the deleted chat's state over it.
+   * persisted mute/archive/pin is reset and the row marks the deletion ({@link chatDeletedAt}): WhatsApp
+   * keeps nothing of the chat while the gateway keeps its stored messages, and a write keyed to one of
+   * them comes back from Baileys as an update of the chat, which would list it again.
    */
   removeChats(ids: string[] = []): void {
     const keys = new Set(ids.flatMap(id => this.chatTwins(id)));
@@ -339,23 +349,38 @@ export class BaileysSessionStore {
       this.lastInbound.delete(key);
     }
     if (keys.size && this.chatStateStore && this.sessionId) {
-      void this.forgetChatState(this.chatStateStore, this.sessionId, ids, keys);
+      void this.markDeleted(this.chatStateStore, this.sessionId, ids, keys);
     }
   }
 
   /**
-   * The in-memory mappings can lack the lid or phone twin after a restart, and a delete is never
-   * retried, so a row under that twin would outlive the chat and put it back in the listing. The
-   * known keys are forgotten first, queued ahead of any later write; the twins only the mapping
-   * table pairs follow.
+   * The marked row is written under the chat's state key, folding the rows of the known twins onto it,
+   * queued ahead of any later write. The in-memory mappings can lack the lid or phone twin after a
+   * restart, and a delete is never retried, so the twins only the mapping table pairs are forgotten
+   * after: a row there would outlive the deletion and put the chat back in the listing.
+   *
+   * Baileys reports a deletion by ids alone, so it is dated on arrival. One synced on a reconnect is
+   * dated later than it happened: a message delivered in the same reconnect counts as older, and the
+   * chat stays unlisted, its writes declined, until the next one.
    */
-  private async forgetChatState(
-    store: ChatStateStore,
-    sessionId: string,
-    ids: string[],
-    keys: Set<string>,
-  ): Promise<void> {
-    const forgotten = store.forget(sessionId, [...keys]);
+  private async markDeleted(store: ChatStateStore, sessionId: string, ids: string[], keys: Set<string>): Promise<void> {
+    const reset = { muteEndTime: null, archived: false, pinned: false, deletedAt: Date.now() };
+    // Each chat folds its own twins: one event can delete several chats.
+    const twinsOf = new Map<string, Set<string>>();
+    for (const id of ids) {
+      const key = this.stateKey(id);
+      twinsOf.set(key, new Set([...(twinsOf.get(key) ?? []), ...this.chatTwins(id)]));
+    }
+    const marked = Promise.all(
+      [...twinsOf].map(([key, twins]) =>
+        store.fold(
+          sessionId,
+          key,
+          [...twins].filter(k => !twinsOf.has(k)),
+          reset,
+        ),
+      ),
+    );
     const extra = new Set<string>();
     for (const id of ids) {
       const parsed = parseWaId(id);
@@ -370,9 +395,44 @@ export class BaileysSessionStore {
         // The table cannot be read; the keys the caches knew are already going.
       }
     }
-    await forgotten;
-    const missed = [...extra].filter(k => !keys.has(k));
+    await marked;
+    const missed = [...extra].filter(k => !keys.has(k) && !twinsOf.has(k));
     if (missed.length) await store.forget(sessionId, missed);
+  }
+
+  /**
+   * When WhatsApp deleted the chat (epoch ms), read from its persisted state under any spelling, or
+   * null when it did not, or a message has re-created the chat since. A message sent at or before it
+   * belongs to the deleted chat.
+   */
+  chatDeletedAt(chatId: string): number | null {
+    return this.chatState(chatId, this.chatTwins(chatId))?.deletedAt ?? null;
+  }
+
+  /**
+   * Whether the chat is marked deleted for a message or chat update dated `timestamp` (epoch seconds, 0
+   * for none). A message newer than the deletion re-creates the chat on WhatsApp, as a new chat, so its
+   * marked row goes and the answer is false. Only the rows a mark can sit under are read, the state key
+   * and the lids the jid and the persisted table name: an empty index skips the scan of this session's
+   * mappings, too slow to run for each of the thousands of messages a first sync records.
+   */
+  private stillDeleted(jid: string, timestamp: number): boolean {
+    const store = this.chatStateStore;
+    const sid = this.sessionId;
+    if (!store || !sid) return false;
+    const key = this.stateKey(jid);
+    const rows = [key, ...this.stateTwins([jid], key, new Map())].flatMap(k => {
+      const value = store.get(sid, k);
+      return value ? [{ k, value }] : [];
+    });
+    const deletedAt = mergeTwinStates(rows.map(r => r.value))?.deletedAt;
+    if (!deletedAt) return false;
+    if (timestamp * 1000 <= deletedAt) return true;
+    void store.forget(
+      sid,
+      rows.map(r => r.k),
+    );
+    return false;
   }
 
   addLidMappings(mappings: { lid?: string; pn?: string }[] = [], isReported = true): void {
@@ -423,7 +483,15 @@ export class BaileysSessionStore {
     else void this.lidStore?.rememberIfUnknown?.(userPart(lidJid), userPart(pnJid), this.sessionId);
   }
 
-  recordMessage(msg: WAMessage, type?: MessageType): void {
+  /**
+   * The next place in the observed order. A live message takes its place on arrival, before the media
+   * download and the store reads that can let a later one finish first; history, which has none, records 0.
+   */
+  nextMessageOrder(): number {
+    return ++this.messageOrder;
+  }
+
+  recordMessage(msg: WAMessage, type?: MessageType, order = this.nextMessageOrder()): void {
     const chatId = msg.key?.remoteJid;
     if (!chatId || !msg.key) {
       return;
@@ -435,16 +503,36 @@ export class BaileysSessionStore {
     // A received broadcast-list message previews in its sender's chat, where Baileys lists it.
     const key = this.toEngineJid(baileysChatJid(chatId, msg.key.participant, msg.key.fromMe === true));
     const timestamp = this.toUnixSeconds(msg.messageTimestamp);
+    // Recorded either way: the readers skip a message from before the deletion, and a newer one clears it.
+    this.stillDeleted(key, timestamp);
     if (!msg.key.fromMe) {
       const inbound = this.lastInbound.get(key);
-      if (!inbound || inbound.timestamp < timestamp) this.lastInbound.set(key, { key: msg.key, timestamp });
+      if (
+        !inbound ||
+        inbound.timestamp < timestamp ||
+        (inbound.timestamp === timestamp && this.followsOther(msg, order, inbound))
+      ) {
+        this.lastInbound.set(key, { key: msg.key, timestamp, order });
+      }
     }
     const existing = this.lastMessages.get(key);
-    if (existing && existing.timestamp >= timestamp) {
+    if (
+      existing &&
+      (existing.timestamp > timestamp || (existing.timestamp === timestamp && !this.followsOther(msg, order, existing)))
+    ) {
       return; // keep the newest
     }
     const text = msg.message?.conversation ?? msg.message?.extendedTextMessage?.text ?? '';
-    this.lastMessages.set(key, { key: msg.key, timestamp, text, type });
+    this.lastMessages.set(key, { key: msg.key, timestamp, text, type, order });
+  }
+
+  /**
+   * Whether a message sent in the same second as `other` came after it. Timestamps have a resolution of
+   * a second, so two messages of a burst tie; the order they were observed in decides, and a repeat of
+   * the same message (a redelivery) is no later than itself.
+   */
+  private followsOther(msg: WAMessage, order: number, other: { key: WAMessageKey; order: number }): boolean {
+    return !!msg.key.id && other.key.id !== msg.key.id && order > other.order;
   }
 
   /**
@@ -476,8 +564,20 @@ export class BaileysSessionStore {
     return twins.find(k => this.chats.has(k)) ?? twins.find(k => this.lastMessages.has(k)) ?? this.toEngineJid(jid);
   }
 
+  /**
+   * The `<lid>@lid` this session knows for a 1:1 chat or a person, under any spelling of it, or null
+   * when none is known (and always for a group). WhatsApp keys a lid-migrated contact's chat by its lid.
+   */
+  lidOf(jid: string): string | null {
+    for (const twin of this.chatTwins(jid)) {
+      const parsed = parseWaId(twin);
+      if (parsed.kind === 'lid') return `${parsed.userPart}@lid`;
+    }
+    return null;
+  }
+
   /** Every spelling of one chat this session can connect: the id, its engine form, and its lid or phone twin. */
-  private chatTwins(jid: string): string[] {
+  chatTwins(jid: string): string[] {
     const parsed = parseWaId(jid);
     const twins = [jid, this.toEngineJid(jid)];
     if (parsed.kind === 'lid') {
@@ -614,7 +714,8 @@ export class BaileysSessionStore {
           ? userPart(c.id)
           : '';
       const lid = c.lid ? userPart(c.lid) : c.id.endsWith('@lid') ? userPart(c.id) : '';
-      if (phone !== want && lid !== want) continue;
+      // Digits are only comparable within one kind: a lid and a phone number can read the same.
+      if ((parsed.kind === 'user' ? phone : lid) !== want) continue;
       if (c.name) return this.toNeutralContact(c);
       unnamed ??= c;
     }
@@ -639,7 +740,9 @@ export class BaileysSessionStore {
     for (const [key, m] of [...this.lastMessages.entries()]) {
       const id = this.toNeutralJid(key);
       const seen = previews.get(id);
-      if (!seen || m.timestamp > seen.timestamp) previews.set(id, m);
+      if (!seen || m.timestamp > seen.timestamp || (m.timestamp === seen.timestamp && m.order > seen.order)) {
+        previews.set(id, m);
+      }
     }
     const byId = new Map<string, Chat[]>();
     for (const c of [...this.chats.values()]) {
@@ -652,14 +755,14 @@ export class BaileysSessionStore {
       if (!byId.has(id)) byId.set(id, [{ id: key }]);
     }
     // A new engine starts with no chats (see the class comment), but a chat with a persisted state is
-    // known to exist: a deleted chat loses its row. So it is listed before its next message arrives.
+    // known to exist, unless the row marks its deletion. So it is listed before its next message arrives.
     if (this.chatStateStore && this.sessionId) {
       for (const chatId of this.chatStateStore.chatIds(this.sessionId)) {
         const id = this.toNeutralJid(chatId);
         if (!byId.has(id)) byId.set(id, [{ id: chatId }]);
       }
     }
-    return [...byId].map(([id, records]) => this.toNeutralChat(id, records, previews.get(id), lidIndex));
+    return [...byId].flatMap(([id, records]) => this.toNeutralChat(id, records, previews.get(id), lidIndex) ?? []);
   }
 
   /**
@@ -680,7 +783,8 @@ export class BaileysSessionStore {
 
   /** The newest message the chat received (not one this account sent), or null when none is known. */
   lastInboundMessage(chatId: string): { key: WAMessageKey; timestamp: number } | null {
-    return this.newestAcrossTwins(this.lastInbound, chatId) ?? null;
+    const m = this.newestAcrossTwins(this.lastInbound, chatId);
+    return m ? { key: m.key, timestamp: m.timestamp } : null;
   }
 
   /**
@@ -688,11 +792,19 @@ export class BaileysSessionStore {
    * contact's lid before the lid->phone mapping was learned stays on the lid twin while the chat key
    * moves to the phone-keyed chat record, so reading the chat key alone would lose it.
    */
-  private newestAcrossTwins<T extends { timestamp: number }>(map: LruMap<string, T>, chatId: string): T | undefined {
+  private newestAcrossTwins<T extends { timestamp: number; order: number }>(
+    map: LruMap<string, T>,
+    chatId: string,
+  ): T | undefined {
     let newest: T | undefined;
     for (const k of [this.chatKey(chatId), ...this.chatTwins(chatId)]) {
       const v = map.get(k);
-      if (v && (!newest || v.timestamp > newest.timestamp)) newest = v;
+      if (
+        v &&
+        (!newest || v.timestamp > newest.timestamp || (v.timestamp === newest.timestamp && v.order > newest.order))
+      ) {
+        newest = v;
+      }
     }
     return newest;
   }
@@ -798,14 +910,14 @@ export class BaileysSessionStore {
 
   /**
    * Project the records that share neutral `id` (usually one) into a row. `last` is the newest preview
-   * filed under any of their keys.
+   * filed under any of their keys. Null for a chat WhatsApp deleted that no message has re-created since.
    */
   private toNeutralChat(
     id: string,
     records: Chat[],
     last: LastMessage | undefined,
     lidIndex: Map<string, string[]>,
-  ): ChatSummary {
+  ): ChatSummary | null {
     // Chat.id is nullable on Baileys' own type (it's the raw proto.IConversation field), but
     // upsertChats() only ever stores a record under a truthy r.id, so every value in `this.chats`
     // is provably keyed by a real id. Phone-keyed first, then the lower raw id: stable across calls.
@@ -820,6 +932,11 @@ export class BaileysSessionStore {
       records.map(r => r.id!),
       lidIndex,
     );
+    // Only a message newer than the deletion re-creates the chat: a record without one is a state update,
+    // and a message sent before it, delivered late, is the deleted chat's.
+    const active = () =>
+      Math.max(last?.timestamp ?? 0, ...records.map(r => this.toUnixSeconds(r.conversationTimestamp)));
+    if (st?.deletedAt && active() * 1000 <= st.deletedAt) return null;
     return {
       id,
       name: c.name ?? others.find(o => o.name)?.name ?? this.resolveContactName(rawId),
@@ -931,7 +1048,7 @@ export class BaileysSessionStore {
    * are folded onto the state key on the chat's next change (see {@link persistChatState}). `recordIds`
    * are the raw ids of every chat record merged into the row, whose lids are twins too.
    */
-  private chatState(rawId: string, recordIds: string[], lidIndex: Map<string, string[]>): ChatStateValue | undefined {
+  private chatState(rawId: string, recordIds: string[], lidIndex?: Map<string, string[]>): ChatStateValue | undefined {
     const store = this.chatStateStore;
     const sid = this.sessionId;
     if (!store || !sid) return undefined;

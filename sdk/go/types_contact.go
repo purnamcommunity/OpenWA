@@ -37,7 +37,7 @@ type ProfilePictureResponse struct {
 }
 
 // ProfilePicturesResponse is a batch profile-picture lookup: a map of contact
-// id → picture URL (null when the lookup failed).
+// id → picture URL (null when the lookup failed). An id skipped after a lookup timed out is absent from the map; ask for it again.
 type ProfilePicturesResponse struct {
 	Pictures map[string]*string `json:"pictures"`
 }

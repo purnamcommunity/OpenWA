@@ -32,6 +32,10 @@ export const BULK_RECIPIENTS_FILE_MAX_BYTES = 2 * 1024 * 1024;
  */
 const FIELD_SEPARATORS = /[,;\t\u060C\u061B]/;
 
+// A quote at the edge of a field is the CSV quoting of a cell, never part of a chat id: `"123@g.us"` is the chat id
+// 123@g.us. Quotes are not tracked across fields or lines, so one that never closes cannot swallow what follows it.
+const stripEdgeQuotes = (field: string): string => field.replace(/^"/, '').replace(/"$/, '').trim();
+
 /**
  * Fewest digits a bare number may carry to be treated as a phone number, matching the bound the
  * gateway and the session form already enforce (`/^[0-9]{6,15}$/`).
@@ -60,7 +64,8 @@ export function parseBulkRecipients(text: string): string[] {
       const field = rawField.trim();
       if (!field) continue;
       if (field.includes('@')) {
-        if (CHAT_ID.test(field)) seen.add(field);
+        const id = stripEdgeQuotes(field);
+        if (CHAT_ID.test(id)) seen.add(id);
         continue;
       }
       const digits = field.replace(/[^0-9]/g, '');

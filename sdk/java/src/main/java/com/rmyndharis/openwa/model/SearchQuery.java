@@ -13,6 +13,7 @@ package com.rmyndharis.openwa.model;
  */
 public record SearchQuery(
     String q,
+    SearchMatch match,
     String sessionId,
     String chatId,
     MessageDirection direction,
@@ -22,12 +23,28 @@ public record SearchQuery(
     Long dateTo,
     Integer limit,
     Integer offset) {
+    /** Back-compatible constructor without a match mode, the server's default (word). */
+    public SearchQuery(
+        String q,
+        String sessionId,
+        String chatId,
+        MessageDirection direction,
+        String type,
+        String from,
+        Long dateFrom,
+        Long dateTo,
+        Integer limit,
+        Integer offset) {
+        this(q, null, sessionId, chatId, direction, type, from, dateFrom, dateTo, limit, offset);
+    }
+
     public static Builder builder() {
         return new Builder();
     }
 
     public static final class Builder {
         private String q;
+        private SearchMatch match;
         private String sessionId;
         private String chatId;
         private MessageDirection direction;
@@ -39,11 +56,17 @@ public record SearchQuery(
         private Integer offset;
 
         /**
-         * Required. The search term; must be non-empty at {@link #build()} time. At most 1000
+         * Required. The search resource rejects a null or blank term before dispatch. At most 1000
          * characters and 32 words; the server answers 400 above either.
          */
         public Builder q(String v) {
             this.q = v;
+            return this;
+        }
+
+        /** Match mode; the server defaults to {@link SearchMatch#WORD} when omitted. */
+        public Builder match(SearchMatch v) {
+            this.match = v;
             return this;
         }
 
@@ -93,7 +116,7 @@ public record SearchQuery(
         }
 
         public SearchQuery build() {
-            return new SearchQuery(q, sessionId, chatId, direction, type, from, dateFrom, dateTo, limit, offset);
+            return new SearchQuery(q, match, sessionId, chatId, direction, type, from, dateFrom, dateTo, limit, offset);
         }
     }
 }

@@ -1,6 +1,6 @@
 # rmyndharis-openwa
 
-This document describes SDK 0.7.0. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later.
+This document describes SDK 0.7.0. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
 
 Official Python SDK for [OpenWA](https://github.com/rmyndharis/OpenWA), the open-source WhatsApp API Gateway. OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or Meta.
 
@@ -55,8 +55,10 @@ client = OpenWAClient(base_url="…", api_key="…", transport=httpx.MockTranspo
 ## Search
 
 `GET /search` is wrapped as `client.search.search(params)`. Only `q` is required;
-the rest (`sessionId`, `chatId`, `direction`, `type`, `from`, `dateFrom`,
+the rest (`match`, `sessionId`, `chatId`, `direction`, `type`, `from`, `dateFrom`,
 `dateTo`, `limit`, `offset`) are optional. `dateFrom` / `dateTo` are epoch-ms.
+`match` is `word` (the default) or `contains`, which the server answers with 501
+unless it sets `SEARCH_CONTAINS_ENABLED=true`.
 The active search provider (built-in DB full-text, or a plugin) answers; if none
 is configured the server returns 501.
 
@@ -174,10 +176,6 @@ Cutting a release:
 3. The workflow re-runs the test suite, builds the sdist and wheel, and
    uploads. The artifacts published are the ones those tests passed against.
 
-## License
-
-MIT
-
 ## Send idempotency
 
 The example below requires SDK 0.6.0 or later and OpenWA 0.25.0 or later. SDK 0.5.1 does not expose this per-send key argument.
@@ -189,3 +187,7 @@ client.messages.send_text(session_id, {"chatId": "628123@c.us", "text": "Hello"}
 ```
 
 The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply and forward sends. Completed calls replay their response; a 409 with the error `code` `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (the `code` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk, product and button operations have no such guarantee. Omit the key to preserve existing behavior.
+
+## License
+
+MIT

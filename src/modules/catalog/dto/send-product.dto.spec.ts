@@ -19,7 +19,7 @@ describe('SendProductDto', () => {
   });
 
   it('rejects an empty chatId or productId', async () => {
-    expect(await failures({ ...valid, chatId: '' })).toEqual({ chatId: ['isNotEmpty'] });
+    expect(await failures({ ...valid, chatId: '' })).toEqual({ chatId: ['matches', 'isNotEmpty'] });
     expect(await failures({ ...valid, productId: '' })).toEqual({ productId: ['isNotEmpty'] });
   });
 

@@ -467,14 +467,16 @@ code {
   background-position: left 0.75rem center;
 }
 
-/* Glyphs that point along the reading direction flip with it. The sidebar chevron is swapped in
-   Layout.tsx instead, so it is not listed here. */
+/* Glyphs that point along the reading direction flip with it, and so does the chat page's contact panel toggle,
+   whose panel opens on the inline end. The sidebar's panel icons are swapped in Layout.tsx instead, so they are not
+   listed here. */
 [dir='rtl'] .lucide-arrow-left,
 [dir='rtl'] .lucide-arrow-right,
 [dir='rtl'] .lucide-corner-up-left,
 [dir='rtl'] .lucide-corner-up-right,
 [dir='rtl'] .lucide-log-in,
 [dir='rtl'] .lucide-log-out,
+[dir='rtl'] .lucide-panel-right,
 [dir='rtl'] .lucide-send {
   transform: scaleX(-1);
 }

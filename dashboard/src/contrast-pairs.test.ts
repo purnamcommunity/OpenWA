@@ -7,7 +7,8 @@ import ts from 'typescript';
 
 // The brand green (#25d366) and the amber warning fill are light colours: white on them is 1.98:1 and 2.15:1,
 // far under the 4.5:1 AA needs, and the green as text on white is the same 1.98:1. Text and icons on those fills are
-// dark (#0f172a, 9.0:1 on the green, as .btn-primary has it), and the brand green as text is --primary-text.
+// dark (#0f172a, 9.0:1 on the green, as .btn-primary has it), and the brand green as text is --primary-text. The chat
+// page's accent (#00a884, 3.03:1 against white either way) follows the same rule, with --chat-accent-text as its text.
 
 const SRC = dirname(fileURLToPath(import.meta.url));
 
@@ -39,13 +40,34 @@ function rules(): Rule[] {
 const WHITE = /^(?:#fff|#ffffff|white)$/i;
 // Solid fills only: a translucent tint (rgba, color-mix) is a different pair and is checked by its own ratio.
 const LIGHT_FILL =
-  /^(?:var\(--primary(?:-hover)?(?:,[^)]*)?\)|var\(--warning(?:,[^)]*)?\)|#25d366|#1da851|#16a34a|#f59e0b|#d97706)$/i;
+  /^(?:var\(--(?:primary|chat-accent)(?:-hover)?(?:,[^)]*)?\)|var\(--warning(?:,[^)]*)?\)|#25d366|#1da851|#16a34a|#f59e0b|#d97706|#00a884|#008f6f)$/i;
+
+// A gradient is a light fill when one of its stops is: `linear-gradient(135deg, #5fd17b, var(--chat-accent))`.
+function fillStops(r: Rule): string[] {
+  const fill = r.decl.background ?? r.decl['background-color'] ?? '';
+  const gradient = /^linear-gradient\((.*)\)$/.exec(fill);
+  return gradient ? (gradient[1].match(/(?:[^,(]|\([^)]*\))+/g) ?? []).map(stop => stop.trim().split(' ')[0]) : [fill];
+}
+
+// The colour a selector draws in: its own rule's, else the one of the rule it refines, so a state rule that only paints
+// the fill (`.select-check.checked`) is paired with the white its base rule (`.select-check`) sets.
+function colourOf(all: Rule[], selector: string): string {
+  let at = selector;
+  while (at && !/\s$/.test(at)) {
+    const colour = all.find(r => r.selectors.split(/,\s*/).includes(at) && r.decl.color)?.decl.color;
+    if (colour) return colour;
+    const base = at.replace(/(?:\.[\w-]+|:[\w-]+(?:\([^)]*\))?)$/, '');
+    if (base === at) break;
+    at = base;
+  }
+  return '';
+}
 
 test('no rule sets white text on the brand green or amber fill', () => {
-  const offenders = rules()
-    .filter(
-      r => WHITE.test(r.decl.color ?? '') && LIGHT_FILL.test(r.decl.background ?? r.decl['background-color'] ?? ''),
-    )
+  const all = rules();
+  const offenders = all
+    .filter(r => fillStops(r).some(stop => LIGHT_FILL.test(stop)))
+    .filter(r => r.selectors.split(/,\s*/).some(selector => WHITE.test(colourOf(all, selector))))
     .map(r => `${r.at}: ${r.selectors}`);
   assert.deepEqual(offenders, []);
 });
@@ -90,13 +112,15 @@ test('the inline scan sees white on a light fill and leaves dark text alone', ()
 
 test('the brand green is never used as a text colour', () => {
   const css = rules()
-    .filter(r => /^(?:var\(--primary(?:,[^)]*)?\)|#25d366)$/i.test(r.decl.color ?? ''))
+    .filter(r => /^(?:var\(--(?:primary|chat-accent)(?:,[^)]*)?\)|#25d366|#00a884)$/i.test(r.decl.color ?? ''))
     .map(r => `${r.at}: ${r.selectors}`);
   const inline = filesUnder(SRC, ['.tsx']).flatMap(full =>
     readFileSync(full, 'utf8')
       .split('\n')
       .map((line, i) => ({ line, at: `${full.slice(SRC.length + 1)}:${i + 1}` }))
-      .filter(({ line }) => /(?<![\w-])color:\s*['"](?:var\(--primary\)|#25d366)['"]/.test(line))
+      .filter(({ line }) =>
+        /(?<![\w-])color:\s*['"](?:var\(--(?:primary|chat-accent)\)|#25d366|#00a884)['"]/.test(line),
+      )
       .map(({ at }) => at),
   );
   assert.deepEqual([...css, ...inline], []);

@@ -9,6 +9,7 @@ import { Message, MessageDirection, MessageStatus } from '../message/entities/me
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { KeyedMutationQueue } from '../../common/utils/keyed-mutation-queue';
 import { awaitNoOpenTransaction } from '../../common/utils/shared-connection';
+import { captureSessionWrites } from '../../common/utils/session-write-scope';
 import { SessionLidResolver } from './session-lid-resolver.service';
 import { buildMessageMetadata, REVOKED_ROW_PATCH, storableWaMessageId } from './message-row.mapper';
 import { MessageMutationProjector } from './message-mutation-projector';
@@ -632,6 +633,9 @@ export class MessageProjector {
 
   /** Record a message as not yet written; a re-fire of the same id keeps the changes recorded so far. */
   private trackInFlight(key: string, message: InboundMessageData): InFlightEntry {
+    // A message whose id the engine could not read is registered under no key: the empty id would be shared by
+    // every such message, and a revoke or ack that names no message would reach all of them.
+    if (!message.id) return { ref: refOf(message) };
     const inFlight = this.inboundInFlight.get(key) ?? {
       // The first delivery of an id says whose message it is: a repeat sent from another chat must not
       // take that over from it, or a change aimed through the repeat would be judged by the wrong rule.
@@ -749,7 +753,9 @@ export class MessageProjector {
           // The ingest awaited; a stop()/delete() can retire this engine mid-flight — don't
           // dispatch for a session that no longer exists (mirrors message.received's re-check).
           if (!this.engines.isLive(id, engine)) return;
-          if (created) this.dispatchStatusReceived(id, row);
+          // One that expired while the ingest ran (a slow media write) is gone from every read: announcing it
+          // would point a consumer at a status the API no longer serves.
+          if (created && row.expiresAt > Date.now()) this.dispatchStatusReceived(id, row);
         })
         .catch(err =>
           this.logger.warn('Status ingest failed', {
@@ -952,7 +958,12 @@ export class MessageProjector {
   ): Promise<InsertOutcome> {
     const label = `Failed to save ${direction} message ${dbMessage.waMessageId} to database`;
     const insert = async (): Promise<InsertOutcome> => {
-      const result = await this.messageRepository.insert(dbMessage as unknown as QueryDeepPartialEntity<Message>);
+      // Registered with the session's write scope, so a delete drains an insert already under way before it
+      // removes the session's rows; the row has no foreign key to refuse one that lands afterwards.
+      const writes = captureSessionWrites(this.messageRepository.manager?.connection ?? this.messageRepository, id);
+      const result = await writes
+        .write(() => this.messageRepository.insert(dbMessage as unknown as QueryDeepPartialEntity<Message>))
+        .finally(() => writes.close());
       // `insert()` (not `save()`) does NOT merge DB-generated columns (@PrimaryGeneratedColumn,
       // @CreateDateColumn) back onto the entity instance — so merge them explicitly here, before
       // the `message:persisted` emit. `identifiers[0]` always carries the PK on both SQLite and

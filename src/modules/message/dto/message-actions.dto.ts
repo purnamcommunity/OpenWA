@@ -12,10 +12,13 @@ import {
   MaxLength,
   IsIn,
   Validate,
+  Matches,
 } from 'class-validator';
 import { ToStrictArray, ToStrictBoolean, ToStrictNumber, ToStrictString } from '../../../common/utils/strict-boolean';
 import {
   CHAT_ID_MAX_LENGTH,
+  CHAT_JID_MESSAGE,
+  CHAT_JID_PATTERN,
   MENTIONS_DESCRIPTION,
   MENTIONS_MAX,
   MENTION_WID_MAX_LENGTH,
@@ -45,6 +48,7 @@ export class SendLocationDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty({ example: -6.2088 })
@@ -85,6 +89,7 @@ export class SendContactDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty({ maxLength: CONTACT_NAME_MAX_LENGTH })
@@ -115,6 +120,7 @@ export class SendPollDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty({ description: 'Poll question / title', maxLength: 255, example: 'Where should we meet?' })
@@ -166,6 +172,7 @@ export class ReplyMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty()
@@ -205,6 +212,7 @@ export class ForwardMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   fromChatId!: string;
 
   @ApiProperty({ maxLength: CHAT_ID_MAX_LENGTH })
@@ -212,6 +220,7 @@ export class ForwardMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   toChatId!: string;
 
   @ApiProperty()
@@ -227,6 +236,7 @@ export class ReactMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty()
@@ -252,6 +262,7 @@ export class DeleteMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty()
@@ -284,6 +295,7 @@ export class PinMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty()
@@ -333,6 +345,7 @@ export class VotePollDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty({ description: 'The poll creation message to vote on.' })
@@ -361,6 +374,7 @@ export class ClickButtonDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty({ description: 'WhatsApp id of the business prompt message that offered the buttons.' })
@@ -400,6 +414,7 @@ export class StarMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty()
@@ -422,6 +437,7 @@ export class UnpinMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty()
@@ -437,6 +453,7 @@ export class EditMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty()

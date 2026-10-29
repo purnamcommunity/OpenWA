@@ -56,6 +56,8 @@ export class DockerService implements OnModuleInit {
   private readonly logger = createLogger(DockerService.name);
   private docker: Docker | null = null;
   private isAvailable = false;
+  /** Whether a daemon has ever answered, so a later loss is a reconnect and not a deployment without Docker. */
+  private hasConnected = false;
   private reinitInFlight = false;
   /** Visible for testing. */
   callTimeoutMs = DOCKER_CALL_TIMEOUT_MS;
@@ -152,6 +154,7 @@ export class DockerService implements OnModuleInit {
       this.docker = new Docker(this.buildDockerOptions());
       await this.answered(abortSignal => this.abortable<unknown>('ping', abortSignal), 'a ping');
       this.isAvailable = true;
+      this.hasConnected = true;
       this.logger.log('Docker API connected successfully');
     } catch (error) {
       this.logger.warn('Docker not available. Container orchestration disabled.', {
@@ -180,25 +183,30 @@ export class DockerService implements OnModuleInit {
    * (DOCKER_HOST=tcp://...), the proxy container may not be accepting connections at
    * the moment onModuleInit runs (compose `service_started` doesn't wait for readiness).
    * If the first connect failed, retry it once in the background here so orchestration
-   * recovers without a process restart. Only for the DOCKER_HOST (proxy/tcp) case — a
-   * socket-based or docker-less deployment has no such race.
+   * recovers without a process restart. Only for the DOCKER_HOST (proxy/tcp) case or a daemon
+   * that answered before: a docker-less deployment has no such race. Built-in services the boot
+   * skipped while Docker was unreachable are started once it answers.
    */
   isDockerAvailable(): boolean {
-    if (!this.isAvailable && !this.reinitInFlight && process.env.DOCKER_HOST) {
+    if (!this.isAvailable && !this.reinitInFlight && (process.env.DOCKER_HOST || this.hasConnected)) {
       this.reinitInFlight = true;
-      void this.initializeDocker().finally(() => {
-        this.reinitInFlight = false;
-      });
+      void this.initializeDocker()
+        .then(() => this.bootstrapOrchestration())
+        .catch(error => this.logger.warn('Could not start built-in services after Docker recovery', String(error)))
+        .finally(() => {
+          this.reinitInFlight = false;
+        });
     }
     return this.isAvailable;
   }
 
   /**
-   * List all OpenWA-related containers
+   * List all OpenWA-related containers, or null when the daemon could not be asked: an empty list
+   * means it was asked and none exist, which callers act on.
    */
-  async listContainers(): Promise<ContainerInfo[]> {
+  async listContainers(): Promise<ContainerInfo[] | null> {
     if (!this.docker || !this.isAvailable) {
-      return [];
+      return null;
     }
 
     try {
@@ -221,7 +229,8 @@ export class DockerService implements OnModuleInit {
         }));
     } catch (error) {
       this.logger.error('Failed to list containers', error);
-      return [];
+      this.isAvailable = false;
+      return null;
     }
   }
 
@@ -230,10 +239,14 @@ export class DockerService implements OnModuleInit {
    * `com.openwa.service` label (`database` | `cache` | `storage`), and who created each: `'compose'` for one
    * Docker Compose created (it carries Compose's project label and belongs to the deployment), `'openwa'` for
    * one createService made. Lets the dashboard show the real built-in state instead of the saved intent. All
-   * false when Docker is unavailable or none run.
+   * false when none run; null when Docker could not be observed.
    */
-  async getRunningBuiltinServices(): Promise<Record<'database' | 'cache' | 'storage', false | 'compose' | 'openwa'>> {
+  async getRunningBuiltinServices(): Promise<Record<
+    'database' | 'cache' | 'storage',
+    false | 'compose' | 'openwa'
+  > | null> {
     const containers = await this.listContainers();
+    if (containers === null) return null;
     const creator = (svc: string): false | 'compose' | 'openwa' => {
       const running = containers.find(
         c =>
@@ -433,7 +446,7 @@ export class DockerService implements OnModuleInit {
       // Check if container already exists
       const existing = await this.getContainerByService(profile);
       if (existing) {
-        const info = await existing.inspect();
+        const info = await this.answered(abortSignal => existing.inspect({ abortSignal }), 'a container inspection');
         this.warnOnImageDrift(profile, spec.name, info);
         if (info.State.Running) {
           this.logger.log(`Container ${spec.name} already running`);
@@ -448,14 +461,26 @@ export class DockerService implements OnModuleInit {
       // Pull only when the image is not already on the host, as compose's default
       // `pull_policy: missing` does: a host that has the image keeps working when the registry is
       // unreachable or has withdrawn it. As with compose, a cached floating tag is not refreshed
-      // here. Any inspect failure falls back to pulling.
-      const cached = await this.docker
-        .getImage(spec.image)
-        .inspect()
-        .then(
-          () => true,
-          () => false,
-        );
+      // here. Only an answer that the image is absent pulls: a daemon that fails or does not answer the
+      // inspection could not complete a pull either, and the pull itself is not bounded.
+      const cached = await this.answered(abortSignal => {
+        const image = Object.create(this.docker!.getImage(spec.image)) as Docker.Image;
+        const modem = this.docker!.modem;
+        // Dockerode 5 leaves the signal out of an image inspection; forward it without changing the shared modem.
+        const imageModem = Object.create(modem) as Docker['modem'];
+        image.modem = imageModem;
+        imageModem.dial = (
+          options: Parameters<Docker['modem']['dial']>[0],
+          callback: Parameters<Docker['modem']['dial']>[1],
+        ) => modem.dial({ ...options, abortSignal }, callback);
+        return image.inspect({ abortSignal } as Docker.ImageInspectOptions);
+      }, 'an image inspection').then(
+        () => true,
+        (error: unknown) => {
+          if ((error as { statusCode?: number } | null)?.statusCode !== 404) throw error;
+          return false;
+        },
+      );
       if (!cached) {
         this.logger.log(`Pulling image: ${spec.image}`);
         await new Promise<void>((resolve, reject) => {
@@ -547,7 +572,7 @@ export class DockerService implements OnModuleInit {
     }
 
     try {
-      const info = await container.inspect();
+      const info = await this.answered(abortSignal => container.inspect({ abortSignal }), 'a container inspection');
       this.warnOnImageDrift(profile, info.Name?.replace(/^\//, '') || service, info);
       if (info.State.Running) {
         this.logger.log(`Service '${service}' is already running`);
@@ -624,7 +649,7 @@ export class DockerService implements OnModuleInit {
     }
 
     try {
-      const info = await container.inspect();
+      const info = await this.answered(abortSignal => container.inspect({ abortSignal }), 'a container inspection');
       if (!info.State.Running) {
         this.logger.log(`Service '${service}' is already stopped`);
         return true;

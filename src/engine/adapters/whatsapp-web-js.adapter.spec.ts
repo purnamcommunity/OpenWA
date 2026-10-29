@@ -1308,6 +1308,16 @@ describe('WhatsAppWebJsAdapter channels (#625 — wwebjs Client has no getChanne
     expect(result).toEqual([{ id: 'M1', body: 'hello', timestamp: 1700000000, hasMedia: false }]);
   });
 
+  it('getChannelMessages finds a channel whose id carries only the renamed `$1` field, as getChannelById does', async () => {
+    const fetchMessages = jest.fn().mockResolvedValue([]);
+    const getChannels = jest.fn().mockResolvedValue([{ id: { $1: CHANNEL }, name: 'News', fetchMessages }]);
+    const adapter = readyAdapter({ getChannels });
+
+    await expect(adapter.getChannelById(CHANNEL)).resolves.toMatchObject({ id: CHANNEL });
+    await expect(adapter.getChannelMessages(CHANNEL, 10)).resolves.toEqual([]);
+    expect(fetchMessages).toHaveBeenCalledWith({ limit: 10 });
+  });
+
   it('getChannelMessages surfaces a not-found channel as ChannelNotFoundError (→ 404), not a silent []', async () => {
     const getChannels = jest
       .fn()
@@ -4027,6 +4037,116 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
   });
 });
 
+describe('WhatsAppWebJsAdapter vote_update (poll.vote)', () => {
+  const wireVoteHandler = (): { onPollVote: jest.Mock; client: EventEmitter } => {
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-vote-test',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { _serialized: 'me@c.us', user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    const onPollVote = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onPollVote };
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
+    return { onPollVote, client };
+  };
+
+  // The shape `PollVote` builds: `voter` and `parentMsgKey` are raw page-context Wids, and
+  // `parentMessage` a Message built from the poll creation message (or from nothing).
+  const ownPoll = {
+    id: { _serialized: 'true_peer@c.us_POLL1' },
+    from: 'me@c.us',
+    to: 'peer@c.us',
+    fromMe: true,
+    pollName: 'Did you finish the report?',
+  };
+  const vote = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    voter: { _serialized: 'peer@c.us' },
+    selectedOptions: [{ name: 'Done', localId: 0 }],
+    interractedAtTs: 1786000000123,
+    parentMessage: ownPoll,
+    parentMsgKey: { _serialized: 'true_peer@c.us_POLL1', remote: { _serialized: 'peer@c.us' } },
+    ...overrides,
+  });
+
+  it('maps a vote on a poll the account sent to the neutral event', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    client.emit('vote_update', vote());
+
+    expect(onPollVote).toHaveBeenCalledWith({
+      pollMessageId: 'true_peer@c.us_POLL1',
+      chatId: 'peer@c.us',
+      voterId: 'peer@c.us',
+      selectedOptions: ['Done'],
+      pollName: 'Did you finish the report?',
+      timestamp: 1786000000,
+      timestampMs: 1786000000123,
+    });
+  });
+
+  it('takes the chat from the sender of a poll the account received in a group', () => {
+    const { onPollVote, client } = wireVoteHandler();
+    const groupPoll = { ...ownPoll, from: '120363000000000001@g.us', to: 'me@c.us', fromMe: false };
+
+    client.emit('vote_update', vote({ parentMessage: groupPoll, voter: { _serialized: 'member@lid' } }));
+
+    expect(onPollVote).toHaveBeenCalledWith(
+      expect.objectContaining({ chatId: '120363000000000001@g.us', voterId: 'member@lid' }),
+    );
+  });
+
+  it('reports a cleared vote as an empty selection', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    client.emit('vote_update', vote({ selectedOptions: [] }));
+
+    expect(onPollVote).toHaveBeenCalledWith(expect.objectContaining({ selectedOptions: [] }));
+  });
+
+  it('falls back to the poll key for a cleared vote when WhatsApp Web no longer holds the poll', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    // Without the creation message, PollVote builds an empty Message from the poll key alone.
+    client.emit('vote_update', vote({ parentMessage: {}, selectedOptions: [], voter: { $1: 'peer@c.us' } }));
+
+    const event = (onPollVote.mock.calls as Array<[Record<string, unknown>]>)[0][0];
+    expect(event).toEqual({
+      pollMessageId: 'true_peer@c.us_POLL1',
+      chatId: 'peer@c.us',
+      voterId: 'peer@c.us',
+      selectedOptions: [],
+      timestamp: 1786000000,
+      timestampMs: 1786000000123,
+    });
+    expect(event).not.toHaveProperty('pollName');
+  });
+
+  it('skips a vote whose options WhatsApp Web cannot name, rather than reporting it as a cleared vote', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    // Without the creation message PollVote keeps only local option ids, so the choice is unknown.
+    client.emit(
+      'vote_update',
+      vote({ parentMessage: {}, selectedOptions: [{ name: undefined, localId: 1 }], voter: { $1: 'peer@c.us' } }),
+    );
+
+    expect(onPollVote).not.toHaveBeenCalled();
+  });
+
+  it('logs and drops a malformed vote instead of throwing into the client', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    expect(() => client.emit('vote_update', null)).not.toThrow();
+    expect(onPollVote).not.toHaveBeenCalled();
+  });
+});
+
 describe('WhatsAppWebJsAdapter message_reaction (id resolution across WA Web builds)', () => {
   const wireReactionHandler = (): { onMessageReaction: jest.Mock; client: EventEmitter } => {
     const adapter = new WhatsAppWebJsAdapter({
@@ -5743,6 +5863,50 @@ describe('LID mapping persistence to LidMappingStore (#583 R3)', () => {
       readyWithStore({ getNumberId, sendMessage }, makeStore(remember)).sendTextMessage('529934031058@c.us', 'hi'),
     ).resolves.toBeDefined();
   });
+
+  it.each(['resolves false', 'rejects'])(
+    'reports the pair again with the next send when the mapping write %s, without probing again',
+    async failure => {
+      const remember = jest.fn().mockResolvedValue(true);
+      if (failure === 'rejects') remember.mockRejectedValueOnce(new Error('db down'));
+      else remember.mockResolvedValueOnce(false);
+      const getNumberId = jest.fn().mockResolvedValue({ _serialized: '555000111@lid' });
+      const sendMessage = jest.fn<Promise<typeof sentMessage>, [string, ...unknown[]]>().mockResolvedValue(sentMessage);
+      const adapter = readyWithStore({ getNumberId, sendMessage }, makeStore(remember));
+
+      await adapter.sendTextMessage('628111@c.us', 'first');
+      await adapter.sendTextMessage('628111@c.us', 'second');
+      await adapter.sendTextMessage('628111@c.us', 'third');
+
+      expect(getNumberId).toHaveBeenCalledTimes(1);
+      expect(remember).toHaveBeenCalledTimes(2);
+      expect(remember).toHaveBeenNthCalledWith(2, '555000111', '628111', 's1');
+      expect(sendMessage.mock.calls.map(call => call[0])).toEqual(['555000111@lid', '555000111@lid', '555000111@lid']);
+    },
+  );
+
+  it('does not report a newer resolution again when an older mapping write fails late', async () => {
+    let settleOlder!: (stored: boolean) => void;
+    const getNumberId = jest
+      .fn()
+      .mockResolvedValueOnce({ _serialized: '555000111@lid' })
+      .mockResolvedValueOnce({ _serialized: '555000222@lid' });
+    const remember = jest
+      .fn()
+      .mockReturnValueOnce(new Promise<boolean>(resolve => (settleOlder = resolve)))
+      .mockResolvedValue(true);
+    const sendMessage = jest.fn<Promise<typeof sentMessage>, [string, ...unknown[]]>().mockResolvedValue(sentMessage);
+    const adapter = readyWithStore({ getNumberId, sendMessage }, makeStore(remember));
+
+    await Promise.all([adapter.sendTextMessage('628111@c.us', 'a'), adapter.sendTextMessage('628111@c.us', 'b')]);
+    settleOlder(false);
+    await new Promise(resolve => setImmediate(resolve));
+    await adapter.sendTextMessage('628111@c.us', 'c');
+
+    expect(getNumberId).toHaveBeenCalledTimes(2);
+    expect(remember).toHaveBeenCalledTimes(2);
+    expect(sendMessage.mock.calls[2][0]).toBe('555000222@lid');
+  });
 });
 
 describe('extractWwebjsCall (call_log → { video, missed }, salvaged from #494)', () => {
@@ -6894,6 +7058,53 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
     await expect(adapter.probeLiveness()).resolves.toBe(true);
   });
 
+  it.each([false, true])('keeps a newer navigation after an older probe settles; previous=%s', async previous => {
+    jest.useFakeTimers();
+    const { adapter, client } = wireAdapter();
+    if (previous) client.pupPage.emit('framenavigated', navFrame());
+    let resolve!: (state: WAState) => void;
+    client.getState.mockReturnValueOnce(
+      new Promise<WAState>(done => {
+        resolve = done;
+      }),
+    );
+    const probe = adapter.probeLiveness();
+    client.pupPage.emit('framenavigated', navFrame());
+    resolve(WAState.CONNECTED);
+    await expect(probe).resolves.toBe(true);
+    await expect(adapter.getChats()).rejects.toBeInstanceOf(EngineNotReadyError);
+  });
+
+  it('keeps a newer recovery episode when overlapping probes settle out of order', async () => {
+    jest.useFakeTimers();
+    const { adapter, client } = wireAdapter();
+    let first!: (state: WAState) => void;
+    let second!: (state: WAState) => void;
+    client.getState
+      .mockReturnValueOnce(
+        new Promise<WAState>(done => {
+          first = done;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<WAState>(done => {
+          second = done;
+        }),
+      );
+    const older = adapter.probeLiveness();
+    client.pupPage.emit('framenavigated', navFrame());
+    const current = adapter.probeLiveness();
+    second(WAState.CONNECTED);
+    await expect(current).resolves.toBe(true);
+    const lifecycle = (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle;
+    expect(lifecycle.isInNavigationReinjectWindow()).toBe(false);
+    client.pupPage.emit('framenavigated', navFrame());
+    first(WAState.CONNECTED);
+    await expect(older).resolves.toBe(true);
+    expect(lifecycle.isInNavigationReinjectWindow()).toBe(true);
+    await expect(adapter.getChats()).rejects.toBeInstanceOf(EngineNotReadyError);
+  });
+
   it('does not report a transport-matching error as death inside the window (in-flight race)', () => {
     const { adapter, client } = wireAdapter();
     const report = (adapter as unknown as { reportIfPageTransportError: (e: unknown, c: string) => void })
@@ -7967,6 +8178,16 @@ describe('WhatsAppWebJsAdapter group join + settings + own profile', () => {
     it('rejects with EngineNotSupportedError (501)', async () => {
       const err = await readyAdapter({})
         .setGroupEphemeral('g@g.us', 86400)
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EngineNotSupportedError);
+      expect((err as EngineNotSupportedError).getStatus()).toBe(501);
+    });
+  });
+
+  describe('setGroupMemberLabel (no wwjs 1.34.7 API → honest 501)', () => {
+    it('rejects with EngineNotSupportedError (501)', async () => {
+      const err = await readyAdapter({})
+        .setGroupMemberLabel('g@g.us', 'Site A')
         .catch((e: unknown) => e);
       expect(err).toBeInstanceOf(EngineNotSupportedError);
       expect((err as EngineNotSupportedError).getStatus()).toBe(501);

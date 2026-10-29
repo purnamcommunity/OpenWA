@@ -128,6 +128,8 @@ export interface ChatStateRow {
   pinned: boolean | number;
   // Absent from an archive taken before the column existed; null reads as its set fields observed.
   observed?: string | null;
+  // Epoch ms WhatsApp deleted the chat; absent from an archive taken before the column existed.
+  deletedAt?: number | null;
   updatedAt: string;
 }
 

@@ -34,6 +34,7 @@ function withListRead<T extends object>(qb: T, repository: Partial<Repository<Me
     select: jest.fn().mockReturnValue(qb),
     addSelect: jest.fn().mockReturnValue(qb),
     clone: jest.fn().mockReturnValue(qb),
+    getMany: jest.fn().mockImplementation(() => Promise.resolve(rows())),
     getCount: jest.fn().mockImplementation(() => Promise.resolve(rows().length)),
     getRawMany: jest
       .fn()
@@ -267,7 +268,7 @@ describe('MessageService', () => {
 
       const result = await service.getMessages('sess-1', { after: 'm-1', offset: 500 });
 
-      expect(qb.skip).not.toHaveBeenCalled();
+      expect(qb.skip.mock.calls.every(([value]) => value === undefined)).toBe(true);
       const [clause, params] = qb.andWhere.mock.calls[0] as [string, Record<string, unknown>];
       // rowid, not id: the stub repository carries no manager, which reads as "not postgres".
       expect(clause).toContain('(message.createdAt, message.rowid) <');

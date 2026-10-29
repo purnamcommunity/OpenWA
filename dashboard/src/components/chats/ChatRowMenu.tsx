@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChevronDown } from 'lucide-react';
 import type { Chat } from '../../services/api';
+import { chatTitle } from '../../utils/formatPhone';
 import { chatActionItems, type ChatActionItem, type ChatRowActions } from './chatActionItems';
 
 /**
@@ -143,7 +144,7 @@ function ChatRowMenu({ chat, actions }: { chat: Chat; actions: ChatRowActions })
           setOpen(value => !value);
         }}
         aria-expanded={open}
-        aria-label={t('chats.rowActions.actionsFor', { name: chat.name || chat.id.split('@')[0] })}
+        aria-label={t('chats.rowActions.actionsFor', { name: chatTitle(chat) })}
         title={t('chats.moreActions')}
       >
         <ChevronDown size={18} />

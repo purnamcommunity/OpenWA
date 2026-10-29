@@ -11,6 +11,7 @@ import { AuditAction } from '../audit/entities/audit-log.entity';
 import { SUBSCRIBABLE_EVENTS, buildRoomName } from './dto/ws-messages.dto';
 import type { WSClientMessage, WSErrorResponse, WSSubscribedResponse, WSEventMessage } from './dto/ws-messages.dto';
 import { WEBHOOK_RESERVED_EVENTS } from '../webhook/dto/webhook.dto';
+import { SlidingWindowLimiter } from './ws-rate-limit';
 
 describe('isSessionSubscriptionAllowed (WS session-scope enforcement)', () => {
   it('allows an unrestricted key (null allowedSessions) to subscribe to anything, including *', () => {
@@ -491,6 +492,76 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
 
     expect(res.code).toBe('FORBIDDEN_SESSION');
     expect(sessionRoomJoins(sock)).toEqual([]);
+  });
+
+  describe('pending subscription cancellation', () => {
+    const pendingSubscribe = async (sessionId = 'sess-1') => {
+      const apiKey = { id: 'k1', name: 'k', role: 'viewer', allowedSessions: null };
+      authService.validateApiKey.mockResolvedValue(apiKey);
+      const sock = makeSocket({ apiKey: 'good' });
+      sock.join.mockImplementation((room: string) => sock.rooms.add(room));
+      sock.leave.mockImplementation((room: string) => sock.rooms.delete(room));
+      await gateway.handleConnection(asSocket(sock));
+      let resolve!: (key: typeof apiKey) => void;
+      let reject!: (error: Error) => void;
+      const validation = new Promise<typeof apiKey>((yes, no) => {
+        resolve = yes;
+        reject = no;
+      });
+      let entered!: () => void;
+      const started = new Promise<void>(yes => (entered = yes));
+      authService.validateApiKey.mockImplementationOnce(() => {
+        entered();
+        return validation;
+      });
+      const subscribing = gateway.handleMessage(asSocket(sock), subscribeMsg(sessionId, ['message.received']));
+      await started;
+      return { sock, apiKey, resolve, reject, subscribing };
+    };
+    const pendingFor = (sock: MockSocket) =>
+      (gateway as unknown as { pendingSubscriptions: WeakMap<Socket, Set<unknown>> }).pendingSubscriptions.get(
+        asSocket(sock),
+      );
+
+    it.each([
+      ['sess-1', 'sess-1'],
+      ['sess-1', '*'],
+      ['*', '*'],
+    ])('cancels a pending subscribe to %s when unsubscribing from %s', async (sessionId, unsubscribe) => {
+      const pending = await pendingSubscribe(sessionId);
+      expect(
+        await gateway.handleMessage(asSocket(pending.sock), { type: 'unsubscribe', sessionId: unsubscribe }),
+      ).toMatchObject({ type: 'unsubscribed' });
+      pending.resolve(pending.apiKey);
+      expect(await pending.subscribing).toMatchObject({ code: 'SUBSCRIPTION_CANCELLED', requestId: 'r1' });
+      expect(sessionRoomJoins(pending.sock)).toEqual([]);
+      expect(pendingFor(pending.sock)).toBeUndefined();
+
+      expect(
+        await gateway.handleMessage(asSocket(pending.sock), subscribeMsg(sessionId, ['message.received'])),
+      ).toMatchObject({ type: 'subscribed' });
+      expect(pending.sock.rooms.has(buildRoomName(sessionId, 'message.received'))).toBe(true);
+    });
+
+    it('does not cancel a pending subscribe when another session is unsubscribed', async () => {
+      const pending = await pendingSubscribe();
+      expect(
+        await gateway.handleMessage(asSocket(pending.sock), { type: 'unsubscribe', sessionId: 'sess-2' }),
+      ).toMatchObject({ type: 'unsubscribed' });
+      pending.resolve(pending.apiKey);
+      expect(await pending.subscribing).toMatchObject({ type: 'subscribed' });
+      expect(pending.sock.rooms.has(buildRoomName('sess-1', 'message.received'))).toBe(true);
+    });
+
+    it('still refuses failed authorization after a cancellation and clears the pending subscription', async () => {
+      const pending = await pendingSubscribe();
+      await gateway.handleMessage(asSocket(pending.sock), { type: 'unsubscribe', sessionId: '*' });
+      pending.reject(new UnauthorizedException('API key revoked'));
+      expect(await pending.subscribing).toMatchObject({ code: 'UNAUTHORIZED' });
+      expect(pending.sock.disconnected).toBe(true);
+      expect(sessionRoomJoins(pending.sock)).toEqual([]);
+      expect(pendingFor(pending.sock)).toBeUndefined();
+    });
   });
 
   // Client-IP resolution: an IP-restricted key (allowedIps set) must be ENFORCED at the WS surface,
@@ -1134,6 +1205,40 @@ describe('EventsGateway rate limiting', () => {
       }
       expect(authService.validateApiKey).toHaveBeenCalledTimes(6);
     });
+
+    it.each([false, true])(
+      'keeps newer failures charged after a delayed valid handshake (pruned: %s)',
+      async pruned => {
+        let now = 0;
+        let finish!: (key: unknown) => void;
+        const validation = new Promise(resolve => (finish = resolve));
+        authService.validateApiKey.mockImplementation((raw: string) =>
+          raw === 'good' ? validation : Promise.reject(new UnauthorizedException('Invalid API key')),
+        );
+        const gw = buildGateway();
+        (gw as unknown as { handshakeLimiter: SlidingWindowLimiter }).handshakeLimiter = new SlidingWindowLimiter(
+          2,
+          1000,
+          () => now,
+        );
+        const good = makeSock('good', { apiKey: 'good' });
+        const connecting = gw.handleConnection(asSocket(good));
+        now = pruned ? 1001 : 500;
+        await gw.handleConnection(asSocket(makeSock('bad-1', { apiKey: 'bad' })));
+        now = pruned ? 1002 : 600;
+        finish({ id: 'k1', name: 'k', allowedSessions: null });
+        await connecting;
+        expect(good.disconnect).not.toHaveBeenCalled();
+        expect(authService.validateApiKey).toHaveBeenCalledWith('good', '203.0.113.5');
+        now = pruned ? 1003 : 1001;
+        await gw.handleConnection(asSocket(makeSock('bad-2', { apiKey: 'bad' })));
+        const blocked = makeSock('bad-3', { apiKey: 'bad' });
+        await gw.handleConnection(asSocket(blocked));
+        expect(blocked.emit).toHaveBeenCalledWith('message', expect.objectContaining({ code: 'RATE_LIMITED' }));
+        expect(authService.validateApiKey).toHaveBeenCalledTimes(3);
+        gw.handleDisconnect(asSocket(good));
+      },
+    );
 
     it('throttles an unauthenticated handshake flood before any credential/audit work', async () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '2';

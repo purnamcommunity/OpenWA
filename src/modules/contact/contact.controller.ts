@@ -63,8 +63,9 @@ export class ContactController {
   @ApiOperation({
     summary: 'Batch-resolve profile picture URLs for up to 50 contacts',
     description:
-      'One request for a whole chat sidebar — avoids the burst of parallel single fetches that ' +
-      'would exhaust the per-IP throttle. Engine lookups run 5 at a time; per-id failures return null.',
+      'Resolve a chat sidebar in one request to avoid bursts of per-contact HTTP calls. ' +
+      'Engine lookups run 5 at a time; per-id failures return null. After a lookup times out, ' +
+      'later chunks are skipped and their ids are absent from the response.',
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiQuery({ name: 'ids', required: true, description: 'Comma-separated contact ids (max 50 used)' })

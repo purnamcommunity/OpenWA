@@ -5,7 +5,7 @@ import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error'
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { parseWaId, userPart } from '../identity/wa-id';
 import { readVerifiedName, readWid, type SerializedWid } from '../types/whatsapp-web-js.types';
-import { type WwebjsEngineHost, withPage } from './wwebjs-host';
+import { type WwebjsEngineHost, rethrowIfNavigation, withPage } from './wwebjs-host';
 import { isProtocolTimeout } from './wwebjs-lifecycle';
 
 /** The raw whatsapp-web.js contact element type, kept local so the wwebjs `Contact` type never leaks. */
@@ -192,6 +192,7 @@ export class WwebjsContacts {
       unreadable = read?.failed ?? 0;
       firstError = read?.firstError;
     } catch (error) {
+      rethrowIfNavigation(this.host, error);
       // A dead page surfaces here as a raw Puppeteer error; convert it to the documented transport
       // failure the way wwebjs-chats.ts does, so a transport death answers 503 instead of a bare 500.
       if (this.host.isPageTransportError(error)) {
@@ -254,6 +255,7 @@ export class WwebjsContacts {
       // because that would change a published list payload for every consumer.
       return mapped && { ...mapped, isMe: contact.isMe === true };
     } catch (error) {
+      rethrowIfNavigation(this.host, error);
       // Unlike the avatar lookup, a throw here can legitimately mean the contact is absent:
       // `window.WWebJS.getContact` has no try/catch and reads `contact.isBusiness` straight off
       // `Contact.find`, so an unknown id throws a TypeError on null. Null (→ 404) stays the answer
@@ -387,6 +389,7 @@ export class WwebjsContacts {
     try {
       url = await this.client().getProfilePicUrl(contactId);
     } catch (error) {
+      rethrowIfNavigation(this.host, error);
       const pageDown = this.host.isPageTransportError(error) || isProtocolTimeout(error);
       const viaLid = byLid && !pageDown ? await this.profilePictureByLid(contactId) : undefined;
       if (viaLid) return viaLid;

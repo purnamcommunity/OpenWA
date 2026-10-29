@@ -85,6 +85,17 @@ class GroupsResource:
             body={"description": description},
         )
 
+    def set_member_label(self, session_id: str, group_id: str, label: str) -> SuccessResult:
+        """Set this account's member label in the group (empty string clears it).
+
+        Baileys only; whatsapp-web.js answers 501. A 200 means the label message was
+        handed to WhatsApp; it cannot be read back.
+        """
+        return self._http.request(
+            "PUT", f"/api/sessions/{quote_segment(session_id)}/groups/{quote_segment(group_id)}/member-label",
+            body={"label": label},
+        )
+
     def leave(self, session_id: str, group_id: str) -> SuccessResult:
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/groups/{quote_segment(group_id)}/leave")
 

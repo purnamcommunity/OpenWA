@@ -107,6 +107,7 @@ export class MessageMutationProjector {
       // ephemeral one under STORE_EPHEMERAL_MESSAGES=false, or one that arrived before the session
       // went live) — but the notification is not: `message.reaction` is a declared webhook event and
       // the dashboard stream is the point of it, the same contract handleMessageRevoked states.
+      // A write that fails is the same case: it is logged, and the reaction goes out without the full list.
       const metadata = await updateMessageMetadata(
         this.messageRepository,
         { sessionId: id, waMessageId: event.messageId },
@@ -116,7 +117,10 @@ export class MessageMutationProjector {
           else reactions[event.senderId] = event.reaction;
           return { ...current, reactions };
         },
-      );
+      ).catch((err: unknown) => {
+        this.logger.error(`Failed to update message reaction: ${event.messageId}`, String(err));
+        return null;
+      });
       const reactions = metadata?.reactions as Record<string, string> | undefined;
 
       // `reactions` is the post-apply snapshot of EVERY reaction on the message and consumers REPLACE

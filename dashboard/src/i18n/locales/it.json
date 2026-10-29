@@ -218,6 +218,9 @@
       "read": "Letto",
       "failed": "Fallito"
     },
+    "today": "Oggi",
+    "switchSession": "Cambia sessione",
+    "searchMessages": "Cerca messaggi",
     "clearSearch": "Cancella ricerca",
     "filters": {
       "label": "Filtra chat",
@@ -228,11 +231,13 @@
       "unknown": "Sconosciuti"
     },
     "noFilterResults": "Nessuna chat corrisponde a questo filtro",
+    "contactInfo": "Info contatto",
     "moreActions": "Altre azioni",
     "copyChatId": "Copia ID chat",
     "chatIdCopied": "ID chat copiato",
     "copyFailed": "Impossibile copiare negli appunti",
     "closeChat": "Chiudi chat",
+    "phone": "Numero di telefono",
     "chatId": "ID chat",
     "newChat": {
       "title": "Nuova chat",
@@ -257,6 +262,12 @@
       "created": "Gruppo \"{{name}}\" creato",
       "createFailed": "Impossibile creare il gruppo",
       "removeParticipant": "Rimuovi {{name}}"
+    },
+    "sessionPicker": {
+      "searchPlaceholder": "Cerca sessioni...",
+      "noMatch": "Nessuna sessione corrisponde",
+      "addTitle": "Collega un altro numero",
+      "addHint": "Crea una sessione e collegala con un codice QR"
     },
     "group": {
       "info": "Info gruppo",
@@ -669,7 +680,6 @@
       "message.revoked": "Quando un messaggio viene eliminato per tutti",
       "message.reaction": "Quando una reazione viene aggiunta, modificata o rimossa",
       "message.edited": "Quando un messaggio viene modificato",
-      "message.poll_vote": "Quando qualcuno vota in un sondaggio o cambia il proprio voto",
       "session.status": "Quando cambia lo stato di una sessione",
       "session.qr": "Quando viene generato un codice QR",
       "session.authenticated": "Quando una sessione è associata e pronta",
@@ -678,6 +688,7 @@
       "session.restriction": "Quando WhatsApp limita l'account o rimuove una limitazione",
       "presence.update": "Quando una chat seguita va online, scrive o va offline",
       "event.response": "Quando un invitato risponde a un evento WhatsApp (partecipa, non partecipa, forse)",
+      "poll.vote": "Quando qualcuno seleziona o deseleziona opzioni di un sondaggio (whatsapp-web.js)",
       "group.join": "Quando dei partecipanti entrano in un gruppo o vengono aggiunti",
       "group.leave": "Quando dei partecipanti lasciano un gruppo o vengono rimossi",
       "group.update": "Quando cambiano il nome, la descrizione o le impostazioni di un gruppo",
@@ -1032,7 +1043,7 @@
     "single": {
       "title": "Verifica un singolo account",
       "phoneLabel": "Numero di telefono",
-      "phonePlaceholder": "es. 919876543210 o 6281234567890 (con prefisso del paese)",
+      "phonePlaceholder": "es. 919876543210 o 6281234567890",
       "check": "Verifica",
       "checking": "Verifica in corso...",
       "autoPrefix": "Aggiungi automaticamente il prefisso <strong>+91</strong> ai numeri di 10 cifre (i numeri di 12 cifre restano invariati)",

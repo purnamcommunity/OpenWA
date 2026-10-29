@@ -134,6 +134,11 @@ export function applyDatabaseSection(
       if (database.username !== undefined) updates.DATABASE_USERNAME = database.username.trim() || 'postgres';
       setSecret(updates, 'DATABASE_PASSWORD', database.password);
       if (database.database !== undefined) updates.DATABASE_NAME = database.database || 'openwa';
+      // Left from SQLite, the key holds a file path, which the next boot would open as a PostgreSQL database name.
+      // A file with no type beside a PostgreSQL pin holds a name the pinned server uses, so that one stays.
+      else if (existing.DATABASE_TYPE !== 'postgres' && nextBootValue('DATABASE_TYPE', existing) !== 'postgres') {
+        staleKeys.add('DATABASE_NAME');
+      }
       if (database.schema !== undefined) {
         // Refuse a schema the next boot would reject, or the saved file crash-loops the instance.
         const schemaError = database.schema ? postgresSchemaError(database.schema) : null;
@@ -170,12 +175,13 @@ export function applyDatabaseSection(
     // Switching to sqlite: drop stale postgres connection keys, and reset the built-in
     // flag with them — there is no bundled Postgres backing a SQLite database.
     updates.POSTGRES_BUILTIN = 'false';
+    // A SQLite name is its file path; only the PostgreSQL name belongs to the mode being left.
+    if (existing.DATABASE_TYPE === 'postgres') staleKeys.add('DATABASE_NAME');
     for (const k of [
       'DATABASE_HOST',
       'DATABASE_PORT',
       'DATABASE_USERNAME',
       'DATABASE_PASSWORD',
-      'DATABASE_NAME',
       'DATABASE_POOL_SIZE',
       'DATABASE_SSL',
       'DATABASE_SSL_REJECT_UNAUTHORIZED',
@@ -202,6 +208,12 @@ export function applyRedisSection(
     // would make the client AUTH against a passwordless server on the next boot.
     updates.REDIS_HOST = 'redis';
     updates.REDIS_PORT = '6379';
+    // It also listens in plaintext and defines no ACL user, so TLS and a username kept from an external
+    // server would fail the connection. Beside a host pinned elsewhere the stored values stay with that server.
+    if (!hostPinnedElsewhere('redis')) {
+      updates.REDIS_TLS = 'false';
+      staleKeys.add('REDIS_USERNAME');
+    }
     if (!redis.password) staleKeys.add('REDIS_PASSWORD');
   } else if (!redisBuiltIn) {
     // External Redis (explicit, or inherited when builtIn is absent)

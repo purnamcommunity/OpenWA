@@ -1408,7 +1408,7 @@ export const infraApi = {
       method: 'PUT',
       body: JSON.stringify(config),
     }),
-  restart: (profiles?: string[], profilesToRemove?: string[]) =>
+  restart: (profiles?: string[], profilesToRemove?: string[], signal?: AbortSignal) =>
     request<{
       message: string;
       restarting: boolean;
@@ -1421,12 +1421,14 @@ export const infraApi = {
     }>('/infra/restart', {
       method: 'POST',
       body: JSON.stringify({ profiles: profiles || [], profilesToRemove: profilesToRemove || [] }),
+      signal,
     }),
   // Readiness, not the plain /infra/health ping. The restart poll must not be able to latch onto the
   // process it just asked to shut down: /infra/health answers 200 for the whole drain,
   // while /health/ready reports 503 as soon as draining starts and stays 503 until both databases
   // answer. Public (no API key), like /infra/health.
-  healthCheck: () => request<{ status: 'ok' | 'error'; details: Record<string, { status: string }> }>('/health/ready'),
+  healthCheck: (signal?: AbortSignal) =>
+    request<{ status: 'ok' | 'error'; details: Record<string, { status: string }> }>('/health/ready', { signal }),
   // Data migration: export all Data-DB tables (call while still on the OLD database, before switching),
   // then import after the switch + restart. Used by the DB-switch migration guard so data isn't lost.
   exportData: () =>

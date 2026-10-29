@@ -26,6 +26,8 @@ import {
   BatchMessageResult,
 } from './entities/message-batch.entity';
 import { SendBulkMessageDto } from './dto/bulk-message.dto';
+import { MENTIONS_MAX, MENTION_WID_MAX_LENGTH } from './dto/send-message.dto';
+import { isMentionWid } from './dto/is-mention-wid.validator';
 import { isMediaUrl } from '../../common/media/media-url';
 import { MessageStatus } from './entities/message.entity';
 import { EngineRegistry } from '../../engine/engine-registry.service';
@@ -915,6 +917,20 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
    * creation (a 400) and again per item after variables and the message:sending gate.
    */
   private assertItemContent(type: string, content: BulkMessageContent, beforeRender = false): void {
+    // A mention may be a placeholder until it is rendered, so the DTO accepts it unchecked. What is sent is
+    // held to the single-send rule: a malformed WID reaches the engine as an opaque failure otherwise.
+    const mentions = content?.mentions;
+    if (
+      !beforeRender &&
+      mentions != null &&
+      (!Array.isArray(mentions) ||
+        mentions.length > MENTIONS_MAX ||
+        Array.from(mentions).some(
+          wid => typeof wid !== 'string' || wid.length > MENTION_WID_MAX_LENGTH || !isMentionWid(wid),
+        ))
+    ) {
+      throw new BadRequestException('content.mentions must contain bounded individual WIDs');
+    }
     if (type === 'text') {
       if (typeof content?.text !== 'string' || !content.text) {
         throw new BadRequestException('A text item requires a non-empty content.text');

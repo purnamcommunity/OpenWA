@@ -175,6 +175,30 @@ describe('MessageSendService', () => {
   // ── sendText ──────────────────────────────────────────────────────
 
   describe('auto-typing before send (SIMULATE_TYPING, on by default)', () => {
+    it.each([
+      ['caps positive jitter', 'x'.repeat(100), 0.999999, 5000],
+      ['keeps negative jitter', 'x'.repeat(100), 0, 4250],
+      ['keeps an uncapped short pause', 'hi', 0.5, 590],
+    ] as const)('%s at the configured typing delay', async (_label, text, random, delay) => {
+      jest.useFakeTimers();
+      const randomValue = jest.spyOn(Math, 'random').mockReturnValue(random);
+      delete process.env.SIMULATE_TYPING;
+      process.env.SIMULATE_TYPING_MAX_MS = '5000';
+      const sending = service.sendText('sess-1', { chatId: '628123456789@c.us', text });
+      try {
+        await jest.advanceTimersByTimeAsync(delay - 1);
+        expect(mockEngine.sendTextMessage).not.toHaveBeenCalled();
+        await jest.advanceTimersByTimeAsync(1);
+        expect(mockEngine.sendTextMessage).toHaveBeenCalledTimes(1);
+        await sending;
+      } finally {
+        await jest.runOnlyPendingTimersAsync();
+        await sending;
+        randomValue.mockRestore();
+        jest.useRealTimers();
+      }
+    });
+
     it('sends a typing presence before the message by default', async () => {
       delete process.env.SIMULATE_TYPING; // default = on
       process.env.SIMULATE_TYPING_MAX_MS = '1'; // keep the humanising delay ~instant in tests

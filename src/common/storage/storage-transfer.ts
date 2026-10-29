@@ -97,7 +97,7 @@ export async function createExportStream(
   return output;
 }
 
-function enforceSize(file: string, size: number | undefined): Transform {
+function enforceSize(file: string, size: number | undefined, onRead: (bytes: number) => void): Transform {
   let seen = 0;
   const mismatch = (): Error => new Error(`Export failed: ${file} changed size while being read (expected ${size})`);
   return new Transform({
@@ -106,7 +106,9 @@ function enforceSize(file: string, size: number | undefined): Transform {
       callback(size !== undefined && seen > size ? mismatch() : null, chunk);
     },
     flush(callback) {
-      callback(size !== undefined && seen < size ? mismatch() : null);
+      if (size !== undefined && seen < size) return callback(mismatch());
+      onRead(seen);
+      callback();
     },
   });
 }
@@ -164,8 +166,6 @@ async function appendEntries(
       continue;
     }
     const { stream, size } = source;
-    exportedBytes += size ?? 0;
-    if ((size ?? 0) > largest.size) largest = { file, size: size ?? 0 };
     // The output closes early when the archive fails or the consumer goes away: stop reading files.
     // Checked synchronously before waiting, so a 'close' that already fired cannot be missed.
     if (output.destroyed) {
@@ -176,11 +176,19 @@ async function appendEntries(
     // its header. A file rewritten between open and read does that, so the length is checked here and
     // a mismatch fails the export like a read error, naming the file, before the sink sees the extra
     // byte or the early end. pipeline() also forwards a source error, which pipe() does not.
-    const entry = pipeline(stream, enforceSize(file, size), err => {
-      if (!err || output.destroyed) return;
-      logger.error(`Export failed reading file: ${file}`, String(err));
-      output.destroy(err);
-    });
+    // The import-limit warnings below count the bytes read, since a backend may not report a length.
+    const entry = pipeline(
+      stream,
+      enforceSize(file, size, bytes => {
+        exportedBytes += bytes;
+        if (bytes > largest.size) largest = { file, size: bytes };
+      }),
+      err => {
+        if (!err || output.destroyed) return;
+        logger.error(`Export failed reading file: ${file}`, String(err));
+        output.destroy(err);
+      },
+    );
     await new Promise<void>(resolve => {
       const done = (): void => {
         output.removeListener('close', done);

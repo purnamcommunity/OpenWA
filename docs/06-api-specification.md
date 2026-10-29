@@ -47,7 +47,7 @@ API keys carry one of three roles, ordered by privilege:
 
 A key may additionally be scoped to specific sessions (`allowedSessions`) and/or source IPs (`allowedIps`). The scope/IP check runs in the guard **before** any role check, so a request outside that scope is rejected with `403` even if the role would otherwise allow it. `401` is kept for a missing, unknown, revoked or expired key.
 
-A key may also be restricted to selected chats (`allowedChats`: group `<id>@g.us`, contact `<phone>@c.us` or `<lid>@lid`, or a bare phone number, which is stored as `<phone>@c.us`), at most 2000 entries. An empty or absent list leaves the key unrestricted. A chat-restricted key is **denied by default**: it may call only routes marked as chat-scoped, and every other route (webhooks, automation, status, channels, key management, and any route added later) answers `403 "API key is restricted to selected chats"` after the role check. The chat-scoped routes are the message sends (text, template, image, video, audio, document, location, contact, sticker, poll, reply, click-button, forward, bulk and `send-product`), react, edit, delete, pin, unpin, star and vote-poll, and the history, reactions and media of one chat; the chat actions (read, unread, archive, mute, pin, delete, typing, clearing a chat's messages) and a chat's presence (subscribe and read); one contact's read, profile picture, phone lookup, update, delete, block and unblock routes; one group's detail, settings, subject, description, leave and picture routes; the label routes that address a chat; and the session's own detail (`GET /api/sessions/:sessionId`), which names no chat. On a chat-scoped route, every chat id the request names (a `:chatId` / `:groupId` / `:contactId` path param, `?chatId=`, a body `chatId` / `fromChatId` / `toChatId`, and each `messages[].chatId` of a bulk send) must be inside the allowlist, or the request answers `403 "API key not authorized for this chat"`; a contact entry also matches its mapped `@lid` form, and the reverse. The chat, group, contact and label-chat list routes (`GET /api/sessions/:sessionId/chats`, `/groups`, `/contacts` and `/labels/:labelId/chats`) return only the allowed entries, filtered before paging. `GET /api/search` with the built-in provider narrows its hits to the allowed chats before `limit`/`offset`/`total` apply, and an optional `?chatId=` must name an allowed chat. Plugin providers return `403` for these keys before the worker is invoked; set `SEARCH_PROVIDER=builtin-fts` to enable scoped search. `GET /api/sessions/:sessionId/groups/:groupId` and its `GET`/`PUT .../settings` admit a group inside the allowlist and answer `403` for any other. On `GET /api/sessions/:sessionId/messages` such a key must pass `?chatId=`; omitting it answers `403`. A `quotedMessageId` is refused with `403` everywhere except the reply route, which binds the quote to the chat it sends into. The `/events` WebSocket admits chat-restricted keys and delivers only chat events inside their allowlist. MCP tools enforce the same chat fence, filter list results before paging, and refuse tools without chat-scoped authorization. The Bull Board queue dashboard still refuses chat-restricted keys with `403`.
+A key may also be restricted to selected chats (`allowedChats`: group `<id>@g.us`, contact `<phone>@c.us` or `<lid>@lid`, or a bare phone number, which is stored as `<phone>@c.us`), at most 2000 entries. An empty or absent list leaves the key unrestricted. A chat-restricted key is **denied by default**: it may call only routes marked as chat-scoped, and every other route (webhooks, automation, status, channels, key management, and any route added later) answers `403 "API key is restricted to selected chats"` after the role check. The chat-scoped routes are the message sends (text, template, image, video, audio, document, location, contact, sticker, poll, reply, click-button, forward, bulk and `send-product`), react, edit, delete, pin, unpin, star and vote-poll, and the history, reactions and media of one chat; the chat actions (read, unread, archive, mute, pin, delete, typing, clearing a chat's messages) and a chat's presence (subscribe and read); one contact's read, profile picture, phone lookup, update, delete, block and unblock routes; one group's detail, settings, subject, description, member label, leave and picture routes; the label routes that address a chat; and the session's own detail (`GET /api/sessions/:sessionId`), which names no chat. On a chat-scoped route, every chat id the request names (a `:chatId` / `:groupId` / `:contactId` path param, `?chatId=`, a body `chatId` / `fromChatId` / `toChatId`, and each `messages[].chatId` of a bulk send) must be inside the allowlist, or the request answers `403 "API key not authorized for this chat"`; a contact entry also matches its mapped `@lid` form, and the reverse. The chat, group, contact and label-chat list routes (`GET /api/sessions/:sessionId/chats`, `/groups`, `/contacts` and `/labels/:labelId/chats`) return only the allowed entries, filtered before paging. `GET /api/search` with the built-in provider narrows its hits to the allowed chats before `limit`/`offset`/`total` apply, and an optional `?chatId=` must name an allowed chat. Plugin providers return `403` for these keys before the worker is invoked; set `SEARCH_PROVIDER=builtin-fts` to enable scoped search. `GET /api/sessions/:sessionId/groups/:groupId` and its `GET`/`PUT .../settings` admit a group inside the allowlist and answer `403` for any other. On `GET /api/sessions/:sessionId/messages` such a key must pass `?chatId=`; omitting it answers `403`. A `quotedMessageId` is refused with `403` everywhere except the reply route, which binds the quote to the chat it sends into. The `/events` WebSocket admits chat-restricted keys and delivers only chat events inside their allowlist. MCP tools enforce the same chat fence, filter list results before paging, and refuse tools without chat-scoped authorization. The Bull Board queue dashboard still refuses chat-restricted keys with `403`.
 
 ### API-Key Lifecycle
 
@@ -147,7 +147,7 @@ All media send routes (`send-image`, `send-video`, `send-audio`, `send-document`
 
 | Field      | Type     | Required    | Constraints                                         | Description                                                                                                                                                                               |
 | ---------- | -------- | ----------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `chatId`   | string   | yes         | non-empty, max 255 chars                            | Recipient — `<phone>@c.us` or `<groupId>@g.us`                                                                                                                                            |
+| `chatId`   | string   | yes         | non-empty, max 255 chars, `localpart@host`          | Recipient — `<phone>@c.us` or `<groupId>@g.us`                                                                                                                                            |
 | `url`      | string   | conditional | valid http/https URL; required when `base64` absent | Remote media URL. Fetched server-side through an SSRF guard; a blocked/internal URL, a non-2xx answer, a timeout or a failed connection yields `400`, a download over the media cap `413` |
 | `base64`   | string   | conditional | required when `url` absent                          | Raw base64 media data. Decoded size is checked against the media cap                                                                                                                      |
 | `mimetype` | string   | conditional | required when `base64` is used                      | MIME type, e.g. `image/jpeg`, `video/mp4`, `application/pdf`                                                                                                                              |
@@ -727,7 +727,7 @@ A session stopped with `POST /stop` or `POST /force-kill` is marked to run again
 
 On multiple nodes, an explicit start may clear a peer's stop recorded before it successfully claimed ownership. It checks ownership and the stop record again after the start hook, before creating an engine; a lost claim or failed renewal answers `409` with no engine launched. A stop or claim loss during engine initialization retires that engine when initialization finishes.
 
-**Errors:** `400` session already started / already starting, or this node already holds `MAX_CONCURRENT_SESSIONS` slots, counting running and starting engines and sessions waiting to relaunch after a failed reconnect (`Maximum concurrent sessions reached (N)`, answered only after the `404` and the `409` for a session running on another node; the session is not started, so retry once a slot frees or on a node with room) · `401` · `403` · `404` not found · `409` credential teardown for the same session name still in flight (retryable; body carries `code: 'SESSION_NAME_TEARDOWN_PENDING'`; no destructive side effect runs before the refusal — a retry after cleanup settles proceeds), or another node currently holds this session's engine (refused before any engine is launched), or, with no `code`, a `POST /stop`, a `POST /force-kill` that found a running engine to kill, or a data import (`stopOrphans`) of this session that began or finished while the start was waiting, or a delete of it still running or sent while the start was waiting and failed once it began removing (the start yields and launches nothing; after a stop, a force-kill or a delete that failed part-way a new `POST /start` clears it and starts the session, after a delete or an import that removed the session the retry answers `404`) · `503` the gateway is shutting down, or the engine's browser or socket connection died during launch and the one automatic retry failed too; no engine is left running, so the start can be retried · `504` the engine did not finish starting within its timeout (WhatsApp Web or the network unreachable, a stalled browser or resource limit, or, on whatsapp-web.js, an unreachable `proxyUrl`); the engine is torn down, so the start can be retried once the cause is addressed
+**Errors:** `400` session already started / already starting, or this node already holds `MAX_CONCURRENT_SESSIONS` slots, counting running and starting engines and sessions waiting to relaunch after a failed reconnect (`Maximum concurrent sessions reached (N)`, answered only after the `404` and the `409` for a session running on another node; the session is not started, so retry once a slot frees or on a node with room) · `401` · `403` · `404` not found · `409` credential teardown for the same session name still in flight (retryable; body carries `code: 'SESSION_NAME_TEARDOWN_PENDING'`; no destructive side effect runs before the refusal — a retry after cleanup settles proceeds), or another node currently holds this session's engine (refused before any engine is launched), or, with no `code`, a `POST /stop`, a `POST /logout` or `POST /force-kill` that found a running engine, or a data import (`stopOrphans`) of this session that began or finished while the start was waiting, or a delete of it still running or sent while the start was waiting and failed once it began removing (the start yields and launches nothing; after a stop, a force-kill or a delete that failed part-way a new `POST /start` clears it and starts the session, after a delete or an import that removed the session the retry answers `404`) · `503` the gateway is shutting down, or the engine's browser or socket connection died during launch and the one automatic retry failed too; no engine is left running, so the start can be retried · `504` the engine did not finish starting within its timeout (WhatsApp Web or the network unreachable, a stalled browser or resource limit, or, on whatsapp-web.js, an unreachable `proxyUrl`); the engine is torn down, so the start can be retried once the cause is addressed
 
 #### POST /api/sessions/:sessionId/stop
 
@@ -887,7 +887,7 @@ Like `stop`, a force-killed session stays down across restarts and takeover unti
 
 Request an 8-char pairing code to link via phone number (alternative to QR).
 
-> ⚠️ **On the whatsapp-web.js engine, only request a code for a number you are prepared to re-link.** A request for a number that already has a linked session has been observed to end with WhatsApp revoking that device: the linked session logs a LOGOUT, its credentials are deleted, and it falls back to `qr_ready` with no phone. Nothing here refuses such a request: the guards check the session's state, never the number. The request runs inside the shared WhatsApp Web page and resets its linking mode before asking for a code, so the blast radius is the account rather than the session. Baileys was not affected in the same tests. Link by QR when a session of that number must stay up.
+> ⚠️ **On the whatsapp-web.js engine, only request a code for a number you are prepared to re-link.** A request for a number that already has a linked session has been observed to end with WhatsApp revoking that device: the linked session logs a LOGOUT, its credentials are deleted, and it falls back to `qr_ready` with no phone. The gateway refuses with `409` a number that is the stored phone of another of its sessions (a Brazilian, Mexican or Argentine mobile number counts under either spelling of its marker digit), but it cannot see a link made on another gateway or only on the phone, and refuses nothing there. The request runs inside the shared WhatsApp Web page and resets its linking mode before asking for a code, so the blast radius is the account rather than the session. Baileys was not affected in the same tests and is not refused: sessions of one number may coexist there. Link by QR when a session of that number must stay up.
 
 **Auth:** API key (OPERATOR) · **Scope:** session-scoped
 
@@ -915,7 +915,7 @@ Request an 8-char pairing code to link via phone number (alternative to QR).
 
 `status` is the lowercase session status.
 
-**Errors:** `400` validation, or session not started, or already authenticated · `401` · `403` · `404` not found · `409` session not waiting to be linked yet; wait for `status` to read `qr_ready` and retry (after a code was accepted, wait for `ready` instead). On Baileys a session that already reads `qr_ready` can still answer `409` while its socket is closing, for up to the WebSocket close timeout (30 s); that is retryable and the status follows shortly. · `503` whatsapp-web.js only: the gateway stopped waiting after its attempt budget, usually because WhatsApp Web kept reloading its QR page; retryable, and the last attempt's reason rides in the message. An attempt that timed out may still have reached WhatsApp, and a retry starts the linking flow again, so the unlink warning above applies to the retry too.
+**Errors:** `400` validation, or session not started, or already authenticated · `401` · `403` · `404` not found · `409` session not waiting to be linked yet; wait for `status` to read `qr_ready` and retry (after a code was accepted, wait for `ready` instead). On Baileys a session that already reads `qr_ready` can still answer `409` while its socket is closing, for up to the WebSocket close timeout (30 s); that is retryable and the status follows shortly. On whatsapp-web.js a `409` also answers a number that is the stored phone of another session; log that session out or delete it before pairing this one. · `503` whatsapp-web.js only: the gateway stopped waiting after its attempt budget, usually because WhatsApp Web kept reloading its QR page; retryable, and the last attempt's reason rides in the message. An attempt that timed out may still have reached WhatsApp, and a retry starts the linking flow again, so the unlink warning above applies to the retry too.
 
 #### DELETE /api/sessions/:sessionId/pairing-code
 
@@ -1065,7 +1065,7 @@ Mark a chat as read/seen.
 | `chatId`     | string   | Yes      | `@IsString`; `@IsNotEmpty`; `@MaxLength(255)`; `@Matches(/^[^\s@]+@[^\s@]+$/)` (localpart@host, no whitespace) | Engine-native JID, e.g. `1234567890@c.us` (wwebjs) or `1234@s.whatsapp.net` (Baileys)                                |
 | `messageIds` | string[] | No       | `@IsArray`; `@ArrayNotEmpty`; `@ArrayMaxSize(100)`; each a non-empty token with no whitespace                  | Messages to acknowledge. Omit the field to acknowledge only the newest received message; an empty array is rejected. |
 
-Baileys acknowledges individual messages rather than chats, and the receipt enumerates ids instead of carrying a read-up-to watermark. Without `messageIds` only the newest received message the engine still holds in memory gets a receipt, so a burst leaves its earlier messages unread and a session restarted since the message arrived has nothing to acknowledge at all. Each supplied id is resolved through the message store, which is what carries the `participant` a group receipt needs. An id the store never held (history backfill) in a group takes its `participant` from the author the gateway stored for that message; one with no stored author is left out of the receipt, and the route answers `{ "success": false }` when none of the ids could be named. Ignored by whatsapp-web.js, whose own `sendSeen` is chat-level.
+Baileys acknowledges individual messages rather than chats, and the receipt enumerates ids instead of carrying a read-up-to watermark. Without `messageIds` only the newest received message gets a receipt: the one the engine holds in memory, else, for a session restarted since it arrived, the newest received message the gateway stored. A burst therefore leaves its earlier messages unread. Each supplied id is resolved through the message store, which is what carries the `participant` a group receipt needs. An id the store never held (history backfill) in a group takes its `participant` from the author the gateway stored for that message; one with no stored author is left out of the receipt, and the route answers `{ "success": false }` when none of the ids could be named. Ignored by whatsapp-web.js, whose own `sendSeen` is chat-level.
 
 ```json
 { "chatId": "1234567890@c.us", "messageIds": ["3EB0C767D26B8A3F1A2B", "3EB0C767D26B8A3F1A2C"] }
@@ -1080,8 +1080,8 @@ Baileys acknowledges individual messages rather than chats, and the receipt enum
 Returns HTTP `200`, matching the OpenAPI contract.
 
 > **`success: false` is a real outcome on the Baileys engine.** The read receipt is sent against the
-> newest message the chat received, so a chat the session has received no message in (one holding
-> only the account's own sends included) is reported as declined rather than marked read. The
+> newest message the chat received, in memory or stored, so a chat with neither (one holding only
+> the account's own sends included) is reported as declined rather than marked read. The
 > whatsapp-web.js engine reads the chat from the page and needs no local history, but it still
 > answers `success: false` for a chat the page cannot find or when the page declines the read.
 
@@ -1106,6 +1106,8 @@ Mark a chat as unread.
 | `chatId` | string | Yes      | `@IsString`; `@IsNotEmpty`; `@MaxLength(255)`; `@Matches(/^[^\s@]+@[^\s@]+$/)` | Engine-native JID, e.g. `1234567890@c.us` |
 
 This route takes `chatId` alone. It previously shared `MarkChatReadDto`, which is why the two are described separately now that the read body carries `messageIds`.
+
+On Baileys the mark is keyed to the chat's newest message: the one held in memory, else the newest one the gateway stored. With neither it is sent without one, which WhatsApp applies to a chat in the list. The route answers `success: false` instead for an archived chat, which the phone leaves unmarked without one, and for an id the session knows no chat for.
 
 ```json
 { "chatId": "1234567890@c.us" }
@@ -1142,9 +1144,9 @@ Delete every message in a chat, keeping the chat itself in the list.
 
 On success the gateway also removes its stored copies of the chat's messages (rows, inline and archived media, search entries) and emits `message:deleted` for each. Changes made on the phone are not mirrored.
 
-> **`success: false` is a real outcome**, as with `chats/archive`: an unknown chat on
-> whatsapp-web.js, or on Baileys a chat with no known history — the clear is an app-state
-> modification keyed to the chat's last message.
+> **`success: false` is a real outcome**: an unknown chat on whatsapp-web.js, or on Baileys a chat
+> with no message in memory or stored — the clear is an app-state modification keyed to the chat's
+> last message, and the gateway never guesses one.
 
 **Errors:** `400` session not ready · `401` missing/invalid API key · `404` session not found · `409` the session is not connected (engine exists but is not `ready`) · `503` WhatsApp did not answer within the request budget, or the engine’s browser page died — the change may or may not have been applied
 
@@ -1177,10 +1179,12 @@ Archive or unarchive a chat.
 { "success": true }
 ```
 
-> **`success: false` is a real outcome here, not an error.** On the Baileys engine the archive is an
-> app-state modification keyed to the chat's **last message**, so a chat with no known history
-> cannot be archived at all — the same limitation `chats/delete` and `chats/unread` already carry on
-> that engine. Rather than fail with a 500, the endpoint reports `success: false`.
+> On the Baileys engine the archive is an app-state modification keyed to the chat's **last
+> message**: the one held in memory, else the newest one the gateway stored. A chat with neither,
+> one that had no traffic since the session started and none stored, is archived without one, which
+> WhatsApp applies as well. An id the session knows no chat for (no chat record, persisted state or
+> stored message) answers `success: false`: Baileys replays its own change locally, so archiving it
+> would list a chat the account does not have.
 
 > **No `chat.archived` webhook fires for your own archive.** Baileys emits no event for a change the
 > account itself made (remote-device archives arrive later via chat-update diffing), and
@@ -1314,6 +1318,9 @@ Returns HTTP `200`, matching the OpenAPI contract.
 
 On success the gateway also removes its stored copies of the chat's messages (rows, inline and archived media, search entries) and emits `message:deleted` for each. Changes made on the phone are not mirrored.
 
+> **`success: false` is a real outcome**, as with the clear: on Baileys the delete is keyed to the
+> chat's last message, in memory or stored, and a chat with neither is not deleted.
+
 **Errors:** `400` validation, or session not started · `401` · `403` · `404` session not found · `409` the session is not connected (engine exists but is not `ready`) · `503` WhatsApp did not answer within the request budget, or the engine’s browser page died — the change may or may not have been applied
 
 #### POST /api/sessions/:sessionId/chats/typing
@@ -1330,10 +1337,10 @@ Send a typing/recording presence indicator to a chat (or clear it with `paused`)
 
 **Request body** — `SendChatStateDto`
 
-| Field    | Type                                | Required | Constraints                                                                                         | Description                                                 |
-| -------- | ----------------------------------- | -------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `chatId` | string                              | Yes      | `@IsString`; `@IsNotEmpty`; `@MaxLength(255)` (no JID regex; engine-neutral, the adapter validates) | Engine-native chat id, e.g. `1234567890@c.us`               |
-| `state`  | `typing` \| `recording` \| `paused` | Yes      | `@IsIn(['typing','recording','paused'])`                                                            | `typing`/`recording` show the indicator; `paused` clears it |
+| Field    | Type                                | Required | Constraints                                                                                                    | Description                                                 |
+| -------- | ----------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `chatId` | string                              | Yes      | `@IsString`; `@IsNotEmpty`; `@MaxLength(255)`; `@Matches(/^[^\s@]+@[^\s@]+$/)` (localpart@host, no whitespace) | Engine-native chat id, e.g. `1234567890@c.us`               |
+| `state`  | `typing` \| `recording` \| `paused` | Yes      | `@IsIn(['typing','recording','paused'])`                                                                       | `typing`/`recording` show the indicator; `paused` clears it |
 
 ```json
 { "chatId": "1234567890@c.us", "state": "typing" }
@@ -1372,6 +1379,10 @@ The delete first removes the session's messages, webhook outbox rows and webhook
 ### 6.4.2 Messages
 
 All routes are mounted under `/api/sessions/:sessionId/messages`. Reads (`GET` history, batch status, reactions) accept any valid API key (including VIEWER). All write/send routes require **API key (OPERATOR)** or higher. Single-recipient send routes return `MessageResponseDto { messageId, timestamp }` (`timestamp` is an epoch **number** in seconds; there is no `status` field); `POST send-bulk` instead returns `202` with `BulkMessageResponseDto`. The global ValidationPipe runs `whitelist` + `forbidNonWhitelisted`, so any body field not listed below is rejected with `400`.
+
+#### Chat ids
+
+A `chatId` (and `fromChatId` / `toChatId` on `forward`) in a send or message-action body, and the matching `chatId` of the MCP message tools, must be `localpart@host` with no whitespace, for example `6281234567890@c.us`, `120363000000000001@g.us`, `1234567890123@s.whatsapp.net` or `1234567890123@lid`. A bare phone number, a number sent as a JSON number, or any other text without a domain answers `400` with `chatId must be a valid chat JID in the form localpart@host`; it used to reach the engine and answer `500`.
 
 #### Idempotent sends
 
@@ -1598,7 +1609,7 @@ Returns a bare array of `PollVote`:
 > **Only what this session has seen.** The votes come from WhatsApp Web's own stored table, so a
 > vote cast before this session was linked is simply absent, and an empty array can mean either
 > "nobody voted" or "nobody voted while we were watching". Live votes arrive as the
-> `message.poll_vote` event.
+> `poll.vote` event, which names the poll `pollMessageId`.
 
 > **Only recent polls can be read.** The poll must be within the same 100-message window
 > `vote-poll` uses; an older one comes back `404`.
@@ -1980,7 +1991,7 @@ Send a plain text message.
 
 | Field             | Type     | Required | Constraints                              | Description                                                                                  |
 | ----------------- | -------- | -------- | ---------------------------------------- | -------------------------------------------------------------------------------------------- |
-| chatId            | string   | Yes      | non-empty, max 255                       | `phone@c.us` or `groupId@g.us`                                                               |
+| chatId            | string   | Yes      | non-empty, max 255, `localpart@host`     | `phone@c.us` or `groupId@g.us`                                                               |
 | text              | string   | Yes      | non-empty, max 4096                      | Message text                                                                                 |
 | mentions          | string[] | No       | array of WIDs, max 1024 of 64 characters | WIDs to @mention (e.g. `["62811@c.us"]`). See **Mentions** below                             |
 | linkPreview       | boolean  | No       | —                                        | `false` suppresses it; on Baileys `true` is required to get one. See **Link previews** below |
@@ -2038,7 +2049,7 @@ rejected with `400` rather than guessing which half was meant.
 { "messageId": "true_628123456789@c.us_3EB0ABCD", "timestamp": 1719312000 }
 ```
 
-`messageId` is the WhatsApp message id from the engine. By default (`SIMULATE_TYPING`; set it to `false` to disable) a typing indicator and a humanising pause run before the send: 500 ms plus 45 ms per character, capped at `SIMULATE_TYPING_MAX_MS` (default 5000 ms), with +/-15% jitter.
+`messageId` is the WhatsApp message id from the engine. By default (`SIMULATE_TYPING`; set it to `false` to disable) a typing indicator and a humanising pause run before the send: 500 ms plus 45 ms per character, capped at `SIMULATE_TYPING_MAX_MS` (default 5000 ms), with +/-15% jitter; the pause never exceeds that cap, jitter included.
 
 **Errors:** `400` unknown body field, validation failure, or session not active / blocked by a plugin hook · `401` missing/invalid API key · `403` key role below OPERATOR · `404` the `quotedMessageId` could not be resolved (see Quoted sends) · `500` engine error · `409` conflict or engine not ready (retryable) · `501` not supported on the active engine · `422` the `Idempotency-Key` was already used for a different request (see [Idempotent sends](#idempotent-sends)) · `503` Baileys recipient lookup failed or timed out before the operation was sent, or WhatsApp rate-limited the send (code 429: nothing was sent, the `Idempotency-Key` is freed) or timed out a query it awaits (code 408: the outcome is not proven, the key stays taken)
 
@@ -2106,7 +2117,7 @@ Render a stored text template (header/body/footer joined by blank lines, `{{vars
 
 | Field        | Type                    | Required    | Constraints                                       | Description                                                 |
 | ------------ | ----------------------- | ----------- | ------------------------------------------------- | ----------------------------------------------------------- |
-| chatId       | string                  | Yes         | non-empty, max 255                                | Target chat                                                 |
+| chatId       | string                  | Yes         | non-empty, max 255, `localpart@host`              | Target chat                                                 |
 | templateId   | string                  | Conditional | non-empty; required when `templateName` is absent | Stored template id                                          |
 | templateName | string                  | Conditional | non-empty; required when `templateId` is absent   | Stored template name                                        |
 | vars         | Record\<string,string\> | No          | object                                            | Substituted into `{{placeholder}}` tokens; defaults to `{}` |
@@ -2147,7 +2158,7 @@ Send an image (by URL or base64) with an optional caption.
 
 | Field           | Type     | Required    | Constraints                              | Description                                                                              |
 | --------------- | -------- | ----------- | ---------------------------------------- | ---------------------------------------------------------------------------------------- |
-| chatId          | string   | Yes         | non-empty, max 255                       | Target chat                                                                              |
+| chatId          | string   | Yes         | non-empty, max 255, `localpart@host`     | Target chat                                                                              |
 | url             | string   | Conditional | URL; required when `base64` is absent    | http/https media URL (SSRF-guarded; a blocked internal or unreachable URL maps to `400`) |
 | base64          | string   | Conditional | string; required when `url` is absent    | Base64 media data (capped to the media byte limit)                                       |
 | mimetype        | string   | Conditional | string; required when using `base64`     | MIME type of the media                                                                   |
@@ -2267,14 +2278,14 @@ Send a location pin.
 
 **Request body** — `SendLocationDto`
 
-| Field           | Type   | Required | Constraints        | Description                                                                       |
-| --------------- | ------ | -------- | ------------------ | --------------------------------------------------------------------------------- |
-| chatId          | string | Yes      | non-empty, max 255 | Target chat                                                                       |
-| latitude        | number | Yes      | valid latitude     | Latitude (out-of-range → `400`)                                                   |
-| longitude       | number | Yes      | valid longitude    | Longitude (out-of-range → `400`)                                                  |
-| description     | string | No       | string, max 1024   | Pin description                                                                   |
-| address         | string | No       | string, max 1024   | Pin address                                                                       |
-| quotedMessageId | string | No       | non-empty          | Quote an earlier message, making this a reply — see [Quoted sends](#quoted-sends) |
+| Field           | Type   | Required | Constraints                          | Description                                                                       |
+| --------------- | ------ | -------- | ------------------------------------ | --------------------------------------------------------------------------------- |
+| chatId          | string | Yes      | non-empty, max 255, `localpart@host` | Target chat                                                                       |
+| latitude        | number | Yes      | valid latitude                       | Latitude (out-of-range → `400`)                                                   |
+| longitude       | number | Yes      | valid longitude                      | Longitude (out-of-range → `400`)                                                  |
+| description     | string | No       | string, max 1024                     | Pin description                                                                   |
+| address         | string | No       | string, max 1024                     | Pin address                                                                       |
+| quotedMessageId | string | No       | non-empty                            | Quote an earlier message, making this a reply — see [Quoted sends](#quoted-sends) |
 
 ```json
 {
@@ -2308,12 +2319,12 @@ Send a contact card (vCard).
 
 **Request body** — `SendContactDto`
 
-| Field           | Type   | Required | Constraints        | Description                                                                       |
-| --------------- | ------ | -------- | ------------------ | --------------------------------------------------------------------------------- |
-| chatId          | string | Yes      | non-empty, max 255 | Target chat                                                                       |
-| contactName     | string | Yes      | non-empty, max 255 | Display name for the contact card                                                 |
-| contactNumber   | string | Yes      | non-empty, max 30  | Contact phone number                                                              |
-| quotedMessageId | string | No       | non-empty          | Quote an earlier message, making this a reply — see [Quoted sends](#quoted-sends) |
+| Field           | Type   | Required | Constraints                          | Description                                                                       |
+| --------------- | ------ | -------- | ------------------------------------ | --------------------------------------------------------------------------------- |
+| chatId          | string | Yes      | non-empty, max 255, `localpart@host` | Target chat                                                                       |
+| contactName     | string | Yes      | non-empty, max 255                   | Display name for the contact card                                                 |
+| contactNumber   | string | Yes      | non-empty, max 30                    | Contact phone number                                                              |
+| quotedMessageId | string | No       | non-empty                            | Quote an earlier message, making this a reply — see [Quoted sends](#quoted-sends) |
 
 ```json
 { "chatId": "628123456789@c.us", "contactName": "John Doe", "contactNumber": "628987654321" }
@@ -2627,7 +2638,7 @@ Send messages to multiple recipients as an async batch — returns immediately a
 | messages | BulkMessageItemDto[]  | Yes      | array, max 100, nested-validated | The batch items (see below); exact duplicate entries (same `chatId`, `type`, `content` and `variables`) are collapsed before processing, first occurrence wins, order preserved; distinct messages to the same `chatId` are all sent |
 | options  | BulkMessageOptionsDto | No       | nested-validated                 | Pacing/error options (see below)                                                                                                                                                                                                     |
 
-Each `BulkMessageItemDto`: `{ chatId: string, type: 'text'|'image'|'video'|'audio'|'document', content: BulkMessageContentDto, variables?: Record<string,string> }`. `content` (all fields optional, nested-validated): `text?: string`, `image?`/`video?`/`audio?`/`document?`: `{ url?, base64?, mimetype?, filename?, ptt? }` (`ptt` applies to `audio` only), `caption?: string`, `mentions?: string[]` (per item; a batch fans out to many chats, and a WID is only taggable in a chat the participant is in).
+Each `BulkMessageItemDto`: `{ chatId: string, type: 'text'|'image'|'video'|'audio'|'document', content: BulkMessageContentDto, variables?: Record<string,string> }`. `content` (all fields optional, nested-validated): `text?: string`, `image?`/`video?`/`audio?`/`document?`: `{ url?, base64?, mimetype?, filename?, ptt? }` (`ptt` applies to `audio` only), `caption?: string`, `mentions?: string[]` (per item; a batch fans out to many chats, and a WID is only taggable in a chat the participant is in). An entry may hold a placeholder such as `{{phone}}@c.us` that the item's `variables` fill in, so one batch can tag a different participant per item; the request accepts it unchecked, and a rendered list that is not made of individual WIDs fails that item.
 
 `BulkMessageOptionsDto`: `{ delayBetweenMessages?: number (1000–60000, default 3000), randomizeDelay?: boolean (default true), stopOnError?: boolean (default false) }`.
 
@@ -2905,7 +2916,7 @@ Batch-resolve profile picture URLs for many contacts in one request (a chat side
 }
 ```
 
-`pictures` is keyed by the requested id. A per-id failure — or a lookup that exceeds the 8 s per-id deadline — yields `null` for that id rather than failing the batch. An omitted or empty `ids` returns `{ "pictures": {} }`.
+`pictures` is keyed by the requested id. Lookups run five at a time. A per-id failure yields `null` for that id rather than failing the batch. A lookup that exceeds its 8 s deadline also yields `null` for its id and ends the request there: the ids of the later chunks are absent from `pictures`, as are the ids past the 50th, so ask for them again instead of reading them as having no picture. Completed pictures are kept. An omitted or empty `ids` returns `{ "pictures": {} }`.
 
 An engine that is not ready is the exception: it describes the session rather than one id, so the whole request answers `409` and no partial result is returned.
 
@@ -3438,6 +3449,47 @@ No `@HttpCode`; PUT default is `200`.
 
 **Errors:** `400` validation (`description` missing / not a string) / session not started · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, or the engine refused (admin rights required) · `404` no such group · `409` conflict or engine not ready (retryable) · `503` session not ready or dependency unavailable (retryable); on Baileys, also when WhatsApp rate-limits or times out the request (code 429 or 408): retry after a pause
 
+#### PUT /api/sessions/:sessionId/groups/:groupId/member-label
+
+Set this account's own member label in the group: the per-group tag WhatsApp shows beside its name, so
+one number can carry a different label in each group. An empty string clears the label.
+
+**Auth:** API key (OPERATOR) · **Engines:** Baileys only; whatsapp-web.js returns `501`
+
+A key restricted to selected chats reaches only the groups on its list.
+
+**Path parameters**
+
+| Name      | Type   | Description                                   |
+| --------- | ------ | --------------------------------------------- |
+| sessionId | string | Session ID                                    |
+| groupId   | string | Group ID (`<id>@g.us`); any other id is `400` |
+
+**Request body**: `GroupMemberLabelDto`
+
+| Field | Type   | Required | Constraints                                            | Description                                                          |
+| ----- | ------ | -------- | ------------------------------------------------------ | -------------------------------------------------------------------- |
+| label | string | Yes      | `@IsString` (no `@IsNotEmpty`), ≤ 30 UTF-16 code units | Must be present and a string, but `""` is valid and clears the label |
+
+The 30 is counted in UTF-16 code units, the unit Baileys cuts the label at, so an emoji outside the
+Basic Multilingual Plane takes two of them. A longer label is refused rather than shortened.
+
+```json
+{ "label": "Site A Management" }
+```
+
+**Response** `200`
+
+The label message was handed to WhatsApp. Baileys sends it to the group as a protocol message, so
+there is no per-request confirmation, and group metadata does not carry the label, so it cannot be
+read back through this API.
+
+```json
+{ "success": true, "message": "Group member label sent" }
+```
+
+**Errors:** `400` validation (`label` missing / not a string / too long), the id does not name a group, or session not started · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role or the group is outside a chat-restricted key's list, or WhatsApp refused the group lookup the label message depends on (for example, the account is no longer a member) · `404` no such group · `409` conflict or engine not ready (retryable) · `501` whatsapp-web.js, which has no member-label setter · `503` WhatsApp did not answer within the request budget, so the label may or may not have been sent; on Baileys, also when WhatsApp rate-limits or times out the request (code 429 or 408): retry after a pause
+
 #### POST /api/sessions/:sessionId/groups/:groupId/leave
 
 Leave a group.
@@ -3706,14 +3758,14 @@ for every **named** requester is a `403`.
 }
 ```
 
-**Errors:** `400` validation / session not started · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, or the engine refused (admin rights / every named requester failed) · `404` no such group · `409` engine not ready · `503` WhatsApp did not answer within the request budget; on Baileys, also when WhatsApp rate-limits or times out the request (code 429 or 408): retry after a pause
+**Errors:** `400` validation / session not started / a body that is a JSON list, or one sent in a content type other than `application/json` or `application/x-www-form-urlencoded`, which would otherwise act on every pending request · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, or the engine refused (admin rights / every named requester failed) · `404` no such group · `409` engine not ready · `503` WhatsApp did not answer within the request budget; on Baileys, also when WhatsApp rate-limits or times out the request (code 429 or 408): retry after a pause
 
 #### POST /api/sessions/:sessionId/groups/:groupId/membership-requests/reject
 
 Reject pending join requests. Same body, response shape, batch-guard contract and error map as
 `.../membership-requests/approve`; rejecting an empty queue is likewise a no-op.
 
-**Errors:** `400` validation / session not started · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, or the engine refused (admin rights / every named requester failed) · `404` no such group · `409` engine not ready · `503` WhatsApp did not answer within the request budget; on Baileys, also when WhatsApp rate-limits or times out the request (code 429 or 408): retry after a pause
+**Errors:** `400` validation / session not started / a body that is a JSON list, or one sent in a content type other than `application/json` or `application/x-www-form-urlencoded`, which would otherwise act on every pending request · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role, or the engine refused (admin rights / every named requester failed) · `404` no such group · `409` engine not ready · `503` WhatsApp did not answer within the request budget; on Baileys, also when WhatsApp rate-limits or times out the request (code 429 or 408): retry after a pause
 
 ```json
 {
@@ -4038,11 +4090,11 @@ Send a product message (catalog product card) to a chat. Note: this route lives 
 
 **Request body** — `SendProductDto`
 
-| Field       | Type   | Required | Constraints                             | Description                                                       |
-| ----------- | ------ | -------- | --------------------------------------- | ----------------------------------------------------------------- |
-| `chatId`    | string | Yes      | `@IsString @IsNotEmpty @MaxLength(255)` | Target chat/recipient id (e.g. `6281234567890@c.us`).             |
-| `productId` | string | Yes      | `@IsString @IsNotEmpty @MaxLength(255)` | Catalog product id to send.                                       |
-| `body`      | string | No       | `@IsString @MaxLength(4096)`            | Optional message body/caption; `null` is the same as omitting it. |
+| Field       | Type   | Required | Constraints                                                           | Description                                                       |
+| ----------- | ------ | -------- | --------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `chatId`    | string | Yes      | `@IsString @IsNotEmpty @MaxLength(255) @Matches(/^[^\s@]+@[^\s@]+$/)` | Target chat/recipient id (e.g. `6281234567890@c.us`).             |
+| `productId` | string | Yes      | `@IsString @IsNotEmpty @MaxLength(255)`                               | Catalog product id to send.                                       |
+| `body`      | string | No       | `@IsString @MaxLength(4096)`                                          | Optional message body/caption; `null` is the same as omitting it. |
 
 ```json
 {
@@ -4851,7 +4903,7 @@ Webhooks are configured per session and managed under `/api/sessions/:sessionId/
 
 Two fields — `secret` and `headers` — are **write-only**: they are accepted on create/update but are never returned by any webhook route (the response DTO has no `@Expose` for them, so `fromEntity` drops them). `GET /api/infra/export-data` also omits both from its `webhooks` rows, so a backup no longer carries webhook credentials — a restored webhook comes back unsigned (`secret` null, `headers` `{}`) until you set them again. The `secret` is used to compute the `X-OpenWA-Signature: sha256=<hex>` HMAC-SHA256 header on deliveries.
 
-The `events` array accepts these members plus the `*` wildcard: `message.received`, `message.sent`, `message.ack`, `message.receipt`, `message.failed`, `message.revoked`, `message.reaction`, `message.poll_vote`, `message.edited`, `session.status`, `session.qr`, `session.authenticated`, `session.disconnected`, `session.reconnect_loop`, `session.restriction`, `presence.update`, `event.response`, `call.accepted`, `call.rejected`, `call.missed`, `group.join`, `group.leave`, `group.update`, `group.join_request`, `call.received`, `status.received`. All of them are actively dispatched by at least one engine — none is a reserved placeholder. Six are **Baileys only**, because whatsapp-web.js produces no callback behind them: `message.receipt` (whatsapp-web.js has no per-recipient receipt event), `presence.update` (its prerequisite `POST .../presence/subscribe` answers `501` there, so this one announces itself), `event.response` (accepted on subscribe and never fired) and `call.accepted` / `call.rejected` / `call.missed` (whatsapp-web.js has no call-outcome callback, so these three are accepted on subscribe and then simply never fire). `message.receipt` is the one event a `*` subscription does not receive: it fires once per recipient, so it must be named explicitly. `call.received` is dispatched by both engines but is not reliable on whatsapp-web.js: it fired there in a live test on 2026-09-17 and did not in one on 2026-08-10. See the per-event catalog below for engine scope.
+The `events` array accepts these members plus the `*` wildcard: `message.received`, `message.sent`, `message.ack`, `message.receipt`, `message.failed`, `message.revoked`, `message.reaction`, `message.edited`, `session.status`, `session.qr`, `session.authenticated`, `session.disconnected`, `session.reconnect_loop`, `session.restriction`, `presence.update`, `event.response`, `poll.vote`, `call.accepted`, `call.rejected`, `call.missed`, `group.join`, `group.leave`, `group.update`, `group.join_request`, `call.received`, `status.received`. All of them are actively dispatched by at least one engine — none is a reserved placeholder. Six are **Baileys only**, because whatsapp-web.js produces no callback behind them: `message.receipt` (whatsapp-web.js has no per-recipient receipt event), `presence.update` (its prerequisite `POST .../presence/subscribe` answers `501` there, so this one announces itself), `event.response` (accepted on subscribe and never fired) and `call.accepted` / `call.rejected` / `call.missed` (whatsapp-web.js has no call-outcome callback, so these three are accepted on subscribe and then simply never fire). `message.receipt` is the one event a `*` subscription does not receive: it fires once per recipient, so it must be named explicitly. `call.received` is dispatched by both engines but is not reliable on whatsapp-web.js: it fired there in a live test on 2026-09-17 and did not in one on 2026-08-10. One is **whatsapp-web.js only**: `poll.vote` (the Baileys adapter does not decrypt vote updates, so it is accepted on subscribe and never fires there). See the per-event catalog below for engine scope.
 
 #### GET /api/sessions/:sessionId/webhooks
 
@@ -5034,7 +5086,7 @@ timeout does not cancel the batch; inspect the failure log before retrying it.
 }
 ```
 
-`redriven` equals `delivered`; `enqueued` is retained for response compatibility and is always `0`. A row is excluded before applying the limit when it has `attempts: 0`, holds no event data, is past the retention window or out of scope, or its webhook is removed, disabled, unsubscribed from the event or no longer in the row's session. `skipped` counts selected rows cancelled by a hook or invalidated during the call. `remaining` counts eligible rows in the same requested session, webhook and IDs after the call. Retry another batch only after resolving persistent failures or hook cancellations; `remaining > 0` alone does not mean another call will succeed.
+`redriven` equals `delivered`; `enqueued` is retained for response compatibility and is always `0`. A row is excluded before applying the limit when it has `attempts: 0`, holds no event data, is past the retention window or out of scope, or its webhook is removed, disabled, unsubscribed from the event or no longer in the row's session. `skipped` counts selected rows cancelled by a hook or invalidated during the call. `remaining` counts eligible rows in the same requested session, webhook and IDs after the call. A replay a hook cancels counts as an attempt on its row, like a failed one, and keeps its payload, so cancelled rows move behind rows with fewer attempts instead of leading every batch. Retry another batch only after resolving persistent failures or hook cancellations; `remaining > 0` alone does not mean another call will succeed.
 
 **Errors:** `400` body fails validation · `401` missing/invalid API key · `403` key role below ADMIN
 
@@ -5509,7 +5561,10 @@ Content-Type `text/plain` with the parameters `version=0.0.4` and `charset=utf-8
 When the data database cannot be read the database-derived series (`openwa_sessions*`,
 `openwa_messages*`) are OMITTED rather than reported as zero — a zero would fire an alert
 claiming every session had dropped. `openwa_stats_available` is what tells the two cases apart,
-so alert on it rather than reading a missing series as zero. `docs/10` lists every series.
+so alert on it rather than reading a missing series as zero. A scrape waits at most 2 seconds for
+that read and serves the last result it kept, up to 5 minutes after that read started, when it is late; the series are omitted when
+the read failed (which also discards the kept result) or no result is that recent, so a database that stalls costs those series and not the
+rest of the scrape. `docs/10` lists every series.
 
 ```
 # HELP openwa_up 1 if the OpenWA process is running
@@ -5537,7 +5592,7 @@ openwa_messages_total{direction="incoming"} 940
 openwa_messages_failed_total 4
 ```
 
-Values come from `StatsService.getOverview()` plus `process.memoryUsage()`/`process.uptime()`. The render is memoized for 5000 ms to avoid re-running the overview query on every scrape, and `getOverview()` is itself memoized for `STATS_CACHE_TTL_MS` (default 30 s), so the database-derived series and `openwa_stats_available` can trail the data database by up to `STATS_CACHE_TTL_MS` + 5 s plus the time the overview query takes (the memo TTL counts from when the query completes).
+Values come from `StatsService.getOverview()` plus `process.memoryUsage()`/`process.uptime()`. The render is memoized for 5000 ms to avoid re-running the overview query on every scrape, and `getOverview()` is itself memoized for `STATS_CACHE_TTL_MS` (default 30 s), so the database-derived series and `openwa_stats_available` can trail the data database by up to `STATS_CACHE_TTL_MS` + 5 s plus the time the overview query takes (the memo TTL counts from when the query completes), or by up to 5 minutes plus `STATS_CACHE_TTL_MS` when the database stops answering and the last kept result stands in for the late read.
 
 **Errors:** `401` — `METRICS_TOKEN` is configured but the bearer is missing or does not match (`{ "statusCode": 401, "message": "Invalid metrics token", "error": "Unauthorized" }`) · `404` — `METRICS_TOKEN` is unset/blank, so the endpoint is disabled (`{ "statusCode": 404, "message": "Metrics endpoint is disabled (set METRICS_TOKEN to enable)", "error": "Not Found" }`) · `429`: 10 failed token attempts from one client within a minute; only failures count, and the block lifts as the window slides (`{ "statusCode": 429, "message": "Too many failed metrics token attempts" }`).
 
@@ -5665,7 +5720,7 @@ Notes: raw return of an in-memory `Settings` object built once in the controller
 
 #### GET /api/audit
 
-List audit-log entries, newest first. API-key lifecycle changes, session lifecycle events, send-pacing and rate-limit enforcement, queue-dashboard mutations, webhook delivery redrives, integration-instance changes, plugin management (install, update, uninstall, enable, disable, configuration, session activation) and ADMIN infra operations land here. **The eight actions below are never emitted**, so filtering for any of them returns zero rows by design: `message_sent` and `message_failed` (every send and its outcome is in the `messages` table), `webhook_triggered` and `webhook_failed` (tracked in `webhook_delivery_failures` and the `openwa_webhook_delivery_failures_total` counter), `webhook_created` and `webhook_deleted` (not wired yet), `api_key_used` (it would fire on every authenticated request; failed authentication is audited as `api_key_auth_failed`), and `session_connected` (an engine-level transition already reflected in `sessions.status`; the user-initiated `session_started` and `session_stopped` are audited).
+List audit-log entries, newest first. API-key lifecycle changes, session lifecycle events, send-pacing and rate-limit enforcement, queue-dashboard mutations, webhook delivery redrives, integration-instance changes, plugin management (install, update, uninstall, enable, disable, configuration, session activation) and ADMIN infra operations land here. **The eight actions below are never emitted**, so filtering for any of them returns zero rows by design: `message_sent` and `message_failed` (every send and its outcome is in the `messages` table), `webhook_triggered` and `webhook_failed` (tracked in `webhook_delivery_failures` and the `openwa_webhook_delivery_failures_total` counter), `webhook_created` and `webhook_deleted` (not wired yet), `api_key_used` (it would fire on every authenticated request; failed authentication is audited as `api_key_auth_failed`), and `session_connected` (an engine-level transition already reflected in `sessions.status`; the user-initiated `session_started` and `session_stopped` are audited, and `session_stopped` is also written, with `via: infra_import_data` in its metadata, for each session a data import with `stopOrphans` stops, whether or not the import then commits).
 
 **Auth:** API key (ADMIN) · **Scope:** rows are confined to the calling key's `allowedSessions` — the `sessionId` query may only narrow within that list, never widen it
 
@@ -5775,7 +5830,7 @@ The `queue.webhooks` counters are live BullMQ job counts (`pending` = waiting + 
 
 `builtIn` (on `database`/`redis`/`storage`) reports whether OpenWA's own bundled container is actually running _and_ backing this service, detected live from the labelled container (on a daemon another OpenWA instance shares, its container counts too while this instance's host is spelled like the bundled one, see [13 - Horizontal Scaling](./13-horizontal-scaling.md)); when Docker is unreachable it falls back to the saved `*_BUILTIN` flag (one pinned by the environment first, else the one in `data/.env.generated`) beside a host that reaches the bundled container: a host name alone counts for nothing there, since an external server may be called `postgres`, and neither does the flag beside another host, which the process dials. `running` (on the same three) reports whether a bundled container OpenWA itself created is up, whether or not the service uses it: one Docker Compose created (it carries Compose's project label) reads `false`, so does one beside a configuration whose `POSTGRES_BUILTIN`, `REDIS_BUILTIN` or `MINIO_BUILTIN` (the environment's first, else the saved one) is not `true` (the container names are fixed per Docker daemon, so another OpenWA instance on the same daemon sees the same containers), and the key is absent while Docker is unreachable, since nothing can be seen or stopped then. In S3 mode `storage` additionally carries `bucket` and `endpoint` (each when one is configured; a bundled MinIO that is stopped still reports `http://minio:9000` here, with `builtIn` false) and `s3Available` (re-probed, throttled, while false; once true it stays true until a restart, so a later outage does not clear it); in local mode neither key is present. `engine.webVersion`/`engine.webVersionSource` (`pinned` / `auto` / `native`) appear only on `whatsapp-web.js`; `webVersion` is `null` until the auto-resolve first succeeds. `engine.browserArgs` is the effective launch argument list: `PUPPETEER_ARGS` (or the four defaults shown) with `--lang=en-US` appended unless a `--lang` flag is already present.
 
-`envPinned` lists which of the keys `PUT /api/infra/config` writes the host environment or the project `.env` sets, by name only: `DATABASE_TYPE`, `POSTGRES_BUILTIN`, `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USERNAME`, `DATABASE_PASSWORD`, `DATABASE_NAME`, `DATABASE_POOL_SIZE`, `POSTGRES_SCHEMA`, `DATABASE_SSL`, `DATABASE_SSL_REJECT_UNAUTHORIZED`, `REDIS_ENABLED`, `REDIS_BUILTIN`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `QUEUE_ENABLED`, `STORAGE_TYPE`, `MINIO_BUILTIN`, `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `STORAGE_LOCAL_PATH`, `ENGINE_TYPE`, `PUPPETEER_HEADLESS`, `SESSION_DATA_PATH` and `PUPPETEER_ARGS`. Those layers win over `data/.env.generated`, so a value saved for one of these keys through `PUT /api/infra/config` cannot take effect until that layer is changed. A pinned host also decides whether the bundled container backs its service, whatever `builtIn` is saved. A pinned `POSTGRES_BUILTIN`, `REDIS_BUILTIN` or `MINIO_BUILTIN` participates in container startup: `true` starts the container only while its datastore is in use and the environment does not pin its host to another server. The service uses the container only when its effective host reaches it.
+`envPinned` lists which of the keys `PUT /api/infra/config` writes the host environment or the project `.env` sets, by name only: `DATABASE_TYPE`, `POSTGRES_BUILTIN`, `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USERNAME`, `DATABASE_PASSWORD`, `DATABASE_NAME`, `DATABASE_POOL_SIZE`, `POSTGRES_SCHEMA`, `DATABASE_SSL`, `DATABASE_SSL_REJECT_UNAUTHORIZED`, `REDIS_ENABLED`, `REDIS_BUILTIN`, `REDIS_TLS`, `REDIS_USERNAME`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `QUEUE_ENABLED`, `STORAGE_TYPE`, `MINIO_BUILTIN`, `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `STORAGE_LOCAL_PATH`, `ENGINE_TYPE`, `PUPPETEER_HEADLESS`, `SESSION_DATA_PATH` and `PUPPETEER_ARGS`. Those layers win over `data/.env.generated`, so a value saved for one of these keys through `PUT /api/infra/config` cannot take effect until that layer is changed. A pinned host also decides whether the bundled container backs its service, whatever `builtIn` is saved. A pinned `POSTGRES_BUILTIN`, `REDIS_BUILTIN` or `MINIO_BUILTIN` participates in container startup: `true` starts the container only while its datastore is in use and the environment does not pin its host to another server. The service uses the container only when its effective host reaches it.
 
 **Errors:** `401` missing/invalid key · `403` key role < ADMIN, or key is session-scoped
 
@@ -5860,7 +5915,7 @@ release number until the next release bumps it.
 
 #### GET /api/infra/config
 
-Read the effective infrastructure config used to hydrate the dashboard form. Each field resolves with the boot precedence: a value pinned by the host environment (e.g. Compose `environment:`) or the project `.env` wins over `data/.env.generated`, while a key that only ever lived in the saved file reports the freshly-saved value even before a restart applies it ("saved, pending restart"). **Secrets are never returned** — only `*Set`/`*CredentialsSet` booleans indicate that a secret is stored.
+Read the effective infrastructure config used to hydrate the dashboard form. Each field resolves with the boot precedence: a value pinned by the host environment (e.g. Compose `environment:`) or the project `.env` wins over `data/.env.generated`, while a key that only ever lived in the saved file reports the freshly-saved value even before a restart applies it ("saved, pending restart"). **Secrets are never returned** — only `*Set`/`*CredentialsSet` booleans indicate that a secret is stored. `database.database` is an empty string while the effective database type is `sqlite`, where the stored key holds a file path.
 
 **Auth:** API key (ADMIN)
 
@@ -5991,11 +6046,11 @@ Built-in flags: a section sent without `builtIn` follows its stored host or endp
 }
 ```
 
-Write/IO errors are caught and returned as HTTP `200` with `{ "saved": false, "envPath": "", "profiles": [], "message": "Failed to save configuration: …" }`. DTO validation, an unknown engine type, an invalid `database.schema`, CR/LF injection, a value that cannot be stored so that it reads back unchanged, and a merged config the production boot guard would reject (an empty or default `DATABASE_PASSWORD` or S3 key on an external datastore, or a placeholder `REDIS_PASSWORD`; message starts `Refusing to save a configuration that would be rejected at production boot.`), and a local `storage.localPath` the app cannot create or write (message starts `Refusing to save the storage path`; the next start would refuse to boot on it, and a path pinned by the host environment or the project `.env` is not judged, as the boot never reads the submitted one) are real HTTP `400` responses, and nothing is written. `profiles` lists newly-required Docker profiles.
+Write/IO errors are caught and returned as HTTP `200` with `{ "saved": false, "envPath": "", "profiles": [], "message": "Failed to save configuration: …" }`. DTO validation, an unknown engine type, an invalid `database.schema`, CR/LF injection, a value that cannot be stored so that it reads back unchanged, and a merged config the production boot guard would reject (an empty or default `DATABASE_PASSWORD` or S3 key on an external datastore, or a placeholder `REDIS_PASSWORD`; message starts `Refusing to save a configuration that would be rejected at production boot.`), and a merged config the boot environment validation rejects, such as a PostgreSQL selection without a host, a pool size that is not an integer, `REDIS_TLS=true` beside the built-in Redis or, in a save that changes `S3_ENDPOINT` or newly selects S3, an `S3_ENDPOINT` that is not an `http(s)` URL while `STORAGE_TYPE=s3` (boot only logs it; message starts `Refusing to save a configuration that fails boot validation.` and carries the boot message), and a local `storage.localPath` the app cannot create or write (message starts `Refusing to save the storage path`; the next start would refuse to boot on it, and a path pinned by the host environment or the project `.env` is not judged, as the boot never reads the submitted one) are real HTTP `400` responses, and nothing is written. `profiles` lists newly-required Docker profiles.
 
 **Errors:** `400` unknown/mistyped body field, a `database.type`/`storage.type` left out with none stored or pinned, unknown
 `engine.type`, invalid `database.schema`, CR-LF in a value, a value that cannot round-trip through the
-env file, a config the production boot secret guard would reject, or a local
+env file, a config the production boot secret guard or the boot environment validation would reject, or a local
 `storage.localPath` the app cannot create or write · `401` · `403`
 
 ---
@@ -6029,7 +6084,7 @@ Request a graceful server restart, optionally orchestrating Docker profiles (add
 }
 ```
 
-`estimatedTime` (seconds, a typical healthy value rather than a bound; teardown is force-exited 67 s after the grace at the default `WEBHOOK_SHUTDOWN_DRAIN_MS`) = base 15 + 20/postgres + 13/redis + 15/minio + 5/removal. The echoed `profilesToRemove`, and the removal count, already omit any bundled service the environment pins the app to (for example `DATABASE_HOST=postgres` set in the host environment or the project `.env`, or the container name `openwa-postgres`, in any letter case); such a service is never stopped. Likewise the echoed `profiles` omit a bundled service whose host the environment pins to anything else (for example `DATABASE_HOST=db.example.com`): the next boot dials that host, so its container is not started. `orchestration` is present only when Docker is available and at least one managed profile (`postgres`, `redis`, `minio`) remains in `profiles`; `removal` only when Docker is available and at least one managed profile remains in `profilesToRemove` after dropping pinned services and profiles that are also being started. Without Docker, a `data/.orchestration-request.json` signal file is written instead. After responding, `shutdownService.shutdown()` runs (default ~3s grace); readiness returns `503` during drain.
+`estimatedTime` (seconds, a typical healthy value rather than a bound; teardown is force-exited 67 s after the grace at the default `WEBHOOK_SHUTDOWN_DRAIN_MS`) = base 15 + 20/postgres + 13/redis + 15/minio + 5/removal. The echoed `profilesToRemove`, and the removal count, already omit any bundled service the environment pins the app to (for example `DATABASE_HOST=postgres` set in the host environment or the project `.env`, or the container name `openwa-postgres`, in any letter case); such a service is kept while the next boot uses its datastore, and stopped by the restart once that datastore is switched off (SQLite, local storage, no consumer of Redis), even when the pinned host still names it. Likewise the echoed `profiles` omit a bundled service whose host the environment pins to anything else (for example `DATABASE_HOST=db.example.com`): the next boot dials that host, so its container is not started. `orchestration` is present only when Docker is available and at least one managed profile (`postgres`, `redis`, `minio`) remains in `profiles`; `removal` only when Docker is available and at least one managed profile remains in `profilesToRemove` after dropping pinned services and profiles that are also being started. Without Docker, a `data/.orchestration-request.json` signal file is written instead. After responding, `shutdownService.shutdown()` runs (default ~3s grace); readiness returns `503` during drain.
 
 **Errors:** `401` · `403`
 
@@ -6355,7 +6410,7 @@ The catalog is fetched from `PLUGIN_CATALOG_URL`, which defaults to the OpenWA-p
 
 The dashboard installs and updates an entry by passing its `download` URL to `POST /api/plugins/install-url` or `POST /api/plugins/:id/update`, so the pin rule of those routes applies: under `NODE_ENV=production` (unless `PLUGIN_INSTALL_REQUIRE_PIN=false`) an entry whose `download` has no `#sha256=` pin cannot be installed. Every entry in the default catalog carries one.
 
-**Errors:** `400` catalog fetch failed / not a JSON array · `401` · `403`
+**Errors:** `400` catalog fetch failed / not a JSON array / an entry without a text `id`, `name` or `version`, or with a non-text optional field · `401` · `403`
 
 ---
 
@@ -6648,7 +6703,7 @@ Update an installed plugin in place from a URL, preserving config + enabled stat
 
 #### DELETE /api/plugins/:id
 
-Uninstall a plugin: dispatch its `onUnload` lifecycle hook, delete its files, drop its registry entry, and remove its `ctx.storage` data directory (`<dataDir>/plugins/<id>` — a separate tree when `PLUGINS_DIR` points outside the data dir). Built-in plugins are protected. A plugin that is installed but not loaded — one whose code went missing — can be uninstalled too; there is simply no runtime to tear down first. `404` therefore means an id the gateway has no registry entry for.
+Uninstall a plugin: dispatch its `onUnload` lifecycle hook, delete its files, remove its `ctx.storage` data directory (`<dataDir>/plugins/<id>` — a separate tree when `PLUGINS_DIR` points outside the data dir), and drop its registry entry last. Built-in plugins are protected. A plugin that is installed but not loaded — one whose code went missing — can be uninstalled too; there is simply no runtime to tear down first. `404` therefore means an id the gateway has no registry entry for.
 
 **Auth:** API key (ADMIN)
 
@@ -6666,7 +6721,7 @@ Uninstall a plugin: dispatch its `onUnload` lifecycle hook, delete its files, dr
 
 Note: this DELETE returns `200` with a body (not the usual `204`).
 
-**Errors:** `400` cannot uninstall (e.g. built-in) · `401` · `403` · `404` unknown id · `409` the plugin is still being restored after startup (retry shortly)
+**Errors:** `400` cannot uninstall (e.g. built-in, or a package or storage folder that could not be removed; the registry entry stays, so the call can be repeated) · `401` · `403` · `404` unknown id · `409` the plugin is still being restored after startup (retry shortly)
 
 ---
 
@@ -6676,7 +6731,8 @@ Re-dispatch one bounded batch of dead-lettered inbound deliveries for an integra
 **doc 25, Integration Fabric** for the DLQ and redrive design). Rows are drained fewest-attempts-first,
 then oldest-first, up to `batchSize` (100) — so a row that keeps failing moves behind never-retried
 rows instead of livelocking the window, while staying redrivable. `remaining` reports the DLQ depth
-still outstanding after this batch.
+still outstanding after this batch. Only rows written under the instance's current session binding are
+redriven and counted; rows of an earlier binding stay in the dead-letter table.
 
 **Auth:** API key (ADMIN) · **Scope:** session-scoped (a key restricted to `allowedSessions` may only
 redrive an instance whose current `sessionScope` is inside that allowlist; out of scope and missing
@@ -6748,7 +6804,7 @@ Key facts:
 }
 ```
 
-For `tools/call` the result is an MCP `CallToolResult` (`content` array of `text` or embedded base64 `resource` items — payloads over 4096 bytes become a `resource`). **Tool-level failures are returned in-band as `CallToolResult` with `isError:true`** (HTTP stays 200), including a role, session or chat refusal (`name:'ForbiddenException'`), rate-limit hits (`message:'MCP rate limit exceeded'`), and an unknown tool or arguments that fail the tool's `inputSchema` (text `MCP error -32602: …`).
+For `tools/call` the result is an MCP `CallToolResult` (`content` array of `text` or embedded base64 `resource` items — payloads over 4096 bytes of UTF-8 become a `resource`). **Tool-level failures are returned in-band as `CallToolResult` with `isError:true`** (HTTP stays 200), including a role, session or chat refusal (`name:'ForbiddenException'`), rate-limit hits (`message:'MCP rate limit exceeded'`), and an unknown tool or arguments that fail the tool's `inputSchema` (text `MCP error -32602: …`).
 
 **Errors:** `401` for a missing or invalid key and `403` for a key carrying `allowedIps`, each with a JSON-RPC error body · `406` when `Accept` does not list both `application/json` and `text/event-stream` · `415` for a non-JSON `Content-Type` · `400` for malformed JSON, or with a `-32700` JSON-RPC error body for JSON that is not a valid JSON-RPC message · in-band JSON-RPC errors `-32601` (unknown method) and `-32603` (params that fail the method's schema, such as a `tools/call` without `name`; the message carries the validation issues), at HTTP 200 · `500` if the key lookup fails for a reason other than a refused key, or if the transport throws before headers are sent · `404` when `MCP_ENABLED` is not `true`
 
@@ -6773,18 +6829,19 @@ Search messages across sessions (active search provider).
 
 **Query parameters**
 
-| Name        | Type                            | Required | Default | Description                                                                                                                                                                                                                                                                                                     |
-| ----------- | ------------------------------- | -------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `q`         | string                          | **Yes**  | —       | Search term. Must be non-empty after trim; `400` for whitespace-only, over 1000 characters, or over 32 words (punctuation separates words, a symbol or emoji that stands apart counts as a word, a whitespace-separated word said again counts once). Passed to the active provider's native full-text matcher. |
-| `sessionId` | string                          | No       | —       | Restrict to a single session id (intersected with the key's `allowedSessions` scope).                                                                                                                                                                                                                           |
-| `chatId`    | string                          | No       | —       | Restrict to a single chat id. With the built-in provider, a phone also matches the chat's other stored forms (the other user dialect, any lid that resolves to it). For a key restricted to selected chats this must name an allowed chat (`403` otherwise), and its hits are also narrowed to the allowlist.   |
-| `direction` | enum (`incoming` \| `outgoing`) | No       | —       | Filter by message direction.                                                                                                                                                                                                                                                                                    |
-| `type`      | string                          | No       | —       | Filter by stored message `type` (e.g. `text`, `image`, `video`). Compared against `messages.type`; not an enum validation, any string is accepted and unmatched values simply return no hits.                                                                                                                   |
-| `from`      | string                          | No       | —       | Filter by sender; with the built-in provider, matches `from` or a group message's `author`, and a phone also matches any lid that resolves to it.                                                                                                                                                               |
-| `dateFrom`  | integer (epoch ms)              | No       | —       | Inclusive lower bound on `timestamp`. Must be between -9007199254740991 and 9007199254740991; a non-numeric or out-of-range value is rejected with `400`.                                                                                                                                                       |
-| `dateTo`    | integer (epoch ms)              | No       | —       | Inclusive upper bound on `timestamp`. Must be between -9007199254740991 and 9007199254740991; a non-numeric or out-of-range value is rejected with `400`.                                                                                                                                                       |
-| `limit`     | integer (≥ 1)                   | No       | `50`    | Max hits to return. Clamped to `SEARCH_LIMIT_MAX` (default `100`). A non-integer value is rejected with `400`.                                                                                                                                                                                                  |
-| `offset`    | integer (≥ 0)                   | No       | `0`     | Pagination offset, at most `100000`. A non-integer or larger value is rejected with `400`.                                                                                                                                                                                                                      |
+| Name        | Type                            | Required | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------- | ------------------------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `q`         | string                          | **Yes**  | —       | Search term. Must be non-empty after trim; `400` for whitespace-only, over 1000 characters, over 32 words (punctuation separates words, a symbol or emoji that stands apart counts as a word, a whitespace-separated word said again counts once), or holding a NUL character. Passed to the active provider's native full-text matcher.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `match`     | enum (`word` \| `contains`)     | No       | `word`  | `word` matches whole words. `contains` matches any part of a word, ignoring case and accents (`voic` finds "Invoice", `cafe` finds "Café"); every term must appear, at least one term needs 3+ characters, on PostgreSQL 3+ letters or digits in a row, the terms together may hold at most 64 characters, spaces not counted (`400` otherwise, so a query of two-character words alone, as most Korean and many Chinese and Japanese words are, needs `word`), and `%`/`_` match literally. It ranks the 1,000 most recently stored matches by match quality (whole word, then word start, then inside a word; newest first within a score), so `total` is at most 1,000. Opt-in on the built-in provider: `501` unless the server sets `SEARCH_CONTAINS_ENABLED=true` and has finished building the index (on PostgreSQL also the `pg_trgm` and `unaccent` extensions). PostgreSQL also folds letters such as `Ł`, `ß` and `Ø` that SQLite keeps. See [26 - Global Search](./26-global-search.md#match-modes). |
+| `sessionId` | string                          | No       | —       | Restrict to a single session id (intersected with the key's `allowedSessions` scope).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `chatId`    | string                          | No       | —       | Restrict to a single chat id. With the built-in provider, a phone also matches the chat's other stored forms (the other user dialect, any lid that resolves to it). For a key restricted to selected chats this must name an allowed chat (`403` otherwise), and its hits are also narrowed to the allowlist.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `direction` | enum (`incoming` \| `outgoing`) | No       | —       | Filter by message direction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `type`      | string                          | No       | —       | Filter by stored message `type` (e.g. `text`, `image`, `video`). Compared against `messages.type`; not an enum validation, any string is accepted and unmatched values simply return no hits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `from`      | string                          | No       | —       | Filter by sender; with the built-in provider, matches `from` or a group message's `author`, and a phone also matches any lid that resolves to it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `dateFrom`  | integer (epoch ms)              | No       | —       | Inclusive lower bound on `timestamp`. Must be between -9007199254740991 and 9007199254740991; a non-numeric or out-of-range value is rejected with `400`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `dateTo`    | integer (epoch ms)              | No       | —       | Inclusive upper bound on `timestamp`. Must be between -9007199254740991 and 9007199254740991; a non-numeric or out-of-range value is rejected with `400`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `limit`     | integer (≥ 1)                   | No       | `50`    | Max hits to return. Clamped to `SEARCH_LIMIT_MAX` (default `100`). A non-integer value is rejected with `400`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `offset`    | integer (≥ 0)                   | No       | `0`     | Pagination offset, at most `100000`. A non-integer or larger value is rejected with `400`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 **Response** `200` — `SearchResults`
 
@@ -6816,20 +6873,26 @@ Search messages across sessions (active search provider).
   markers and render each segment as text, never the raw snippet as HTML.
 - `timestamp` is Unix **seconds**, as in the message routes, while the `dateFrom`/`dateTo` bounds are
   epoch **milliseconds**.
-- `total` is an exact count for pagination, computed lazily only when the returned page could be full.
+- `total` is an exact count for pagination, computed lazily only when the returned page could be full. With
+  `match=contains` it counts the ranked window, at most 1,000 matches.
 - `provider` names which backend answered (e.g. `builtin-fts`); it is the registered `SearchProvider`
   id, so it changes when a plugin backend is selected via `SEARCH_PROVIDER`. A plugin provider
   receives `chatId` and `from` as the caller sent them, without the other stored forms the built-in
   provider matches.
 - `score` is optional and provider-specific (rank ordering is stable within a provider; cross-provider
   scores are not comparable). The built-in provider on SQLite leaves it out for a key restricted to
-  selected sessions or chats, since it is computed over the whole index.
+  selected sessions or chats, since it is computed over the whole index. With `match=contains` it is
+  the match quality on both dialects (3 per term found as a whole word, 2 at a word start, 1 inside a
+  word) and every key gets it, since it reads only its own message.
 
-**Errors:** `400` empty/whitespace `q`, a non-numeric `dateFrom`/`dateTo`/`limit`/`offset`, a `dateFrom`/`dateTo` beyond 9007199254740991 in either direction, an `offset` above `100000`, or a malformed
+**Errors:** `400` empty/whitespace `q` or one holding a NUL character, a non-numeric `dateFrom`/`dateTo`/`limit`/`offset`, a `dateFrom`/`dateTo` beyond 9007199254740991 in either direction, an `offset` above `100000`, an unknown `match`, a
+`match=contains` query with no term of 3 or more characters (on PostgreSQL, 3 letters or digits in a row) or with more than 64 characters in its terms, or a malformed
 SQLite FTS5 query (unbalanced quote/paren, bare operator) — Postgres's `websearch_to_tsquery` is
 tolerant and has no equivalent · `401` missing/invalid `X-API-Key` · `403` key role below `OPERATOR`, or a chat-restricted key
 that names a `chatId` outside its allowlist or uses a plugin provider ·
-`501` no search provider configured (including a non-FTS5 SQLite build, where the provider is absent) ·
+`501` no search provider configured (including a non-FTS5 SQLite build, where the provider is absent), or for
+`match=contains` the trigram index is not usable: `SEARCH_CONTAINS_ENABLED` is off, the index is still being built,
+or it cannot be (PostgreSQL without `pg_trgm` and `unaccent`, or SQLite older than 3.45); the message says which ·
 `502` the active plugin provider returned an invalid result shape (not retryable until the plugin is fixed) ·
 `503` the active plugin provider did not answer (worker not running, timed out, or reported a failure;
 retryable). The built-in provider returns neither `502` nor `503`.
@@ -6956,6 +7019,8 @@ Generate a shareable WhatsApp call link.
 #### POST /api/sessions/:sessionId/calls/:callId/reject
 
 Reject a currently ringing incoming call. **Baileys only**: the whatsapp-web.js engine answers `501`. Only a live call can be rejected: the id is valid while the call rings (a short server-side cache); afterwards it expires.
+
+A failed rejection can be retried only while the same call is still ringing; a call that ends or rings again during the attempt is not restored. If the call is accepted, rejected or missed while a rejection is pending, that outcome is reported once as the call's `call.accepted`, `call.rejected` or `call.missed` event, even when the rejection then fails or times out. A rejection that completes after a `terminate` for the same call still reports `call.rejected`. One that no longer belongs to the current call, because the connection was cleared or another caller took the call id meanwhile, reports nothing.
 
 **Auth:** API key (OPERATOR)
 
@@ -7170,7 +7235,7 @@ including playlists and manifests, is refused with `400`.
 { "base64": "T2dnUwACAAAA...", "mimetype": "audio/ogg; codecs=opus", "bytes": 14970 }
 ```
 
-**Errors:** `400` neither field given, a `url` that is not an absolute http(s) URL or answers non-2xx, times out or cannot be reached, or ffmpeg refused the input (its reason is included) · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role · `413` media above the size cap · `503` conversion is disabled, the ffmpeg binary is not runnable, the conversion queue is saturated, or a `url` fetch through the session's egress proxy failed before any response, the proxy or the target at fault
+**Errors:** `400` neither field given, a `url` that is not an absolute http(s) URL or answers non-2xx, times out or cannot be reached, or ffmpeg refused the input (its reason is included) · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role · `413` media above the size cap · `503` conversion is disabled, the ffmpeg binary is not runnable, the conversion queue is saturated, the gateway is shutting down, or a `url` fetch through the session's egress proxy failed before any response, the proxy or the target at fault
 
 #### POST /api/sessions/:sessionId/media/convert/video
 
@@ -7178,7 +7243,7 @@ Convert video into an MP4 every WhatsApp client accepts: baseline H.264 with AAC
 fitted inside 1280x720, or 720x1280 for portrait (never upscaled), frame rate capped at 30 fps, index moved to the front so playback can start before the whole
 file arrives.
 
-**Errors:** `400` neither field given, a `url` that is not an absolute http(s) URL or answers non-2xx, times out or cannot be reached, or ffmpeg refused the input (its reason is included) · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role · `413` media above the size cap · `503` conversion is disabled, the ffmpeg binary is not runnable, the conversion queue is saturated, or a `url` fetch through the session's egress proxy failed before any response, the proxy or the target at fault
+**Errors:** `400` neither field given, a `url` that is not an absolute http(s) URL or answers non-2xx, times out or cannot be reached, or ffmpeg refused the input (its reason is included) · `401` missing/invalid `X-API-Key` · `403` key lacks OPERATOR role · `413` media above the size cap · `503` conversion is disabled, the ffmpeg binary is not runnable, the conversion queue is saturated, the gateway is shutting down, or a `url` fetch through the session's egress proxy failed before any response, the proxy or the target at fault
 
 **Response** `200`
 
@@ -7534,7 +7599,7 @@ Live events are pushed as a **nested** envelope (note: `data` is under `payload`
 }
 ```
 
-Error `code` values include `UNAUTHORIZED`, `INVALID_MESSAGE`, `INVALID_SESSION`, `INVALID_EVENTS`, `FORBIDDEN_SESSION`, `FORBIDDEN_EVENTS`, `TOO_MANY_SUBSCRIPTIONS`, and `RATE_LIMITED`. `RATE_LIMITED` is followed by a disconnect when a handshake exceeds the per-IP connection-attempt window or the key's concurrent-socket cap; a frame over the per-key frame budget gets `RATE_LIMITED` and is dropped undispatched, and the socket stays open. A subscribe answers `INVALID_SESSION` when `sessionId` is missing, or is neither `"*"` nor a session id of at most 128 letters, digits and hyphens. An unsubscribe answers `INVALID_SESSION` when `sessionId` is missing, empty, not a string, or neither `"*"` nor such a session id. A subscribe answers `TOO_MANY_SUBSCRIPTIONS` when it would take the connection past 4096 rooms; chat-restricted subscriptions count every literal chat address form for each session and event. When the rooms already held are the cause, unsubscribe before subscribing to more. A chat-restricted frame can also need more than 4096 on its own (its address forms times the events it names); unsubscribing cannot help there: name fewer events or subscribe with `"*"`, and a list stored before the 2000-entry bound whose address forms alone exceed 4096 has to be shortened.
+Error `code` values include `UNAUTHORIZED`, `INVALID_MESSAGE`, `INVALID_SESSION`, `INVALID_EVENTS`, `FORBIDDEN_SESSION`, `FORBIDDEN_EVENTS`, `TOO_MANY_SUBSCRIPTIONS`, `SUBSCRIPTION_CANCELLED`, and `RATE_LIMITED`. `RATE_LIMITED` is followed by a disconnect when a handshake exceeds the per-IP connection-attempt window or the key's concurrent-socket cap; a frame over the per-key frame budget gets `RATE_LIMITED` and is dropped undispatched, and the socket stays open. A subscribe answers `INVALID_SESSION` when `sessionId` is missing, or is neither `"*"` nor a session id of at most 128 letters, digits and hyphens. An unsubscribe answers `INVALID_SESSION` when `sessionId` is missing, empty, not a string, or neither `"*"` nor such a session id. A subscribe still checking the API key when an unsubscribe for the same session, or for `"*"`, arrives answers `SUBSCRIPTION_CANCELLED` and joins no rooms. A subscribe answers `TOO_MANY_SUBSCRIPTIONS` when it would take the connection past 4096 rooms; chat-restricted subscriptions count every literal chat address form for each session and event. When the rooms already held are the cause, unsubscribe before subscribing to more. A chat-restricted frame can also need more than 4096 on its own (its address forms times the events it names); unsubscribing cannot help there: name fewer events or subscribe with `"*"`, and a list stored before the 2000-entry bound whose address forms alone exceed 4096 has to be shortened.
 
 ### Subscribable events
 
@@ -7547,7 +7612,6 @@ message.ack
 message.receipt
 message.revoked
 message.reaction
-message.poll_vote
 message.edited
 session.status
 session.qr
@@ -7556,6 +7620,7 @@ session.disconnected
 session.restriction
 presence.update
 event.response
+poll.vote
 group.join
 group.leave
 group.update
@@ -7573,7 +7638,7 @@ A subscribe request whose `events` array contains no recognized name (after filt
 
 ### Wildcards and scoping
 
-- **Chat-restricted keys receive only events for `allowedChats`.** Message, presence and `event.response` events require `data.chatId`; group events require `data.groupId`. Persisted phone/LID aliases are matched at delivery time, including mappings learned after subscribing. An event without a resolvable chat is omitted. Account events, calls, statuses, QR codes, and `group.join_request` (it names people outside the allowed chats, as the membership-request routes do) are omitted even with `events: ["*"]`; a request containing only account events answers `FORBIDDEN_EVENTS`. These filters apply across Redis replicas. A changed chat authorization disconnects the socket on its next subscribe.
+- **Chat-restricted keys receive only events for `allowedChats`.** Message, presence, `event.response` and `poll.vote` events require `data.chatId`; group events require `data.groupId`. Persisted phone/LID aliases are matched at delivery time, including mappings learned after subscribing. An event without a resolvable chat is omitted. Account events, calls, statuses, QR codes, and `group.join_request` (it names people outside the allowed chats, as the membership-request routes do) are omitted even with `events: ["*"]`; a request containing only account events answers `FORBIDDEN_EVENTS`. These filters apply across Redis replicas. A changed chat authorization disconnects the socket on its next subscribe.
 - **`sessionId: "*"`** subscribes to every session; **`events: ["*"]`** subscribes to every subscribable event except `message.receipt`, whose per-recipient volume makes it opt-in by name. They combine (e.g. `"*"` + `["*"]` = every wildcard-covered event of every session).
 - The API key is **re-validated on every `subscribe`** (not just at connect), so a key revoked or expired mid-connection is caught — the server replies `UNAUTHORIZED` and disconnects.
 - **Per-key session scope is enforced** against the fresh key: a key restricted via `allowedSessions` may NOT subscribe to `"*"` and may NOT subscribe to a session outside its allowlist — either is rejected with `FORBIDDEN_SESSION`. An unrestricted key (no `allowedSessions`) may subscribe to anything, including `"*"`.
@@ -7637,7 +7702,6 @@ These are the events OpenWA actually emits. A webhook is registered with an `eve
 | `message.failed`                                  | A receipt resolves to `failed` (dispatched in addition to `message.ack`)                                                                                                                                                              | `{ id, messageId, status: "failed", ack: -1, chatId? }`; `chatId` follows the same rules as `message.ack`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `message.revoked`                                 | A message is deleted/recalled                                                                                                                                                                                                         | `{ id, revokedId?, chatId, from, to, type: "revoked", body: "", timestamp }` — **reconcile on `revokedId`** (the original deleted message's id), falling back to `id`. On whatsapp-web.js `id` is the _revocation notification_ (a distinct message that won't match a stored id) and `revokedId` may be absent when the original isn't cached locally; on Baileys the two coincide                                                                                                                                                                                                                                                                                                             |
 | `message.reaction`                                | A reaction is added, changed, or removed                                                                                                                                                                                              | `{ messageId, chatId, reaction, senderId, reactions? }` — `reactions` is the post-apply `{ senderId: emoji }` snapshot, omitted when the gateway holds no stored copy of the message to compute it from (an ephemeral message, or one predating the session going live); treat it as unknown rather than empty and keep the map you already hold. `reaction` is empty when removed                                                                                                                                                                                                                                                                                                              |
-| `message.poll_vote`                               | Someone selects or deselects options on a poll                                                                                                                                                                                        | `{ messageId, chatId, voterId, selectedOptions, timestamp }` — `messageId` is the poll creation message and `selectedOptions` is the voter's WHOLE current selection by option text, empty when they cleared their vote. Replace what you hold for that voter rather than incrementing a count, or a changed mind is counted twice. `voterId` is often a `@lid` privacy id; `GET .../poll-votes?resolveContacts=true` resolves names and numbers. **whatsapp-web.js only** — Baileys receives poll updates encrypted and surfaces no vote callback                                                                                                                                              |
 | `message.edited`                                  | A message body or media caption is edited                                                                                                                                                                                             | `{ messageId, chatId, body, senderId, from, to, fromMe, isGroup, type, hasMedia, author?, mentionedIds?, timestamp }` — `messageId` is the original message id, `body` is the latest text/caption, and `timestamp` is the edit occurrence time in epoch **seconds** (not the original creation time)                                                                                                                                                                                                                                                                                                                                                                                            |
 | `session.qr`                                      | A new pairing QR is generated                                                                                                                                                                                                         | `{ sessionId, qr }` — `qr` is a **PNG data URL** (`data:image/png;base64,…`), the same rendered value `GET /api/sessions/{sessionId}/qr` returns as `qrCode`, not the raw `2@…` linking ref. Render it directly in an `<img src>`; the raw ref never leaves the engine adapter                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `session.authenticated`                           | The session pairs and becomes ready                                                                                                                                                                                                   | `{ sessionId, phone, pushName }`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -7645,6 +7709,7 @@ These are the events OpenWA actually emits. A webhook is registered with an `eve
 | `session.reconnect_loop`                          | Every 5th consecutive reconnect attempt is scheduled (attempt 5, 10, 15, …) — the session is failing to come back up                                                                                                                  | `{ sessionId, attempts, nextDelayMs }`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `presence.update`                                 | A subscribed chat's presence changed — someone came online, started typing, or stopped. Only actual CHANGES are dispatched: WhatsApp repeats itself freely, and every repeat would otherwise be a delivery                            | `{ sessionId, chatId, participants: [{ id, state, lastSeen? }], groupOnlineCount? }` — `state` is `available`/`unavailable`/`composing`/`recording`/`paused`; `lastSeen` is epoch **seconds** and absent when the contact hides it. Requires `POST .../presence/subscribe` first, and Baileys — whatsapp-web.js cannot observe presence                                                                                                                                                                                                                                                                                                                                                         |
 | `event.response`                                  | A guest answered a WhatsApp event invitation (going, not going, maybe). **Baileys only**; see the payload note below                                                                                                                  | `{ sessionId, eventMessageId, chatId, responderId, contact?, fromMe, response, extraGuestCount?, eventName?, responseMessageId, timestamp }`. `response` is `going`/`not_going`/`maybe`/`unknown`; `timestamp` is epoch **seconds** on the guest's clock. Order a guest's answers by `timestamp`, not by delivery                                                                                                                                                                                                                                                                                                                                                                               |
+| `poll.vote`                                       | A voter selected or cleared options on a poll. **whatsapp-web.js only**; see the payload note below                                                                                                                                   | `{ sessionId, pollMessageId, chatId, voterId, selectedOptions, pollName?, timestamp, timestampMs }`. `selectedOptions` holds the option texts now selected, `[]` when the vote was cleared; `timestamp` is epoch **seconds** and `timestampMs` the same instant in milliseconds, both on the voter's clock. Order a voter's changes by `timestampMs`, not by delivery                                                                                                                                                                                                                                                                                                                           |
 | `session.restriction`                             | WhatsApp places a restriction on the account, or lifts one. Deduped: an unchanged restriction is not re-announced, and a lift is only sent when one was in force                                                                      | `{ sessionId, active, kind, code, expiresAt }` — `active` is `false` for a lift and `kind`/`code` then describe the restriction that ended; `expiresAt` is an ISO timestamp or `null`. See `restriction` on the session response for the `kind` values                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `session.status`                                  | The session status transitions                                                                                                                                                                                                        | `{ sessionId, status }` where `status` is one of `created` / `initializing` / `qr_ready` / `authenticating` / `ready` / `disconnected` / `action_required` / `failed`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `group.join`                                      | Participant(s) are added to or join a group this session is in                                                                                                                                                                        | `{ groupId, actorId?, participantIds, timestamp }`. `actorId` is the admin/inviter when known. **Baileys**: a session added to or joining a group reports only its own id in `participantIds` (members added with it are not listed)                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -7701,6 +7766,23 @@ Existing stored mappings from older releases have mixed origins, so an upgrade r
 >
 > WhatsApp encrypts every RSVP with a key derived from the event creation message, so only answers to events **this session received and still holds in its message store** can be reported: an event posted before the number was linked, or one evicted past `BAILEYS_MESSAGE_STORE_LIMIT`, yields no `event.response`. This covers events in groups and in 1:1 chats, with one known gap: in a 1:1 chat, an answer from the person who posted the event, whether the other person or this account answering its own event, cannot be decrypted (Baileys derives the event's creator from the chat partner's side of the chat) and is not reported. Answers given while the session was offline are reported when WhatsApp replays them on reconnect. Baileys merges the updates it receives within one short buffer window per event, so several answers to one event that arrive in the same window, even from different guests (the whole replay after a reconnect, or answers a fraction of a second apart live), arrive as the last one only. whatsapp-web.js accepts the subscription and never fires the event.
 
+> **`poll.vote` reports poll votes (whatsapp-web.js only).** A poll (sent with [`send-poll`](#post-apisessionssessionidmessagessend-poll) or from the phone) arrives as an ordinary `message.received` or `message.sent` when it is posted. Each time a voter changes their selection, the whole new selection arrives as `poll.vote`:
+>
+> ```json
+> {
+>   "sessionId": "8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a",
+>   "pollMessageId": "true_6281111111111@c.us_3EB0C767D26B8A3F1A2B",
+>   "chatId": "6281111111111@c.us",
+>   "voterId": "6281111111111@c.us",
+>   "selectedOptions": ["Done"],
+>   "pollName": "Did you finish the report?",
+>   "timestamp": 1786000000,
+>   "timestampMs": 1786000000123
+> }
+> ```
+>
+> `selectedOptions` are the option texts exactly as they appear on the poll, the same strings [`vote-poll`](#post-apisessionssessionidmessagesvote-poll) takes. It is the voter's whole current selection, not a delta: `[]` means they cleared their vote, and the event with the latest `timestampMs` per `voterId` is the current state. Order by `timestampMs` rather than by arrival: `timestamp` has one-second resolution, so a voter's changes within one second share it. `pollName` is present only when WhatsApp Web still holds the poll creation message; without it whatsapp-web.js cannot name the options either, so a vote on such a poll is not reported (a cleared vote still is, with `[]`). Vote counts are not kept by the gateway: tally them from these events. Baileys accepts the subscription and never fires it.
+
 > WhatsApp also sends a contact's edit, and a reaction in some chats, encrypted under a secret carried by the message it changes. On Baileys they are read with the stored copy of that message, so `message.edited` fires for a message **this session received** and `message.reaction` for one it **received or sent**, while its message store still holds it; an edit or reaction of one the store no longer holds (evicted past `BAILEYS_MESSAGE_STORE_LIMIT`, or from before the number was linked) is not delivered. An edit the account makes from its own phone to its own message is applied under the account's own id the same way, whether it arrives as a plain or as an encrypted edit. whatsapp-web.js gets both already decrypted from WhatsApp Web.
 
 > There is **no** `contact.update` event. `presence.update` is emitted only for chats you have subscribed to (see the presence-subscription endpoint); call outcomes are reported as `call.accepted`, `call.rejected` and `call.missed` alongside `call.received`.
@@ -7718,7 +7800,7 @@ Webhook delivery is **at-least-once**. A consumer can legitimately receive the s
 
 Outbox creation is best effort, and message persistence and outbox insertion are separate transactions. A write failure or crash between them can still lose the webhook delivery. Failure records with zero attempts are excluded from operator redrive. Capacity and shutdown rejections can still be recovered from an unsettled outbox record; shutdown during retry backoff may follow earlier POSTs. The direct dispatcher leaves its local in-flight work alone during reconciliation. Graceful shutdown drains current queue jobs for at most 10 s; direct sends, an operator redrive replay in flight, and an outbox replay in flight with its plugin hooks, get up to `WEBHOOK_SHUTDOWN_DRAIN_MS` (default 5s). That replay sends at most one more POST, bounded by `WEBHOOK_TIMEOUT`, and no further row is replayed; the next start replays what it left pending.
 
-**Opt-in events are bounded, not replayed.** `message.receipt` fires once per recipient and status, so one flush of buffered receipts can be thousands of events in a tick. Each webhook that names it has a queue of its own before the shared dispatch pool: a quarter of `WEBHOOK_DISPATCH_CONCURRENCY` deliveries run at once, divided among the session's webhooks that name `message.receipt` and never fewer than one running delivery per webhook, and up to three quarters of `WEBHOOK_DISPATCH_MAX_QUEUED` more receipts wait their turn. With the defaults a flush of 500 is delivered in full and at least 750 of a flush of 2000 (754 with one webhook, 751 with four). A flush drains at that quarter of the pool: 750 receipts to a receiver that takes 30 ms each take about 6 s, or about 24 s when four webhooks share the quarter. Any further receipt is dropped for that webhook: it leaves no outbox or failure row, is not replayed, and is counted in `openwa_webhook_delivery_failures_total` once for each webhook it is dropped for. It is logged once per burst and webhook (`webhook_opt_in_dropping` when the webhook starts dropping, then `webhook_opt_in_dropped` with the count). A webhook's queue is its own, so a receiver of it that never answers holds only that webhook's places: the session's other webhooks and its other events are not slowed. Between sessions the isolation has a limit, because the dispatch pool is shared. A receiver that never answers holds its places for a `WEBHOOK_TIMEOUT`; a session holds up to four at once, or one per webhook when it has more than four. That share is fixed when a webhook's queue is created and kept while the queue has events, so a session that adds receipt webhooks while a queue is busy can briefly hold more places than this. An event of another session waits for a slot once such sessions together hold all `WEBHOOK_DISPATCH_CONCURRENCY` of them, which at the defaults is four sessions: it then waits one `WEBHOOK_TIMEOUT` with four or five, two with eight. The receipts waiting in all queues together are not capped. Receipts still waiting at shutdown are dropped without being counted.
+**Opt-in events are bounded, not replayed.** `message.receipt` fires once per recipient and status, so one flush of buffered receipts can be thousands of events in a tick. Each webhook that names it has a queue of its own before the shared dispatch pool: a quarter of `WEBHOOK_DISPATCH_CONCURRENCY` deliveries run at once, divided among the session's webhooks that name `message.receipt` (the session as a whole never runs more than that quarter at once, however many webhooks name it), and up to three quarters of `WEBHOOK_DISPATCH_MAX_QUEUED` more receipts wait their turn. With the defaults a flush of 500 is delivered in full and at least 750 of a flush of 2000 (754 with one webhook, 751 with four). A flush drains at that quarter of the pool: 750 receipts to a receiver that takes 30 ms each take about 6 s, or about 24 s when four webhooks share the quarter. Any further receipt is dropped for that webhook: it leaves no outbox or failure row, is not replayed, and is counted in `openwa_webhook_delivery_failures_total` once for each webhook it is dropped for. It is logged once per burst and webhook (`webhook_opt_in_dropping` when the webhook starts dropping, then `webhook_opt_in_dropped` with the count). A webhook's queue is its own, so a receiver of it that never answers holds only that webhook's places: the session's other webhooks and its other events are not slowed as long as the quarter has a place for each webhook that names `message.receipt` (four at the defaults). With more webhooks, or one added after another's queue was sized, a receiver that never answers can hold the places its siblings need until its `WEBHOOK_TIMEOUT`. Between sessions the isolation has a limit, because the dispatch pool is shared. A receiver that never answers holds its places for a `WEBHOOK_TIMEOUT`; a session holds at most a quarter of the pool at once, four at the defaults, however many webhooks name `message.receipt` and whenever they were added. An event of another session waits for a slot once such sessions together hold all `WEBHOOK_DISPATCH_CONCURRENCY` of them, which at the defaults is four sessions: it then waits one `WEBHOOK_TIMEOUT` with four or five, two with eight. The receipts waiting in all queues together are not capped. Receipts still waiting at shutdown are dropped without being counted.
 
 Before downgrading to a version that does not recognize the `queued` outbox state, drain or recover those records and take a backup. Its cleanup may otherwise treat an unsettled queued record as settled. Reverting the terminal-identity migration removes its index but does not restore historical duplicates.
 
@@ -7770,25 +7852,25 @@ Every delivery includes:
 - `message.receipt`: `receipt_{sessionId}_{messageId}_{participant}_{status}`
 - `message.failed`: `failed_{sessionId}_{messageId}_{status}`
 - `message.revoked`: `rev_{sessionId}_{messageId}`
-- `message.edited`: `edit_{sessionId}_{messageId}_{occurredAt}`
-- `message.reaction`: `react_{sessionId}_{messageId}_{senderId}_{occurredAt}`
-- `message.poll_vote`: `poll_{sessionId}_{messageId}_{voterId}_{occurredAt}`
+- `message.edited`: `edit_{sessionId}_{messageId}_{occurrenceId}`
+- `message.reaction`: `react_{sessionId}_{messageId}_{senderId}_{occurrenceId}`
 - `session.qr`: `qr_{sessionId}_{hash(qr)}`
-- `session.status`: `sess_{sessionId}_{status}_{occurredAt}`
-- `session.authenticated`: `auth_{sessionId}_{hash(data)}_{occurredAt}`
-- `session.disconnected`: `disc_{sessionId}_{hash(reason)}_{occurredAt}`
-- `session.reconnect_loop`: `loop_{sessionId}_{attempts}_{occurredAt}`
-- `group.join` / `group.leave`: `grp_{groupId}_{hash(participantIds)}_{join|leave}_{occurredAt}`
-- `group.update`: `grp_{groupId}_update_{hash(changes)}_{occurredAt}`
-- `group.join_request`: `grp_{groupId}_{hash(participantIds)}_join_request_{occurredAt}` (salted like `group.join` — a rejected user can legitimately ask again)
-- `call.received`: `call_{sessionId}_{callId}` (a call id is unique per call, so no `occurredAt` salt)
-- `call.accepted` / `call.rejected` / `call.missed`: `call_{sessionId}_{callId}_{outcome}` (each call ends once, so no `occurredAt` salt)
-- `session.restriction`: `restr_{sessionId}_{kind}_{active}_{occurredAt}`
-- `presence.update`: `pres_{sessionId}_{chatId}_{hash(participants)}_{occurredAt}`
-- `event.response`: `rsvp_{sessionId}_{responseMessageId}` (every answer is its own message with its own id, so no `occurredAt` salt)
+- `session.status`: `sess_{sessionId}_{status}_{occurrenceId}`
+- `session.authenticated`: `auth_{sessionId}_{hash(data)}_{occurrenceId}`
+- `session.disconnected`: `disc_{sessionId}_{hash(reason)}_{occurrenceId}`
+- `session.reconnect_loop`: `loop_{sessionId}_{attempts}_{occurrenceId}`
+- `group.join` / `group.leave`: `grp_{groupId}_{hash(participantIds)}_{join|leave}_{occurrenceId}`
+- `group.update`: `grp_{groupId}_update_{hash(changes)}_{occurrenceId}`
+- `group.join_request`: `grp_{groupId}_{hash(participantIds)}_join_request_{occurrenceId}` (salted like `group.join` — a rejected user can legitimately ask again)
+- `call.received`: `call_{sessionId}_{callId}` (a call id is unique per call, so no `occurrenceId` salt)
+- `call.accepted` / `call.rejected` / `call.missed`: `call_{sessionId}_{callId}_{outcome}` (each call ends once, so no `occurrenceId` salt)
+- `session.restriction`: `restr_{sessionId}_{kind}_{active}_{occurrenceId}`
+- `presence.update`: `pres_{sessionId}_{chatId}_{hash(participants)}_{occurrenceId}`
+- `event.response`: `rsvp_{sessionId}_{responseMessageId}` (every answer is its own message with its own id, so no `occurrenceId` salt)
+- `poll.vote`: `vote_{sessionId}_{pollMessageId}_{voterId}_{timestampMs}_{hash(selectedOptions)}` (each change of a selection carries the voter's own millisecond timestamp and the selection is hashed in, so changes within one second stay distinct, including a return to an earlier selection, and no `occurrenceId` salt is needed)
 - any other event (for example `status.received`): `evt_{event with . replaced by _}_{hash(data)}`
 
-Recurring lifecycle events (and `message.reaction` / `message.edited` / `presence.update`) carry the same content across occurrences — the same phone on every reconnect, a constant disconnect reason, a re-applied emoji, or editing the same message multiple times — so they are salted with an `occurredAt` timestamp captured **once per dispatch and reused across that dispatch's retries**. This gives distinct occurrences distinct keys while keeping retries of one occurrence stable. Message keys are scoped by `sessionId` because WhatsApp message ids are unique per account, not globally.
+Recurring lifecycle events (and `message.reaction` / `message.edited` / `presence.update`) carry the same content across occurrences — the same phone on every reconnect, a constant disconnect reason, a re-applied emoji, or editing the same message multiple times — so they are salted with an `occurrenceId`, a random id minted **once per dispatch and reused across that dispatch's retries**; it is not a timestamp, so two occurrences within the same millisecond still get distinct keys. This gives distinct occurrences distinct keys while keeping retries of one occurrence stable. Message keys are scoped by `sessionId` because WhatsApp message ids are unique per account, not globally.
 
 ### Retries with exponential backoff
 

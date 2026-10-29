@@ -22,8 +22,6 @@ public enum WebhookEvent {
     MESSAGE_REVOKED,
     @SerializedName("message.reaction")
     MESSAGE_REACTION,
-    @SerializedName("message.poll_vote")
-    MESSAGE_POLL_VOTE,
     @SerializedName("message.edited")
     MESSAGE_EDITED,
     @SerializedName("session.status")
@@ -42,6 +40,8 @@ public enum WebhookEvent {
     PRESENCE_UPDATE,
     @SerializedName("event.response")
     EVENT_RESPONSE,
+    @SerializedName("poll.vote")
+    POLL_VOTE,
     @SerializedName("call.accepted")
     CALL_ACCEPTED,
     @SerializedName("call.rejected")

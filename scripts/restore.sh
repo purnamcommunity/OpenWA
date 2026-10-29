@@ -478,19 +478,32 @@ fi
 if [ -f "$STAGE/.api-key" ]; then
   archive_target BOOTSTRAP_KEY_FILE "$ADMIN_KEY_FILE" file "$DATA_DIR/.api-key"
 fi
+# Written into the data dir after the trees, at fixed names, so no key moves them. A refilled tree can still
+# stand on one of them, and a copy onto a directory goes into it, through any link the archive put there.
+for fixed in .env.generated database.sql; do
+  if [ -f "$STAGE/$fixed" ]; then
+    TARGET_KEYS+=("$fixed")
+    TARGET_PATHS+=("$(resolve_path "$DATA_DIR/$fixed")")
+    TARGET_KINDS+=(file)
+    TARGET_CHOSEN+=(0)
+  fi
+done
 i=0
 while [ "$i" -lt "${#TARGET_KEYS[@]}" ]; do
   j=0
   while [ "$j" -lt "${#TARGET_KEYS[@]}" ]; do
     if [ "${TARGET_KINDS[j]}" = dir ] && [ "${TARGET_CHOSEN[i]}${TARGET_CHOSEN[j]}" != 00 ]; then
+      where=""
       case "${TARGET_PATHS[i]}" in
-        "${TARGET_PATHS[j]%/}/"?*)
-          key="${TARGET_KEYS[i]}"
-          [ "${TARGET_CHOSEN[i]}" -eq 1 ] || key="${TARGET_KEYS[j]}"
-          refuse_archive_path "$key" "${TARGET_PATHS[i]}" \
-            "puts the ${TARGET_KEYS[i]} target inside the ${TARGET_KEYS[j]} directory, which is refilled from the archive"
-          ;;
+        "${TARGET_PATHS[j]%/}/"?*) where=inside ;;
+        "${TARGET_PATHS[j]}") [ "${TARGET_KINDS[i]}" != file ] || where=on ;;
       esac
+      if [ -n "$where" ]; then
+        key="${TARGET_KEYS[i]}"
+        [ "${TARGET_CHOSEN[i]}" -eq 1 ] || key="${TARGET_KEYS[j]}"
+        refuse_archive_path "$key" "${TARGET_PATHS[i]}" \
+          "puts the ${TARGET_KEYS[i]} target $where the ${TARGET_KEYS[j]} directory, which is refilled from the archive"
+      fi
     fi
     j=$((j + 1))
   done

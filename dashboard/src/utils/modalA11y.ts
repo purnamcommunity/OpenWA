@@ -49,9 +49,8 @@ export function bindModalA11y(
   modalStack.push(stackEntry);
 
   const onKeyDown = (event: KeyboardEvent) => {
+    if (modalStack[modalStack.length - 1] !== stackEntry) return;
     if (event.key === 'Escape') {
-      // A nested dialog is open above this one — it owns Escape (see modalStack).
-      if (modalStack[modalStack.length - 1] !== stackEntry) return;
       // Capture phase: nested widgets (selects, menus) may also listen for Escape — the dialog
       // owns dismissal while it is open.
       event.stopPropagation();
@@ -60,10 +59,18 @@ export function bindModalA11y(
     }
     if (event.key === 'Tab') {
       const focusables = visibleFocusables(card);
-      if (focusables.length === 0) return;
+      if (focusables.length === 0) {
+        event.preventDefault();
+        card.focus();
+        return;
+      }
       const first = focusables[0];
       const last = focusables[focusables.length - 1];
-      if (event.shiftKey && doc.activeElement === first) {
+      if (!card.contains(doc.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && (doc.activeElement === first || doc.activeElement === card)) {
+        // The card is focusable itself (a click on dialog text lands there), and Shift+Tab from it would leave.
         event.preventDefault();
         last.focus();
       } else if (!event.shiftKey && doc.activeElement === last) {

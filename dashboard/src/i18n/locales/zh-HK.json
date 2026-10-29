@@ -213,6 +213,9 @@
       "read": "已讀",
       "failed": "傳送失敗"
     },
+    "today": "今天",
+    "switchSession": "切換工作階段",
+    "searchMessages": "搜尋訊息",
     "clearSearch": "清除搜尋",
     "filters": {
       "label": "篩選聊天",
@@ -223,11 +226,13 @@
       "unknown": "未知"
     },
     "noFilterResults": "沒有符合此篩選條件的聊天",
+    "contactInfo": "聯絡人資料",
     "moreActions": "更多操作",
     "copyChatId": "複製聊天 ID",
     "chatIdCopied": "已複製聊天 ID",
     "copyFailed": "無法複製到剪貼簿",
     "closeChat": "關閉聊天",
+    "phone": "電話號碼",
     "chatId": "聊天 ID",
     "newChat": {
       "title": "新聊天",
@@ -252,6 +257,12 @@
       "created": "已建立群組「{{name}}」",
       "createFailed": "無法建立群組",
       "removeParticipant": "移除 {{name}}"
+    },
+    "sessionPicker": {
+      "searchPlaceholder": "搜尋工作階段...",
+      "noMatch": "沒有相符的工作階段",
+      "addTitle": "連結其他號碼",
+      "addHint": "建立工作階段並以 QR 碼連結"
     },
     "group": {
       "info": "群組資訊",
@@ -663,7 +674,6 @@
       "message.revoked": "訊息被收回時",
       "message.reaction": "新增、變更或移除回應時",
       "message.edited": "訊息被編輯時",
-      "message.poll_vote": "有人在投票中投票或更改投票時",
       "session.status": "工作階段狀態變更時",
       "session.qr": "產生 QR 碼時",
       "session.authenticated": "工作階段完成配對並就緒時",
@@ -672,6 +682,7 @@
       "session.restriction": "WhatsApp 限制帳戶或解除限制時",
       "presence.update": "已訂閱的聊天上線、正在輸入或離線時",
       "event.response": "嘉賓回覆 WhatsApp 活動邀請時（參加、不參加、可能參加）",
+      "poll.vote": "有人在投票中選擇或取消選項時（whatsapp-web.js）",
       "group.join": "有成員加入或被加入群組時",
       "group.leave": "有成員退出或被移出群組時",
       "group.update": "群組名稱、描述或設定變更時",
@@ -1026,7 +1037,7 @@
     "single": {
       "title": "檢查單一帳戶",
       "phoneLabel": "電話號碼",
-      "phonePlaceholder": "例如：919876543210 或 6281234567890（含國家代碼）",
+      "phonePlaceholder": "例如：919876543210 或 6281234567890",
       "check": "檢查",
       "checking": "正在檢查...",
       "autoPrefix": "為 10 位號碼自動加上前綴 <strong>+91</strong>（12 位號碼保持原樣）",

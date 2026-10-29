@@ -73,6 +73,8 @@ describe('group writes report an unconfirmed write rather than success', () => {
       (g: BaileysGroups) => g.setGroupMemberAddMode('123@g.us', 'admins'),
     ],
     ['setGroupEphemeral', 'groupToggleEphemeral', (g: BaileysGroups) => g.setGroupEphemeral('123@g.us', 604800)],
+    // A relayed message rather than an IQ, but the group lookup and device fetch before the relay can stall.
+    ['setGroupMemberLabel', 'updateMemberLabel', (g: BaileysGroups) => g.setGroupMemberLabel('123@g.us', 'Site A')],
   ])('%s', async (_name, sockMethod, call) => {
     await expect(call(groups({ [sockMethod]: stub() }, 15))).rejects.toBeInstanceOf(EngineTransportError);
   });

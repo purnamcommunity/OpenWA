@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { localizePlugin } from '../utils/localizePlugin';
 import { configUiSafeConfig, missingRequiredConfig, sparseSessionOverride } from '../utils/pluginConfigRules';
@@ -587,6 +587,38 @@ function SessionsTab({ plugin }: { plugin: Plugin }) {
   );
 }
 
+/**
+ * The remote catalog and its read. The mount prefetch can still be in flight when a later read starts (an install or
+ * an uninstall changes the installed flags), so only the latest read may publish: an older answer finishing after it
+ * would put back flags from before.
+ */
+function useCatalog() {
+  const [catalog, setCatalog] = useState<CatalogPlugin[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const latestRead = useRef(0);
+
+  const loadCatalog = useCallback(async () => {
+    const read = ++latestRead.current;
+    setCatalogLoading(true);
+    setCatalogError(null);
+    try {
+      const entries = await pluginsApi.catalog();
+      if (read === latestRead.current) setCatalog(entries);
+    } catch (err) {
+      // The error renders only inside the Catalog tab, next to a Refresh button, so a failed
+      // page-mount prefetch stays quiet on the page itself (it just means no update chips). It
+      // must still be recorded: a tab opened while that prefetch was in flight would otherwise
+      // settle on "No plugins in the catalog." with no way to retry.
+      if (read === latestRead.current) setCatalogError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (read === latestRead.current) setCatalogLoading(false);
+    }
+  }, []);
+
+  return { catalog, catalogLoading, catalogError, loadCatalog };
+}
+
 export default function Plugins() {
   const { t, i18n } = useTranslation();
   useDocumentTitle(t('plugins.title'));
@@ -626,9 +658,7 @@ export default function Plugins() {
   const [installFile, setInstallFile] = useState<File | null>(null);
   const [installing, setInstalling] = useState(false);
   const [installMode, setInstallMode] = useState<'upload' | 'catalog'>('upload');
-  const [catalog, setCatalog] = useState<CatalogPlugin[]>([]);
-  const [catalogLoading, setCatalogLoading] = useState(false);
-  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const { catalog, catalogLoading, catalogError, loadCatalog } = useCatalog();
   const [catalogSearch, setCatalogSearch] = useState('');
   const [installingId, setInstallingId] = useState<string | null>(null);
 
@@ -756,22 +786,6 @@ export default function Plugins() {
     }
   };
 
-  const loadCatalog = async () => {
-    setCatalogLoading(true);
-    setCatalogError(null);
-    try {
-      setCatalog(await pluginsApi.catalog());
-    } catch (err) {
-      // The error renders only inside the Catalog tab, next to a Refresh button, so a failed
-      // page-mount prefetch stays quiet on the page itself (it just means no update chips). It
-      // must still be recorded: a tab opened while that prefetch was in flight would otherwise
-      // settle on "No plugins in the catalog." with no way to retry.
-      setCatalogError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setCatalogLoading(false);
-    }
-  };
-
   // Load the catalog when the Catalog tab opens with nothing to show: the first time, or again
   // after an earlier load failed.
   useEffect(() => {
@@ -785,7 +799,7 @@ export default function Plugins() {
   // user having to open the Install drawer first. An unreachable catalog just hides the chips.
   useEffect(() => {
     void loadCatalog();
-  }, []);
+  }, [loadCatalog]);
 
   // Catalog entries with a strictly newer version than the installed one, keyed by plugin id —
   // drives both the per-card update chip and the counter on the Install button.

@@ -244,7 +244,7 @@ export class PluginStorageService {
    * Remove a plugin's entire data-storage directory (<dataDir>/plugins/<id>). Called on uninstall.
    * Containment-guarded exactly like the package-dir delete in the loader: an id that resolves
    * outside the storage root is refused, so only the named plugin's directory can ever be touched.
-   * Best-effort — a removal failure is logged, never thrown, so the uninstall still completes.
+   * A removal failure is logged and thrown, so the uninstall fails with its registry entry intact.
    */
   deletePluginData(pluginId: string): void {
     const root = path.resolve(this.dataDir, 'plugins');
@@ -266,6 +266,7 @@ export class PluginStorageService {
         action: 'plugin_storage_delete_failed',
         error: error instanceof Error ? error.message : String(error),
       });
+      throw error;
     }
   }
 
@@ -357,6 +358,8 @@ export class PluginStorageService {
       // These are package-owned files when package code and state share a directory. They must never
       // be treated as legacy plugin storage (or get/delete/set migration can read or remove code).
       if (key === 'manifest' || key === 'package') return null;
+      // A canonical encoded filename belongs to the key it decodes to, not to a legacy key spelled like it.
+      if (decodeStorageFileName(key) !== null) return null;
       const fileName = `${key}.json`;
       return isPathWithin(pluginDataDir, fileName) ? path.join(pluginDataDir, fileName) : null;
     };
@@ -444,7 +447,13 @@ export class PluginStorageService {
               files
                 .filter(f => f.endsWith('.json'))
                 .map(f => f.slice(0, -'.json'.length))
-                .map(stem => decodeStorageFileName(stem) ?? (!isPackageDir && resolveLegacyKeyPath(stem) ? stem : null))
+                .map(stem => {
+                  // A listed key must be one get/set/delete accept, so a canonical name that decodes to an
+                  // unsafe or empty key is not listed (and is not a legacy key either, see resolveLegacyKeyPath).
+                  const decoded = decodeStorageFileName(stem);
+                  if (decoded !== null) return isSafeStorageKey(decoded) ? decoded : null;
+                  return !isPackageDir && resolveLegacyKeyPath(stem) ? stem : null;
+                })
                 .filter((k): k is string => k !== null),
             ),
           );

@@ -291,18 +291,23 @@ export function ApiKeys() {
     }
   };
 
+  const editVisit = useRef<object | null>(null);
+
   const openEdit = (apiKey: ApiKey) => {
+    editVisit.current = {};
     setEditingKey(apiKey);
     setEditDraft(apiKeyDraft(apiKey));
   };
 
   const closeEdit = () => {
+    editVisit.current = null;
     setEditingKey(null);
     setEditDraft(null);
   };
 
   const handleSave = async () => {
     if (!editingKey || !editDraft || !canSave) return;
+    const visit = editVisit.current;
     // A stored expiry left as it is is not sent (see apiKeyPatch), so one past this browser's max (set
     // from another time zone or through the API) does not block an unrelated change.
     const expiryUntouched = editDraft.expires !== '' && editDraft.expires === toDateTimeLocal(editingKey.expiresAt);
@@ -318,7 +323,7 @@ export function ApiKeys() {
         return;
       }
       await updateMutation.mutateAsync({ id: editingKey.id, data });
-      closeEdit();
+      if (editVisit.current === visit) closeEdit();
     } catch (err) {
       console.error('Failed to update key:', err);
       toast.error(t('apiKeys.edit.title'), err instanceof Error ? err.message : t('common.unknownError'));
