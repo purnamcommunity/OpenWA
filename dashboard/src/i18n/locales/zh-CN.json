@@ -38,6 +38,8 @@
     "optional": "可选",
     "fieldTooLong": "最多 {{max}} 个字符（当前 {{count}} 个）。",
     "language": "语言",
+    "changeLanguage": "切换语言",
+    "joinedName": "{{first}}，{{second}}",
     "back": "返回",
     "next": "下一步",
     "previous": "上一步",
@@ -203,7 +205,8 @@
       "delete": "删除消息失败",
       "clickButton": "点击按钮失败",
       "fileTooLarge": "文件过大（最大 18 MB）",
-      "searchHitSessionNotReady": "此消息所属的会话未连接"
+      "searchHitSessionNotReady": "此消息所属的会话未连接",
+      "searchHitChatNotListed": "在列表中找不到此消息所属的聊天"
     },
     "loadMessagesError": "无法加载消息。请检查服务器日志。",
     "messageStatus": {
@@ -599,6 +602,7 @@
     "session": "会话",
     "events": "事件",
     "noEvents": "请至少选择一个事件。",
+    "urlInvalid": "请输入以 http:// 或 https:// 开头的完整地址，例如 https://example.com/webhook。",
     "available": "可用事件",
     "saveChanges": "保存更改",
     "filters": {
@@ -609,6 +613,7 @@
       "badge_other": "{{count}} 个筛选条件",
       "addCondition": "添加条件",
       "removeCondition": "移除条件",
+      "removeValue": "移除 {{value}}",
       "caseSensitive": "区分大小写",
       "contactPlaceholder": "号码或 WhatsApp ID...",
       "textPlaceholder": "要匹配的文本...",
@@ -658,6 +663,7 @@
       "updateFailed": "更新 Webhook 失败：{{message}}",
       "testOk": "Webhook 测试成功！状态：{{status}}",
       "testFailed": "Webhook 测试失败：{{message}}",
+      "testStatus": "接收端返回 HTTP {{status}}",
       "testError": "测试 Webhook 失败：{{message}}"
     },
     "actions": {
@@ -779,6 +785,7 @@
     "modalTitle": "创建 API 密钥",
     "createdTitle": "API 密钥已创建",
     "createdHint": "请立即复制此密钥。之后将无法再次查看。",
+    "copyKey": "复制密钥",
     "namePlaceholder": "例如：Production Key",
     "nameTooShort": "请至少输入 3 个字符。",
     "rolesTitle": "角色参考",
@@ -856,6 +863,7 @@
     "chats": {
       "label": "聊天访问（可选）",
       "hint": "每行一个聊天：以 @g.us 结尾的群组 ID、以 @c.us 或 @lid 结尾的联系人 ID，或电话号码。留空则允许所有聊天。受聊天限制的密钥只能使用对此类密钥开放的路由；通过事件 WebSocket 和 MCP 的访问也仅限于这些聊天。",
+      "lidHint": "@lid 条目也会放行当前映射到它的电话号码。如果该号码转给了他人，此密钥就能触及对方：联系人更换号码时，请检查此密钥。",
       "invalid": "不是聊天 ID 或电话号码：{{value}}",
       "tooMany": "聊天过多（{{count}}）：一个密钥最多可列出 {{max}} 个。"
     },
@@ -1004,6 +1012,7 @@
     },
     "sendFailed": "发送消息失败",
     "notOnWhatsApp": "该号码未在 WhatsApp 注册",
+    "tooLong": "超过 {{max}} 位数字不是一个电话号码。请只输入一个号码。",
     "batch": {
       "status": {
         "pending": "等待中",
@@ -1040,6 +1049,7 @@
       "phonePlaceholder": "例如：919876543210 或 6281234567890",
       "check": "检查",
       "checking": "正在检查...",
+      "tooLong": "超过 {{max}} 位数字不是一个电话号码。请一次检查一个号码。",
       "autoPrefix": "为 10 位号码自动添加前缀 <strong>+91</strong>（12 位号码保持原样）",
       "silent": "<strong>完全静默：</strong>此检查直接查询 WhatsApp 的号码注册信息，对方不会收到任何通知、提示音或消息。",
       "resultTitle": "验证结果",
@@ -1102,6 +1112,7 @@
       "tenDigitAdded": "（{{ten}} 个 10 位号码 → 已添加 +91）",
       "tenDigitAddedPreserved": "（{{ten}} 个 10 位号码 → 已添加 +91，{{twelve}} 个 12 位号码原样保留）",
       "tooMany": "号码过多：已识别 {{parsed}} 个，每次最多 {{max}} 个。请删减 {{excess}} 个后再开始。",
+      "tooLong": "已忽略，超过 {{max}} 位数字（不是一个号码）：{{count}}。请每行只写一个号码。",
       "start": "开始批量检查",
       "stop": "停止检查",
       "export": "导出结果（CSV）",
@@ -1332,6 +1343,7 @@
       "installed": "插件已安装",
       "installFailed": "安装失败",
       "uninstalled": "插件已卸载",
+      "uninstalledWithWarning": "插件已卸载，但有警告",
       "uninstallFailed": "卸载失败",
       "enableFailedTitle": "启用失败",
       "disableFailedTitle": "停用失败",

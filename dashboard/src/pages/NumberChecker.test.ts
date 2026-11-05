@@ -146,6 +146,18 @@ afterEach(() => {
   sessionStorage.clear();
 });
 
+// A read that never produced a list says nothing about the sessions: during a gateway restart the page told an operator
+// with a ready session to go and link one.
+test('NumberChecker: a failed sessions read is reported, not shown as "no session connected"', async () => {
+  globalThis.fetch = (() => Promise.resolve(jsonResponse({ message: 'gateway restarting' }, 502))) as typeof fetch;
+  renderComponent();
+
+  const alert = await rtl.screen.findByRole('alert');
+  rtl.within(alert).getByText(/Failed to load data/);
+  rtl.within(alert).getByText(/gateway restarting/);
+  assert.equal(rtl.screen.queryByText('No active WhatsApp session connected.') === null, true);
+});
+
 test('NumberChecker: renders single check form and tabs', () => {
   const { getByText, getByPlaceholderText } = renderComponent();
   assert.ok(getByText('Check Single Account'));
@@ -573,6 +585,27 @@ test('NumberChecker: a finished single check is announced through a status regio
   await rtl.screen.findByText('Registered on WhatsApp');
   assert.equal(container.querySelector('[role="status"]') === region, true);
   assert.match(region.textContent ?? '', /\+6581234567.*Registered on WhatsApp/);
+});
+
+// The Enter that commits an input method composition (isComposing, or keyCode 229) is the input method's: the number
+// is checked on the Enter pressed once it is typed.
+test('NumberChecker: the Enter that commits an input method composition does not run the check', async () => {
+  const lookups = stubLookups(registered);
+  renderComponent();
+  await rtl.screen.findByRole('option', { name: /Primary Session/ });
+  const field = rtl.screen.getByLabelText('Phone Number');
+
+  rtl.fireEvent.compositionStart(field);
+  rtl.fireEvent.change(field, { target: { value: '6281234567' } });
+  rtl.fireEvent.keyDown(field, { key: 'Enter', isComposing: true });
+  rtl.fireEvent.keyDown(field, { key: 'Enter', keyCode: 229 });
+  rtl.fireEvent.compositionEnd(field);
+
+  rtl.fireEvent.change(field, { target: { value: '6281234567890' } });
+  rtl.fireEvent.keyDown(field, { key: 'Enter' });
+  await rtl.waitFor(() => assert.ok(lookups.length > 0));
+  assert.deepEqual(lookups, ['6281234567890']);
+  await rtl.screen.findByText('Registered on WhatsApp');
 });
 
 test('NumberChecker: the Start and Export buttons wrap onto another row instead of running past a narrow screen', async () => {

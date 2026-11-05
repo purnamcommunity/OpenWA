@@ -9,6 +9,8 @@ import {
   MessageComment,
   MessageContact,
   MessageReaction,
+  MessageReceiptParticipant,
+  MessageReceipts,
   MessageResult,
   PollInput,
   PollVote,
@@ -19,7 +21,7 @@ import { BadRequestException, NotImplementedException } from '@nestjs/common';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
-import { chatKind, userPart } from '../identity/wa-id';
+import { chatKind, parseWaId, toNeutralJid, userPart } from '../identity/wa-id';
 import {
   chatHistoryMediaBudgetBytes,
   coerceDeclaredSize,
@@ -46,8 +48,13 @@ import { MessageCommentsUnavailableError } from '../../common/errors/message-com
  */
 const COMMENT_SEND_EVALUATE_TIMEOUT_MS = 20_000;
 import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { EngineNotSentError, markNothingSent } from '../../common/errors/engine-not-sent.error';
+import { RecipientLookupUnansweredError } from '../../common/errors/engine-page.error';
 import { type WwebjsEngineHost, requireClient, withPage } from './wwebjs-host';
-import { toCapturedPageError } from './wwebjs-lifecycle';
+import { PAGE_RELOADING_MESSAGE, isNavigationError, isProtocolTimeout, toCapturedPageError } from './wwebjs-lifecycle';
+import { recoverGroupChatById } from './wwebjs-chats';
+import { noteVideoLoadTimeout } from './wwebjs-video-load-timeout';
 
 /**
  * Map a whatsapp-web.js MessageAck integer to the neutral DeliveryStatus.
@@ -372,9 +379,18 @@ function ensureSendable(chatId: string, shape: 'reply' | 'location' | 'contact c
   const channel = /@\w*newsletter\b/.test(chatId);
   if (/@\w*broadcast\b/.test(chatId) || (channel && shape !== 'poll' && shape !== 'sticker')) {
     const to = channel ? 'a channel' : 'a status or broadcast list';
-    throw new NotImplementedException(`whatsapp-web.js cannot send a ${shape} to ${to}; nothing was sent.`);
+    throw markNothingSent(
+      new NotImplementedException(`whatsapp-web.js cannot send a ${shape} to ${to}; nothing was sent.`),
+    );
   }
 }
+
+/**
+ * A full serialized message id: `<fromMe>_<chat>_<id>`, plus one more segment on some messages (the sender of
+ * a group message, or `out` on an own 1:1 message). Client.getMessageById parses the chat part in the page and
+ * throws an unnamed error (a 500) for anything else, so this is checked before the page is asked.
+ */
+const SERIALIZED_MESSAGE_ID = /^(?:true|false)_[^_@]+@[^_@]+_[^_]+(?:_[^_]+)?$/;
 
 /**
  * Messaging operations extracted from WhatsAppWebJsAdapter: the send paths (with the @c.us -> @lid
@@ -388,6 +404,18 @@ export class WwebjsMessaging {
   /** Post-ensureReady client handle; see {@link requireClient} for a teardown that lands in between. */
   private client(): Client {
     return requireClient(this.host);
+  }
+
+  /**
+   * The readiness check of a send before anything was handed to the page: its 409 proves nothing was sent, so a
+   * keyed send frees its `Idempotency-Key`. Not for a check after a send attempt, which may have left the page.
+   */
+  private ensureReadyToSend(): void {
+    try {
+      this.host.ensureReady();
+    } catch (error) {
+      throw markNothingSent(error);
+    }
   }
 
   /** See {@link withPage} for what a dead page answers here. */
@@ -406,7 +434,11 @@ export class WwebjsMessaging {
       return await read();
     } catch (error) {
       this.host.reportIfPageTransportError(error, context);
-      this.host.ensureReady();
+      this.ensureReadyToSend();
+      // A reload that cut the read short is the retryable 409 every other call gets for it, and nothing was sent.
+      if (isNavigationError(error)) throw markNothingSent(new EngineNotReadyError(PAGE_RELOADING_MESSAGE));
+      if (isProtocolTimeout(error))
+        throw new EngineNotSentError(`WhatsApp Web did not answer the ${context} read in time`);
       throw error;
     }
   }
@@ -435,25 +467,56 @@ export class WwebjsMessaging {
    * is never blocked on it.
    */
   async resolveSendId(chatId: string): Promise<string> {
-    if (!chatId.endsWith('@c.us')) {
-      return chatId;
+    return (await this.lookupSendId(chatId)).id;
+  }
+
+  /**
+   * {@link resolveSendId} together with whether the lookup answered. A `getNumberId` that threw says nothing
+   * about the recipient: the id is then the unresolved one, and `failure` is what the lookup threw.
+   */
+  private async lookupSendId(recipient: string): Promise<{ id: string; answered: boolean; failure?: unknown }> {
+    // Every spelling of a phone id (the `s.whatsapp.net` dialect, upper case, a `:device` suffix) names one recipient,
+    // resolved and cached in its neutral `<phone>@c.us` form, as the Baileys engine classifies its sends.
+    if (parseWaId(recipient).kind !== 'user') {
+      return { id: recipient, answered: true };
     }
+    const chatId = toNeutralJid(recipient);
     const cached = this.resolvedSendIds.get(chatId);
     if (cached) {
       if (this.unreportedLids.delete(chatId)) this.reportLid(chatId, cached);
-      return cached;
+      return { id: cached, answered: true };
     }
     try {
       const wid = await this.host.getNumberId(chatId);
       if (wid) {
         this.resolvedSendIds.set(chatId, wid);
         if (wid.endsWith('@lid')) this.reportLid(chatId, wid);
-        return wid;
+        return { id: wid, answered: true };
       }
-      return chatId;
-    } catch {
-      return chatId;
+      return { id: chatId, answered: true };
+    } catch (failure) {
+      return { id: chatId, answered: false, failure };
     }
+  }
+
+  /**
+   * The answer to a `No LID for user` send whose re-resolution did not answer. The gateway learned nothing
+   * about the recipient, so it is not reported unreachable: a reload that cut the lookup short is the
+   * retryable 409 the lookup raised, and anything else is what it was, WhatsApp Web refusing the send in the
+   * page. That is an engine error with an unproven outcome (500), so a keyed send keeps its key taken, but one
+   * the send breaker does not count: it says nothing about the account.
+   */
+  private unansweredLookup(chatId: string, sendError: Error, failure: unknown): Error {
+    if (failure instanceof EngineNotReadyError) return failure;
+    this.host.logger.warn('Could not re-resolve a recipient after "No LID for user": the lookup did not answer', {
+      sessionId: this.host.config.sessionId,
+      chatId,
+      error: failure instanceof Error ? failure.message : String(failure),
+    });
+    return new RecipientLookupUnansweredError(
+      { name: sendError.name || 'Error', message: sendError.message },
+      sendError,
+    );
   }
 
   /**
@@ -499,6 +562,8 @@ export class WwebjsMessaging {
    * `No LID for user` is replaced with {@link RecipientUnreachableError} (400). The bare page-side
    * Error carries no status and no recipient, so letting it through produced an opaque 500 for what
    * is really a caller-visible fact the gateway already established: `getNumberId` returned null.
+   * A re-resolution that threw established nothing, so it gets no such verdict and no retry: see
+   * {@link unansweredLookup}.
    *
    * `quotedMessageId` gets the same treatment for the same reason. Opting out of `ignoreQuoteErrors`
    * makes an id the page cannot resolve throw, but it throws a bare Error, and two things follow from
@@ -519,7 +584,7 @@ export class WwebjsMessaging {
     // The lookup is an await a teardown can land in, and resolveSendId answers a failed lookup with the
     // unresolved id. The reply and forward legs send through the Message's own client, which the host's
     // readiness check on getClient never sees, so a send must not leave for a closing page from here.
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     try {
       return await send(to);
     } catch (err) {
@@ -527,19 +592,24 @@ export class WwebjsMessaging {
       // No-op for ordinary send errors; the retry/throw behavior below is unchanged.
       this.host.reportIfPageTransportError(err, 'sendMessage');
       // Before the LID branch: an unresolvable quote is neither stale-id nor transport, and
-      // re-resolving the recipient would not make the quoted message appear.
+      // re-resolving the recipient would not make the quoted message appear. The page refuses it before
+      // it builds the message, and this is the first attempt, so nothing was sent.
       if (quotedMessageId && isQuoteUnresolvedError(err)) {
-        throw new MessageNotFoundError(quotedMessageId);
+        throw markNothingSent(new MessageNotFoundError(quotedMessageId));
       }
-      if (!chatId.endsWith('@c.us') || !isNoLidForUserError(err)) {
+      if (parseWaId(chatId).kind !== 'user' || !isNoLidForUserError(err)) {
         throw toCapturedPageError(err);
       }
-      this.resolvedSendIds.delete(chatId);
-      this.unreportedLids.delete(chatId);
-      const fresh = await this.resolveSendId(chatId);
+      this.resolvedSendIds.delete(toNeutralJid(chatId));
+      this.unreportedLids.delete(toNeutralJid(chatId));
+      const lookup = await this.lookupSendId(chatId);
+      const fresh = lookup.id;
       // Same gap as above, and before the comparison: a lookup that failed because the session went away
       // answers the unresolved id, which would read as an unreachable recipient.
       this.host.ensureReady();
+      if (!lookup.answered) {
+        throw this.unansweredLookup(chatId, err as Error, lookup.failure);
+      }
       if (fresh === to) {
         throw new RecipientUnreachableError(chatId);
       }
@@ -578,7 +648,7 @@ export class WwebjsMessaging {
     mentions?: string[],
     options?: { linkPreview?: boolean; customPreview?: CustomLinkPreview } & Quotable,
   ): Promise<MessageResult> {
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     // wwebjs accepts neutral `<phone>@c.us` WIDs directly as mentionedJidList, so no de-normalization
     // is needed. Omit the options object entirely when none are given to keep today's send behavior.
     //
@@ -590,7 +660,7 @@ export class WwebjsMessaging {
     // description or a thumbnail. Silently dropping the caller's preview would send a message that
     // looks nothing like what they asked for, so it refuses instead.
     if (options?.customPreview) {
-      throw new EngineNotSupportedError('sendTextMessage(customPreview)');
+      throw markNothingSent(new EngineNotSupportedError('sendTextMessage(customPreview)'));
     }
     const sendOptions: {
       mentions?: string[];
@@ -648,7 +718,7 @@ export class WwebjsMessaging {
     extraOptions?: { sendAudioAsVoice?: boolean; sendMediaAsDocument?: boolean },
     fallbackType?: string,
   ): Promise<MessageResult> {
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     this.host.ensureNotChannelRecipient(chatId);
 
     // Build the media once (a remote URL is fetched here); sendResolved may retry the send itself.
@@ -670,13 +740,16 @@ export class WwebjsMessaging {
           ...this.quoteOptions(media.quotedMessageId),
         }),
       media.quotedMessageId,
-    );
+    ).catch((error: unknown) => {
+      noteVideoLoadTimeout(this.host, error, messageMedia.mimetype);
+      throw error;
+    });
 
     return toMessageResult(msg);
   }
 
   async sendLocationMessage(chatId: string, location: LocationInput): Promise<MessageResult> {
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     ensureSendable(chatId, 'location');
     // Import Location class dynamically from whatsapp-web.js
     const module = await import('whatsapp-web.js');
@@ -695,7 +768,7 @@ export class WwebjsMessaging {
   }
 
   async sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult> {
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     ensureSendable(chatId, 'contact card');
     // Shared builder sanitizes name/number (strips CR/LF, digits-only waid) so a crafted contact
     // can't inject extra vCard fields — the previous inline build interpolated raw values.
@@ -714,7 +787,7 @@ export class WwebjsMessaging {
   }
 
   async sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     // Sticker has its own send path (sendMediaAsSticker), not the sendMediaMessage funnel, but it
     // hits the same channel crash: for a channel wwjs drops the sticker form and runs processMediaData
     // with sendToChannel, which still ends at msg.avParams() (Utils.js:518). Guard it too (#673).
@@ -723,6 +796,17 @@ export class WwebjsMessaging {
     // Keep the fetched content-type for a remote URL: here the mimetype selects the conversion, and
     // whatsapp-web.js returns the media unconverted once it reads as webp (Util.formatImageToWebpSticker).
     const messageMedia = await toMessageMedia(media, this.host.config.proxy?.url, { trustDeclaredType: false });
+    // whatsapp-web.js converts only a type it reads as an image or a video, and throws a bare 'Invalid media format'
+    // for anything else before the page send (Util.formatToWebpSticker): a 500 the send breaker counted. Same test as
+    // the library's, refused as the 400 Baileys gives.
+    const type = messageMedia.mimetype ?? '';
+    if (!type.includes('image') && !type.includes('video')) {
+      throw markNothingSent(
+        new BadRequestException(
+          `A sticker must be an image or a video whatsapp-web.js can convert. Received '${type}'.`,
+        ),
+      );
+    }
 
     const msg = await this.sendResolved(
       chatId,
@@ -740,7 +824,7 @@ export class WwebjsMessaging {
   }
 
   async sendPollMessage(chatId: string, poll: PollInput): Promise<MessageResult> {
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     ensureSendable(chatId, 'poll');
     // Import Poll dynamically like Location; the .default fallback covers builds where the
     // classes land on module.default (a plain `module.Poll` would be undefined there and
@@ -767,19 +851,23 @@ export class WwebjsMessaging {
   }
 
   async replyToMessage(chatId: string, quotedMsgId: string, text: string, mentions?: string[]): Promise<MessageResult> {
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     ensureSendable(chatId, 'reply');
     try {
       // Find the message to quote
-      const chat = await this.readBeforeSend('replyToMessage', () => this.client().getChatById(chatId));
+      const chat = await this.readBeforeSend('replyToMessage', () =>
+        this.client()
+          .getChatById(chatId)
+          .catch(error => recoverGroupChatById(this.host, 'replyToMessage', chatId, error)),
+      );
       if (!chat) {
-        throw new MessageNotFoundError(quotedMsgId, chatId);
+        throw markNothingSent(new MessageNotFoundError(quotedMsgId, chatId));
       }
       const messages = await this.readBeforeSend('replyToMessage', () => chat.fetchMessages({ limit: 100 }));
       const quotedMsg = messages.find(m => m.id._serialized === quotedMsgId);
 
       if (!quotedMsg) {
-        throw new MessageNotFoundError(quotedMsgId);
+        throw markNothingSent(new MessageNotFoundError(quotedMsgId));
       }
 
       // Reply's send leg hits the same `No LID for user` path as a normal send for a migrated contact,
@@ -800,17 +888,21 @@ export class WwebjsMessaging {
   }
 
   async forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     try {
-      const chat = await this.readBeforeSend('forwardMessage', () => this.client().getChatById(fromChatId));
+      const chat = await this.readBeforeSend('forwardMessage', () =>
+        this.client()
+          .getChatById(fromChatId)
+          .catch(error => recoverGroupChatById(this.host, 'forwardMessage', fromChatId, error)),
+      );
       if (!chat) {
-        throw new MessageNotFoundError(messageId, fromChatId);
+        throw markNothingSent(new MessageNotFoundError(messageId, fromChatId));
       }
       const messages = await this.readBeforeSend('forwardMessage', () => chat.fetchMessages({ limit: 100 }));
       const msgToForward = messages.find(m => m.id._serialized === messageId);
 
       if (!msgToForward) {
-        throw new MessageNotFoundError(messageId);
+        throw markNothingSent(new MessageNotFoundError(messageId));
       }
 
       // The forward's send leg fails with `No LID for user` for a LID-migrated destination, so resolve
@@ -824,6 +916,7 @@ export class WwebjsMessaging {
       // older history in before the second read, and those messages are older than every one loaded.
       let resolvedTo = toChatId;
       let before = undefined as { ids: Set<string>; newest: number } | undefined;
+      let attempted = false;
       await this.sendResolved(toChatId, async to => {
         resolvedTo = to;
         before = undefined;
@@ -842,8 +935,11 @@ export class WwebjsMessaging {
           this.host.logger.warn(`Could not read the destination chat before forwarding: ${String(error)}`);
         }
         // The read above is a page round trip a teardown can land in. Its failure only leaves the copy
-        // unidentified, unless it shows the page is gone, which this check then refuses.
-        this.host.ensureReady();
+        // unidentified, unless it shows the page is gone, which this check then refuses. Before the first
+        // attempt nothing was forwarded, so that refusal frees a keyed send's key; a retry's may follow a copy.
+        if (attempted) this.host.ensureReady();
+        else this.ensureReadyToSend();
+        attempted = true;
         return msgToForward.forward(to);
       });
 
@@ -888,7 +984,9 @@ export class WwebjsMessaging {
    * that many, which in a chat this account rarely writes to walks the whole history.
    */
   private async loadedOwnMessages(chatId: string): Promise<Message[]> {
-    const chat = await this.client().getChatById(chatId);
+    const chat = await this.client()
+      .getChatById(chatId)
+      .catch(error => recoverGroupChatById(this.host, 'forwardMessage', chatId, error));
     return (await chat?.fetchMessages({ fromMe: true })) ?? [];
   }
 
@@ -898,7 +996,9 @@ export class WwebjsMessaging {
       // NOTE: do NOT resolve chatId to @lid here — whatsapp-web.js reacts using the found message's own
       // id, not this chatId, so LID-resolving the lookup gives no send benefit and would miss a message
       // stored under the pre-migration @c.us chat (#583).
-      const chat = await this.client().getChatById(chatId);
+      const chat = await this.client()
+        .getChatById(chatId)
+        .catch(error => recoverGroupChatById(this.host, 'reactToMessage', chatId, error));
       // getChatById RESOLVES undefined for an unknown chat (wwebjs does not throw); guard it so the
       // caller gets the 404 editMessage returns rather than a TypeError surfacing as an opaque 500.
       if (!chat) {
@@ -920,7 +1020,9 @@ export class WwebjsMessaging {
   async getMessageReactions(chatId: string, messageId: string): Promise<MessageReaction[]> {
     this.host.ensureReady();
     const reactions = await this.withPage('getMessageReactions', async () => {
-      const chat = await this.client().getChatById(chatId);
+      const chat = await this.client()
+        .getChatById(chatId)
+        .catch(error => recoverGroupChatById(this.host, 'getMessageReactions', chatId, error));
       if (!chat) {
         throw new MessageNotFoundError(messageId, chatId);
       }
@@ -1068,6 +1170,69 @@ export class WwebjsMessaging {
     );
   }
 
+  /**
+   * Who received, read and played a message this account sent. The message is resolved by its full id from
+   * everything WhatsApp Web holds, not from the 100-message window the writes search, so an older message
+   * still answers. The chat fence only checks `chatId`, so the message must sit in that chat: one from
+   * another chat is a 404, checked before the direction so the answer says nothing about that chat.
+   */
+  async getMessageReceipts(chatId: string, messageId: string): Promise<MessageReceipts> {
+    this.host.ensureReady();
+    // getMessageById throws an unnamed page error (a 500) for anything but a full serialized id, so any other
+    // shape is answered here, without a page call: no message has one.
+    if (!SERIALIZED_MESSAGE_ID.test(messageId)) throw new MessageNotFoundError(messageId, chatId);
+    const info = await this.withPage('getMessageReceipts', async () => {
+      const message = await this.client().getMessageById(messageId);
+      if (!message || !(await this.isInChat(message, chatId))) {
+        throw new MessageNotFoundError(messageId, chatId);
+      }
+      // getInfo answers null for a received message, which would read as nobody having seen it.
+      if (!message.fromMe) {
+        throw new EngineRefusedError(
+          `message ${messageId} was not sent by this account; only its own messages carry receipts`,
+        );
+      }
+      // getInfo reads through the page of the client that resolved the message: a teardown since is the 409.
+      this.host.ensureReady();
+      return message.getInfo();
+    });
+    // Past the checks above, getInfo answers null only for a message WhatsApp Web no longer holds.
+    if (!info) throw new MessageNotFoundError(messageId, chatId);
+
+    const mapReceipts = (list?: Array<{ id: SerializedWid | string; t: number }>): MessageReceiptParticipant[] => {
+      if (!Array.isArray(list)) return [];
+      return list.map(item => ({
+        participant: toNeutralJid(readWid(item.id) || ''),
+        timestamp: Number(item.t || 0),
+      }));
+    };
+
+    return {
+      delivery: mapReceipts(info.delivery),
+      deliveryRemaining: typeof info.deliveryRemaining === 'number' ? info.deliveryRemaining : undefined,
+      read: mapReceipts(info.read),
+      readRemaining: typeof info.readRemaining === 'number' ? info.readRemaining : undefined,
+      played: mapReceipts(info.played),
+      playedRemaining: typeof info.playedRemaining === 'number' ? info.playedRemaining : undefined,
+    };
+  }
+
+  /**
+   * Whether a message sits in the named chat: `to` for one this account sent, else `from`, as
+   * buildIncomingMessageBase reads it. A 1:1 chat WhatsApp Web keeps under its `@lid` can be named by the
+   * contact's `@c.us`, so a name that differs is resolved through the chat WhatsApp Web opens for it.
+   */
+  private async isInChat(message: Message, chatId: string): Promise<boolean> {
+    const own = message.fromMe ? message.to : message.from;
+    // A message that names no chat belongs to none; without this, a missing chat on both sides would compare equal.
+    if (!own) return false;
+    if (toNeutralJid(own) === toNeutralJid(chatId)) return true;
+    const chat = await this.client()
+      .getChatById(chatId)
+      .catch(error => recoverGroupChatById(this.host, 'getMessageReceipts', chatId, error));
+    return chat?.id._serialized === own;
+  }
+
   async getChatHistory(
     chatId: string,
     limit: number = 50,
@@ -1080,7 +1245,9 @@ export class WwebjsMessaging {
     // OPEN and returns every loaded message. Substitute the default, as getChannelMessages does.
     const safeLimit = Number.isFinite(limit) && limit >= 1 ? Math.trunc(limit) : 50;
     const messages = await this.withPage('getChatHistory', async () => {
-      const chat = await this.client().getChatById(chatId);
+      const chat = await this.client()
+        .getChatById(chatId)
+        .catch(error => recoverGroupChatById(this.host, 'getChatHistory', chatId, error));
       // Unknown chat: getChatById resolves undefined rather than throwing. A chat this account cannot
       // see has no history to return, so yield an empty page instead of dereferencing undefined (a
       // TypeError that would surface as a 500).
@@ -1199,7 +1366,9 @@ export class WwebjsMessaging {
     // this chatId, so LID-resolving the lookup gives no benefit and would miss a message stored under
     // the pre-migration @c.us chat (#583).
     await this.withPage('deleteMessage', async () => {
-      const chat = await this.client().getChatById(chatId);
+      const chat = await this.client()
+        .getChatById(chatId)
+        .catch(error => recoverGroupChatById(this.host, 'deleteMessage', chatId, error));
       if (!chat) {
         throw new MessageNotFoundError(messageId, chatId);
       }
@@ -1217,13 +1386,13 @@ export class WwebjsMessaging {
   async editMessage(chatId: string, messageId: string, body: string, mentions?: string[]): Promise<MessageResult> {
     this.host.ensureReady();
     // Same lookup window as react/delete: fetchMessages sees only the 100 most recent messages.
-    // NOTE: do NOT resolve chatId to @lid here — edit operates on the found message's own key, not
+    // NOTE: do NOT resolve chatId to @lid here - edit operates on the found message's own key, not
     // this chatId, so LID-resolving the lookup would miss a message stored under the pre-migration
     // @c.us chat (#583).
     const edited = await this.withPage('editMessage', async () => {
-      const chat = await this.client().getChatById(chatId);
-      // getChatById RESOLVES undefined for an unknown chat (wwebjs does not throw) — that is the same
-      // client-facing outcome as a message outside the fetch window, not a TypeError (-> 500).
+      const chat = await this.client()
+        .getChatById(chatId)
+        .catch(error => recoverGroupChatById(this.host, 'editMessage', chatId, error));
       if (!chat) {
         throw new MessageNotFoundError(messageId, chatId);
       }
@@ -1261,7 +1430,9 @@ export class WwebjsMessaging {
    * a teardown that landed in the lookup would otherwise reach a closing page.
    */
   private async findInFetchWindow(chatId: string, messageId: string): Promise<Message> {
-    const chat = await this.client().getChatById(chatId);
+    const chat = await this.client()
+      .getChatById(chatId)
+      .catch(error => recoverGroupChatById(this.host, 'findInFetchWindow', chatId, error));
     // getChatById RESOLVES undefined for an unknown chat rather than throwing, which is the same
     // client-facing outcome as a message outside the window — a 404, not a TypeError-driven 500.
     if (!chat) throw new MessageNotFoundError(messageId, chatId);

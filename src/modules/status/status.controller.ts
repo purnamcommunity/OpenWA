@@ -3,6 +3,7 @@ import type { Response } from 'express';
 import { ApiTags, ApiOperation, ApiParam, ApiResponse } from '@nestjs/swagger';
 import { StatusDeletedResponseDto, StatusListResponseDto, StatusResultDto } from './dto/status-response.dto';
 import { StatusService } from './status.service';
+import { retryAfterWhenBusy, storedFileAttachment } from '../../common/storage/storage-transfer';
 import { SendTextStatusDto } from './dto/send-text-status.dto';
 import { SendImageStatusDto, SendVideoStatusDto, SendVoiceStatusDto } from './dto/send-media-status.dto';
 import { RequireRole } from '../auth/decorators/auth.decorators';
@@ -52,22 +53,25 @@ export class StatusController {
     content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } },
   })
   @ApiResponse({ status: 404, description: 'No stored media (text status, omitted, or expired).' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'On S3 storage, the gateway already has 50 media downloads open across the status and chat media ' +
+      'routes. Retry once the Retry-After header (1 second) has passed.',
+  })
   async getStatusMedia(
     @Param('sessionId') sessionId: string,
     @Param('statusId') statusId: string,
     @Res({ passthrough: true }) res: Response,
   ): Promise<StreamableFile> {
-    const { buffer, mimetype } = await this.statusService.getStatusMedia(sessionId, statusId);
+    const { mimetype, ...source } = await this.statusService
+      .getStatusMedia(sessionId, statusId)
+      .catch(retryAfterWhenBusy(res));
     // attachment + nosniff together, mirroring the chat-media route: the mimetype is already
     // reduced to an inert set by the service, and forcing a download means even a mistake there
     // cannot render as active content on the API origin. The dashboard fetches status media as a
     // blob (fetch ignores Content-Disposition), so nothing depends on inline display here.
-    res.set({
-      'Content-Type': mimetype,
-      'X-Content-Type-Options': 'nosniff',
-      'Content-Disposition': 'attachment',
-    });
-    return new StreamableFile(buffer);
+    return storedFileAttachment(res, source, mimetype);
   }
 
   @Post('send-text')

@@ -1,6 +1,6 @@
 # rmyndharis/openwa
 
-This document describes SDK 0.7.0. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later.
+This document describes `main`. `messages->receipts` is an unreleased addition after SDK 0.9.0 and requires the corresponding server change after OpenWA 0.27.1. `contacts->lid` requires OpenWA 0.27.1 or later. `groups->setMemberLabel` and the `match` search key require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later.
 
 Official PHP SDK for [OpenWA](https://github.com/rmyndharis/OpenWA), the open-source WhatsApp API Gateway. OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or Meta.
 
@@ -67,8 +67,12 @@ A non-2xx response throws a typed `OpenWA\Exceptions\OpenWAApiException` subclas
 `OpenWAAuthException` (401), `OpenWAForbiddenException` (403), `OpenWANotFoundException` (404),
 `OpenWAConflictException` (409), `OpenWARateLimitException` (429), `OpenWANotImplementedException`
 (501), `OpenWAServiceUnavailableException` (503) — each exposing `getStatus()` and the parsed
-`getBody()`. A timeout throws `OpenWATimeoutException`. 503 means the gateway could not complete the
-request right now: the path to WhatsApp failed, the gateway is draining or short of a dependency,
+`getBody()`. A timeout throws `OpenWATimeoutException`, though the gateway may still complete the
+request: retry a send only with the same `Idempotency-Key`. Both extend `OpenWAException`, which
+covers API responses and timeouts only: a transport failure (a refused or reset connection, a DNS
+failure, a cut body) is a `GuzzleHttp\Exception\TransferException`, and an invalid argument (an empty
+or dot id, a bad raw path or idempotency key) an `\InvalidArgumentException`. 503 means the gateway
+could not complete the request right now: the path to WhatsApp failed, the gateway is draining or short of a dependency,
 or, on Baileys, WhatsApp throttled (code 429) or timed out (code 408) the request. Back off and
 retry later instead of at once, because repeating a throttled request straight away prolongs the
 throttle; a catalog 503 can persist because WhatsApp may never answer that query, so bound any
@@ -80,14 +84,15 @@ seconds when only sends still in flight caused it, the rest of the failure break
 (`SEND_PACING_BREAKER_COOLDOWN_MS`, 15 minutes by default) after a run of send failures, otherwise
 up to the next UTC day. `getHeaders()` returns the response headers. A 503 does not always prove a
 write was never carried out: when WhatsApp timed out, the change may still have been applied, so
-re-read the state before repeating it. A throttle on a send or a single write is the exception: it
-was turned away before it ran, so nothing was sent or applied, and a keyed send frees its
-`Idempotency-Key`. A group settings update with several fields applies them one at a time, so a 503
-on a later field, a throttle included, leaves the earlier ones applied; its message lists them after
-`already applied:`, so re-read the settings before retrying, or send one field per request. In a
-routed deployment a forward that fails before reaching the owner node answers 503, one that fails
-after the request reached it answers 502 or 504, and a 503 from the owner itself is relayed
-unchanged.
+re-read the state before repeating it. A throttle on a send or a single write was turned away before
+it ran, so nothing was sent or applied; a send also sent nothing when its recipient lookup failed,
+its connection closed before the message was written, or its media or preview image URL could not be
+fetched through the session's proxy. Each of these frees a keyed send's `Idempotency-Key`. A group
+settings update with several fields applies them one at a time, so a 503 on a later field, a
+throttle included, leaves the earlier ones applied; its message lists them after `already applied:`,
+so re-read the settings before retrying, or send one field per request. In a routed deployment a
+forward that fails before reaching the owner node answers 503, one that fails after the request
+reached it answers 502 or 504, and a 503 from the owner itself is relayed unchanged.
 
 Guzzle's stream handler, which Guzzle uses on a host without `ext-curl`, throws a plain Guzzle exception
 when a gateway stays silent past the timeout, before the response headers on either Guzzle major and, on
@@ -101,6 +106,14 @@ on Guzzle 7 the wait for the response headers is still ended by PHP's `default_s
 default), which surfaces as a `GuzzleHttp\Exception\ConnectException`: catch
 `GuzzleHttp\Exception\TransferException` as well as `OpenWATimeoutException` if the application sets
 `timeout` to `0` on such a host.
+
+A body that ends before the `Content-Length` it declares, such as a media download the gateway cut off
+when its store failed mid-read, is a failed transfer raised as a `GuzzleHttp\Exception\TransferException`:
+cURL and Guzzle 8 raise their own, and on Guzzle 7's stream handler, which returns such a body as if it
+were whole, the SDK raises a `RequestException` naming the request and the byte counts. That handler
+still returns two cut bodies without an error, because neither carries a length to compare with: a
+chunked body (the gateway sends a `Content-Length` with media whenever the store reports a size) and a
+compressed body the application asked for with its own `Accept-Encoding` default header.
 
 ```php
 use OpenWA\Exceptions\OpenWANotFoundException;
@@ -131,16 +144,27 @@ $delivery = json_decode($raw, true);
 // Process $delivery['event'] and $delivery['data'] here.
 ```
 
+The signature covers the body only and carries no timestamp, so a captured delivery still verifies
+when it is sent again. Dedupe on `$delivery['idempotencyKey']` (also the `X-OpenWA-Idempotency-Key`
+header): the gateway's own retries and an operator's redrive of a failed delivery reuse it, so a key
+you have already handled is the same event arriving again.
+
 ## Notes
 
 - **Use HTTPS in production** — the API key is sent as `X-API-Key` and is bearer-equivalent.
   Over plaintext `http://` to a non-localhost host the client writes a warning with `error_log()`;
   pass `'allowInsecureHttp' => true` to skip it (for example on a private Docker network).
+- A list you build into a body (`mentions`, poll `options`, status `recipients`) must be a PHP list:
+  `json_encode` writes an array whose keys have gaps, as `array_unique` and `array_filter` leave them,
+  as an object, which the gateway answers with `400`. Pass it through `array_values()`; the SDK does
+  that itself for participant lists and the bulk `messages` list.
 - The SDK does **not** retry, and **never follows redirects** (so the key is never re-sent to
   a redirect target). Path segments are percent-encoded; a base-URL path prefix (e.g. behind a
   reverse proxy) is preserved.
 - Escape hatch for endpoints the SDK does not wrap:
-  `$client->request($method, $path, $query, $body)`.
+  `$client->request($method, $path, $query, $body)`. A path with a `.` or `..` segment (also after an encoded
+  slash, as in `..%2F`), or one that does not begin with `/`, throws `InvalidArgumentException` before anything
+  is sent. An id with a `.` or `..` part between slashes, such as `../x`, is refused the same way.
 
 ## Releasing
 
@@ -168,7 +192,7 @@ Cutting a release:
 1. If the minor line changes, update `extra.branch-alias.dev-main` in
    `composer.json` (e.g. `0.1.x-dev` → `0.2.x-dev`) and land it on `main`. The
    release workflow refuses to publish when the alias does not match the tag.
-2. Tag that commit `php-sdk-v<version>` (e.g. `php-sdk-v0.7.0`) and push the
+2. Tag that commit `php-sdk-v<version>` (e.g. `php-sdk-v0.9.0`) and push the
    tag. The SDK has its own version line — the monorepo's `v*` tags are the app
    version and never trigger an SDK release.
 3. The workflow runs the test suite, then tags the mirror `<version>` (no `v`

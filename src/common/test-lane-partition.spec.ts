@@ -147,22 +147,27 @@ describe('Test lane partition', () => {
   /**
    * A spec that picks its dialect from DATABASE_TYPE is not a `*.pg.spec.ts`, so the scan above never
    * sees it, yet its PostgreSQL half runs only in this job. Dropping it from both workflows at once
-   * leaves release-gate-parity green (the two still agree) and the scenarios silently SQLite-only.
-   * Listed by hand for that reason, and a plain spec this job gains must be listed too.
+   * leaves release-gate-parity green (the two still agree) and the scenarios silently SQLite-only. A
+   * hand-kept list cannot see a spec nobody added to it, so the list is every plain spec on disk that
+   * compares DATABASE_TYPE with postgres (`===`, `!==`, or the loose forms). A spec that reads the variable
+   * into another name first is not seen; compare it in place.
    */
-  const dialectSwitchedSpecs = [
-    'src/modules/session/session-content-lifetime.spec.ts',
-    'src/modules/session/session-delete-claim.spec.ts',
-    'src/engine/identity/lid-mapping-store.spec.ts',
-  ];
+  const dialectSwitchedSpecs = (): string[] =>
+    (readdirSync(join(repoRoot, 'src'), { recursive: true }) as string[])
+      .map(path => `src/${path.split('\\').join('/')}`)
+      .filter(path => path.endsWith('.spec.ts') && !path.endsWith('.pg.spec.ts'))
+      .filter(path => /DATABASE_TYPE\s*[!=]==?\s*['"]postgres['"]/.test(readFileSync(join(repoRoot, path), 'utf8')))
+      .sort();
 
   it.each(['ci.yml', 'release.yml'])('runs the dialect-switched specs in the %s test-postgres job', file => {
+    const onDisk = dialectSwitchedSpecs();
     const named = postgresJobSpecs(file).filter(path => !path.endsWith('.pg.spec.ts'));
 
-    expect(dialectSwitchedSpecs.filter(path => !existsSync(join(repoRoot, path)))).toEqual([]);
+    // Vacuity guard: the scan must find the twelve specs that switch today.
+    expect(onDisk.length).toBeGreaterThanOrEqual(12);
     expect({
-      neverRun: dialectSwitchedSpecs.filter(path => !named.includes(path)),
-      unlisted: named.filter(path => !dialectSwitchedSpecs.includes(path)),
+      neverRun: onDisk.filter(path => !named.includes(path)),
+      unlisted: named.filter(path => !onDisk.includes(path)).sort(),
     }).toEqual({ neverRun: [], unlisted: [] });
   });
 

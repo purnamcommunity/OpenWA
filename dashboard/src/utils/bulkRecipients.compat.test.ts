@@ -1,7 +1,8 @@
-// The recipients parser differs from the one before quote handling was added only in reading a chat id wrapped in
-// CSV quotes: every recipient that parser found, this one finds too, and each line is read on its own, so an
-// unmatched quote cannot take other lines with it. The reference below is the pre-quote-handling parser, kept
-// verbatim.
+// The recipients parser differs from the one before quote handling was added in reading a chat id wrapped in CSV
+// quotes, in dropping a field of more than 15 digits and in dropping a leading 00 exit code, which the generator below
+// never builds (bulkRecipients.digit-limit.test.ts pins both): every recipient
+// that parser found, this one finds too, and each line is read on its own, so an unmatched quote cannot take other
+// lines with it. The reference below is the pre-quote-handling parser, kept verbatim.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseBulkRecipients } from './bulkRecipients.ts';
@@ -42,7 +43,7 @@ const NUMBERS = [
   '628111222333',
   '+62 812-3456-7890',
   '+1 (555) 010-2233',
-  '0049 170 1234567',
+  '+49 170 1234567',
   '12345',
   '1',
   '٦٢٨١٢٣٤٥٦٧٨٩',

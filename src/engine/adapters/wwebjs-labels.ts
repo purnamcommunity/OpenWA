@@ -1,14 +1,40 @@
 import { NotFoundException } from '@nestjs/common';
-import { type Client } from 'whatsapp-web.js';
+import { type Chat, type Client } from 'whatsapp-web.js';
 import { mapWwebjsMessageType } from './message-mapper';
 import { Label, ChatSummary } from '../interfaces/whatsapp-engine.interface';
-import { GroupChat, BusinessClient } from '../types/whatsapp-web-js.types';
+import { GroupChat, BusinessClient, readWid } from '../types/whatsapp-web-js.types';
 import { isChannelJid, chatKind } from '../identity/wa-id';
 import { ChatLabelsUnsupportedError } from '../../common/errors/chat-labels-unsupported.error';
 import { LabelNotFoundError } from '../../common/errors/label-not-found.error';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { type WwebjsEngineHost, rethrowIfNavigation, withPage } from './wwebjs-host';
 import { isProtocolTimeout } from './wwebjs-lifecycle';
+import { isPageInvariant, readChats, recoverGroupChatById } from './wwebjs-chats';
+
+/** The labels on a chat, read IN-PAGE as window.WWebJS.getChatLabels reads them without refreshing group metadata. */
+export async function readLocalChatLabels(chatId: string): Promise<Label[] | null> {
+  const w = window as unknown as {
+    WWebJS: {
+      getChat: (id: string, options: { getAsModel: boolean }) => Promise<{ labels?: string[] } | null>;
+      getLabel: (id: string) => Label;
+    };
+  };
+  const chat = await w.WWebJS.getChat(chatId, { getAsModel: false });
+  return chat ? (chat.labels || []).map(id => w.WWebJS.getLabel(id)) : null;
+}
+
+/** The ids of the chats carrying a label, read IN-PAGE exactly as Client.getChatsByLabelId reads them. */
+export function readLabelChatIds(labelId: string): string[] {
+  type LabelItem = { parentType: string; parentId: string };
+  const w = window as unknown as {
+    require: (m: string) => {
+      Label: { get: (id: string) => { labelItemCollection: { getModelsArray: () => LabelItem[] } } };
+    };
+  };
+  const items = w.require('WAWebCollections').Label.get(labelId).labelItemCollection.getModelsArray();
+  return items.filter(item => item.parentType === 'Chat').map(item => item.parentId);
+}
 
 /**
  * Chat-label operations (WhatsApp Business only) extracted from WhatsAppWebJsAdapter. The adapter
@@ -55,8 +81,12 @@ export class WwebjsLabels {
     // the same answer getLabelById gives.
     let chats: Awaited<ReturnType<BusinessClient['getChatsByLabelId']>>;
     try {
-      chats = await (this.client() as unknown as BusinessClient).getChatsByLabelId(labelId);
+      chats = await (this.client() as unknown as BusinessClient)
+        .getChatsByLabelId(labelId)
+        .catch((error: unknown) => this.readLabelChatsLocally(labelId, error));
     } catch (error) {
+      // A session that went away during the local re-read below is the retryable 409, not a 404.
+      if (error instanceof EngineNotReadyError) throw error;
       // Same split the group read makes: a dead page is a 503, not "no such label".
       rethrowIfNavigation(this.host, error);
       if (this.host.isPageTransportError(error)) {
@@ -102,6 +132,20 @@ export class WwebjsLabels {
     return summaries;
   }
 
+  /**
+   * The library resolves a label's chats through getChatById, so one group whose refresh fails one of
+   * WhatsApp Web's own invariants failed the whole list. Re-read them with readChatModels, which serves
+   * that group from the metadata the page already holds, as the group list does: as last loaded and
+   * without a last message, so its summary has no lastMessageType. Any other rejection is rethrown.
+   */
+  private async readLabelChatsLocally(labelId: string, error: unknown): Promise<Chat[]> {
+    if (!isPageInvariant(error)) throw error;
+    const page = (
+      this.client() as unknown as { pupPage: { evaluate: <T>(fn: (id: string) => T, id: string) => Promise<T> } }
+    ).pupPage;
+    return readChats(this.host, 'getChatsByLabel', await page.evaluate(readLabelChatIds, labelId));
+  }
+
   async getLabelById(labelId: string): Promise<Label | null> {
     this.host.ensureReady();
     // Client.getLabelById never resolves null: its page code serializes the looked-up label without
@@ -129,24 +173,45 @@ export class WwebjsLabels {
       return [];
     }
     // An unknown chat carries no labels, which is an honest answer for a read.
-    return (await this.readChatLabels(chatId)) ?? [];
+    return (await this.readChatLabels(chatId))?.labels ?? [];
   }
 
-  /** The chat's labels, or null when the page cannot resolve the chat (getChatById resolves undefined). */
-  private async readChatLabels(chatId: string): Promise<Label[] | null> {
+  /**
+   * The chat's own id and labels, or null when the page cannot resolve the chat (getChatById resolves undefined).
+   * The id is the one a write must name: WhatsApp Web keys a migrated contact's chat by its lid and finds it for the
+   * phone id as well, while addOrRemoveLabels selects chats by their exact id.
+   */
+  private async readChatLabels(chatId: string): Promise<{ id: string; labels: Label[] } | null> {
+    let id = chatId;
     const labels = await withPage(this.host, 'getChatLabels', async () => {
-      const chat = await this.client().getChatById(chatId);
-      return chat ? ((await (chat as unknown as GroupChat).getLabels()) ?? []) : null;
+      const chat = await this.client()
+        .getChatById(chatId)
+        .catch(error => recoverGroupChatById(this.host, 'getChatLabels', chatId, error));
+      if (!chat) return null;
+      id = readWid(chat.id) ?? chatId;
+      return (chat as unknown as GroupChat)
+        .getLabels()
+        .then(res => res ?? [])
+        .catch(async (error: unknown) => {
+          if (!isPageInvariant(error)) throw error;
+          const page = (
+            this.client() as unknown as { pupPage: { evaluate: <T>(fn: (id: string) => T, id: string) => Promise<T> } }
+          ).pupPage;
+          return page.evaluate(readLocalChatLabels, chatId);
+        });
     });
     if (!labels) {
       return null;
     }
 
-    return labels.map(label => ({
-      id: String(label.id),
-      name: String(label.name),
-      hexColor: String(label.hexColor),
-    }));
+    return {
+      id,
+      labels: labels.map(label => ({
+        id: String(label.id),
+        name: String(label.name),
+        hexColor: String(label.hexColor),
+      })),
+    };
   }
 
   async addLabelToChat(chatId: string, labelId: string): Promise<void> {
@@ -196,14 +261,14 @@ export class WwebjsLabels {
     if (!current) {
       throw new NotFoundException(`Chat ${chatId} does not exist on this session`);
     }
-    const ids = new Set(current.map(label => label.id));
+    const ids = new Set(current.labels.map(label => label.id));
     if (add) {
       ids.add(labelId);
     } else {
       ids.delete(labelId);
     }
     try {
-      await withPage(this.host, 'changeChatLabel', () => this.client().addOrRemoveLabels([...ids], [chatId]));
+      await withPage(this.host, 'changeChatLabel', () => this.client().addOrRemoveLabels([...ids], [current.id]));
     } catch (error) {
       // whatsapp-web.js throws `[LT01] Only Whatsapp business` from the page context on a personal account.
       if (String(error instanceof Error ? error.message : error).includes('LT01')) {

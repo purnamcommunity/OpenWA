@@ -48,6 +48,9 @@ let extraPlugins: Record<string, unknown>[] = [];
 let disableGate: Promise<void> | undefined;
 // Whether GET /api/plugins answers with a server error, as it does while the plugin registry is unavailable.
 let pluginListFails = false;
+// What DELETE /api/plugins/:id answers; the plain answer is the one for a complete removal.
+const UNINSTALLED = `Plugin ${PLUGIN.id} uninstalled successfully`;
+let deleteReply: { success: boolean; message: string } = { success: true, message: UNINSTALLED };
 
 function installFetchStub(): void {
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -68,7 +71,7 @@ function installFetchStub(): void {
     }
     if (method === 'POST' && path === '/api/plugins/install') return Promise.resolve(jsonResponse(PLUGIN));
     if (method === 'DELETE' && path === `/api/plugins/${PLUGIN.id}`) {
-      return Promise.resolve(jsonResponse({ success: true, message: 'Uninstalled' }));
+      return Promise.resolve(jsonResponse(deleteReply));
     }
     if (method === 'GET' && path === '/api/sessions') return Promise.resolve(jsonResponse([SESSION, SESSION_2]));
     if (method === 'PUT' && path === `/api/plugins/${PLUGIN.id}/config`) {
@@ -131,6 +134,7 @@ afterEach(() => {
   extraPlugins = [];
   disableGate = undefined;
   pluginListFails = false;
+  deleteReply = { success: true, message: UNINSTALLED };
   rtl.cleanup();
   queryClient?.clear();
   queryClient = undefined;
@@ -152,7 +156,7 @@ async function openSessionOverride(sessionLabel: string): Promise<void> {
   renderPlugins();
 
   fireEvent.click(await screen.findByTitle('Configure'));
-  fireEvent.click(await screen.findByRole('button', { name: 'Sessions' }));
+  fireEvent.click(await screen.findByRole('tab', { name: 'Sessions' }));
   const select = await screen.findByRole('combobox', { name: 'Select a session…' });
   await findByText(select, sessionLabel);
   fireEvent.change(select, { target: { value: SESSION.id } });
@@ -267,6 +271,51 @@ test('uninstalling a plugin reloads the catalog, whose installed flags it change
   }
 });
 
+/** Click Uninstall, wait for the toast titled `title` and for the refetches the uninstall started to settle. */
+async function uninstallAndReadToast(title: string): Promise<Element> {
+  const { screen, fireEvent, waitFor } = rtl;
+  const realConfirm = window.confirm;
+  window.confirm = () => true;
+  try {
+    renderPlugins();
+    await waitFor(() => assert.equal(catalogReads, 1));
+    fireEvent.click(await screen.findByTitle('Uninstall'));
+    const toast = (await screen.findByText(title)).closest('.toast');
+    assert.ok(toast, `no toast titled ${title}`);
+    await waitFor(() => assert.equal(catalogReads, 2));
+    await waitFor(() => assert.equal(queryClient?.isFetching(), 0));
+    return toast;
+  } finally {
+    window.confirm = realConfirm;
+  }
+}
+
+// A complete removal names the plugin as the operator's language shows it, not the server's English sentence.
+test('a plain uninstall answer shows the localized plugin name, not the server text', async () => {
+  pluginOverride = { i18n: { en: { name: 'Welcome bot' } } };
+
+  const toast = await uninstallAndReadToast('Plugin uninstalled');
+
+  assert.equal(toast.getAttribute('role'), 'status');
+  assert.equal(toast.querySelector('.toast-message')?.textContent, 'Welcome bot');
+  assert.ok(!toast.textContent?.includes(UNINSTALLED), toast.textContent ?? '');
+});
+
+// When only the final registry delete fails the uninstall still answers success, with a message naming the call that
+// removes the entry it left. The plugin's card is gone by then, so that message is the operator's only pointer.
+test('an uninstall that kept its registry entry warns with the answer that says how to remove it', async () => {
+  const kept =
+    'Plugin greeter uninstalled, but the plugin registry could not be written: registry.json keeps its entry, ' +
+    'emptied of config, sessions and the enable decision, reported at startup as a plugin with no code ' +
+    'until DELETE /api/plugins/greeter is repeated once the registry is writable';
+  deleteReply = { success: true, message: kept };
+
+  const toast = await uninstallAndReadToast('Plugin uninstalled, with a warning');
+
+  assert.equal(toast.getAttribute('role'), 'alert');
+  assert.equal(toast.querySelector('.toast-message')?.textContent, kept);
+});
+
 // The mount prefetch can still be in flight when a later read starts; its older answer must not replace the newer one.
 test('a catalog read that finishes after a newer one does not replace it', async () => {
   const { screen, fireEvent, waitFor, act } = rtl;
@@ -324,7 +373,7 @@ test('a config schema without properties opens the config modal and the Sessions
   renderPlugins();
   fireEvent.click(await screen.findByTitle('Configure'));
   assert.equal(screen.queryByRole('button', { name: 'Save Configuration' }) === null, true);
-  fireEvent.click(await screen.findByRole('button', { name: 'Sessions' }));
+  fireEvent.click(await screen.findByRole('tab', { name: 'Sessions' }));
   // No declared field means nothing to override per session.
   await screen.findByText('Run for');
   assert.equal(screen.queryByRole('combobox', { name: 'Select a session…' }) === null, true);

@@ -854,10 +854,25 @@ export default function Plugins() {
     if (!window.confirm(t('plugins.uninstallConfirm', { name: localizePlugin(plugin, i18n.language).name }))) return;
     startAction(plugin.id);
     try {
-      await pluginsApi.uninstall(plugin.id);
+      const res = await pluginsApi.uninstall(plugin.id);
       refetchAll();
       void loadCatalog();
-      toast.success(t('plugins.toasts.uninstalled', 'Plugin uninstalled'), localizePlugin(plugin, i18n.language).name);
+      // The server ships with this page, so any answer but its plain one reports work left behind (a registry entry
+      // the uninstall could not drop), and with the card gone the answer is all that is left to say so. It stays until
+      // closed: it names the call left to make, and is too long to read before a timed toast leaves.
+      if (res.message === `Plugin ${plugin.id} uninstalled successfully`) {
+        toast.success(
+          t('plugins.toasts.uninstalled', 'Plugin uninstalled'),
+          localizePlugin(plugin, i18n.language).name,
+        );
+      } else {
+        toast.addToast({
+          type: 'warning',
+          title: t('plugins.toasts.uninstalledWithWarning'),
+          message: res.message,
+          duration: 0,
+        });
+      }
     } catch (err) {
       toast.error(t('plugins.toasts.uninstallFailed', 'Uninstall failed'), err instanceof Error ? err.message : '');
     } finally {
@@ -966,7 +981,10 @@ export default function Plugins() {
                             type="button"
                             className="plugin-update-chip"
                             title={`${t('plugins.catalog.updateAvailable', 'Update available')} (v${plugin.version} → v${updatesById.get(plugin.id)!.version})`}
-                            aria-label={t('plugins.catalog.updateAvailable', 'Update available')}
+                            aria-label={t('common.joinedName', {
+                              first: `v${updatesById.get(plugin.id)!.version}`,
+                              second: t('plugins.catalog.updateAvailable', 'Update available'),
+                            })}
                             onClick={() => {
                               // Land the user directly on this plugin's catalog entry, where the
                               // existing Update button (and its confirmation flow) lives.
@@ -1087,14 +1105,18 @@ export default function Plugins() {
           className="install-modal"
           closeLabel={t('common.close')}
           headerExtra={
-            <div className="install-tabs">
+            <div className="install-tabs" role="tablist">
               <button
+                role="tab"
+                aria-selected={installMode === 'upload'}
                 className={`install-tab${installMode === 'upload' ? ' active' : ''}`}
                 onClick={() => setInstallMode('upload')}
               >
                 <Upload size={15} /> {t('plugins.installModal.tabUpload', 'Upload .zip')}
               </button>
               <button
+                role="tab"
+                aria-selected={installMode === 'catalog'}
                 className={`install-tab${installMode === 'catalog' ? ' active' : ''}`}
                 onClick={() => setInstallMode('catalog')}
               >
@@ -1145,7 +1167,6 @@ export default function Plugins() {
                 <input
                   type="file"
                   accept=".zip,application/zip"
-                  hidden
                   onChange={e => setInstallFile(e.target.files?.[0] ?? null)}
                 />
                 <Upload size={28} />
@@ -1293,8 +1314,10 @@ export default function Plugins() {
               closeLabel={t('common.close')}
               subheader={
                 showTabs ? (
-                  <div className="modal-tabs">
+                  <div className="modal-tabs" role="tablist">
                     <button
+                      role="tab"
+                      aria-selected={configTab === 'config'}
                       className={`modal-tab ${configTab === 'config' ? 'active' : ''}`}
                       onClick={() => setConfigTab('config')}
                     >
@@ -1302,6 +1325,8 @@ export default function Plugins() {
                     </button>
                     {configPlugin.sessionScoped !== false && (
                       <button
+                        role="tab"
+                        aria-selected={configTab === 'sessions'}
                         className={`modal-tab ${configTab === 'sessions' ? 'active' : ''}`}
                         onClick={() => setConfigTab('sessions')}
                       >
@@ -1310,6 +1335,8 @@ export default function Plugins() {
                     )}
                     {configPlugin.ingressCapable && (
                       <button
+                        role="tab"
+                        aria-selected={configTab === 'instances'}
                         className={`modal-tab ${configTab === 'instances' ? 'active' : ''}`}
                         onClick={() => setConfigTab('instances')}
                       >

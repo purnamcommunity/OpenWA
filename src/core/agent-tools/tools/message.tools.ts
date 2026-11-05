@@ -82,11 +82,24 @@ const customLinkPreviewSchema = z
       .max(CUSTOM_PREVIEW_TITLE_MAX_LENGTH)
       .describe('Required: WhatsApp renders no preview without a title.'),
     description: z.string().max(CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH).optional(),
+    thumbnailUrl: z
+      .string()
+      .optional()
+      .describe('Preview image URL (http/https), fetched under the media SSRF rules; renders the large card.'),
+    thumbnailBase64: z
+      .string()
+      .optional()
+      .describe('Preview image as base64, at most 5 MiB decoded. Wins over thumbnailUrl.'),
+  })
+  .refine(p => hasValidMediaUrl({ url: p.thumbnailUrl, base64: p.thumbnailBase64 }), {
+    error: MEDIA_URL_MESSAGE,
+    path: ['thumbnailUrl'],
   })
   .optional()
   .describe(
-    'Attach a preview you supply instead of one fetched from the URL, so nothing is fetched and it ' +
-      'works for a URL the gateway cannot reach. Baileys only: whatsapp-web.js answers 501.',
+    'Attach a preview you supply instead of one fetched from the URL, so the page is not fetched and ' +
+      'it works for a URL the gateway cannot reach. Only an optional thumbnail image is fetched. ' +
+      'Baileys only: whatsapp-web.js answers 501.',
   );
 
 export function messageTools(message: MessageService): AnyToolDescriptor[] {

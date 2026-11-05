@@ -22,6 +22,7 @@ const require = createRequire(import.meta.url);
 const lib = await import('@whiskeysockets/baileys');
 const { BaileysEvents } = require('../../dist/engine/adapters/baileys-events.js');
 const { ConcurrencyLimiter } = require('../../dist/common/utils/concurrency-limiter.js');
+const { baileysMessageText, extractBaileysBody } = require('../../dist/engine/adapters/baileys-message-mapper.js');
 
 const SELF = '6280000000000@s.whatsapp.net';
 const PEER = '6281111111111@s.whatsapp.net';
@@ -247,3 +248,30 @@ test('a group message from an @lid participant names its author and flags the li
   assert.equal(payload.author, LID);
   assert.equal(payload.isLidSender, true);
 });
+
+// The chat preview reads a message's text without the library at hand, so it opens the envelopes itself; it must
+// open them as the library's normalizeMessageContent does, or a wrapped message previews blank again.
+for (const [label, message] of [
+  ['a disappearing-chat text', { ephemeralMessage: { message: { extendedTextMessage: { text: 'gone soon' } } } }],
+  ['a captioned photo', { imageMessage: { caption: 'the receipt', mimetype: 'image/jpeg' } }],
+  [
+    'a captioned document',
+    {
+      documentWithCaptionMessage: {
+        message: { documentMessage: { caption: 'the report', mimetype: 'application/pdf' } },
+      },
+    },
+  ],
+  ['a view-once video', { viewOnceMessageV2: { message: { videoMessage: { caption: 'look once' } } } }],
+  [
+    'a view-once photo in a disappearing chat',
+    { ephemeralMessage: { message: { viewOnceMessage: { message: { imageMessage: { caption: 'twice wrapped' } } } } } },
+  ],
+]) {
+  test(`the preview text of ${label}, read from its wire bytes, is the body the library unwraps`, () => {
+    const decoded = lib.proto.Message.decode(lib.proto.Message.encode(lib.proto.Message.fromObject(message)).finish());
+    const expected = extractBaileysBody(lib.normalizeMessageContent(decoded));
+    assert.notEqual(expected, '');
+    assert.equal(baileysMessageText(decoded), expected);
+  });
+}

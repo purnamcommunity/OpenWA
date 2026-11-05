@@ -54,6 +54,7 @@ import { Modal } from '../components/Modal';
 import './Sessions.css';
 import { formatLastActive, formatSessionStatus } from '../utils/sessionDisplay';
 import { normalizePhoneText } from '../utils/phone';
+import { isComposingKey } from '../utils/composition';
 
 /**
  * The hover title for a restriction: the engine's own cause token, plus when enforcement ends if
@@ -67,6 +68,9 @@ function restrictionTitle(restriction: AccountRestriction, t: TFunction): string
   }
   return parts.join(' · ');
 }
+
+// How long the list reads that pushes ask for are held so that the pushes around them share one read.
+const PUSHED_READ_WINDOW_MS = 250;
 
 // The most digits a phone number has. A longer paste is kept whole and refused, never cut to a number nobody typed.
 const PAIRING_PHONE_MAX_DIGITS = 15;
@@ -136,6 +140,8 @@ export function Sessions() {
   // Set while the last list read failed. Cleared as a read starts, so a connect that already triggered
   // a reload (onReconnect) is not followed by a second read from the recovery effect below.
   const listReadFailed = useRef(false);
+  // The wait, in ms, the last failed read was told to observe (Retry-After on a throttled read).
+  const listRetryAfterMs = useRef(0);
   // Spends the one retry the recovery effect below is allowed per connect. Given back by a read that
   // actually succeeded, so a later independent failure on the same connection is retried too.
   const retriedThisConnect = useRef(false);
@@ -151,6 +157,8 @@ export function Sessions() {
   const listApplied = useRef(0);
   const rowWrites = useRef(0);
   const latestList = useRef<Promise<Session[]>>(Promise.resolve([]));
+  // The read the pushes of the current window share (see readForPush), until it is sent.
+  const pushedRead = useRef<{ rows: Promise<Session[]>; timer: ReturnType<typeof setTimeout> } | null>(null);
 
   // Mirror the latest sessions in a ref so the WS handler can compare against the current status without
   // depending on `sessions` (which would churn the callback identity and re-subscribe the socket). Every
@@ -182,6 +190,8 @@ export function Sessions() {
         if (rowWrites.current === writes) break;
         // Only the most recently started read can hold the newest request, so this is never itself.
         if (request !== listRequest.current) return latestList.current;
+        // A read pushes have queued since is sent after that write, so it brings what this one would have.
+        if (pushedRead.current) return pushedRead.current.rows;
       }
       listApplied.current = request;
       sessionsRef.current = data;
@@ -204,6 +214,7 @@ export function Sessions() {
       // A failure older than a read already applied says nothing about the list on screen.
       if (request < listApplied.current) return sessionsRef.current;
       listReadFailed.current = true;
+      listRetryAfterMs.current = ((err as { retryAfterSeconds?: number }).retryAfterSeconds ?? 0) * 1000;
       setError(err instanceof Error ? err.message : t('sessions.create.errorDefault'));
       setListFailed(true);
       return [];
@@ -213,6 +224,20 @@ export function Sessions() {
     }
   }, [t, queryClient]);
   const fetchSessions = useCallback(() => (latestList.current = readSessions()), [readSessions]);
+  // A push needs only the server fields of a read that starts after it, so the pushes of one window share a read
+  // sent when the window closes. One read per push sent a burst (every session coming back after a network drop)
+  // past the gateway's limit on this route, 10 reads a second per client, and the newest read was the one refused.
+  const readForPush = useCallback((): Promise<Session[]> => {
+    if (!pushedRead.current) {
+      let timer!: ReturnType<typeof setTimeout>;
+      const rows = new Promise<void>(resolve => (timer = setTimeout(resolve, PUSHED_READ_WINDOW_MS))).then(() => {
+        pushedRead.current = null;
+        return fetchSessions();
+      });
+      pushedRead.current = { rows, timer };
+    }
+    return pushedRead.current.rows;
+  }, [fetchSessions]);
 
   const {
     qrData,
@@ -283,8 +308,8 @@ export function Sessions() {
   // `session.restriction`, and a restriction can arrive with no status transition at all, because the
   // Baileys reachout timelock rides a connect probe, so that push is purely a refetch signal.)
   const refetchSessions = useCallback(() => {
-    void fetchSessions();
-  }, [fetchSessions]);
+    void readForPush();
+  }, [readForPush]);
 
   const { isConnected, connectionFailed, reconnect } = useSessionFeed({
     sessions,
@@ -321,7 +346,7 @@ export function Sessions() {
         void invalidateSessionQueries(queryClient, queryKeys.sessions);
         if (event.status === 'ready') {
           // Refresh so the card picks up the phone and lastActive the gateway writes on READY.
-          void fetchSessions();
+          void readForPush();
           toast.success(t('sessions.toasts.readyTitle'), t('sessions.toasts.readyDesc'));
         } else if (event.status === 'disconnected') {
           // Refresh so the card picks up `engineLoaded` from the API. `disconnected` is the one status
@@ -333,7 +358,7 @@ export function Sessions() {
           // first: scanning it cannot work, and the modal shows its loading state until the session
           // is back at `qr_ready` with a fresh one.
           clearQrCodeForSession(event.sessionId);
-          void fetchSessions().then(rows => {
+          void readForPush().then(rows => {
             if (rows.find(s => s.id === event.sessionId)?.engineLoaded === false) {
               // Only if nothing arrived while the answer was in flight: a reconnect that completed
               // in that window has already pushed a fresh code into the modal blanked above, and
@@ -344,22 +369,29 @@ export function Sessions() {
           toast.warning(t('sessions.toasts.disconnectedTitle'), t('sessions.toasts.disconnectedDesc'));
         } else if (event.status === 'action_required') {
           // Refresh so the card picks up the lastError reason (what the operator must do) from the API.
-          void fetchSessions();
+          void readForPush();
           toast.warning(t('sessions.toasts.actionRequiredTitle'), t('sessions.toasts.actionRequiredDesc'));
         } else if (event.status === 'failed') {
           // Refresh so the card picks up the lastError reason from the API. Every FAILED write evicts the
           // engine, so an open QR modal for this session can never show a code: close it, uncovering the card.
-          void fetchSessions();
+          void readForPush();
           dismissQrForSession(event.sessionId);
           toast.error(t('sessions.toasts.failedTitle'), t('sessions.toasts.failedDesc'));
+        } else if (event.status === 'initializing' && prev?.status === 'qr_ready') {
+          // The wait to be linked ended with its connection (on Baileys also a pairing code left unused for five
+          // minutes), and the session registers again with a new QR. Neither the QR nor a pairing code on screen can
+          // link any more. From authenticating the code was used, and the modal closes on the ready that follows.
+          clearQrCodeForSession(event.sessionId);
         }
       },
-      [toast, t, fetchSessions, queryClient, dismissQrForSession, clearQrCodeForSession, updateSessions],
+      [toast, t, readForPush, queryClient, dismissQrForSession, clearQrCodeForSession, updateSessions],
     ),
   });
 
   useEffect(() => {
     fetchSessions();
+    // A read still waiting for its window goes with the page, so nothing reads the list for a page that is gone.
+    return () => clearTimeout(pushedRead.current?.timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -370,17 +402,27 @@ export function Sessions() {
   // only once per connect: failures whose messages differ (a 502, then a 504) would otherwise each
   // change `error` and re-read the list with no backoff for as long as the upstream stays down. The
   // allowance (declared with `listReadFailed` above) is given back by a successful read, so the loop
-  // stays closed while a later failure on the same connection is still retried.
+  // stays closed while a later failure on the same connection is still retried. A refused read names its wait
+  // (Retry-After), and a retry sent sooner is refused in the same window, so the retry waits it out. It goes through
+  // readForPush, so it shares the read a connect's onReconnect has queued instead of adding one.
   useEffect(() => {
     if (!isConnected) {
       retriedThisConnect.current = false;
       return;
     }
-    if (listReadFailed.current && !retriedThisConnect.current) {
-      retriedThisConnect.current = true;
-      void fetchSessions();
-    }
-  }, [isConnected, error, fetchSessions]);
+    if (!listReadFailed.current || retriedThisConnect.current) return;
+    retriedThisConnect.current = true;
+    let asked = false;
+    const timer = setTimeout(() => {
+      asked = true;
+      void readForPush();
+    }, listRetryAfterMs.current);
+    // Cleared before it asked (another failure changed `error`, or the page closed), the retry is not spent.
+    return () => {
+      clearTimeout(timer);
+      if (!asked) retriedThisConnect.current = false;
+    };
+  }, [isConnected, error, readForPush]);
 
   const handleDelete = async (id: string) => {
     // The confirm modal stays open until the request answers, so a double-click would delete twice and
@@ -430,9 +472,10 @@ export function Sessions() {
       // A session that came back already linked has nothing to scan. Decided from the re-read rather
       // than left to handleShowQR's own guard, which reads the sessions state this render still
       // holds: that state predates both the start response and the re-read, so it would let the
-      // modal open over a connected session and then poll for a QR that can never arrive.
+      // modal open over a connected session and then poll for a QR that can never arrive. A stopped session keeps
+      // its link, and a start answers before the engine connects, so `initializing` with a phone is linked too.
       if (row?.status === 'ready') return;
-      if (!row || isSessionStarted(row)) handleShowQR(id);
+      if (!row || (isSessionStarted(row) && awaitsPairing(row))) handleShowQR(id);
     } catch (err) {
       console.error('Failed to start:', err);
       // A credential teardown for this name is still settling — the backend fails closed with 409 +
@@ -452,7 +495,7 @@ export function Sessions() {
       const fresh = await fetchSessions();
       const current = fresh.find(s => s.id === id);
       if (current && isSessionStarted(current)) {
-        if (current.status !== 'ready') handleShowQR(id);
+        if (awaitsPairing(current)) handleShowQR(id);
         return;
       }
       // The answer to this request, not the row's lastError: that is shown on the card, and it can be the
@@ -646,11 +689,16 @@ export function Sessions() {
       // The error response carries no Session body, so re-fetch authoritative state regardless of
       // how we classify the toast — phone:null/status come from the list endpoint.
       await fetchSessions();
-      if (classifyUnlinkError(err) === 'incomplete') {
+      const kind = classifyUnlinkError(err);
+      if (kind === 'incomplete') {
         // 502 + SESSION_LOGOUT_INCOMPLETE — the session stopped locally but the unlink operation is
         // incomplete. Surface the server's specific message/retry guidance as a warning, not an error.
         const msg = err instanceof Error && err.message ? err.message : t('sessions.unlink.incomplete');
         toast.warning(t('sessions.unlink.incompleteTitle'), msg);
+      } else if (kind === 'notLinked') {
+        // 409: the session has no linked device, so there was nothing to unlink. The gateway's message says it was
+        // stopped and to start or delete it instead.
+        toast.error(t('sessions.unlink.failedTitle'), err instanceof Error ? err.message : t('sessions.unlink.failed'));
       } else {
         // A reverse-proxy 502 (bare or JSON without the exact code) may never have reached the
         // gateway, so nothing was stopped — generic failure, not retry guidance.
@@ -737,6 +785,7 @@ export function Sessions() {
               { value: 'inactive', label: t('sessions.filter.inactive') },
               { value: 'connecting', label: t('sessions.filter.connecting') },
             ]}
+            ariaLabel={t('sessions.details.status')}
           />
         </div>
       </div>
@@ -782,7 +831,7 @@ export function Sessions() {
               const value = e.target.value.toLowerCase().replace(/\s+/g, '-');
               setNewSessionName(value);
             }}
-            onKeyDown={e => e.key === 'Enter' && !createDisabled && handleCreate()}
+            onKeyDown={e => e.key === 'Enter' && !isComposingKey(e.nativeEvent) && !createDisabled && handleCreate()}
           />
           <p className="input-hint">
             <Trans i18nKey="sessions.create.hint" components={{ code: <code /> }} />
@@ -891,10 +940,9 @@ export function Sessions() {
               // Pairing Code Content
               <div className="pairing-container" role="tabpanel">
                 {pairingError && <div className="pairing-error">{pairingError}</div>}
-                {/* The guards behind this button check the session's state, never the number: a code
-                    requested for a number linked elsewhere has been seen to unlink that device on the
-                    whatsapp-web.js engine. Shown on both engines, since the page cannot tell which one
-                    a session runs without another round-trip, and the copy names the engine. */}
+                {/* On whatsapp-web.js a code requested for a number linked elsewhere has been seen to unlink
+                    that device. The gateway refuses a number another of its sessions holds, but it cannot
+                    know of a device linked outside it. The copy names the engine, so it is shown on both. */}
                 <div className="pairing-warning">{t('sessions.pairing.relinkWarning')}</div>
 
                 {!pairingCode ? (
@@ -921,7 +969,12 @@ export function Sessions() {
                         )
                       }
                       onCompositionEnd={e => setPhoneNumber(readPairingPhone(e.currentTarget.value))}
-                      onKeyDown={e => e.key === 'Enter' && !pairingPhoneInvalid && handleGeneratePairingCode()}
+                      onKeyDown={e =>
+                        e.key === 'Enter' &&
+                        !isComposingKey(e.nativeEvent) &&
+                        !pairingPhoneInvalid &&
+                        handleGeneratePairingCode()
+                      }
                     />
                     {pairingPhoneInvalid && (
                       <p id="pairing-phone-error" className="input-error" role="alert">

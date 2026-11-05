@@ -104,6 +104,26 @@ test('a 401 without a message reads as an invalid key', async () => {
   assert.equal(await submitAndReadError(), 'Invalid API key');
 });
 
+// A 200 that is not the gateway's answer (a reverse proxy serving the app's HTML for a misrouted /api) or that does not
+// say the key is valid signed in any typed text as a viewer, and every page then failed its first read.
+for (const [label, body] of [
+  ['an HTML page', '<!doctype html><title>OpenWA</title>'],
+  ['valid: false', JSON.stringify({ valid: false })],
+] as const) {
+  test(`a 200 carrying ${label} is a connection error, not a sign-in`, async () => {
+    const { screen, fireEvent } = rtl;
+    reply = () => new Response(body, { status: 200 });
+    // Recorded, not thrown: the form's own catch would turn a throw here into the very error this test expects.
+    const logins: string[] = [];
+    rtl.render(createElement(Login, { onLogin: (key: string) => logins.push(key) }));
+    fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'owa_k1_secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    await rtl.waitFor(() => assert.ok(logins.length > 0 || document.querySelector('.error-message')));
+    assert.deepEqual(logins, [], 'the answer signed the key in');
+    assert.equal(screen.getByRole('alert').textContent, 'Unable to connect to server. Please try again.');
+  });
+}
+
 test('a refusal other than 401 without a message is a connection error, not an invalid key', async () => {
   reply = () => new Response('', { status: 403 });
   assert.equal(await submitAndReadError(), 'Unable to connect to server. Please try again.');
@@ -115,4 +135,10 @@ test('the login form aligns to the document direction, which is set on <html>', 
   // would need a second element carrying `dir` inside the page and never matches.
   assert.deepEqual(css.match(/[^\s,{}][^,{}]*\s\[dir[^\]]*\][^{]*/g) ?? [], []);
   assert.match(css, /\.login-container \.login-form \{\s*text-align: start;\s*\}/);
+});
+
+// The language picker shows the language in use; its name says it picks the language and keeps the shown words.
+test('the language picker is named for what it sets and for the language it shows', () => {
+  rtl.render(createElement(Login, { onLogin: () => undefined }));
+  assert.ok(rtl.screen.getByRole('button', { name: 'Language, English' }));
 });

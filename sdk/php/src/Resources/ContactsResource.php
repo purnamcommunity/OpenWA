@@ -73,6 +73,19 @@ class ContactsResource
     }
 
     /**
+     * Look up the `@lid` WhatsApp holds for a phone number, without sending a message. `lid` is null when WhatsApp
+     * holds none, which an unregistered number also answers. The lookup can query WhatsApp (Baileys on every call,
+     * whatsapp-web.js when the page holds no LID), so bulk lookups put the linked account at risk. Requires an
+     * OPERATOR key.
+     *
+     * @return array<string,mixed>
+     */
+    public function lid(string $sessionId, string $number): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($number)}/lid");
+    }
+
+    /**
      * Block a contact. Requires an OPERATOR key.
      *
      * @return array<string,mixed>

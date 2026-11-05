@@ -38,6 +38,8 @@
     "optional": "選填",
     "fieldTooLong": "最多 {{max}} 個字元（目前 {{count}} 個）。",
     "language": "語言",
+    "changeLanguage": "切換語言",
+    "joinedName": "{{first}}，{{second}}",
     "back": "返回",
     "next": "下一步",
     "previous": "上一步",
@@ -203,7 +205,8 @@
       "delete": "刪除訊息失敗",
       "clickButton": "點擊按鈕失敗",
       "fileTooLarge": "檔案過大（最大 18 MB）",
-      "searchHitSessionNotReady": "此訊息所屬的工作階段未連線"
+      "searchHitSessionNotReady": "此訊息所屬的工作階段未連線",
+      "searchHitChatNotListed": "在清單中找不到此訊息所屬的聊天"
     },
     "loadMessagesError": "無法載入訊息。請檢查伺服器日誌。",
     "messageStatus": {
@@ -599,6 +602,7 @@
     "session": "工作階段",
     "events": "事件",
     "noEvents": "請至少選擇一個事件。",
+    "urlInvalid": "請輸入以 http:// 或 https:// 開頭的完整地址，例如 https://example.com/webhook。",
     "available": "可用事件",
     "saveChanges": "儲存變更",
     "filters": {
@@ -609,6 +613,7 @@
       "badge_other": "{{count}} 個篩選條件",
       "addCondition": "新增條件",
       "removeCondition": "移除條件",
+      "removeValue": "移除 {{value}}",
       "caseSensitive": "區分大小寫",
       "contactPlaceholder": "號碼或 WhatsApp ID...",
       "textPlaceholder": "要符合的文字...",
@@ -658,6 +663,7 @@
       "updateFailed": "更新 Webhook 失敗：{{message}}",
       "testOk": "Webhook 測試成功！狀態：{{status}}",
       "testFailed": "Webhook 測試失敗：{{message}}",
+      "testStatus": "接收端回應 HTTP {{status}}",
       "testError": "測試 Webhook 失敗：{{message}}"
     },
     "actions": {
@@ -779,6 +785,7 @@
     "modalTitle": "建立 API 金鑰",
     "createdTitle": "API 金鑰已建立",
     "createdHint": "請立即複製此金鑰。之後將無法再次查看。",
+    "copyKey": "複製金鑰",
     "namePlaceholder": "例如：Production Key",
     "nameTooShort": "請至少輸入 3 個字元。",
     "rolesTitle": "角色參考",
@@ -856,6 +863,7 @@
     "chats": {
       "label": "聊天存取（選填）",
       "hint": "每行一個聊天：以 @g.us 結尾的群組 ID、以 @c.us 或 @lid 結尾的聯絡人 ID，或電話號碼。留空則允許所有聊天。受聊天限制的金鑰只可使用對此類金鑰開放的路由；透過事件 WebSocket 及 MCP 的存取亦僅限於這些聊天。",
+      "lidHint": "@lid 項目亦會放行目前對應到它的電話號碼。如該號碼轉給了他人，此金鑰便能接觸到對方：聯絡人更換號碼時，請檢查此金鑰。",
       "invalid": "不是聊天 ID 或電話號碼：{{value}}",
       "tooMany": "聊天過多（{{count}}）：一個金鑰最多可列出 {{max}} 個。"
     },
@@ -1004,6 +1012,7 @@
     },
     "sendFailed": "傳送訊息失敗",
     "notOnWhatsApp": "此號碼未在 WhatsApp 註冊",
+    "tooLong": "超過 {{max}} 位數字不是一個電話號碼。請只輸入一個號碼。",
     "batch": {
       "status": {
         "pending": "等候中",
@@ -1040,6 +1049,7 @@
       "phonePlaceholder": "例如：919876543210 或 6281234567890",
       "check": "檢查",
       "checking": "正在檢查...",
+      "tooLong": "超過 {{max}} 位數字不是一個電話號碼。請一次檢查一個號碼。",
       "autoPrefix": "為 10 位號碼自動加上前綴 <strong>+91</strong>（12 位號碼保持原樣）",
       "silent": "<strong>完全靜默：</strong>此檢查會直接查詢 WhatsApp 的號碼註冊資料，對方不會收到任何通知、提示音或訊息。",
       "resultTitle": "驗證結果",
@@ -1102,6 +1112,7 @@
       "tenDigitAdded": "（{{ten}} 個 10 位號碼 → 已加上 +91）",
       "tenDigitAddedPreserved": "（{{ten}} 個 10 位號碼 → 已加上 +91，{{twelve}} 個 12 位號碼原樣保留）",
       "tooMany": "號碼過多：已識別 {{parsed}} 個，每次最多 {{max}} 個。請刪減 {{excess}} 個後再開始。",
+      "tooLong": "已略過，超過 {{max}} 位數字（不是一個號碼）：{{count}}。請每行只寫一個號碼。",
       "start": "開始批量檢查",
       "stop": "停止檢查",
       "export": "匯出結果（CSV）",
@@ -1332,6 +1343,7 @@
       "installed": "外掛已安裝",
       "installFailed": "安裝失敗",
       "uninstalled": "外掛已解除安裝",
+      "uninstalledWithWarning": "外掛已解除安裝，但有警告",
       "uninstallFailed": "解除安裝失敗",
       "enableFailedTitle": "啟用失敗",
       "disableFailedTitle": "停用失敗",

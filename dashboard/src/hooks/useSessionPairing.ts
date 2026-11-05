@@ -260,10 +260,13 @@ export function useSessionPairing({ sessions, sessionsRef, reloadSessions }: Use
   // Blank the displayed code while keeping the modal open, for a disconnect whose engine is still
   // registered (an engine-internal reconnect): the code on screen was minted by a connection that is
   // now gone, so scanning it cannot work. The modal falls back to its loading state, and the poll
-  // fills it again once the session is back at `qr_ready` with a fresh code.
+  // fills it again once the session is back at `qr_ready` with a fresh code. A pairing code shown
+  // in the modal was requested on that connection too and goes with it; the number stays, for a new
+  // request once the session waits to be linked again.
   const clearQrCodeForSession = useCallback((sessionId: string) => {
     if (qrVisit.current.sessionId === sessionId) {
       qrVisit.current = { sessionId, requested: 0, applied: 0 };
+      setPairingCode(null);
     }
     setQrData(current => (current?.sessionId === sessionId ? { ...current, qrCode: '' } : current));
   }, []);

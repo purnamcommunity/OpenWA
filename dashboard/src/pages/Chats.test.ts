@@ -11,12 +11,13 @@
 // JSX), loader hooks registered before any app-module import (see test-helpers/register-hooks),
 // and JSDOM installed before importing modules that read `window` at import time.
 import '../test-helpers/register-hooks.ts';
-import { test, before, afterEach, type TestContext } from 'node:test';
+import { test, before, afterEach, mock, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { Session, Chat, ChatMessage, SearchHit, Channel, ChannelMessage, StatusUpdate } from '../services/api';
 import { MENTION_CLOSE, MENTION_OPEN } from '../utils/messageFormatter.ts';
+import { MEDIA_PAYLOAD_CACHE_LIMIT } from '../utils/chatMessages.ts';
 import type { installJsdomGlobals as installJsdomGlobalsFn } from '../test-helpers/jsdom.ts';
 // socket.io-client resolves to a double under this runner (see vite-shim-hooks.mjs), which is what
 // lets a test deliver a server frame to the page's realtime handlers.
@@ -48,6 +49,8 @@ let sessionListStatus: number | null = null;
 
 // Hits the global search answers with.
 let searchHits: SearchHit[] = [];
+// The phone the gateway resolves a privacy id to, by id; an id it knows nothing about answers null.
+const lidPhones: Record<string, string> = {};
 
 // The engine the gateway reports: only whatsapp-web.js lists channels.
 let engineType = 'baileys';
@@ -163,6 +166,8 @@ const PAGED_OLDEST = Array.from({ length: 20 }, (_, i) =>
 let olderPageGate: Promise<void> | null = null;
 // When true, an older-page request (any offset but 0) answers 500 instead of a page.
 let olderPageFails = false;
+// Rows Carol's older page serves after the fixture rows (oldest last, as the gateway orders them).
+let olderPageExtra: ChatMessage[] = [];
 
 function holdOlderPage(): () => void {
   let release!: () => void;
@@ -183,6 +188,10 @@ let firstPageExtra: ChatMessage[] = [];
 
 // The id a text send answers with. whatsapp-web.js answers '' when it cannot read the sent id back.
 let sendTextId = 'wamid.out.1';
+// The id an image send answers with; '' as whatsapp-web.js answers when it cannot read the sent id back.
+let sendImageId = 'wamid.out.image';
+// Set by a test whose image send the gateway refuses.
+let sendImageFails = false;
 
 function holdSend(): () => void {
   let release!: () => void;
@@ -330,7 +339,7 @@ function installFetchStub(): void {
       if (query.get('chatId') === CHAT_2.id) {
         const isFirstPage = Number(query.get('offset')) === 0;
         if (!isFirstPage && olderPageFails) return Promise.resolve(jsonResponse({ message: 'boom' }, 500));
-        const messages = isFirstPage ? PAGED_NEWEST : PAGED_OLDEST;
+        const messages = isFirstPage ? PAGED_NEWEST : [...PAGED_OLDEST, ...olderPageExtra];
         // `total` deliberately does NOT equal the 120 rows actually served (PAGED_NEWEST.length +
         // PAGED_OLDEST.length). The current termination rule never reads this field — it stops on a
         // page short of what it asked for — so the value doesn't matter to it either way. It matters
@@ -371,11 +380,22 @@ function installFetchStub(): void {
     if (method === 'POST' && path === `/api/sessions/${SESSION.id}/messages/send-audio`) {
       return Promise.resolve(jsonResponse({ messageId: 'wamid.out.audio', timestamp: 1_700_000_100 }));
     }
+    if (method === 'POST' && path === `/api/sessions/${SESSION.id}/messages/send-image`) {
+      const send = () =>
+        sendImageFails
+          ? jsonResponse({ message: 'boom' }, 500)
+          : jsonResponse({ messageId: sendImageId, timestamp: 1_700_000_100 });
+      return sendGate ? sendGate.then(send) : Promise.resolve(send());
+    }
     if (method === 'POST' && path === `/api/sessions/${SESSION.id}/messages/send-document`) {
       return Promise.resolve(jsonResponse({ messageId: 'wamid.out.document', timestamp: 1_700_000_100 }));
     }
     if (method === 'GET' && path.startsWith('/api/search?')) {
       return Promise.resolve(jsonResponse({ hits: searchHits, total: searchHits.length }));
+    }
+    if (method === 'GET' && /\/contacts\/[^/]+\/phone$/.test(path)) {
+      const id = decodeURIComponent(path.split('/contacts/')[1].split('/phone')[0]);
+      return Promise.resolve(jsonResponse({ contactId: id, phone: lidPhones[id] ?? null }));
     }
     if (method === 'POST' && path === `/api/sessions/${SESSION.id}/status/send-text`) {
       return Promise.resolve(jsonResponse({ success: true }));
@@ -424,6 +444,8 @@ before(async () => {
 });
 
 afterEach(async () => {
+  // A test that failed while it held the retry pauses on a fake clock must not leave it to the next one.
+  mock.timers.reset();
   rtl.cleanup();
   resetSocketDouble();
   // Cancel before clearing. clear() silently cancels a fetch still in flight, and that fetch's finally
@@ -440,8 +462,12 @@ afterEach(async () => {
   firstPageGate = null;
   firstPageExtra = [];
   sendTextId = 'wamid.out.1';
+  sendImageId = 'wamid.out.image';
+  sendImageFails = false;
   olderPageFails = false;
+  olderPageExtra = [];
   chatsResponder = null;
+  for (const id of Object.keys(lidPhones)) delete lidPhones[id];
   thirdSessionStatus = null;
   sessionListStatus = null;
   searchHits = [];
@@ -571,6 +597,52 @@ test('status compose modal posts a text status with the baileys recipient allow-
   });
 });
 
+// The form was filled for the account its session is, its recipients picked from that account's contacts: when the
+// session is deleted elsewhere and the next ready one is opened, Post would send the status through that one.
+test('a status being composed closes when its session gives way to another, reading nothing through it', async () => {
+  const { screen, fireEvent, within, waitFor, act } = rtl;
+  twoSessions = true;
+  let mainDeleted = false;
+  const sent: string[] = [];
+  const stub = globalThis.fetch;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input).replace(/^https?:\/\/[^/]+/, '');
+    sent.push(url);
+    if ((init?.method ?? 'GET') === 'GET' && url === '/api/sessions' && mainDeleted) {
+      return Promise.resolve(jsonResponse([SESSION_2]));
+    }
+    return stub(input, init);
+  }) as typeof fetch;
+  try {
+    const { container } = renderChats();
+    await screen.findByText(SESSION.name);
+    fireEvent.click(screen.getByRole('tab', { name: 'Status' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Post a status' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.change(within(dialog).getByPlaceholderText('Text'), { target: { value: STATUS_TEXT } });
+    await within(dialog).findByText('Bob');
+    fireEvent.click(within(dialog).getByRole('checkbox'));
+    sent.length = 0;
+
+    // Deleted from another tab: showing the page again reads the list, which opens the next ready session.
+    mainDeleted = true;
+    await act(async () => {
+      document.dispatchEvent(new window.Event('visibilitychange'));
+    });
+    await waitFor(() => assert.equal(selectedSessionId(container), SESSION_2.id));
+    await flush();
+    assert.equal(screen.queryByRole('dialog') === null, true, 'the status form stayed open for the next session');
+    assert.deepEqual(
+      sent.filter(url => url.startsWith(`/api/sessions/${SESSION_2.id}/contacts?`)),
+      [],
+      "the next session's address book was read for the form",
+    );
+  } finally {
+    globalThis.fetch = stub;
+    twoSessions = false;
+  }
+});
+
 test('Refresh on a feed that never connected refetches the open thread once the socket is back', async () => {
   const { screen, fireEvent, within, waitFor, act } = rtl;
   resetFetchCalls();
@@ -624,6 +696,211 @@ test('a typed draft survives closing and reopening the room', async () => {
   assert.equal(input.value, 'draft survives');
 });
 
+// A draft is the chat's, like a staged file or reply: carried into another chat, the next Enter would deliver it to
+// the wrong recipient. It is kept for the chat it was typed in, so looking at another one loses nothing.
+test('a typed draft stays with its chat: another chat opens with its own, and the first gets it back', async () => {
+  const { screen, fireEvent, within } = rtl;
+  const { container } = renderChats();
+  const composer = () => screen.getByPlaceholderText('Type a message...') as HTMLInputElement;
+  const open = async (name: string) => {
+    fireEvent.click(within(container.querySelector('.chats-sidebar') as HTMLElement).getByText(name));
+    await within(container.querySelector('.room-header') as HTMLElement).findByText(name);
+  };
+
+  await screen.findByText(SESSION.name);
+  fireEvent.click(await screen.findByText('Alice'));
+  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+  fireEvent.change(composer(), { target: { value: 'for alice' } });
+
+  await open('Carol');
+  assert.equal(composer().value, '', "Alice's draft followed the user into Carol's room");
+  fireEvent.change(composer(), { target: { value: 'for carol' } });
+
+  await open('Alice');
+  assert.equal(composer().value, 'for alice');
+  // Closing the room in between keeps the draft of the chat that was open, as closing and reopening it does.
+  fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+  await open('Carol');
+  assert.equal(composer().value, 'for carol');
+});
+
+test('a typed draft stays with its session: the same chat on another account opens without it', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  twoSessions = true;
+  try {
+    resetFetchCalls();
+    const { container } = renderChats();
+    const composer = () => screen.getByPlaceholderText('Type a message...') as HTMLInputElement;
+    const openAlice = async () => {
+      fireEvent.click(await within(container.querySelector('.chats-sidebar') as HTMLElement).findByText('Alice'));
+      await within(container.querySelector('.room-header') as HTMLElement).findByText('Alice');
+    };
+
+    await screen.findByText(SESSION.name);
+    await openAlice();
+    fireEvent.change(composer(), { target: { value: 'from session one' } });
+
+    // Session 2 lists a chat with Alice's id (a contact both accounts share).
+    selectSession(container, SESSION_2.id);
+    await waitFor(() => assert.equal(container.querySelector('.room-header') === null, true));
+    await openAlice();
+    assert.equal(composer().value, '', 'the draft followed the user into the other session');
+    fireEvent.submit(container.querySelector('.input-form') as HTMLFormElement);
+    assert.equal(
+      countFetchCalls('POST', `/api/sessions/${SESSION.id}/messages/send-text`),
+      0,
+      'the draft was sent from the other session',
+    );
+
+    selectSession(container, SESSION.id);
+    await waitFor(() => assert.equal(container.querySelector('.room-header') === null, true));
+    await openAlice();
+    assert.equal(composer().value, 'from session one');
+  } finally {
+    twoSessions = false;
+  }
+});
+
+/** Run `body` with every send to `route` refused as a gateway whose engine reconnects refuses it, once `gate()` opens. */
+async function withSendsRefused(
+  route: string,
+  body: () => Promise<void>,
+  gate: () => Promise<void> = () => Promise.resolve(),
+): Promise<void> {
+  const stub = globalThis.fetch;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    if (!String(input).endsWith(`/messages/${route}`)) return stub(input, init);
+    return gate().then(() => jsonResponse({ statusCode: 409, message: 'Engine not ready', error: 'Conflict' }, 409));
+  }) as typeof fetch;
+  try {
+    await body();
+  } finally {
+    globalThis.fetch = stub;
+  }
+}
+
+// The field is emptied as Send is pressed, and the bubble of a refused send lasts only until the thread is read again (a
+// session switch and back, a reconnect), so the text the gateway refused goes back where it was typed.
+test('a refused send puts its text back in the field, where it stays across a session switch and back', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  twoSessions = true;
+  try {
+    await withSendsRefused('send-text', async () => {
+      const { container } = renderChats();
+      const composer = () => screen.getByPlaceholderText('Type a message...') as HTMLInputElement;
+      const thread = () => container.querySelector('.room-messages') as HTMLElement;
+      await screen.findByText(SESSION.name);
+      fireEvent.click(await screen.findByText('Alice'));
+      await within(thread()).findByText('hello from alice');
+      fireEvent.change(composer(), { target: { value: 'a reply worth keeping' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+      await waitFor(() => assert.ok(thread().querySelector('.message-status-icon.failed'), 'the send was not refused'));
+      assert.equal(composer().value, 'a reply worth keeping');
+
+      selectSession(container, SESSION_2.id);
+      await waitFor(() => assert.equal(selectedSessionId(container), SESSION_2.id));
+      selectSession(container, SESSION.id);
+      await waitFor(() => assert.equal(selectedSessionId(container), SESSION.id));
+      fireEvent.click(await within(container.querySelector('.chats-sidebar') as HTMLElement).findByText('Alice'));
+      await within(thread()).findByText('hello from alice');
+      assert.equal(composer().value, 'a reply worth keeping');
+    });
+  } finally {
+    twoSessions = false;
+  }
+});
+
+// The text goes back to the chat it was typed in, and never over what was typed since: carried into the chat open by
+// then, the next Enter would send it to the wrong recipient.
+test('a refused send gives its text back to its own chat only, and not over text typed since', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  // Each send waits for its own answer.
+  let answer = () => {};
+  const gate = () =>
+    new Promise<void>(resolve => {
+      answer = resolve;
+    });
+  await withSendsRefused(
+    'send-text',
+    async () => {
+      const { container } = renderChats();
+      const composer = () => screen.getByPlaceholderText('Type a message...') as HTMLInputElement;
+      const failed = () => container.querySelectorAll('.room-messages .message-status-icon.failed').length;
+      const open = async (name: string) => {
+        fireEvent.click(within(container.querySelector('.chats-sidebar') as HTMLElement).getByText(name));
+        await within(container.querySelector('.room-header') as HTMLElement).findByText(name);
+      };
+      await screen.findByText('Alice');
+      await open('Alice');
+      fireEvent.change(composer(), { target: { value: 'for alice only' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+      await open('Carol');
+      answer();
+      await screen.findByText('Failed to send message');
+      assert.equal(composer().value, '', "the refused text went into Carol's field");
+      await open('Alice');
+      assert.equal(composer().value, 'for alice only');
+
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+      fireEvent.change(composer(), { target: { value: 'typed while it was out' } });
+      answer();
+      await waitFor(() => assert.equal(failed(), 2, 'the second send was not refused'));
+      assert.equal(composer().value, 'typed while it was out');
+    },
+    gate,
+  );
+});
+
+test('a refused file send puts its caption back in the field', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  await withSendsRefused('send-document', async () => {
+    const { container } = renderChats();
+    fireEvent.click(await screen.findByText('Alice'));
+    const thread = container.querySelector('.room-messages') as HTMLElement;
+    await within(thread).findByText('hello from alice');
+    await stageAttachment(container, 'contract.pdf');
+    fireEvent.change(screen.getByPlaceholderText('Add a caption...'), { target: { value: 'the signed copy' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => assert.ok(thread.querySelector('.message-status-icon.failed'), 'the send was not refused'));
+    assert.equal((screen.getByPlaceholderText('Type a message...') as HTMLInputElement).value, 'the signed copy');
+  });
+});
+
+// The gateway refuses a text past 4096 characters and a caption past 1024, counting an astral character as one. The
+// composer holds such a send and says why, instead of leaving it to a refusal.
+test('the composer holds a message past the gateway limit and says why', async () => {
+  const { screen, fireEvent, within } = rtl;
+  resetFetchCalls();
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+  const field = () => container.querySelector('.message-text-input') as HTMLInputElement;
+  const send = () => screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement;
+  const hint = () => container.querySelector('.room-input-footer [role="status"]')?.textContent;
+
+  fireEvent.change(field(), { target: { value: 'a'.repeat(4097) } });
+  assert.equal(send().disabled, true, 'a text the gateway refuses can be sent');
+  assert.equal(hint(), 'Limited to 4096 characters (4097 now).');
+  fireEvent.submit(container.querySelector('.input-form') as HTMLFormElement);
+  await flush();
+  assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/messages/send-text`), 0, 'Enter sent it');
+
+  // 4096 emoji are 8192 UTF-16 units, and 4096 characters to the gateway.
+  fireEvent.change(field(), { target: { value: '😀'.repeat(4096) } });
+  assert.equal(send().disabled, false, 'a text the gateway takes is held');
+  assert.equal(hint(), '');
+
+  fireEvent.change(field(), { target: { value: 'c'.repeat(1025) } });
+  await stageAttachment(container, 'contract.pdf');
+  assert.equal(send().disabled, true, 'a caption the gateway refuses can be sent');
+  assert.equal(hint(), 'Limited to 1024 characters (1025 now).');
+
+  // Text next to audio is not sent with it, so it holds nothing back.
+  await stageAttachment(container, 'voice.ogg', 'audio/ogg');
+  assert.equal(send().disabled, false, 'text that does not travel with the audio held it');
+  assert.equal(hint(), '');
+});
+
 test('Escape dismisses the emoji picker instead of the conversation behind it', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
   resetFetchCalls();
@@ -635,6 +912,10 @@ test('Escape dismisses the emoji picker instead of the conversation behind it', 
 
   fireEvent.click(screen.getByTitle('Pick emoji'));
   await waitFor(() => assert.ok(container.querySelector('.chats-emoji-picker'), 'the emoji picker did not open'));
+
+  fireEvent.keyDown(document, { key: 'Escape', keyCode: 229 });
+  assert.ok(container.querySelector('.chats-emoji-picker'), 'an Escape the input method processed closed the picker');
+  assert.ok(screen.queryByRole('button', { name: 'Back' }), 'an Escape the input method processed closed the room');
 
   // Driven from document, which is where a real Escape lands: focus is on the toggle button, not
   // inside the picker, so a handler bound to the picker element would never see this event. One
@@ -705,6 +986,8 @@ test('Escape closes the open room, and is left alone while a dialog owns it', as
   assert.ok(screen.queryByRole('button', { name: 'Back' }), 'Escape closed the room while a dialog was open');
 
   dialog.remove();
+  fireEvent.keyDown(document, { key: 'Escape', keyCode: 229 });
+  assert.ok(screen.queryByRole('button', { name: 'Back' }), 'an Escape the input method processed closed the room');
   fireEvent.keyDown(document, { key: 'Escape' });
   await waitFor(() =>
     assert.equal(screen.queryByRole('button', { name: 'Back' }) === null, true, 'Escape did not close the room'),
@@ -849,6 +1132,73 @@ test('a chat whose newest message has no text does not claim to have no messages
   });
   await waitFor(() => assert.ok(screen.queryByLabelText('3 unread messages'), 'the arrival did not reach the row'));
   assert.equal(row.querySelector('.no-message')?.textContent ?? null, null, 'the row reads "No messages yet"');
+});
+
+// The list draws every chat of the account, so a row is drawn again only when what it shows changes: a keystroke in
+// the composer redraws none, and a message redraws the row of its chat and moves it, nothing else. A row's time is
+// formatted from its timestamp each time the row is drawn, which is what this counts, by the row's own timestamp.
+test('typing in the composer draws no chat row again, and a message draws only the row of its chat', async () => {
+  const { screen, fireEvent, within, waitFor, act } = rtl;
+  const others = Array.from({ length: 20 }, (_, n) => ({
+    ...CHAT_2,
+    id: `1555100${String(n).padStart(4, '0')}@c.us`,
+    name: `Other ${n}`,
+    timestamp: 1_650_000_200 + n,
+  }));
+  const alice = { ...CHAT, timestamp: 1_650_000_101 };
+  const carol = { ...CHAT_2, timestamp: 1_650_000_102 };
+  chatsResponder = () => Promise.resolve(jsonResponse([alice, carol, ...others]));
+  const drawn: number[] = [];
+  const original = Date.prototype.toDateString;
+  Date.prototype.toDateString = function (this: Date) {
+    drawn.push(this.getTime() / 1000);
+    return original.call(this);
+  };
+  const rowsDrawn = (timestamps: number[]) => drawn.filter(ts => timestamps.includes(ts)).length;
+  try {
+    const { container } = renderChats();
+    fireEvent.click(await screen.findByText('Alice'));
+    await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+    await flush();
+
+    drawn.length = 0;
+    fireEvent.change(screen.getByPlaceholderText('Type a message...'), { target: { value: 'h' } });
+    fireEvent.change(screen.getByPlaceholderText('Type a message...'), { target: { value: 'hi' } });
+    await flush();
+    const listed = [alice, carol, ...others].map(chat => chat.timestamp);
+    assert.equal(rowsDrawn(listed), 0, `a keystroke drew ${rowsDrawn(listed)} chat rows again`);
+
+    drawn.length = 0;
+    const socket = lastSocket();
+    assert.ok(socket, 'expected the page to have opened a socket');
+    act(() =>
+      socket.receive('message', {
+        type: 'event',
+        timestamp: new Date(1_650_000_400_000).toISOString(),
+        payload: {
+          event: 'message.received',
+          sessionId: SESSION.id,
+          data: {
+            id: 'wamid.live.carol',
+            chatId: CHAT_2.id,
+            from: CHAT_2.id,
+            to: 'me',
+            body: 'news from carol',
+            type: 'text',
+            fromMe: false,
+            timestamp: 1_650_000_300,
+          },
+        },
+      }),
+    );
+    const names = () =>
+      Array.from(container.querySelectorAll('.chats-list .chat-item-name')).map(name => name.textContent);
+    await waitFor(() => assert.equal(names()[0], 'Carol', 'the row did not move to the top'));
+    assert.ok(rowsDrawn([1_650_000_300]) > 0, "Carol's row was not drawn with the message");
+    assert.equal(rowsDrawn(listed), 0, `the message drew ${rowsDrawn(listed)} rows of other chats again`);
+  } finally {
+    Date.prototype.toDateString = original;
+  }
 });
 
 test('a message arriving the moment the chat list commits updates the listed row without a refetch', async () => {
@@ -1473,6 +1823,50 @@ test('sends answered with no message id each keep their own bubble', async () =>
   assert.ok(within(thread).queryByText('second id-less'), 'the later id-less send is missing');
 });
 
+// A send is drawn at the browser's clock until the gateway answers with its own. The fixtures are years older than the
+// browser clock, so a sent message left on it sorts after every one of them.
+test('a send whose echo lands before its answer takes the time the gateway gave it', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  firstPageExtra = [
+    {
+      ...DB_MESSAGE,
+      id: 'db-later',
+      waMessageId: 'wamid.later',
+      body: 'a reply from alice after it',
+      timestamp: 1_700_000_200,
+      createdAt: new Date(1_700_000_200_000).toISOString(),
+    },
+  ];
+  const release = holdSend();
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const thread = container.querySelector('.room-messages') as HTMLElement;
+  await within(thread).findByText('a reply from alice after it');
+
+  fireEvent.change(screen.getByPlaceholderText('Type a message...'), { target: { value: 'sent before the reply' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+  receiveEvent('message.sent', {
+    id: 'wamid.out.1',
+    chatId: CHAT.id,
+    from: 'me',
+    to: CHAT.id,
+    body: 'sent before the reply',
+    type: 'text',
+    fromMe: true,
+    timestamp: 1_700_000_100,
+  });
+  await waitFor(() => assert.ok(thread.querySelector('[data-wa-message-id="wamid.out.1"]')));
+  release();
+  await waitFor(() => assert.equal(within(thread).getAllByText('sent before the reply').length, 1));
+  await flush();
+
+  const order = [...thread.querySelectorAll('[data-wa-message-id]')].map(el => el.getAttribute('data-wa-message-id'));
+  assert.ok(
+    order.indexOf('wamid.out.1') < order.indexOf('wamid.later'),
+    `the sent message sorts by the browser clock: ${order.join(', ')}`,
+  );
+});
+
 test('a caption sent with a document shows in its bubble', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
   resetFetchCalls();
@@ -1699,6 +2093,106 @@ test('a staged reply is dropped when another session is opened', async () => {
     );
   } finally {
     twoSessions = false;
+  }
+});
+
+/** Run `body` with every request URL recorded as sent, before the stub folds session 2's routes onto session 1's. */
+async function withSentUrls(body: (sent: string[]) => Promise<void>): Promise<void> {
+  const sent: string[] = [];
+  const stub = globalThis.fetch;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    sent.push(String(input).replace(/^https?:\/\/[^/]+/, ''));
+    return stub(input, init);
+  }) as typeof fetch;
+  try {
+    await body(sent);
+  } finally {
+    globalThis.fetch = stub;
+  }
+}
+
+// A switch leaves the previous session's list on screen until the new one lands, and the chat open in it. Both
+// belong to the account left: the session switched to is asked nothing about them.
+for (const engine of ['baileys', 'whatsapp-web.js']) {
+  test(`a session switch on ${engine} asks the new session nothing about the chat open in the previous one`, async () => {
+    const { screen, fireEvent, within, waitFor } = rtl;
+    twoSessions = true;
+    window.sessionStorage.setItem('openwa_engine_type', engine);
+    // Session 2 does not list Alice.
+    chatsResponder = sessionId => Promise.resolve(jsonResponse(sessionId === SESSION.id ? [CHAT, CHAT_2] : [CHAT_2]));
+    try {
+      await withSentUrls(async sent => {
+        const { container } = renderChats();
+        await screen.findByText(SESSION.name);
+        fireEvent.click(await screen.findByText('Alice'));
+        await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+        sent.length = 0;
+
+        selectSession(container, SESSION_2.id);
+        await waitFor(() => assert.equal(screen.queryByText('Alice') === null, true, "session 2's list did not land"));
+        await flush();
+        const aliceThroughTwo = sent.filter(
+          url => url.includes(`/sessions/${SESSION_2.id}/`) && url.includes(encodeURIComponent(CHAT.id)),
+        );
+        assert.deepEqual(aliceThroughTwo, [], 'session 2 was asked about a chat only session 1 lists');
+      });
+    } finally {
+      twoSessions = false;
+      window.sessionStorage.setItem('openwa_engine_type', 'baileys');
+    }
+  });
+}
+
+test('a session switch asks the new session for the pictures of its own list, not of the one it replaces', async () => {
+  const { screen, waitFor } = rtl;
+  twoSessions = true;
+  chatsResponder = sessionId => Promise.resolve(jsonResponse(sessionId === SESSION.id ? [CHAT, CHAT_2] : [CHAT_2]));
+  try {
+    await withSentUrls(async sent => {
+      const { container } = renderChats();
+      await screen.findByText('Alice');
+      sent.length = 0;
+
+      selectSession(container, SESSION_2.id);
+      await waitFor(() => assert.equal(screen.queryByText('Alice') === null, true, "session 2's list did not land"));
+      await flush();
+      const asked = sent
+        .filter(url => url.startsWith(`/api/sessions/${SESSION_2.id}/contacts/profile-pictures`))
+        .map(url => new URL(url, 'http://localhost').searchParams.get('ids'));
+      assert.deepEqual(asked, [CHAT_2.id], "session 2 was not asked for exactly its own list's pictures");
+    });
+  } finally {
+    twoSessions = false;
+  }
+});
+
+test('a session switch with a channel open asks the new session nothing about that channel', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  twoSessions = true;
+  engineType = 'whatsapp-web.js';
+  window.sessionStorage.setItem('openwa_engine_type', engineType);
+  channels = [CHANNEL];
+  channelPosts = [{ id: 'post-1', body: 'news of the day', timestamp: 1_700_000_000, hasMedia: false }];
+  try {
+    await withSentUrls(async sent => {
+      const { container } = renderChats();
+      await screen.findByText(SESSION.name);
+      fireEvent.click(screen.getByRole('tab', { name: 'Channels' }));
+      fireEvent.click(await screen.findByText(CHANNEL.name));
+      await screen.findByText('news of the day');
+      sent.length = 0;
+
+      selectSession(container, SESSION_2.id);
+      await waitFor(() => assert.ok(container.querySelector('.chats-room-placeholder'), 'the channel stayed open'));
+      await flush();
+      const channelThroughTwo = sent.filter(url =>
+        url.startsWith(`/api/sessions/${SESSION_2.id}/channels/${encodeURIComponent(CHANNEL.id)}`),
+      );
+      assert.deepEqual(channelThroughTwo, [], "session 2 was asked for the posts of session 1's open channel");
+    });
+  } finally {
+    twoSessions = false;
+    window.sessionStorage.setItem('openwa_engine_type', 'baileys');
   }
 });
 
@@ -2283,6 +2777,47 @@ test('the New chat panel leaves no way to another session, and a hit after it cl
   }
 });
 
+// The panel lists the address book of the session it was opened for: when that session is deleted elsewhere and the
+// next ready one is opened, the panel closes with the switch instead of reading the next account's contacts first.
+test('the New chat panel closes when its session gives way to another, reading nothing through it', async () => {
+  const { screen, fireEvent, waitFor, act } = rtl;
+  twoSessions = true;
+  let mainDeleted = false;
+  const sent: string[] = [];
+  const stub = globalThis.fetch;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input).replace(/^https?:\/\/[^/]+/, '');
+    sent.push(url);
+    if ((init?.method ?? 'GET') === 'GET' && url === '/api/sessions' && mainDeleted) {
+      return Promise.resolve(jsonResponse([SESSION_2]));
+    }
+    return stub(input, init);
+  }) as typeof fetch;
+  try {
+    const { container } = renderChats();
+    await screen.findByText('Alice');
+    fireEvent.click(screen.getByRole('button', { name: 'New chat' }));
+    assert.ok(container.querySelector('.new-chat-panel'), 'the panel did not open');
+    sent.length = 0;
+
+    mainDeleted = true;
+    await act(async () => {
+      document.dispatchEvent(new window.Event('visibilitychange'));
+    });
+    await waitFor(() => assert.equal(selectedSessionId(container), SESSION_2.id));
+    await flush();
+    assert.equal(container.querySelector('.new-chat-panel'), null, 'the panel stayed open for the next session');
+    assert.deepEqual(
+      sent.filter(url => url.startsWith(`/api/sessions/${SESSION_2.id}/contacts?`)),
+      [],
+      "the next session's address book was read for the panel",
+    );
+  } finally {
+    globalThis.fetch = stub;
+    twoSessions = false;
+  }
+});
+
 test('a search hit in a session that is not connected stays on the selected session', async () => {
   const { screen, waitFor } = rtl;
   thirdSessionStatus = 'disconnected';
@@ -2376,6 +2911,10 @@ test("a search hit in another session opens that session's chat, not the one the
   }
 });
 
+// The notice a hit gives when no listed chat is found to be its chat. Only the newest privacy-id chats are asked for
+// their phone, so it says the chat was not found rather than that the list lacks it.
+const CHAT_NOT_LISTED = 'The chat of this message could not be found in the list';
+
 // Search reads stored messages while the list comes from the engine, so a hit's chat can be missing.
 test("a search hit whose chat the other session's list lacks does not open it later on its own", async () => {
   const { screen, fireEvent, within, act, waitFor } = rtl;
@@ -2387,6 +2926,7 @@ test("a search hit whose chat the other session's list lacks does not open it la
     await screen.findByText('Alice');
     await clickSearchHit(container);
     await waitFor(() => assert.equal(selectedSessionId(container), SESSION_2.id));
+    await screen.findByText(CHAT_NOT_LISTED);
     await flush();
 
     fireEvent.click(await screen.findByText('Carol'));
@@ -2505,6 +3045,126 @@ test('a second search hit in the chat already open scrolls to it at once', async
   }
 });
 
+// A stored row keeps the chat id it was written with: an API client may send to the raw `@s.whatsapp.net` form of a
+// chat the list names by `@c.us`, or to the phone of a contact the list holds under its privacy id. The thread read
+// takes those as one chat, so the hit opens the listed chat and scrolls to the message there.
+for (const variant of ['the same session', 'another session', 'a privacy-id chat'] as const) {
+  test(`a search hit stored under another spelling of a listed chat opens it and scrolls to the message (${variant})`, async () => {
+    const { screen, waitFor, within } = rtl;
+    const LID_ALICE: Chat = { ...CHAT, id: '262813461250099@lid' };
+    if (variant === 'another session') twoSessions = true;
+    if (variant === 'a privacy-id chat') {
+      chatsResponder = () => Promise.resolve(jsonResponse([LID_ALICE, CHAT_2]));
+      lidPhones[LID_ALICE.id] = '15550001111';
+    }
+    searchHits = [
+      {
+        ...THIRD_SESSION_HIT,
+        sessionId: variant === 'another session' ? SESSION_2.id : SESSION.id,
+        chatId: variant === 'a privacy-id chat' ? '15550001111@c.us' : '15550001111@s.whatsapp.net',
+        waMessageId: DB_MESSAGE.waMessageId!,
+      },
+    ];
+    const scrolled: Element[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this);
+    };
+    try {
+      const { container } = renderChats();
+      await screen.findByText('Carol');
+      await clickSearchHit(container);
+      await waitFor(() => assert.ok(container.querySelector('.room-header'), "the hit's chat did not open"));
+      await within(container.querySelector('.room-header') as HTMLElement).findByText('Alice');
+      await waitFor(() =>
+        assert.equal(
+          scrolled.filter(el => el.getAttribute('data-wa-message-id') === DB_MESSAGE.waMessageId).length,
+          1,
+          'the open chat did not scroll to the message',
+        ),
+      );
+      assert.equal(screen.queryByText(CHAT_NOT_LISTED) === null, true, 'a hit that opened its chat said it is missing');
+    } finally {
+      Element.prototype.scrollIntoView = original;
+      twoSessions = false;
+    }
+  });
+}
+
+// A hit whose chat the list holds under no spelling, not even as a privacy-id chat of the same phone, opens nothing
+// and says why, rather than leaving the click without an answer.
+for (const variant of ['a phone id', 'a phone no privacy-id chat resolves to'] as const) {
+  test(`a search hit whose chat the list lacks under every spelling says so and opens nothing (${variant})`, async () => {
+    const { screen } = rtl;
+    if (variant === 'a phone no privacy-id chat resolves to') {
+      chatsResponder = () => Promise.resolve(jsonResponse([{ ...CHAT, id: '262813461250099@lid' }, CHAT_2]));
+      lidPhones['262813461250099@lid'] = '15550001111';
+    }
+    searchHits = [{ ...THIRD_SESSION_HIT, sessionId: SESSION.id, chatId: '15550005555@c.us' }];
+    const { container } = renderChats();
+    await screen.findByText('Carol');
+    await clickSearchHit(container);
+    await screen.findByText(CHAT_NOT_LISTED);
+    await flush();
+    assert.equal(container.querySelector('.room-header') === null, true, 'a chat opened for the hit');
+  });
+}
+
+// Only a list that landed for the hit's session can say it lacks the chat. A hit clicked while its session's list is
+// still loading waits for it and opens its chat once it lands, as a hit in another session does; a hit whose session's
+// list failed to load is dropped quietly, since the failure banner already answers and the chat may well be there.
+test('a search hit clicked while its session list loads opens its chat once the list lands', async () => {
+  const { screen, waitFor, within } = rtl;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => (release = resolve));
+  chatsResponder = () => gate.then(() => jsonResponse([CHAT, CHAT_2]));
+  searchHits = [{ ...THIRD_SESSION_HIT, sessionId: SESSION.id, chatId: CHAT.id }];
+  const original = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = () => {};
+  try {
+    const { container } = renderChats();
+    await waitFor(() => assert.equal(selectedSessionId(container), SESSION.id));
+    assert.equal(screen.queryByText('Carol') === null, true, 'the list landed before the click');
+    await clickSearchHit(container);
+    await flush();
+    assert.equal(screen.queryByText(CHAT_NOT_LISTED) === null, true, 'a list still loading was said to lack the chat');
+    release();
+    await waitFor(() => assert.ok(container.querySelector('.room-header'), "the hit's chat did not open"));
+    await within(container.querySelector('.room-header') as HTMLElement).findByText('Alice');
+    assert.equal(screen.queryByText(CHAT_NOT_LISTED) === null, true, 'the chat that opened was said to be missing');
+  } finally {
+    release();
+    Element.prototype.scrollIntoView = original;
+  }
+});
+
+for (const variant of ['the same session', 'another session'] as const) {
+  test(`a search hit whose session list failed to load is not said to lack its chat (${variant})`, async () => {
+    const { screen, waitFor } = rtl;
+    if (variant === 'another session') twoSessions = true;
+    const failing = variant === 'another session' ? SESSION_2.id : SESSION.id;
+    chatsResponder = sessionId =>
+      Promise.resolve(
+        sessionId === failing ? jsonResponse({ message: 'Bad Gateway' }, 502) : jsonResponse([CHAT, CHAT_2]),
+      );
+    searchHits = [{ ...THIRD_SESSION_HIT, sessionId: failing, chatId: CHAT.id }];
+    try {
+      const { container } = renderChats();
+      if (variant === 'another session') await screen.findByText('Carol');
+      else await screen.findByText(/Failed to load chats/);
+      await clickSearchHit(container);
+      await waitFor(() => assert.equal(selectedSessionId(container), failing));
+      await screen.findByText(/Failed to load chats/);
+      await flush();
+      await flush();
+      assert.equal(screen.queryByText(CHAT_NOT_LISTED) === null, true, 'a list that failed was said to lack the chat');
+      assert.equal(container.querySelector('.room-header') === null, true, 'a chat opened for the hit');
+    } finally {
+      twoSessions = false;
+    }
+  });
+}
+
 test('changing the UI language keeps the selected session and the open chat', async () => {
   const { screen, fireEvent, within, waitFor, act } = rtl;
   const { default: i18n } = await import('../i18n/index.ts');
@@ -2618,6 +3278,32 @@ test('the media viewer saves an image under its file name, not its caption', asy
   assert.equal(links[0].download, 'photo.png');
 });
 
+// A sticker is drawn with the image's zoom affordance, and an archived one already opens in its own viewer.
+test('a sticker opens in the media viewer, as an image does', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  firstPageExtra = [
+    {
+      ...DB_MESSAGE,
+      id: 'db-sticker',
+      waMessageId: 'wamid.sticker',
+      body: '',
+      type: 'sticker',
+      timestamp: 1_700_000_003,
+      createdAt: new Date(1_700_000_003_000).toISOString(),
+      metadata: { media: { mimetype: 'image/webp', data: 'http://localhost/media/sticker.webp' } },
+    },
+  ];
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const sticker = await waitFor(() => {
+    const found = container.querySelector('.room-messages img.chat-image-media');
+    assert.ok(found, 'the sticker bubble did not render');
+    return found;
+  });
+  fireEvent.click(sticker);
+  assert.ok(await screen.findByRole('button', { name: 'Download' }), 'the viewer did not open on the sticker');
+});
+
 // whatsapp-web.js reports that a channel post has media but gives no URL for it.
 test('a channel post with media and no URL says the media is unavailable', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
@@ -2677,6 +3363,63 @@ test('a channel post or status caption carrying mention delimiters renders them 
   const caption = await bubbleText();
   assert.equal(caption.textContent, '@Mallory says hi');
   assert.ok(!caption.querySelector('bdi'), 'the status caption rendered a mention');
+});
+
+// The viewer opens at the newest status and follows a new one. Anything else that draws the page again, a message for
+// another chat or a search that keeps the contact, leaves a reader who scrolled up to the older ones where they are.
+test('the status viewer moves to the newest only when the statuses it shows change', async () => {
+  const { screen, fireEvent } = rtl;
+  const contact = { id: '15550009999@c.us', name: 'Dora' };
+  const status = (n: number): StatusUpdate => ({
+    id: `status-${n}`,
+    contact,
+    type: 'text',
+    caption: `status number ${n}`,
+    timestamp: new Date(1_700_000_000_000 + n * 60_000).toISOString(),
+    expiresAt: new Date(1_800_000_000_000).toISOString(),
+  });
+  // Newest first, as the store answers.
+  statuses = [3, 2, 1].map(status);
+  const { container } = renderChats();
+  await screen.findByText(SESSION.name);
+  fireEvent.click(screen.getByRole('tab', { name: 'Status' }));
+  fireEvent.click(await screen.findByText('Dora'));
+  await screen.findByText('status number 1');
+  const feed = container.querySelector('.channel-room .messages-list') as HTMLElement;
+  // The reader has scrolled up to the oldest.
+  let top = 0;
+  const moves: number[] = [];
+  Object.defineProperty(feed, 'scrollHeight', { configurable: true, get: () => 3000 });
+  Object.defineProperty(feed, 'scrollTop', {
+    configurable: true,
+    get: () => top,
+    set: (value: number) => {
+      moves.push(value);
+      top = value;
+    },
+  });
+
+  receiveEvent('message.received', {
+    id: 'wamid.elsewhere.1',
+    chatId: CHAT.id,
+    from: CHAT.id,
+    to: 'me',
+    body: 'a message for another chat',
+    type: 'text',
+    fromMe: false,
+    timestamp: 1_700_000_900,
+  });
+  await flush();
+  await flush();
+  fireEvent.change(screen.getByPlaceholderText('Search chats...'), { target: { value: 'Dor' } });
+  await flush();
+  assert.deepEqual(moves, [], 'the viewer moved a reader who had scrolled up');
+
+  statuses = [4, 3, 2, 1].map(status);
+  receiveEvent('status.received', { id: 'status-4' });
+  await screen.findByText('status number 4');
+  await flush();
+  assert.deepEqual(moves, [3000], 'a new status did not move the viewer to it');
 });
 
 /**
@@ -3645,15 +4388,17 @@ const MESSAGE_FEED_EVENTS = [
  * follows (session.status and the like, on the '*' room) is a subscription of its own and is left out.
  */
 const feedFrames = (): unknown[] =>
-  (lastSocket()?.emitted ?? [])
-    .map(frame => frame.args[0] as { sessionId?: string; events?: string[] })
-    .filter(frame => frame.sessionId !== '*' && !frame.events?.includes('session.status'));
+  sentFrames().filter(frame => frame.sessionId !== '*' && !frame.events?.includes('session.status'));
 
 const SESSION_FEED_EVENTS = ['session.status', 'session.qr', 'session.restriction'];
-const sessionFeedFrames = () =>
-  (lastSocket()?.emitted ?? [])
-    .map(frame => frame.args[0] as { type?: string; sessionId?: string; events?: string[] })
-    .filter(frame => frame.events?.includes('session.status'));
+const sessionFeedFrames = () => sentFrames().filter(frame => frame.events?.includes('session.status'));
+
+/** The frames the page sent, without the requestId that only matches the gateway's answer to one. */
+function sentFrames(): { type?: string; sessionId?: string; events?: string[] }[] {
+  return (lastSocket()?.emitted ?? []).map(frame =>
+    Object.fromEntries(Object.entries(frame.args[0] as object).filter(([key]) => key !== 'requestId')),
+  );
+}
 
 test("the page follows every session's status on the wildcard room, and each listed session for a key refused it", async () => {
   const { screen, waitFor, act } = rtl;
@@ -3709,6 +4454,271 @@ test("the page joins the open session's message events once connected, and moves
   }
 });
 
+type SubscribeFrame = { type?: string; sessionId?: string; events?: string[]; requestId?: string };
+
+/** The subscribe frames the page sent, with the requestId the gateway's answer to each echoes. */
+const subscribeFrames = (): SubscribeFrame[] =>
+  (lastSocket()?.emitted ?? [])
+    .map(frame => frame.args[0] as SubscribeFrame)
+    .filter(frame => frame.type === 'subscribe');
+const isSessionFeed = (frame: SubscribeFrame) => !!frame.events?.includes('session.status');
+const isMessageFeed = (frame: SubscribeFrame) => !!frame.events?.includes('message.received');
+const answerSubscribe = (frame: SubscribeFrame, reply: Record<string, unknown>) =>
+  lastSocket()?.receive('message', { ...reply, requestId: frame.requestId });
+const KEY_UNREADABLE = { type: 'error', code: 'INTERNAL_ERROR', message: 'API key could not be checked' };
+const joined = (frame: SubscribeFrame) => ({ type: 'subscribed', sessionId: frame.sessionId, events: frame.events });
+
+// A session-scoped key holds two subscriptions of the open session: its session feed (the '*' room is refused) and
+// its message feed. The gateway answers INTERNAL_ERROR to a subscribe whose key it could not read, and the page
+// sends it again after a pause; joining the feed of that session meanwhile must not drop the message feed's retry.
+test("a scoped key's open session message feed is sent again after its session feed falls back", async () => {
+  const { waitFor, act } = rtl;
+  twoSessions = true;
+  try {
+    const { container } = renderChats();
+    await waitFor(() => assert.equal(selectedSessionId(container), SESSION.id));
+    await waitFor(() => assert.ok(subscribeFrames().some(isMessageFeed) && subscribeFrames().some(isSessionFeed)));
+    const wildcard = subscribeFrames().find(frame => isSessionFeed(frame) && frame.sessionId === '*');
+    const messages = subscribeFrames().find(frame => isMessageFeed(frame) && frame.sessionId === SESSION.id);
+    assert.ok(wildcard && messages);
+    mock.timers.enable({ apis: ['setTimeout'] });
+    act(() => answerSubscribe(messages, KEY_UNREADABLE));
+    act(() =>
+      answerSubscribe(wildcard, { type: 'error', code: 'FORBIDDEN_SESSION', message: 'Scoped keys cannot join *' }),
+    );
+    const perSession = subscribeFrames().filter(frame => isSessionFeed(frame) && frame.sessionId !== '*');
+    assert.deepEqual(perSession.map(frame => frame.sessionId).sort(), [SESSION.id, SESSION_2.id].sort());
+    act(() => {
+      for (const frame of perSession) answerSubscribe(frame, joined(frame));
+    });
+    act(() => mock.timers.tick(1_000));
+    const sent = subscribeFrames().filter(frame => isMessageFeed(frame) && frame.sessionId === SESSION.id).length;
+    assert.equal(sent, 2, `the open session's message feed was sent ${sent} time(s)`);
+  } finally {
+    mock.timers.reset();
+    twoSessions = false;
+  }
+});
+
+test("after a reconnect whose subscribes all fail, every feed of a scoped key is sent again, both of the open session's", async () => {
+  const { waitFor, act } = rtl;
+  twoSessions = true;
+  try {
+    const { container } = renderChats();
+    await waitFor(() => assert.equal(selectedSessionId(container), SESSION.id));
+    await waitFor(() => assert.ok(subscribeFrames().some(isMessageFeed) && subscribeFrames().some(isSessionFeed)));
+    const wildcard = subscribeFrames().find(frame => isSessionFeed(frame) && frame.sessionId === '*');
+    assert.ok(wildcard);
+    act(() =>
+      answerSubscribe(wildcard, { type: 'error', code: 'FORBIDDEN_SESSION', message: 'Scoped keys cannot join *' }),
+    );
+    await waitFor(() =>
+      assert.equal(subscribeFrames().filter(frame => isSessionFeed(frame) && frame.sessionId !== '*').length, 2),
+    );
+    act(() => {
+      for (const frame of subscribeFrames().filter(frame => frame.sessionId !== '*')) {
+        answerSubscribe(frame, joined(frame));
+      }
+    });
+
+    const before = subscribeFrames().length;
+    act(() => lastSocket()?.receive('disconnect', 'transport close'));
+    act(() => lastSocket()?.receive('connect'));
+    await waitFor(() => assert.equal(subscribeFrames().length - before, 3));
+    mock.timers.enable({ apis: ['setTimeout'] });
+    act(() => {
+      for (const frame of subscribeFrames().slice(before)) answerSubscribe(frame, KEY_UNREADABLE);
+    });
+    act(() => mock.timers.tick(1_000));
+    const label = (frame: SubscribeFrame) => `${frame.sessionId}:${isSessionFeed(frame) ? 'session' : 'messages'}`;
+    assert.deepEqual(
+      subscribeFrames()
+        .slice(before + 3)
+        .map(label)
+        .sort(),
+      [`${SESSION.id}:session`, `${SESSION.id}:messages`, `${SESSION_2.id}:session`].sort(),
+    );
+  } finally {
+    mock.timers.reset();
+    twoSessions = false;
+  }
+  // The reconnect's own re-reads land before the test ends.
+  await flush();
+  await flush();
+});
+
+// The page reads the open thread again on a connect, and the chat list on a reconnect, because a room not joined meanwhile
+// missed its pushes for good. A subscribe the gateway joined only on a retry missed them the same way.
+test('the open thread and the chat list are read again once a retried message subscribe joins', async () => {
+  const { screen, fireEvent, within, waitFor, act } = rtl;
+  resetFetchCalls();
+  const threadPath = `/api/sessions/${SESSION.id}/messages?chatId=${encodeURIComponent(CHAT.id)}`;
+  const threadReads = () => fetchCalls.filter(c => c.method === 'GET' && c.path.startsWith(threadPath)).length;
+  const chatsPath = `/api/sessions/${SESSION.id}/chats?limit=1000&offset=0`;
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+
+  // A socket blip: the page joins again and reads again, but the gateway cannot read the key for the message feed.
+  const before = subscribeFrames().length;
+  act(() => lastSocket()?.receive('disconnect', 'transport close'));
+  act(() => lastSocket()?.receive('connect'));
+  await waitFor(() => assert.ok(subscribeFrames().slice(before).some(isMessageFeed)));
+  await waitFor(() => assert.equal(countFetchCalls('GET', chatsPath), 2));
+  await flush();
+  await flush();
+  const threadReadsBefore = threadReads();
+  const listReadsBefore = countFetchCalls('GET', chatsPath);
+  const rejoin = subscribeFrames().slice(before).find(isMessageFeed);
+
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    act(() => {
+      for (const frame of subscribeFrames().slice(before)) {
+        answerSubscribe(frame, frame === rejoin ? KEY_UNREADABLE : joined(frame));
+      }
+    });
+    act(() => mock.timers.tick(1_000));
+  } finally {
+    mock.timers.reset();
+  }
+  const retry = subscribeFrames().at(-1);
+  assert.ok(retry && retry !== rejoin && isMessageFeed(retry), 'the message subscribe was not sent again');
+  // A message received before this answer reached no one: the room was not joined.
+  act(() => answerSubscribe(retry, joined(retry)));
+  await waitFor(() => assert.ok(threadReads() > threadReadsBefore, 'the thread was not read again'));
+  await waitFor(() =>
+    assert.ok(countFetchCalls('GET', chatsPath) > listReadsBefore, 'the chat list was not read again'),
+  );
+  await flush();
+  await flush();
+});
+
+// The page sends '*' again itself on every session switch. One sent while the failed '*' waits for its retry ends the
+// same gap, so the sessions that connected or dropped meanwhile are read again once it joins.
+test('the session list is read again once the wildcard feed joins on a session switch during its pause', async () => {
+  const { waitFor, act, within } = rtl;
+  twoSessions = true;
+  try {
+    const { container } = renderChats();
+    await waitFor(() => assert.equal(selectedSessionId(container), SESSION.id));
+    await waitFor(() => assert.ok(subscribeFrames().some(isMessageFeed) && subscribeFrames().some(isSessionFeed)));
+    for (let n = 0; n < 5; n++) await flush();
+    const wildcard = subscribeFrames().find(frame => frame.sessionId === '*');
+    assert.ok(wildcard);
+    // The pause before the retry starts on a fake clock that is dropped unmoved, so the retry itself never goes out.
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      act(() => {
+        for (const frame of subscribeFrames())
+          answerSubscribe(frame, frame === wildcard ? KEY_UNREADABLE : joined(frame));
+      });
+    } finally {
+      mock.timers.reset();
+    }
+    const reads = countFetchCalls('GET', '/api/sessions');
+    const before = subscribeFrames().length;
+    selectSession(container, SESSION_2.id);
+    await waitFor(() =>
+      assert.ok(
+        subscribeFrames()
+          .slice(before)
+          .some(frame => frame.sessionId === '*'),
+      ),
+    );
+    act(() => {
+      for (const frame of subscribeFrames().slice(before)) answerSubscribe(frame, joined(frame));
+    });
+    await waitFor(() =>
+      assert.ok(countFetchCalls('GET', '/api/sessions') > reads, 'the session list was not read again'),
+    );
+    await within(container.querySelector('.chats-sidebar') as HTMLElement).findByText('Alice');
+    for (let n = 0; n < 5; n++) await flush();
+  } finally {
+    twoSessions = false;
+  }
+});
+
+// A session-scoped key: leaving a session leaves its feed room too, a waiting retry of it included, and the page then
+// joins that feed again itself. That join ends the same gap.
+test("the session list is read again once a scoped key's failed feed is joined again on a switch away", async () => {
+  const { waitFor, act, within } = rtl;
+  twoSessions = true;
+  try {
+    const { container } = renderChats();
+    await waitFor(() => assert.equal(selectedSessionId(container), SESSION.id));
+    await waitFor(() => assert.ok(subscribeFrames().some(isMessageFeed) && subscribeFrames().some(isSessionFeed)));
+    const wildcard = subscribeFrames().find(frame => frame.sessionId === '*');
+    assert.ok(wildcard);
+    act(() =>
+      answerSubscribe(wildcard, { type: 'error', code: 'FORBIDDEN_SESSION', message: 'Scoped keys cannot join *' }),
+    );
+    await waitFor(() =>
+      assert.equal(subscribeFrames().filter(frame => isSessionFeed(frame) && frame.sessionId !== '*').length, 2),
+    );
+    for (let n = 0; n < 5; n++) await flush();
+    const openFeed = subscribeFrames().find(frame => isSessionFeed(frame) && frame.sessionId === SESSION.id);
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      act(() => {
+        for (const frame of subscribeFrames().filter(frame => frame.sessionId !== '*')) {
+          answerSubscribe(frame, frame === openFeed ? KEY_UNREADABLE : joined(frame));
+        }
+      });
+    } finally {
+      mock.timers.reset();
+    }
+    const reads = countFetchCalls('GET', '/api/sessions');
+    const before = subscribeFrames().length;
+    selectSession(container, SESSION_2.id);
+    await waitFor(() =>
+      assert.ok(
+        subscribeFrames()
+          .slice(before)
+          .some(frame => isSessionFeed(frame) && frame.sessionId === SESSION.id),
+      ),
+    );
+    act(() => {
+      for (const frame of subscribeFrames().slice(before)) answerSubscribe(frame, joined(frame));
+    });
+    await waitFor(() =>
+      assert.ok(countFetchCalls('GET', '/api/sessions') > reads, 'the session list was not read again'),
+    );
+    await within(container.querySelector('.chats-sidebar') as HTMLElement).findByText('Alice');
+    for (let n = 0; n < 5; n++) await flush();
+  } finally {
+    twoSessions = false;
+  }
+});
+
+// The '*' refusal is answered once and never again, so the fallback must not be lost to another error frame the page
+// handles in the same batch, here the open session's message subscribe whose key could not be read.
+test('a refused wildcard answered together with another error still falls back to each listed session', async () => {
+  const { waitFor, act } = rtl;
+  twoSessions = true;
+  try {
+    const { container } = renderChats();
+    await waitFor(() => assert.equal(selectedSessionId(container), SESSION.id));
+    await waitFor(() => assert.ok(subscribeFrames().some(isMessageFeed) && subscribeFrames().some(isSessionFeed)));
+    const wildcard = subscribeFrames().find(frame => isSessionFeed(frame) && frame.sessionId === '*');
+    const messages = subscribeFrames().find(frame => isMessageFeed(frame) && frame.sessionId === SESSION.id);
+    assert.ok(wildcard && messages);
+    act(() => {
+      answerSubscribe(wildcard, { type: 'error', code: 'FORBIDDEN_SESSION', message: 'Scoped keys cannot join *' });
+      answerSubscribe(messages, KEY_UNREADABLE);
+    });
+    assert.deepEqual(
+      subscribeFrames()
+        .filter(frame => isSessionFeed(frame) && frame.sessionId !== '*')
+        .map(frame => frame.sessionId)
+        .sort(),
+      [SESSION.id, SESSION_2.id].sort(),
+    );
+  } finally {
+    twoSessions = false;
+  }
+});
+
 // A failed read of the sessions is not "no connected sessions", which tells the operator to go connect one.
 test('a failed session list says so and offers the read again, not the no-sessions guidance', async () => {
   const { screen, fireEvent, within } = rtl;
@@ -3744,4 +4754,512 @@ test('a failed chat list says so and offers the read again, then clears once a r
   fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
   await screen.findByText('Alice');
   assert.equal(screen.queryByRole('alert') === null, true, 'the failure stayed after the list was read');
+});
+
+// ── The message field stays usable while a send is out ─────────────────────────
+
+// Disabling the field that holds focus makes the browser drop focus to the page (the HTML focus fixup rule), so
+// pressing Enter to send would leave the next keystrokes going nowhere. The field stays enabled while a send is
+// out; the send handler already refuses a second send meanwhile.
+test('the message field keeps focus while a sent message is on its way', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const thread = container.querySelector('.room-messages') as HTMLElement;
+  await within(thread).findByText('hello from alice');
+
+  const releaseSend = holdSend();
+  const input = screen.getByPlaceholderText('Type a message...') as HTMLInputElement;
+  input.focus();
+  fireEvent.change(input, { target: { value: 'first line' } });
+  fireEvent.submit(input.closest('form') as HTMLFormElement);
+  await within(thread).findByText('first line');
+
+  try {
+    assert.equal(input.disabled, false, 'the focused message field was disabled while the send was out');
+    assert.equal(document.activeElement === input, true, 'the message field lost focus during the send');
+  } finally {
+    releaseSend();
+    await waitFor(() => assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/messages/send-text`), 1));
+    await flush();
+  }
+});
+
+// The field being typable during a send must not make a second send possible before the first is answered.
+test('Enter pressed again while a send is out sends nothing and keeps the text typed', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const thread = container.querySelector('.room-messages') as HTMLElement;
+  await within(thread).findByText('hello from alice');
+
+  const releaseSend = holdSend();
+  const input = screen.getByPlaceholderText('Type a message...') as HTMLInputElement;
+  const form = input.closest('form') as HTMLFormElement;
+  fireEvent.change(input, { target: { value: 'first line' } });
+  fireEvent.submit(form);
+  await within(thread).findByText('first line');
+  fireEvent.change(input, { target: { value: 'second line' } });
+  fireEvent.submit(form);
+
+  releaseSend();
+  const sendPath = `/api/sessions/${SESSION.id}/messages/send-text`;
+  await waitFor(() => assert.equal(countFetchCalls('POST', sendPath), 1));
+  await flush();
+  assert.equal(countFetchCalls('POST', sendPath), 1, 'a second send went out while the first was in flight');
+  assert.equal(input.value, 'second line');
+  assert.equal(within(thread).queryByText('second line') === null, true, 'the refused text was drawn as sent');
+});
+
+// Activating Send puts focus on the button, which disables once the sent text is cleared. The field takes focus
+// first, so a keyboard user can type the next message at once.
+test('sending with the Send button leaves focus in the message field', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const thread = container.querySelector('.room-messages') as HTMLElement;
+  await within(thread).findByText('hello from alice');
+
+  const releaseSend = holdSend();
+  fireEvent.change(screen.getByPlaceholderText('Type a message...'), { target: { value: 'by the button' } });
+  const send = screen.getByRole('button', { name: 'Send' });
+  send.focus();
+  fireEvent.click(send);
+  await within(thread).findByText('by the button');
+
+  try {
+    assert.equal(
+      document.activeElement?.getAttribute('placeholder'),
+      'Type a message...',
+      'focus stayed on the Send button the send disabled',
+    );
+  } finally {
+    releaseSend();
+    await waitFor(() => assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/messages/send-text`), 1));
+    await flush();
+  }
+});
+
+// ── The media viewer follows the image it was opened on ─────────────────────────
+
+const inlineImage = (key: string, second: number): ChatMessage => ({
+  ...DB_MESSAGE,
+  id: `db-img-${key}`,
+  waMessageId: `wamid.img.${key}`,
+  body: '',
+  type: 'image',
+  timestamp: 1_700_000_000 + second,
+  createdAt: new Date((1_700_000_000 + second) * 1000).toISOString(),
+  metadata: { media: { mimetype: 'image/png', filename: `${key}.png`, data: `http://localhost/media/${key}.png` } },
+});
+
+const viewerSlideSrc = (): string | null =>
+  document.querySelector('[role="dialog"] .yarl__slide_current img')?.getAttribute('src') ?? null;
+
+const revokeEvent = (waMessageId: string) => ({
+  id: waMessageId,
+  revokedId: waMessageId,
+  chatId: CHAT.id,
+  from: CHAT.id,
+  to: 'me',
+  body: '',
+  type: 'revoked',
+  timestamp: 1_700_003_000,
+});
+
+test('the media viewer keeps showing the image it was opened on when an earlier image is deleted', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  firstPageExtra = [inlineImage('a', 10), inlineImage('b', 11), inlineImage('c', 12)];
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const images = await waitFor(() => {
+    const found = container.querySelectorAll('.room-messages img.chat-image-media');
+    assert.equal(found.length, 3, 'the three image bubbles did not render');
+    return found;
+  });
+  fireEvent.click(images[1]);
+  await waitFor(() => assert.equal(viewerSlideSrc(), 'http://localhost/media/b.png'));
+
+  // The sender deletes the first image for everyone while the second is on screen.
+  receiveEvent('message.revoked', revokeEvent('wamid.img.a'));
+  await waitFor(() => assert.equal(container.querySelectorAll('.room-messages img.chat-image-media').length, 2));
+  await flush();
+
+  assert.equal(viewerSlideSrc(), 'http://localhost/media/b.png', 'the viewer moved to another image');
+});
+
+test('a media viewer whose image was deleted does not open again by itself when another image arrives', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  firstPageExtra = [inlineImage('a', 10)];
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const image = await waitFor(() => {
+    const found = container.querySelector('.room-messages img.chat-image-media');
+    assert.ok(found, 'the image bubble did not render');
+    return found;
+  });
+  fireEvent.click(image);
+  await waitFor(() => assert.equal(viewerSlideSrc(), 'http://localhost/media/a.png'));
+
+  // The only image is deleted for everyone while it is on screen: the viewer has nothing left to show.
+  receiveEvent('message.revoked', revokeEvent('wamid.img.a'));
+  await waitFor(() => assert.equal(document.querySelector('[role="dialog"]') === null, true, 'the viewer stayed open'));
+
+  // Another image arrives in the open chat; nobody asked for the viewer.
+  receiveEvent('message.received', {
+    id: 'wamid.img.new',
+    chatId: CHAT.id,
+    from: CHAT.id,
+    to: 'me',
+    body: '',
+    type: 'image',
+    fromMe: false,
+    timestamp: 1_700_003_001,
+    media: { mimetype: 'image/png', data: 'http://localhost/media/new.png' },
+  });
+  await waitFor(() => assert.ok(container.querySelector('.room-messages img[src="http://localhost/media/new.png"]')));
+  await flush();
+
+  assert.equal(viewerSlideSrc(), null, 'the media viewer opened without a click');
+});
+
+// A thread holding as many media payloads as it keeps drops the oldest one when another arrives, so every image after
+// it moves up the list.
+test('the media viewer keeps its image when a new one pushes the oldest payload out of the thread', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  // Newest first, as the gateway serves a page: the cache holds it oldest first and strips payloads from the front.
+  firstPageExtra = Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => {
+    const n = MEDIA_PAYLOAD_CACHE_LIMIT - 1 - i;
+    return inlineImage(`p${n}`, 10 + n);
+  });
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const images = await waitFor(() => {
+    const found = container.querySelectorAll('.room-messages img.chat-image-media');
+    assert.equal(found.length, MEDIA_PAYLOAD_CACHE_LIMIT, 'the image bubbles did not render');
+    return found;
+  });
+  fireEvent.click(images[50]);
+  await waitFor(() => assert.equal(viewerSlideSrc(), 'http://localhost/media/p50.png'));
+
+  receiveEvent('message.received', {
+    id: 'wamid.img.new',
+    chatId: CHAT.id,
+    from: CHAT.id,
+    to: 'me',
+    body: '',
+    type: 'image',
+    fromMe: false,
+    timestamp: 1_700_003_001,
+    media: { mimetype: 'image/png', data: 'http://localhost/media/new.png' },
+  });
+  await waitFor(() => assert.ok(container.querySelector('.room-messages img[src="http://localhost/media/new.png"]')));
+  await waitFor(() =>
+    assert.equal(container.querySelector('.room-messages img[src="http://localhost/media/p0.png"]') === null, true),
+  );
+  await flush();
+
+  assert.equal(viewerSlideSrc(), 'http://localhost/media/p50.png', 'the viewer moved to another image');
+});
+
+test('the media viewer keeps its image when an older page lands in front of it', async () => {
+  const { fireEvent, waitFor } = rtl;
+  olderPageExtra = [
+    pagedRow(-1, {
+      id: 'paged-img-old',
+      waMessageId: 'wamid.paged.img.old',
+      body: '',
+      type: 'image',
+      metadata: { media: { mimetype: 'image/png', data: 'http://localhost/media/old.png' } },
+    }),
+  ];
+  const { container } = renderChats();
+  const thread = await openPagedChat(container);
+  receiveEvent('message.received', {
+    id: 'wamid.img.carol',
+    chatId: CHAT_2.id,
+    from: CHAT_2.id,
+    to: 'me',
+    body: '',
+    type: 'image',
+    fromMe: false,
+    timestamp: 1_700_003_001,
+    media: { mimetype: 'image/png', data: 'http://localhost/media/carol.png' },
+  });
+  const image = await waitFor(() => {
+    const found = thread.querySelector('img[src="http://localhost/media/carol.png"]');
+    assert.ok(found, 'the image bubble did not render');
+    return found;
+  });
+  fireEvent.click(image);
+  await waitFor(() => assert.equal(viewerSlideSrc(), 'http://localhost/media/carol.png'));
+
+  makeScrollable(thread, 0);
+  fireEvent.scroll(thread);
+  await waitFor(() => assert.ok(thread.querySelector('img[src="http://localhost/media/old.png"]')));
+  await flush();
+
+  assert.equal(viewerSlideSrc(), 'http://localhost/media/carol.png', 'the viewer moved to another image');
+});
+
+test('the media viewer moves to the next image and stays there', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  firstPageExtra = [inlineImage('b', 11), inlineImage('a', 10)];
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const image = await waitFor(() => {
+    const found = container.querySelector('.room-messages img[src="http://localhost/media/a.png"]');
+    assert.ok(found, 'the image bubble did not render');
+    return found;
+  });
+  fireEvent.click(image);
+  await waitFor(() => assert.equal(viewerSlideSrc(), 'http://localhost/media/a.png'));
+
+  fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+  await waitFor(() => assert.equal(viewerSlideSrc(), 'http://localhost/media/b.png'));
+
+  // A new image rebuilds the viewer's list; what it shows then is the image the page holds as viewed.
+  receiveEvent('message.received', {
+    id: 'wamid.img.new',
+    chatId: CHAT.id,
+    from: CHAT.id,
+    to: 'me',
+    body: '',
+    type: 'image',
+    fromMe: false,
+    timestamp: 1_700_003_001,
+    media: { mimetype: 'image/png', data: 'http://localhost/media/new.png' },
+  });
+  await waitFor(() => assert.ok(container.querySelector('.room-messages img[src="http://localhost/media/new.png"]')));
+  await flush();
+  assert.equal(viewerSlideSrc(), 'http://localhost/media/b.png', 'the viewer went back to the image it was opened on');
+});
+
+// ── An image opened while it is still being sent ─────────────────────────
+
+/**
+ * Send an image to Alice with the send held open, and open the media viewer on its optimistic bubble. Returns the
+ * thread, the src the viewer shows, and the release for the send.
+ */
+async function viewImageBeingSent(t: TestContext): Promise<{ thread: HTMLElement; src: string; release: () => void }> {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  // jsdom's File is not a Blob Node's URL accepts; the staged preview needs only some URL.
+  t.mock.method(URL, 'createObjectURL', () => 'blob:staged-preview');
+  t.mock.method(URL, 'revokeObjectURL', () => undefined);
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const thread = container.querySelector('.room-messages') as HTMLElement;
+  await within(thread).findByText('hello from alice');
+  await stageAttachment(container, 'photo.png', 'image/png');
+  const release = holdSend();
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+  const bubble = await waitFor(() => {
+    const found = thread.querySelector('img.chat-image-media[src^="data:image/png"]');
+    assert.ok(found, 'the optimistic image bubble did not render');
+    return found;
+  });
+  fireEvent.click(bubble);
+  const src = await waitFor(() => {
+    const shown = viewerSlideSrc() ?? '';
+    assert.ok(shown.startsWith('data:image/png'), 'the viewer did not open on the image being sent');
+    return shown;
+  });
+  return { thread, src, release };
+}
+
+test('the media viewer opened on an image being sent stays on it when the send is confirmed', async t => {
+  const { waitFor } = rtl;
+  const { thread, src, release } = await viewImageBeingSent(t);
+
+  release();
+  await waitFor(() => assert.ok(thread.querySelector('[data-wa-message-id="wamid.out.image"] img.chat-image-media')));
+  await flush();
+  assert.equal(viewerSlideSrc(), src, 'the viewer closed by itself when the send it showed was confirmed');
+
+  // The echo of the send then restamps the row with the time the engine gives it; the viewer follows the message.
+  receiveEvent('message.sent', {
+    id: 'wamid.out.image',
+    chatId: CHAT.id,
+    from: 'me',
+    to: CHAT.id,
+    body: '',
+    type: 'image',
+    fromMe: true,
+    timestamp: 1_700_000_100,
+  });
+  await waitFor(() => assert.equal(rtl.within(thread).queryByText('Today') === null, true, 'the echo was not applied'));
+  await flush();
+  assert.equal(viewerSlideSrc(), src, 'the viewer closed when the echo restamped the confirmed image');
+
+  // Deleted for everyone, it is gone for good and the viewer closes.
+  receiveEvent('message.revoked', revokeEvent('wamid.out.image'));
+  await waitFor(() => assert.equal(document.querySelector('[role="dialog"]') === null, true, 'the viewer stayed open'));
+});
+
+test('the media viewer stays on an image being sent when the echo of the send lands before its answer', async t => {
+  const { waitFor } = rtl;
+  const { thread, src, release } = await viewImageBeingSent(t);
+
+  receiveEvent('message.sent', {
+    id: 'wamid.out.image',
+    chatId: CHAT.id,
+    from: 'me',
+    to: CHAT.id,
+    body: '',
+    type: 'image',
+    fromMe: true,
+    timestamp: 1_700_000_100,
+  });
+  await waitFor(() => assert.ok(thread.querySelector('[data-wa-message-id="wamid.out.image"]')));
+  release();
+  await waitFor(() => assert.ok(thread.querySelector('[data-wa-message-id="wamid.out.image"] img.chat-image-media')));
+  await flush();
+  assert.equal(viewerSlideSrc(), src, 'the viewer closed by itself when the send it showed was confirmed');
+});
+
+test('the media viewer stays on an image being sent when the engine confirms it without an id', async t => {
+  const { waitFor } = rtl;
+  sendImageId = '';
+  const { thread, src, release } = await viewImageBeingSent(t);
+
+  release();
+  await waitFor(() => assert.ok(thread.querySelector('.message-status-icon.sent')));
+  await flush();
+  assert.equal(viewerSlideSrc(), src, 'the viewer closed by itself when the send it showed was confirmed');
+});
+
+// A file sent alone, from a tap that left nothing focused (a tap on a button does not focus it in Safari on iOS):
+// moving focus into the message field would raise a phone's keyboard over the thread for no typing.
+test('a file sent alone with nothing focused leaves focus where it was', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const thread = container.querySelector('.room-messages') as HTMLElement;
+  await within(thread).findByText('hello from alice');
+  await stageAttachment(container, 'contract.pdf');
+  (document.activeElement as HTMLElement | null)?.blur();
+  assert.equal(document.activeElement === document.body, true, 'precondition: nothing focused');
+
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => assert.ok(findFetchCall('POST', `/api/sessions/${SESSION.id}/messages/send-document`)));
+  await flush();
+  assert.equal(
+    document.activeElement?.getAttribute('placeholder') ?? 'body',
+    'body',
+    'the send moved focus into the message field',
+  );
+});
+
+/**
+ * Stage a file alone in Alice's chat, press Send the way `press` says (a pointer of that type, or a key), and answer
+ * the placeholder of what then holds focus, or 'body'.
+ */
+async function sendFileAlone(press: 'touch' | 'mouse' | 'key', tappedBefore = false): Promise<string> {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const thread = container.querySelector('.room-messages') as HTMLElement;
+  await within(thread).findByText('hello from alice');
+  // A tap on + focuses the button in Chromium, so focus is inside the composer from here on.
+  (screen.getByRole('button', { name: 'Send file / image' }) as HTMLButtonElement).focus();
+  await stageAttachment(container, 'contract.pdf');
+  const send = screen.getByRole('button', { name: 'Send' });
+  if (tappedBefore) fireEvent.pointerDown(send, { pointerType: 'touch' });
+  if (press === 'key') fireEvent.keyDown(send, { key: 'Enter' });
+  else fireEvent.pointerDown(send, { pointerType: press });
+  send.focus();
+  fireEvent.click(send);
+  await waitFor(() => assert.ok(findFetchCall('POST', `/api/sessions/${SESSION.id}/messages/send-document`)));
+  await flush();
+  return document.activeElement?.getAttribute('placeholder') ?? 'body';
+}
+
+// In Chromium a tap focuses the button it hits; a focused message field would raise a phone's keyboard.
+test('a file sent alone by a tap on Send leaves the message field unfocused', async () => {
+  assert.notEqual(await sendFileAlone('touch'), 'Type a message...', 'the tap moved focus into the message field');
+});
+
+test('a file sent alone with a mouse click on Send leaves focus in the message field', async () => {
+  assert.equal(await sendFileAlone('mouse'), 'Type a message...');
+});
+
+test('a key on Send after an earlier tap on it leaves focus in the message field', async () => {
+  assert.equal(await sendFileAlone('key', true), 'Type a message...');
+});
+
+// The answer to a send and the echo of it reach the page close together. The client library tells the page about a
+// cache change on its next timer turn, so an echo frame handled before that turn lands in the same render as the
+// answer: the page never draws the confirmed row with the placeholder's time before the echo restamps it.
+test('the media viewer stays on an image being sent when its echo lands right after its answer', async t => {
+  const { waitFor } = rtl;
+  const { thread, src, release } = await viewImageBeingSent(t);
+  const cache = queryClient!.getQueryCache();
+  let echoed = false;
+  const unsubscribe = cache.subscribe(() => {
+    if (echoed) return;
+    const confirmed = cache
+      .findAll({ queryKey: ['messages', SESSION.id, CHAT.id] })
+      .some(q =>
+        ((q.state.data as { pages?: Array<{ db: ChatMessage[] }> } | undefined)?.pages ?? []).some(page =>
+          page.db.some(m => m.waMessageId === 'wamid.out.image'),
+        ),
+      );
+    if (!confirmed) return;
+    echoed = true;
+    receiveEvent('message.sent', {
+      id: 'wamid.out.image',
+      chatId: CHAT.id,
+      from: 'me',
+      to: CHAT.id,
+      body: '',
+      type: 'image',
+      fromMe: true,
+      timestamp: 1_700_000_100,
+    });
+  });
+  t.after(unsubscribe);
+
+  release();
+  await waitFor(() => assert.ok(thread.querySelector('[data-wa-message-id="wamid.out.image"] img.chat-image-media')));
+  await flush();
+  assert.equal(echoed, true, 'the echo was not delivered');
+  assert.equal(viewerSlideSrc(), src, 'the viewer closed by itself when the send it showed was confirmed');
+});
+
+test('the media viewer stays on an image whose send failed', async t => {
+  const { waitFor } = rtl;
+  sendImageFails = true;
+  const { thread, src, release } = await viewImageBeingSent(t);
+
+  release();
+  await waitFor(() => assert.ok(thread.querySelector('.message-status-icon.failed'), 'the send was not marked failed'));
+  await flush();
+  assert.equal(viewerSlideSrc(), src, 'the viewer closed when the send of its image failed');
+});
+
+test('a confirmed image send leaves the media viewer on the other image it shows', async t => {
+  const { screen, fireEvent, waitFor } = rtl;
+  t.mock.method(URL, 'createObjectURL', () => 'blob:staged-preview');
+  t.mock.method(URL, 'revokeObjectURL', () => undefined);
+  firstPageExtra = [inlineImage('a', 10)];
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const thread = container.querySelector('.room-messages') as HTMLElement;
+  await waitFor(() => assert.ok(thread.querySelector('img.chat-image-media[src="http://localhost/media/a.png"]')));
+  await stageAttachment(container, 'photo.png', 'image/png');
+  const release = holdSend();
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => assert.ok(thread.querySelector('img.chat-image-media[src^="data:image/png"]')));
+  fireEvent.click(thread.querySelector('img.chat-image-media[src="http://localhost/media/a.png"]') as HTMLElement);
+  await waitFor(() => assert.equal(viewerSlideSrc(), 'http://localhost/media/a.png'));
+
+  release();
+  await waitFor(() => assert.ok(thread.querySelector('[data-wa-message-id="wamid.out.image"] img.chat-image-media')));
+  await flush();
+  assert.equal(viewerSlideSrc(), 'http://localhost/media/a.png', 'the viewer left its image when a send was confirmed');
 });

@@ -207,10 +207,11 @@ type WebhookDeliveryFailure struct {
 	LastError      string `json:"lastError"`
 	// CreatedAt is the ISO timestamp of when the failure was first recorded.
 	CreatedAt string `json:"createdAt"`
-	// Replayable is true when the row still holds the event data and can be
-	// replayed with RedriveDeliveryFailures: a terminal row (Attempts > 0)
+	// Replayable is true when the row still holds the event data and its
+	// webhook still exists in the same session: a terminal row (Attempts > 0)
 	// recorded while the gateway's WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS is
-	// above 0, until that window passes.
+	// above 0, until that window passes. RedriveDeliveryFailures replays it
+	// while that webhook is active and subscribed to the event.
 	Replayable bool `json:"replayable"`
 }
 
@@ -238,10 +239,13 @@ type WebhookRedriveResult struct {
 	Enqueued int `json:"enqueued"`
 	// Failed replays failed again; their rows stay, with attempts raised by one.
 	Failed int `json:"failed"`
-	// Skipped rows were not replayed: the webhook was removed, disabled or
-	// unsubscribed, or a plugin cancelled it.
+	// Skipped is the selected rows not replayed: a hook cancelled the replay,
+	// or the row or its webhook changed during the call. Rows of a removed,
+	// disabled or unsubscribed webhook are left out before the batch and not
+	// counted.
 	Skipped int `json:"skipped"`
-	// Remaining is the replayable rows still in scope after this call.
+	// Remaining is the rows the redrive would still take after this call:
+	// replayable, in scope, with an active subscribed webhook.
 	Remaining int `json:"remaining"`
 }
 

@@ -170,6 +170,8 @@ export class WwebjsChannels {
     if (!act) {
       throw new ChannelNotFoundError(channelId);
     }
+    // The channel acts through its own client, which getClient's readiness check never sees again.
+    this.host.ensureReady();
     const ok = await this.withPage('muteChannel', () => act.call(chat));
     if (!ok) {
       throw new EngineRefusedError(`Failed to ${mute ? 'mute' : 'unmute'} channel ${channelId}`);

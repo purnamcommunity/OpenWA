@@ -2494,3 +2494,820 @@ describe('LidMappingStoreService: a negative result on the shared table', () => 
     expect(await store.lidsForPhonesPersisted(['628111'])).toEqual({ 628111: ['111'] });
   });
 });
+
+describe('LidMappingStoreService: a phone reported under a second lid', () => {
+  type Report = Parameters<Parameters<LidMappingStoreService['onSecondLid']>[0]>[0];
+
+  /** Checks are collected over a window; these cases run it at once and wait it out with {@link settle}. */
+  const noWindow = (store: LidMappingStoreService) =>
+    ((store as unknown as { secondLidWindowMs: number }).secondLidWindowMs = 0);
+
+  async function watched(seed: Partial<LidMapping>[] = [], repo = makeFakeRepo(seed)) {
+    const store = await newStore(repo);
+    noWindow(store);
+    const reports: Report[] = [];
+    store.onSecondLid(report => {
+      reports.push(report);
+    });
+    const warn = jest
+      .spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn')
+      .mockImplementation(() => undefined);
+    return { repo, store, reports, warn };
+  }
+
+  const settle = () => new Promise(resolve => setTimeout(resolve, 5));
+  /** Wait for a condition, up to a deadline; the expectations after it then show what is missing. */
+  const until = async (done: () => boolean, ms = 2000): Promise<void> => {
+    for (const end = Date.now() + ms; !done() && Date.now() < end;)
+      await new Promise(resolve => setTimeout(resolve, 2));
+  };
+  const owedChecks = (store: LidMappingStoreService) =>
+    (store as unknown as { secondLidOwed: Map<string, { phone: string }> }).secondLidOwed;
+  const phoneReads = (repo: ReturnType<typeof makeFakeRepo>) =>
+    repo.find.mock.calls.filter(([options]) => (options as { where?: { phone?: unknown } })?.where?.phone).length;
+
+  it('reports the phone, both lids and the reporting session once, and logs a warning', async () => {
+    const { store, reports, warn } = await watched([{ lid: '111', phone: '628999', sessionId: 's1' }]);
+
+    await expect(store.remember('222', '628999', 's2')).resolves.toBe(true);
+    await settle();
+
+    expect(reports).toEqual([{ phone: '628999', previousLid: '111', newLid: '222', sessionId: 's2' }]);
+    expect(warn).toHaveBeenCalledWith(
+      'A phone number was reported under a second privacy id',
+      expect.objectContaining({
+        sessionId: 's2',
+        phone: '628999',
+        previousLid: '111',
+        newLid: '222',
+        action: 'second_lid_reported',
+      }),
+    );
+    // Detection only: the table and the reverse lookup still hold both lids.
+    expect(store.lidsForPhone('628999').sort()).toEqual(['111', '222']);
+  });
+
+  it('reports nothing for a phone first reported, or the same lid reported again', async () => {
+    const { store, reports, warn } = await watched();
+
+    await store.remember('111', '628999', 's1');
+    await store.remember('111', '628999', 's1');
+    await store.remember('111', '628999', 's2');
+    await settle();
+
+    expect(reports).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('counts neither an inferred row nor an inferred lookup as an engine report', async () => {
+    const { store, reports } = await watched([{ lid: '111', phone: '628999', isReported: false }]);
+
+    await store.remember('222', '628999', 's1'); // the earlier row is display data only
+    await store.rememberIfUnknown('333', '628999', 's1'); // a cached lookup is no report
+    await settle();
+
+    expect(reports).toEqual([]);
+  });
+
+  it('reports one transition once, however often either lid is reported again', async () => {
+    const { store, reports } = await watched([{ lid: '111', phone: '628999', sessionId: 's1' }]);
+
+    await store.remember('222', '628999', 's2');
+    await store.remember('222', '628999', 's2');
+    await store.remember('222', '628999', 's3');
+    await store.remember('111', '628999', 's1'); // a history sync replaying the earlier pairing
+    await settle();
+
+    expect(reports).toHaveLength(1);
+  });
+
+  it('keeps the writes and every other report when the listener throws or rejects', async () => {
+    const { repo, store } = await watched([{ lid: '111', phone: '628999' }]);
+    const throwing = jest.fn(() => {
+      throw new Error('listener down');
+    });
+    store.onSecondLid(throwing);
+    await expect(store.remember('222', '628999', 's2')).resolves.toBe(true);
+    await expect(store.remember('333', '628999', 's2')).resolves.toBe(true);
+    await settle();
+    const rejecting = jest.fn(() => Promise.reject(new Error('listener down')));
+    store.onSecondLid(rejecting);
+    await expect(store.remember('444', '628999', 's2')).resolves.toBe(true);
+    await settle();
+
+    // 222 and 333 were checked together: 111-222, 111-333 and 222-333.
+    expect(throwing).toHaveBeenCalledTimes(3);
+    expect(rejecting).toHaveBeenCalledTimes(3);
+    expect(repo.rows.filter(row => row.phone === '628999').map(row => row.lid)).toEqual(['111', '222', '333', '444']);
+    expect(store.getCached('222')).toBe('628999');
+  });
+
+  it('reports a lid that only display data mapped to the phone once an engine reports it', async () => {
+    const { store, reports } = await watched([
+      { lid: '111', phone: '628999' },
+      { lid: '222', phone: '628999', isReported: false },
+    ]);
+
+    await store.remember('222', '628999', 's2');
+    await settle();
+
+    expect(reports).toEqual([{ phone: '628999', previousLid: '111', newLid: '222', sessionId: 's2' }]);
+  });
+
+  it('reports nothing for a write that failed, and reports the one that lands', async () => {
+    const { repo, store, reports } = await watched([{ lid: '111', phone: '628999' }]);
+    repo.upsert.mockRejectedValueOnce(new Error('disk full'));
+
+    await expect(store.remember('222', '628999', 's2')).resolves.toBe(false);
+    await settle();
+    expect(reports).toEqual([]);
+
+    await store.remember('222', '628999', 's2');
+    await settle();
+    expect(reports).toHaveLength(1);
+  });
+
+  describe('with a small mapping cache', () => {
+    const saved = process.env.LID_MAPPING_CACHE_MAX;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.LID_MAPPING_CACHE_MAX;
+      else process.env.LID_MAPPING_CACHE_MAX = saved;
+    });
+
+    // A recycled number: the earlier holder's row is old, so past the preload, and the fence reads the table.
+    it('reports an earlier lid that only the table still holds', async () => {
+      process.env.LID_MAPPING_CACHE_MAX = '2';
+      // reload() indexes the rows in reverse, so the last seed row is the one evicted.
+      const { store, reports } = await watched([
+        { lid: 'a1', phone: '6201' },
+        { lid: 'a2', phone: '6202' },
+        { lid: '111', phone: '628999', sessionId: 's1' },
+      ]);
+      expect(store.lidsForPhone('628999')).toEqual([]);
+
+      await store.remember('222', '628999', 's2');
+      await settle();
+
+      expect((await store.findLidsForPhone('628999')).sort()).toEqual(['111', '222']);
+      expect(reports).toEqual([{ phone: '628999', previousLid: '111', newLid: '222', sessionId: 's2' }]);
+    });
+  });
+
+  it('reports nothing when the reported pairs are replayed', async () => {
+    const { store, reports } = await watched();
+    for (let i = 0; i < 1001; i++) {
+      await store.remember(`1${i}`, `62800${i}`, 's1');
+      await store.remember(`2${i}`, `62800${i}`, 's2');
+    }
+    await settle();
+    expect(reports).toHaveLength(1001);
+
+    for (let i = 0; i < 1001; i++) await store.remember(`2${i}`, `62800${i}`, 's2');
+    await settle();
+    expect(reports).toHaveLength(1001);
+  });
+
+  it('reports nothing again after a restart for a pair it already reported', async () => {
+    const first = await watched([{ lid: '111', phone: '628999', sessionId: 's1' }]);
+    await first.store.remember('222', '628999', 's2');
+    await settle();
+
+    const second = await newStore(first.repo); // same table, new process
+    const reports: Report[] = [];
+    second.onSecondLid(report => void reports.push(report));
+    await second.remember('222', '628999', 's2');
+    await settle();
+
+    expect(first.reports).toHaveLength(1);
+    expect(reports).toEqual([]);
+  });
+
+  it('reports two new lids checked together for one phone once, the first as previous', async () => {
+    const { store, reports } = await watched();
+
+    await Promise.all([store.remember('111', '628999', 's1'), store.remember('222', '628999', 's2')]);
+    await settle();
+
+    expect(reports).toEqual([{ phone: '628999', previousLid: '111', newLid: '222', sessionId: 's2' }]);
+  });
+
+  // The first check runs while the second write has landed in the table but not yet returned, so it reads
+  // the second lid as the one already there; the second lid's own check finds the pair reported.
+  it('reports two new lids checked on different turns once', async () => {
+    const { repo, store, reports } = await watched();
+    await store.remember('111', '628999', 's1');
+    let release: () => void = () => undefined;
+    repo.upsert.mockImplementationOnce((values: Partial<LidMapping>) => {
+      repo.rows.push(values as LidMapping);
+      return new Promise<object>(resolve => (release = () => resolve({})));
+    });
+    const second = store.remember('222', '628999', 's2');
+    await settle();
+    release();
+    await second;
+    await settle();
+
+    expect(reports).toEqual([expect.objectContaining({ previousLid: '222', newLid: '111' })]);
+  });
+
+  it('reports a new lid whose first report failed while an overlapping report of it landed', async () => {
+    const { repo, store, reports } = await watched([{ lid: '111', phone: '628999', sessionId: 's1' }]);
+    let fail: (err: Error) => void = () => undefined;
+    repo.upsert.mockImplementationOnce(() => new Promise((_resolve, reject) => (fail = reject)));
+
+    const first = store.remember('222', '628999', 's2'); // held open, then fails
+    await expect(store.remember('222', '628999', 's2')).resolves.toBe(true);
+    fail(new Error('SQLITE_BUSY: database is locked'));
+    await expect(first).resolves.toBe(false);
+    await settle();
+    await expect(store.remember('222', '628999', 's2')).resolves.toBe(true);
+    await settle();
+
+    expect(reports).toEqual([expect.objectContaining({ phone: '628999', previousLid: '111', newLid: '222' })]);
+  });
+
+  it('collects the checks of a window into one table read', async () => {
+    const { repo, store, reports } = await watched([{ lid: '111', phone: '628999' }]);
+    (store as unknown as { secondLidWindowMs: number }).secondLidWindowMs = 30;
+
+    await store.remember('222', '628999', 's2');
+    await new Promise(resolve => setImmediate(resolve));
+    await store.remember('333', '628888', 's2');
+    await new Promise(resolve => setTimeout(resolve, 60));
+
+    expect(phoneReads(repo)).toBe(1);
+    expect(reports).toEqual([expect.objectContaining({ previousLid: '111', newLid: '222' })]);
+  });
+
+  it('stops at module shutdown without waiting: a collected check is dropped and none is read', async () => {
+    const { repo, store, reports } = await watched([{ lid: '111', phone: '628999' }]);
+    (store as unknown as { secondLidWindowMs: number }).secondLidWindowMs = 30;
+
+    await store.remember('222', '628999', 's2');
+    expect(store.onModuleDestroy()).toBeUndefined();
+    await store.remember('333', '628999', 's2');
+    await new Promise(resolve => setTimeout(resolve, 60));
+
+    expect(phoneReads(repo)).toBe(0);
+    expect(reports).toEqual([]);
+  });
+
+  it('ends a read still under way at shutdown without a report or a warning', async () => {
+    const { repo, store, reports, warn } = await watched([{ lid: '111', phone: '628999' }]);
+    let answer: () => void = () => undefined;
+    repo.find.mockImplementationOnce(
+      (options: { where?: { phone?: Cond } }) =>
+        new Promise(
+          resolve => (answer = () => resolve(repo.rows.filter(row => matches(row.phone, options.where?.phone)))),
+        ),
+    );
+
+    await store.remember('222', '628999', 's2');
+    await settle(); // the read is under way and does not answer
+    store.onModuleDestroy();
+    answer();
+    await settle();
+
+    expect(reports).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('checks a new lid the same sync pushed out of the mapping cache before its write landed', async () => {
+    const saved = process.env.LID_MAPPING_CACHE_MAX;
+    process.env.LID_MAPPING_CACHE_MAX = '3';
+    try {
+      const { store, reports } = await watched([{ lid: '111', phone: '628999', sessionId: 's1' }]);
+      await Promise.all([
+        store.remember('222', '628999', 's2'),
+        store.remember('901', '628001', 's2'),
+        store.remember('902', '628002', 's2'),
+        store.remember('903', '628003', 's2'),
+      ]);
+      await settle();
+
+      expect(reports).toEqual([expect.objectContaining({ phone: '628999', previousLid: '111', newLid: '222' })]);
+    } finally {
+      if (saved === undefined) delete process.env.LID_MAPPING_CACHE_MAX;
+      else process.env.LID_MAPPING_CACHE_MAX = saved;
+    }
+  });
+
+  it('reports an earlier lid whose own report from outside the cache fails while the new lid is checked', async () => {
+    const { repo, store, reports } = await watched([{ lid: '111', phone: '628999', sessionId: 's1' }]);
+    // Out of the cache, as the LRU leaves a row of a table larger than the cap.
+    const internals = store as unknown as { lidToPhone: Map<string, string>; phoneToLids: Map<string, Set<string>> };
+    internals.lidToPhone.delete('111');
+    internals.phoneToLids.delete('628999');
+    let fail: (err: Error) => void = () => undefined;
+    repo.upsert.mockImplementationOnce(() => new Promise((_resolve, reject) => (fail = reject)));
+
+    const earlier = store.remember('111', '628999', 's1'); // counts as new, held open
+    await store.remember('222', '628999', 's2');
+    await settle();
+    fail(new Error('Connection terminated unexpectedly'));
+    await expect(earlier).resolves.toBe(false);
+    await settle();
+
+    expect(reports).toEqual([expect.objectContaining({ phone: '628999', previousLid: '111', newLid: '222' })]);
+  });
+
+  it('reports a pair once when a lid checked again after a failed read finds it reported', async () => {
+    const { repo, store, reports } = await watched();
+    repo.find.mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
+
+    await store.remember('111', '628999', 's1'); // its check's read fails: owed again
+    await settle();
+    await store.remember('222', '628999', 's2');
+    await settle();
+    await store.remember('111', '628999', 's1'); // lands and runs 111's owed check
+    await settle();
+
+    expect(reports.map(report => `${report.previousLid}>${report.newLid}`)).toEqual(['111>222']);
+  });
+
+  it('names no pair for a phone its lid left again within the window', async () => {
+    const { store, reports } = await watched([{ lid: '111', phone: '628999' }]);
+
+    await store.remember('222', '628999', 's2');
+    await store.remember('222', '628888', 's2');
+    await settle();
+
+    expect(reports).toEqual([]);
+  });
+
+  it('reports a pair again once the time it is remembered for has passed', async () => {
+    const { store, reports } = await watched([{ lid: '111', phone: '628999' }]);
+    let clock = 0;
+    (store as unknown as { now: () => number }).now = () => clock;
+
+    await store.remember('222', '628999', 's2');
+    await settle();
+    await store.remember('222', '628888', 's2'); // the lid moves away and back: a change each time
+    await store.remember('222', '628999', 's2');
+    await settle();
+    expect(reports).toHaveLength(1);
+
+    clock += 10 * 60_000;
+    await store.remember('222', '628888', 's2');
+    await store.remember('222', '628999', 's2');
+    await settle();
+    expect(reports).toHaveLength(2);
+  });
+
+  const capLines = (warn: jest.SpyInstance) =>
+    warn.mock.calls.map(call => String((call as unknown[])[0])).filter(line => line.includes('second-lid'));
+
+  // A first link or history sync starts every write at once: their checks wait on the writes, not on the cap.
+  it('checks every lid of a sync larger than the cap of owed checks and logs no drop', async () => {
+    const { store, reports, warn } = await watched([{ lid: '111', phone: '628999' }]);
+
+    await Promise.all([
+      store.remember('222', '628999', 's2'),
+      ...Array.from({ length: 10_001 }, (_, i) => store.remember(`5${i}`, `62700${i}`, 's1')),
+    ]);
+    await settle();
+
+    expect(reports).toEqual([expect.objectContaining({ phone: '628999', previousLid: '111', newLid: '222' })]);
+    expect(capLines(warn)).toEqual([]);
+  });
+
+  // The same sync reports every lid twice, and the second statement fails (SQLITE_BUSY) before the first lands.
+  it('owes no check and logs no drop while the first write of each lid of such a sync is in flight', async () => {
+    const saved = process.env.LID_MAPPING_CACHE_MAX;
+    process.env.LID_MAPPING_CACHE_MAX = '0'; // every lid stays cached, so the second report is not new
+    try {
+      const { repo, store, reports, warn } = await watched([{ lid: '111', phone: '628999' }]);
+      const upsert = repo.upsert.getMockImplementation() as (values: Partial<LidMapping>) => Promise<object>;
+      const land: Array<() => void> = [];
+      repo.upsert.mockImplementation(
+        (values: Partial<LidMapping>) => new Promise(resolve => land.push(() => resolve(upsert(values)))),
+      );
+      const lids = ['222', ...Array.from({ length: 10_001 }, (_, i) => `5${i}`)];
+      const phoneOf = (lid: string) => (lid === '222' ? '628999' : `62700${lid}`);
+      const firsts = lids.map(lid => store.remember(lid, phoneOf(lid), 's2'));
+      repo.upsert.mockRejectedValue(new Error('SQLITE_BUSY'));
+      await Promise.all(lids.map(lid => store.remember(lid, phoneOf(lid), 's2')));
+      const owedInFlight = owedChecks(store).size;
+      land.forEach(write => write());
+      await Promise.all(firsts);
+      await until(() => reports.length > 0);
+
+      expect(owedInFlight).toBe(0);
+      expect(reports).toEqual([expect.objectContaining({ phone: '628999', previousLid: '111', newLid: '222' })]);
+      expect(capLines(warn)).toEqual([]);
+      expect(owedChecks(store).size).toBe(0);
+    } finally {
+      if (saved === undefined) delete process.env.LID_MAPPING_CACHE_MAX;
+      else process.env.LID_MAPPING_CACHE_MAX = saved;
+    }
+  });
+
+  it('keeps at most its cap of owed checks and logs a drop at most once a minute, with a count', async () => {
+    const { repo, store, warn } = await watched();
+    let clock = 0;
+    (store as unknown as { now: () => number }).now = () => clock;
+    repo.upsert.mockRejectedValue(new Error('SQLITE_BUSY'));
+
+    await Promise.all(Array.from({ length: 10_002 }, (_, i) => store.remember(`5${i}`, `62700${i}`, 's1')));
+    expect((store as unknown as { secondLidOwed: Map<string, unknown> }).secondLidOwed.size).toBe(10_000);
+    expect(capLines(warn)).toHaveLength(1);
+
+    clock += 60_000;
+    await store.remember('6', '62701', 's1');
+
+    expect(capLines(warn)).toEqual([
+      'More than 10000 second-lid checks are owed; dropping the oldest',
+      'More than 10000 second-lid checks are owed; dropping the oldest (1 more dropped since the last warning)',
+    ]);
+  });
+
+  // The data source closes when the gateway stops; a check still waiting must not query it or warn.
+  it('neither reads nor warns once the data source is closed', async () => {
+    const dataSource = { isInitialized: true };
+    const repo = Object.assign(makeFakeRepo([{ lid: '111', phone: '628999' }]), { manager: { dataSource } });
+    const { store, reports, warn } = await watched([], repo);
+
+    await store.remember('222', '628999', 's2');
+    dataSource.isInitialized = false;
+    await settle();
+
+    expect(phoneReads(repo)).toBe(0);
+    expect(reports).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('checks again on the next landed write after its table read failed', async () => {
+    const { repo, store, reports } = await watched([{ lid: '111', phone: '628999' }]);
+    repo.find.mockRejectedValueOnce(new Error('connection reset'));
+
+    await store.remember('222', '628999', 's2');
+    await settle();
+    expect(reports).toEqual([]);
+    await store.remember('222', '628999', 's3');
+    await settle();
+
+    expect(reports).toEqual([expect.objectContaining({ previousLid: '111', newLid: '222', sessionId: 's2' })]);
+  });
+
+  /** Hold every phone-keyed read open, or fail the one naming `phone`; the others read the fake table. */
+  function holdPhoneReads(repo: ReturnType<typeof makeFakeRepo>, phone?: string) {
+    const read = repo.find.getMockImplementation() as (options?: { where?: { phone?: Cond } }) => Promise<unknown>;
+    const fail: Array<(err: Error) => void> = [];
+    repo.find.mockImplementation((options?: { where?: { phone?: Cond } }) => {
+      const asked = options?.where?.phone;
+      if (!(asked instanceof FindOperator) || (phone && !(asked.value as unknown[]).includes(phone)))
+        return read(options);
+      return new Promise((_resolve, reject) => fail.push(reject));
+    });
+    return { read, fail };
+  }
+
+  // The new number's write and the current number's check read fail in one database hiccup; the mapping cache then
+  // drops the lid and reads it back from the table at the number it was checked for.
+  it('checks a lid again when the cache reads it back to the number whose check read failed', async () => {
+    const saved = process.env.LID_MAPPING_CACHE_MAX;
+    process.env.LID_MAPPING_CACHE_MAX = '3';
+    try {
+      const { repo, store, reports } = await watched([{ lid: '333', phone: '628777', sessionId: 's1' }]);
+      const { read, fail } = holdPhoneReads(repo);
+
+      await store.remember('222', '628777', 's2'); // lands; its check's read is held open
+      await until(() => fail.length > 0);
+      repo.upsert.mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
+      await expect(store.remember('222', '628111', 's2')).resolves.toBe(false);
+      fail[0](new Error('Connection terminated unexpectedly'));
+      repo.find.mockImplementation(read);
+      for (const lid of ['901', '902', '903']) await store.remember(lid, `62800${lid}`, 's2');
+      expect(store.getCached('222')).toBeUndefined(); // the miss reads the row back
+      await until(() => store.getCached('222') === '628777');
+      await expect(store.remember('222', '628777', 's2')).resolves.toBe(true);
+      await until(() => reports.length > 0);
+
+      expect(repo.rows.filter(row => row.phone === '628777').map(row => row.lid)).toEqual(['333', '222']);
+      expect(reports).toEqual([{ phone: '628777', previousLid: '333', newLid: '222', sessionId: 's2' }]);
+    } finally {
+      if (saved === undefined) delete process.env.LID_MAPPING_CACHE_MAX;
+      else process.env.LID_MAPPING_CACHE_MAX = saved;
+    }
+  });
+
+  // The lid's holder changed number while its earlier check was read, and one database hiccup failed both
+  // that read and the write of the new number.
+  it('keeps a newer owed check of a lid over the one whose read failed', async () => {
+    const { repo, store, reports } = await watched([{ lid: '333', phone: '628777', sessionId: 's1' }]);
+    const { fail } = holdPhoneReads(repo, '628111');
+
+    await store.remember('222', '628111', 's2'); // lands; its check's read is held open
+    await settle();
+    repo.upsert.mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
+    await expect(store.remember('222', '628777', 's2')).resolves.toBe(false);
+    fail[0](new Error('Connection terminated unexpectedly'));
+    await settle();
+    await expect(store.remember('222', '628777', 's2')).resolves.toBe(true);
+    await settle();
+
+    expect(repo.rows.filter(row => row.phone === '628777').map(row => row.lid)).toEqual(['333', '222']);
+    expect(reports).toEqual([{ phone: '628777', previousLid: '333', newLid: '222', sessionId: 's2' }]);
+  });
+
+  it('checks the newer number of a lid again when both its reads fail, the older first', async () => {
+    const { repo, store, reports } = await watched([{ lid: '333', phone: '628777', sessionId: 's1' }]);
+    const { read, fail } = holdPhoneReads(repo);
+
+    await store.remember('222', '628111', 's2'); // lands; read held open
+    await settle();
+    await store.remember('222', '628777', 's2'); // the number changed: lands; read held open
+    await settle();
+    fail[0](new Error('connection reset')); // the older read fails first
+    await settle();
+    fail[1](new Error('connection reset'));
+    await settle();
+    repo.find.mockImplementation(read);
+    await store.remember('222', '628777', 's2');
+    await settle();
+
+    expect(reports).toEqual([{ phone: '628777', previousLid: '333', newLid: '222', sessionId: 's2' }]);
+  });
+
+  // A history and a contact sync report one new pairing together; the first write lands and its check's read fails
+  // while the second write still waits on the database.
+  it('checks a new lid when an overlapping write of it lands after its table read failed', async () => {
+    const { repo, store, reports } = await watched([{ lid: '111', phone: '628999', sessionId: 's1' }]);
+    const { read, fail } = holdPhoneReads(repo);
+    const upsert = repo.upsert.getMockImplementation() as (values: Partial<LidMapping>) => Promise<object>;
+    let land: () => void = () => undefined;
+
+    const first = store.remember('222', '628999', 's2'); // lands at once
+    repo.upsert.mockImplementationOnce(
+      (values: Partial<LidMapping>) => new Promise(resolve => (land = () => resolve(upsert(values)))),
+    );
+    const second = store.remember('222', '628999', 's2'); // the same pairing again, held open
+    await expect(first).resolves.toBe(true);
+    await until(() => fail.length > 0);
+    fail[0](new Error('connection reset'));
+    await until(() => owedChecks(store).has('222'));
+    repo.find.mockImplementation(read);
+    land();
+    await expect(second).resolves.toBe(true);
+    await until(() => reports.length > 0);
+
+    expect(reports).toEqual([{ phone: '628999', previousLid: '111', newLid: '222', sessionId: 's2' }]);
+    expect(owedChecks(store).size).toBe(0);
+  });
+
+  it('logs a failed read at most once a minute, with a count', async () => {
+    const { repo, store, warn } = await watched([{ lid: '111', phone: '628999' }]);
+    let clock = 0;
+    (store as unknown as { now: () => number }).now = () => clock;
+    repo.find.mockRejectedValue(new Error('connection reset'));
+
+    await store.remember('222', '628999', 's2');
+    await settle();
+    await store.remember('333', '628999', 's2');
+    await settle();
+    clock += 60_000;
+    await store.remember('444', '628999', 's2');
+    await settle();
+
+    expect(warn.mock.calls.map(call => String((call as unknown[])[0]))).toEqual([
+      'Could not check for a second lid: connection reset',
+      'Could not check for a second lid: connection reset (1 more failed since the last warning)',
+    ]);
+  });
+
+  it('stays silent about a read the closing data source cut off', async () => {
+    const dataSource = { isInitialized: true };
+    const repo = Object.assign(makeFakeRepo([{ lid: '111', phone: '628999' }]), { manager: { dataSource } });
+    const { store, warn } = await watched([], repo);
+    repo.find.mockImplementationOnce(() => {
+      dataSource.isInitialized = false;
+      return Promise.reject(new Error('Connection terminated'));
+    });
+
+    await store.remember('222', '628999', 's2');
+    await settle();
+    await settle();
+
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('reports a new lid once when two sessions report it while the first write is in flight', async () => {
+    const { repo, store, reports } = await watched([{ lid: '111', phone: '628999' }]);
+    let release: () => void = () => undefined;
+    repo.upsert.mockImplementationOnce((values: Partial<LidMapping>) => {
+      repo.rows.push(values as LidMapping);
+      return new Promise<object>(resolve => (release = () => resolve({})));
+    });
+    const first = store.remember('222', '628999', 's2');
+    await store.remember('222', '628999', 's3');
+    await settle();
+    release();
+    await first;
+    await settle();
+
+    expect(reports).toEqual([expect.objectContaining({ previousLid: '111', newLid: '222' })]);
+  });
+
+  it('names no earlier lid whose own write never reached the table', async () => {
+    const { repo, store, reports } = await watched();
+    let fail: (err: Error) => void = () => undefined;
+    repo.upsert.mockImplementationOnce(() => new Promise((_resolve, reject) => (fail = reject)));
+    const first = store.remember('111', '628999', 's1'); // held open
+    await store.remember('222', '628999', 's2');
+    await settle();
+    fail(new Error('disk full'));
+    await expect(first).resolves.toBe(false);
+    await settle();
+
+    expect(repo.rows.filter(row => row.phone === '628999').map(row => row.lid)).toEqual(['222']);
+    expect(reports).toEqual([]);
+  });
+
+  it('logs a table read that fails and keeps the write', async () => {
+    const { repo, store, reports, warn } = await watched([{ lid: '111', phone: '628999' }]);
+    repo.find.mockRejectedValueOnce(new Error('connection reset'));
+
+    await expect(store.remember('222', '628999', 's2')).resolves.toBe(true);
+    await settle();
+
+    expect(reports).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('connection reset'));
+    expect(store.getCached('222')).toBe('628999');
+  });
+});
+
+describe('LidMappingStoreService: second-lid checks on a real table', () => {
+  // SQLite in memory; on PostgreSQL (DATABASE_TYPE=postgres) a schema of its own, where writes land over time.
+  const pg = process.env.DATABASE_TYPE === 'postgres';
+  const server = {
+    type: 'postgres' as const,
+    host: process.env.DATABASE_HOST || 'localhost',
+    port: Number(process.env.DATABASE_PORT || 5432),
+    username: process.env.DATABASE_USERNAME || 'openwa',
+    password: process.env.DATABASE_PASSWORD || 'openwa',
+    database: process.env.DATABASE_NAME || 'openwa',
+  };
+  const saved = process.env.LID_MAPPING_CACHE_MAX;
+  let ds: DataSource;
+  let schema = '';
+  const onServer = async (sql: string): Promise<void> => {
+    const admin = await new DataSource(server).initialize();
+    await admin.query(sql).finally(() => admin.destroy());
+  };
+
+  beforeEach(async () => {
+    const entities = [LidMapping, Session];
+    if (pg) {
+      schema = `lid_second_${randomUUID().replace(/-/g, '')}`;
+      await onServer(`CREATE SCHEMA "${schema}"`);
+    }
+    ds = await new DataSource(
+      pg
+        ? { ...server, schema, extra: { options: `-c search_path=${schema},public` }, entities, synchronize: true }
+        : { type: 'better-sqlite3', database: ':memory:', entities, synchronize: true },
+    ).initialize();
+  });
+
+  afterEach(async () => {
+    await ds.destroy();
+    if (pg) await onServer(`DROP SCHEMA "${schema}" CASCADE`);
+    if (saved === undefined) delete process.env.LID_MAPPING_CACHE_MAX;
+    else process.env.LID_MAPPING_CACHE_MAX = saved;
+  });
+
+  async function storeOn(cap?: number) {
+    if (cap !== undefined) process.env.LID_MAPPING_CACHE_MAX = String(cap);
+    const repo = ds.getRepository(LidMapping);
+    const store = new LidMappingStoreService(repo);
+    await store.onModuleInit();
+    const warn = jest
+      .spyOn((store as unknown as { logger: { warn: () => void } }).logger, 'warn')
+      .mockImplementation(() => undefined);
+    const reports: { phone: string; previousLid: string; newLid: string }[] = [];
+    store.onSecondLid(report => void reports.push(report));
+    const find = jest.spyOn(repo, 'find');
+    const reads = () =>
+      find.mock.calls.filter(([options]) => (options as { where?: { phone?: unknown } } | undefined)?.where?.phone)
+        .length;
+    return { repo, store, reports, reads, warn, find };
+  }
+
+  /** One sync: every report started together, as addLidMappings does; then its checks have run. */
+  async function sync(store: LidMappingStoreService, pairs: string[][], find: jest.SpyInstance): Promise<void> {
+    await Promise.all(pairs.map(([lid, phone]) => store.remember(lid, phone, 's1')));
+    while ((store as unknown as { secondLidTimer?: unknown }).secondLidTimer !== undefined) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    for (let seen = -1; seen !== find.mock.results.length;) {
+      seen = find.mock.results.length;
+      await Promise.allSettled(find.mock.results.map(result => result.value as unknown));
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  }
+
+  const singles = Array.from({ length: 600 }, (_, i) => [`9${i}`, `62811${i}`]);
+  const earlier = Array.from({ length: 10 }, (_, i) => [`7${i}`, `62899${i}`]);
+  const later = Array.from({ length: 10 }, (_, i) => [`8${i}`, `62899${i}`]);
+  const pairsOf = (reports: { phone: string; previousLid: string; newLid: string }[]) =>
+    reports.map(({ phone, previousLid, newLid }) => `${phone}:${[previousLid, newLid].sort().join('|')}`).sort();
+  const numbers = earlier.map(([lid, phone], i) => `${phone}:${lid}|${later[i][0]}`).sort();
+
+  it('reports each number whose two lids arrive in one sync once', async () => {
+    const { store, reports, reads, warn, find } = await storeOn();
+
+    await sync(store, [...earlier, ...singles, ...later], find);
+
+    expect(pairsOf(reports)).toEqual(numbers);
+    expect(reads()).toBeLessThan(singles.length / 10); // collected over a window; one turn read about 300 times
+    expect(warn).toHaveBeenCalledTimes(reports.length);
+  });
+
+  // A window shorter than the sync splits its checks across reads, so a lid's check can find the other lid
+  // of its number before that lid's own check has run.
+  it('reports each such number once when the checks split across reads', async () => {
+    const { store, reports, find } = await storeOn();
+    (store as unknown as { secondLidWindowMs: number }).secondLidWindowMs = 1;
+
+    await sync(store, [...earlier, ...singles, ...later], find);
+
+    expect(pairsOf(reports)).toEqual(numbers);
+  });
+
+  // The new holder's lid arrives early in the first sync of their account, which holds more lids than the cache.
+  it('reports a new lid that the rest of a sync larger than the cache pushes out of it', async () => {
+    const { repo } = await storeOn();
+    await repo.insert(earlier.map(([lid, phone]) => ({ lid, phone, isReported: true })));
+    const { store, reports, find } = await storeOn(100);
+
+    await sync(store, [...later, ...singles], find);
+
+    expect(reports.map(({ phone, previousLid, newLid }) => `${phone}:${previousLid}|${newLid}`).sort()).toEqual(
+      numbers,
+    );
+  });
+
+  it('reports each held pair once when a sync replays it from outside a small mapping cache', async () => {
+    const { repo } = await storeOn();
+    const rows = [...singles, ...earlier, ...later].map(([lid, phone]) => ({ lid, phone, isReported: true }));
+    for (let i = 0; i < rows.length; i += 200) await repo.insert(rows.slice(i, i + 200));
+    const { store, reports, find } = await storeOn(100);
+
+    await sync(store, [...earlier, ...singles, ...later], find);
+
+    expect(pairsOf(reports)).toEqual(numbers);
+  });
+
+  // A PostgreSQL pool can commit two writes of one lid out of the order they were issued (one waits for a fresh
+  // connection while the other takes an idle one). Here the older write is issued once the newer has committed,
+  // and both return to the store after that, the newer first.
+  it('checks the newer number of a lid whose older write commits after it', async () => {
+    const { repo } = await storeOn();
+    await repo.insert([
+      { lid: '333', phone: '628777', isReported: true },
+      { lid: '444', phone: '628888', isReported: true },
+    ]);
+    const { store, reports, find } = await storeOn();
+    const upsert = repo.upsert.bind(repo);
+    let issueOlder: () => void = () => undefined;
+    let returnOlder: () => void = () => undefined;
+    const issued = new Promise<void>(resolve => (issueOlder = resolve));
+    const returned = new Promise<void>(resolve => (returnOlder = resolve));
+    let olderStored: Promise<unknown> = Promise.resolve();
+    jest
+      .spyOn(repo, 'upsert')
+      .mockImplementationOnce((entity, options) => {
+        const stored = issued.then(() => upsert(entity, options));
+        olderStored = stored;
+        return stored.then(result => returned.then(() => result));
+      })
+      .mockImplementationOnce(async (entity, options) => {
+        const result = await upsert(entity, options);
+        issueOlder();
+        await olderStored;
+        return result;
+      });
+
+    const older = store.remember('222', '628777', 's1');
+    await expect(store.remember('222', '628888', 's1')).resolves.toBe(true);
+    returnOlder();
+    await expect(older).resolves.toBe(true);
+    await sync(store, [], find);
+    expect((await repo.findOneBy({ lid: '222' }))?.phone).toBe('628777');
+
+    await sync(store, [['222', '628888']], find); // the next report of the number this node holds
+    expect((await repo.findOneBy({ lid: '222' }))?.phone).toBe('628888');
+    expect(pairsOf(reports)).toEqual(['628777:222|333', '628888:222|444']);
+  });
+
+  it('checks nothing when a sync replays pairs the mapping cache holds', async () => {
+    const { repo } = await storeOn();
+    const rows = [...singles, ...earlier, ...later].map(([lid, phone]) => ({ lid, phone, isReported: true }));
+    for (let i = 0; i < rows.length; i += 200) await repo.insert(rows.slice(i, i + 200));
+    const { store, reports, reads, find } = await storeOn(5000);
+
+    await sync(store, [...earlier, ...singles, ...later], find);
+
+    expect(reads()).toBe(0);
+    expect(reports).toEqual([]);
+  });
+});

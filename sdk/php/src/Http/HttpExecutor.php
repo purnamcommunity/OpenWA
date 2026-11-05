@@ -11,6 +11,7 @@ use GuzzleHttp\Exception\NetworkTimeoutException;
 use GuzzleHttp\Exception\RequestException;
 use GuzzleHttp\Exception\ResponseException;
 use GuzzleHttp\Exception\ResponseTimeoutException;
+use GuzzleHttp\Psr7\Request;
 use OpenWA\Exceptions\OpenWAApiException;
 use OpenWA\Exceptions\OpenWAException;
 use OpenWA\Exceptions\OpenWATimeoutException;
@@ -236,6 +237,14 @@ class HttpExecutor
         if (!str_starts_with($path, '/')) {
             throw new \InvalidArgumentException('OpenWA: path must begin with "/": ' . $path);
         }
+        $rawPath = explode('#', explode('?', $path, 2)[0], 2)[0];
+        // Decoded before it is split: a proxy that decodes %2F before it resolves dot segments reads an id sent as
+        // "..%2Fx" as "../x" and sends the call to another route.
+        foreach (explode('/', str_replace('\\', '/', rawurldecode($rawPath))) as $seg) {
+            if ($seg === '.' || $seg === '..') {
+                throw new \InvalidArgumentException('OpenWA: path must not contain a dot path segment: ' . $path);
+            }
+        }
         // Auth/JSON headers are applied per-request so they are correct whether
         // a default or injected client is used (and never leak Guzzle exceptions:
         // http_errors disabled so we translate status into typed SDK exceptions).
@@ -313,6 +322,18 @@ class HttpExecutor
         // a success.
         if ($status < 200 || $status >= 300) {
             throw $this->buildApiException($response, $method, $path);
+        }
+        // Guzzle 7's stream handler returns a body cut before its Content-Length as if it were whole, where cURL
+        // and Guzzle 8 raise a TransferException, so raise one too. A HEAD or 204 answer carries no body; every
+        // handler drops the Content-Length of a body it decoded (gzip), so that one is not compared either.
+        $declared = $response->getHeaderLine('Content-Length');
+        $size = $response->getBody()->getSize();
+        if ($method !== 'HEAD' && $status !== 204 && $size !== null && preg_match('/\A\d+\z/', $declared) === 1
+            && $size < (int) $declared) {
+            throw new RequestException(
+                sprintf('OpenWA: %s %s: the response ended after %d of %s bytes', $method, $path, $size, $declared),
+                new Request($method, $url)
+            );
         }
         return $response;
     }

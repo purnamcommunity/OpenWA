@@ -17,7 +17,7 @@ export class SetOwnPresenceDto {
 export class SubscribePresenceDto {
   @ApiProperty({
     maxLength: CHAT_ID_MAX_LENGTH,
-    description: "Chat ID in the active engine's native format (e.g. 1234567890@c.us on whatsapp-web.js)",
+    description: 'Chat ID in the neutral form the gateway returns, on either engine (e.g. 1234567890@c.us)',
     example: '1234567890@c.us',
   })
   @ToStrictString()

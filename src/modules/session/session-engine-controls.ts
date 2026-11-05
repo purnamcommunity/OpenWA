@@ -26,6 +26,7 @@ import { awaitNoOpenTransaction } from '../../common/utils/shared-connection';
 import { EngineFactory } from '../../engine/engine.factory';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { SessionErrorStore } from './session-error-store.service';
 import { SessionRestrictionStore } from './session-restriction-store.service';
 import { PresenceStore } from './presence-store.service';
@@ -196,7 +197,7 @@ export interface SessionEngineControlsHost {
   /** True once shutdown() has begun; the lifecycle never reopens. */
   isClosed(): boolean;
   stoppingSessions: StopMarks;
-  /** The engine each operator-initiated teardown is retiring; see the lifecycle field of the same name. */
+  /** The engine each teardown that writes its own status is retiring; see the lifecycle field of the same name. */
   operatorTeardowns: Map<string, IWhatsAppEngine>;
   reconnectStates: Map<string, ReconnectState>;
   stuckAuthRecoveryUsed: Set<string>;
@@ -370,6 +371,11 @@ export class SessionEngineControls {
       // initializingSessions reservation added synchronously at start() entry: its finally removes it
       // again, so a refused start does not leave a false "already starting" mark behind (briefly held).
       await this.fences.awaitPendingTeardown(session.name);
+      // A reconnect waiting on the same teardown resumes first and launches its engine; launching another over
+      // it would push it out of the registry while it runs. Refused before anything below is touched.
+      if (this.engines.has(id)) {
+        throw new BadRequestException('Session is already started');
+      }
 
       // A delete still running outranks every start, however long it has run: the mark it set is not a
       // stale one, and clearing it below would let an engine start under the delete that is removing the
@@ -557,18 +563,15 @@ export class SessionEngineControls {
   }
 
   /**
-   * Tears down the engine a start registered for a session that was stopped or deleted meanwhile, and drops
-   * the reconnect state it armed for it.
+   * Tears down the engine a start registered for a session that was stopped or deleted meanwhile, or whose
+   * claim this node lost, and drops the reconnect state it armed for it.
    */
   private async reapRetiredEngine(
     id: string,
     resurrected: IWhatsAppEngine | undefined,
     reconnectState?: ReconnectState,
   ): Promise<void> {
-    if (resurrected && this.engines.isLive(id, resurrected)) {
-      await this.fences.destroyWithEscalation(id, resurrected);
-      this.engines.deleteIfLive(id, resurrected);
-    }
+    if (resurrected) await this.retireLaunchedEngine(id, resurrected);
     // The reconnect state this start armed up front serves no engine now, and the stop or delete that retired it
     // may have run before the state was armed, so nothing else would drop it. A replacement engine that
     // registered meanwhile keeps its own.
@@ -578,6 +581,41 @@ export class SessionEngineControls {
     // A delete() that raced this start purged the on-disk auth dirs BEFORE this init re-created them, so
     // purge again: the window then leaves no credential residue behind (no-op for a stop()).
     await this.host.purgeAuthDirsIfDeleted(id);
+  }
+
+  /**
+   * Tear down the engine a start or a reconnect registered for a session retired while it initialized: a
+   * stop, a delete, or a claim this node no longer holds. The read that found the claim gone is newer than
+   * the in-memory ownership the engine callbacks are fenced on, so the engine's own DISCONNECTED report is
+   * held back like an operator teardown's, and the status is written instead only on a row that is still
+   * this node's or has no owner: a peer's row keeps the status its own engine gave it (INV-6).
+   */
+  async retireLaunchedEngine(id: string, engine: IWhatsAppEngine): Promise<void> {
+    if (!this.engines.isLive(id, engine)) return;
+    this.operatorTeardowns.set(id, engine);
+    try {
+      await this.fences.destroyWithEscalation(id, engine);
+      this.engines.deleteIfLive(id, engine);
+    } finally {
+      if (this.operatorTeardowns.get(id) === engine) this.operatorTeardowns.delete(id);
+    }
+    const nodeId = this.host.nodeId;
+    const ours =
+      nodeId === undefined
+        ? { id }
+        : [
+            { id, nodeId },
+            { id, nodeId: IsNull() },
+          ];
+    try {
+      const { affected } = await this.sessionRepository.update(ours, { status: SessionStatus.DISCONNECTED });
+      if (affected) this.broadcaster.announce(id, SessionStatus.DISCONNECTED);
+    } catch (error) {
+      this.logger.warn('Failed to persist the disconnected status of a retired launch', {
+        sessionId: id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async stop(id: string, hooks: StopHooks = {}): Promise<Session> {
@@ -676,7 +714,9 @@ export class SessionEngineControls {
    * Throws a retryable BadGatewayException (502) carrying a stable `code: 'SESSION_LOGOUT_INCOMPLETE'`
    * when an accepted engine-backed attempt stopped locally but the unlink operation did NOT complete
    * — no identity/no send, no IQ acknowledgement, timeout/transport error, OR local credential
-   * cleanup failure. After EVERY engine-backed attempt (200 OR 502) the session is torn down locally
+   * cleanup failure. A Baileys session with no linked device has nothing to unlink, so its engine refuses
+   * with EngineNotReadyError, answered as that 409 after the same local teardown rather than as a 502
+   * whose retry could only repeat. After EVERY engine-backed attempt (200, 409 OR 502) the session is torn down locally
    * (map reconciled, status DISCONNECTED) and `phone` is cleared so the boot auto-start does not
    * resurrect the session into an uncertain/invalid credential state. No success audit is written on
    * the 502 path (the controller audits SESSION_LOGGED_OUT only after the service resolves). The
@@ -702,6 +742,20 @@ export class SessionEngineControls {
     // Announced by the write below rather than from the engine callback, as in stop().
     this.operatorTeardowns.set(id, engine);
     let unlinked: boolean;
+    // The teardown helper keeps only whether the call settled; the engine's refusal of a session with no
+    // linked device is kept here so it can answer instead of the 502.
+    let neverLinked: EngineNotReadyError | undefined;
+    let releaseTeardown!: () => void;
+    let teardownLaunched = false;
+    // Register in pendingTeardowns synchronously before yielding on awaitInitialStatus so a
+    // concurrent delete() that evicts engine while awaitInitialStatus is suspended still observes
+    // this logout at Fence #2.
+    this.fences.trackPendingCredentialTeardown(
+      session.name,
+      new Promise<void>(resolve => {
+        releaseTeardown = resolve;
+      }),
+    );
     try {
       // Await THIS engine's in-flight INITIALIZING write before teardown / the final DISCONNECTED
       // write so a delayed pre-initialize status update can never settle after the retirement.
@@ -709,7 +763,21 @@ export class SessionEngineControls {
       // The credential fence is keyed by session NAME (see awaitPendingTeardown). Captured immutably
       // here so a raw logout that outlives its deadline race is tracked under the right name even if
       // the row is later deleted/recreated.
-      unlinked = await this.fences.teardownEngineSafely(id, engine, e => e.logout(), 'logout', session.name);
+      unlinked = await this.fences.teardownEngineSafely(
+        id,
+        engine,
+        e => {
+          const raw = e.logout().catch((error: unknown) => {
+            if (error instanceof EngineNotReadyError) neverLinked = error;
+            throw error;
+          });
+          teardownLaunched = true;
+          void raw.then(releaseTeardown, releaseTeardown);
+          return raw;
+        },
+        'logout',
+        session.name,
+      );
       this.engines.deleteIfLive(id, engine);
       // Clear `phone` AFTER the attempt, whatever its outcome, to take the session out of the boot
       // auto-start query (phone IS NOT NULL). A completed engine-backed unlink wipes the stored
@@ -720,11 +788,15 @@ export class SessionEngineControls {
       await this.sessionRepository.update(id, { phone: null });
       await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
     } finally {
+      if (!teardownLaunched) {
+        releaseTeardown();
+      }
       if (this.operatorTeardowns.get(id) === engine) {
         this.operatorTeardowns.delete(id);
       }
     }
 
+    if (neverLinked) throw neverLinked;
     if (!unlinked) {
       this.logger.warn(`Session stopped locally but the logout operation did not complete: ${session.name}`, {
         sessionId: id,

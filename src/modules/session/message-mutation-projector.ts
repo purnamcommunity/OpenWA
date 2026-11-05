@@ -26,6 +26,8 @@ export class MessageMutationProjector {
     // Told of each row the marker below lands on.
     private readonly onMarkedEdited: (sessionId: string, waMessageId: string) => void = () => undefined,
     private readonly resolveLid?: (jid: string) => Promise<string | null>,
+    // Told of each row whose text an edit changed, once its marker is written. Must not reject.
+    private readonly onTextChanged: (sessionId: string, waMessageId: string) => Promise<void> = () => Promise.resolve(),
   ) {}
 
   /**
@@ -154,6 +156,7 @@ export class MessageMutationProjector {
       });
       return;
     }
+    let revoked = false;
     try {
       // Never onto a revoked row: a late edit must not bring back text the sender deleted. An event that repeats the
       // stored text is no edit, and the marker would label an unedited message. The write compares, not the read
@@ -162,10 +165,25 @@ export class MessageMutationProjector {
         { sessionId: id, waMessageId: message.messageId, type: Not('revoked'), body: Or(Not(message.body), IsNull()) },
         { body: message.body },
       );
-      if (result.affected) await this.markMessageEdited(id, message.messageId);
+      if (result.affected) {
+        await this.markMessageEdited(id, message.messageId);
+        await this.onTextChanged(id, message.messageId);
+      } else {
+        // Nor announced onto one: the payload carries the new text of a message that was deleted, for everyone or,
+        // through the REST delete, for this account only (which announced nothing). Asked only when the write changed
+        // nothing, so an ordinary edit costs no extra read. A revoke that lands between the write and this read (a
+        // history tombstone or a row stored deleted is written off this chain) makes it read revoked, which is right:
+        // the message is deleted by then.
+        revoked =
+          (await this.messageRepository.findOne({
+            where: { sessionId: id, waMessageId: message.messageId, type: 'revoked' },
+            select: { id: true },
+          })) !== null;
+      }
     } catch (err) {
       this.logger.error(`Failed to update edited message: ${message.messageId}`, String(err));
     }
+    if (revoked) return;
 
     const editedPayload = message as unknown as Record<string, unknown>;
     this.eventsGateway.emitMessageEdited(id, editedPayload);
@@ -207,8 +225,14 @@ export class MessageMutationProjector {
             });
             return;
           }
-          await this.messageRepository.update({ sessionId, waMessageId: messageId, type: Not('revoked') }, { body });
+          // Compared in the write, as applyMessageEdit does: the engine's own echo of this edit reaches the row
+          // too, and only the writer that changed the text reports it.
+          const result = await this.messageRepository.update(
+            { sessionId, waMessageId: messageId, type: Not('revoked'), body: Or(Not(body), IsNull()) },
+            { body },
+          );
           await this.markMessageEdited(sessionId, messageId);
+          if (result?.affected) await this.onTextChanged(sessionId, messageId);
         } catch (err) {
           this.logger.warn(`Failed to update stored body of edited message ${messageId}`, { error: String(err) });
         } finally {

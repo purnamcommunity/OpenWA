@@ -321,3 +321,40 @@ test('a Dockerfile with no COPY source fails instead of passing for lack of inpu
   assert.equal(run.status, 1, run.out);
   assert.match(run.out, /COPY/);
 });
+
+// Docker anchors the bare name of a rule at the context root: `node_modules/` keeps out the top-level tree only.
+// Each path is a tree a checkout grows below the root (an SDK's install or build, a coverage run, a compiler
+// cache), or the media directory an install from 0.2.0 to 0.7.3 may still write.
+const BELOW_ROOT = {
+  '**/node_modules/': 'scripts/node_modules/zx/package.json',
+  'sdk/': 'sdk/javascript/dist/cjs/index.js',
+  '**/*.tsbuildinfo': 'dashboard/tsconfig.app.tsbuildinfo',
+  '**/coverage/': 'dashboard/coverage/lcov.info',
+  'uploads/': 'uploads/s1/2026/10/photo.jpg',
+};
+
+test('trees below the root and the legacy uploads directory stay out of the context', () => {
+  const rules = Object.keys(BELOW_ROOT);
+  const rootOnly = REAL_DOCKERIGNORE.split('\n')
+    .filter(line => !rules.includes(line.trim()))
+    .join('\n');
+  const run = runGate({ Dockerfile: REAL_DOCKERFILE, '.dockerignore': rootOnly });
+  assert.equal(run.status, 1, `a file with only root-level rules passed the gate: ${run.out}`);
+  for (const path of Object.values(BELOW_ROOT)) {
+    assert.ok(run.out.includes(`does not reject '${path}'`), `${path} is not checked: ${run.out}`);
+  }
+  // Non-vacuity: the real file carries each of these rules, so the run above dropped something.
+  for (const rule of rules) assert.ok(REAL_DOCKERIGNORE.split('\n').includes(rule), `${rule} is not in .dockerignore`);
+});
+
+test('a rule that also takes a tracked source fails the gate', () => {
+  // .gitignore ignores media/ at any depth and carves src/ out; the same rule here has no carve-out.
+  const media = runGate(withRule('**/media/'));
+  assert.equal(media.status, 1, media.out);
+  assert.match(media.out, /rejects 'src\/modules\/media\/media\.module\.ts'/);
+  assert.match(media.out, /rejects 'src\/common\/media\/media-url\.ts'/);
+  // A rule over every dot file takes the .npmrc the dashboard's npm ci reads.
+  const dotFiles = runGate(withRule('**/.*'));
+  assert.equal(dotFiles.status, 1, dotFiles.out);
+  assert.match(dotFiles.out, /rejects 'dashboard\/\.npmrc'/);
+});

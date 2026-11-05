@@ -344,6 +344,15 @@
   cursor: default;
 }
 
+/* Spans the 6px FilterBadge leaves between the badge and the popover, above or below it, plus the 1px border and
+   1px for a fractional badge edge: a pointer crossing it stays inside the badge, so the popover stays open. */
+.webhooks-page .filter-popover::before {
+  content: '';
+  position: absolute;
+  inset: -8px -1px;
+  z-index: -1;
+}
+
 .webhooks-page .filter-popover-title {
   font-size: 0.65rem;
   font-weight: 700;

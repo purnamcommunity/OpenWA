@@ -21,7 +21,7 @@ import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.
 import { toMessageMedia } from './wwebjs-messaging';
 import { type WwebjsEngineHost, rethrowIfNavigation, withPage, reportPageDeath } from './wwebjs-host';
 import { isNavigationError, isProtocolTimeout } from './wwebjs-lifecycle';
-import { listChats } from './wwebjs-chats';
+import { listChats, recoverGroupChatById } from './wwebjs-chats';
 
 /**
  * Extracts the JID of the parent community a group is linked to, if any.
@@ -380,8 +380,13 @@ export class WwebjsGroups {
   async getGroupInfo(groupId: string): Promise<GroupInfo | null> {
     this.host.ensureReady();
     try {
-      const chat = await this.client().getChatById(groupId);
-      if (!chat.isGroup) {
+      // A group whose refresh fails one of WhatsApp Web's own invariants is read from the metadata the
+      // page already holds, as the group list reads it (readChatModels): as last loaded, not refreshed,
+      // and without a last message, which this read does not use. Any other rejection falls to the catch.
+      const chat = await this.client()
+        .getChatById(groupId)
+        .catch(error => recoverGroupChatById(this.host, 'getGroupInfo', groupId, error));
+      if (!chat?.isGroup) {
         return null;
       }
       const groupChat = chat as unknown as GroupChat;
@@ -655,6 +660,7 @@ export class WwebjsGroups {
     participants: string[],
   ): Promise<ParticipantOperationResult[]> {
     const chat = await this.requireGroupChat(groupId, op);
+    this.refuseNonAdmin(chat, op, groupId);
     const participantIds = participants.map(toParticipantWid);
     const res = await this.runParticipantBatch(op, groupId, chat, participantIds);
     if (res?.status !== 200) {
@@ -883,7 +889,11 @@ export class WwebjsGroups {
    */
   private async requireGroupChat(groupId: string, context: string): Promise<GroupChat> {
     this.host.ensureReady();
-    const chat = await withPage(this.host, context, () => this.client().getChatById(groupId));
+    const chat = await withPage(this.host, context, () =>
+      this.client()
+        .getChatById(groupId)
+        .catch(error => recoverGroupChatById(this.host, context, groupId, error)),
+    );
     // getChatById RESOLVES undefined for an unknown id (wwebjs does not throw): unknown id and a
     // non-group id are the same client-facing outcome — there is no such group (404, not a 500).
     if (!chat?.isGroup) {
@@ -893,6 +903,19 @@ export class WwebjsGroups {
     // sees, so a teardown that landed in the lookup must be caught here.
     this.host.ensureReady();
     return chat as unknown as GroupChat;
+  }
+
+  /**
+   * Refuse up front (403) when the account is a member of the group that is neither admin nor superadmin. The remove,
+   * promote and demote page bodies answer a fixed status whatever WhatsApp decided, so the routes' documented 403 can
+   * only come from here. An account the participant list does not name (another id dialect) goes ahead as before.
+   */
+  private refuseNonAdmin(chat: GroupChat, op: string, groupId: string): void {
+    const self = readWid(this.client().info?.wid);
+    const me = self === undefined ? undefined : chat.participants?.find(p => readWid(p.id) === self);
+    if (me && !me.isAdmin && !me.isSuperAdmin) {
+      throw new EngineRefusedError(`${op} refused for group ${groupId}: this account is not an admin of the group`);
+    }
   }
 
   // Set "only admins can send messages" (announce)
@@ -977,7 +1000,9 @@ export class WwebjsGroups {
     // Resolved first, like every other group operation in this file. Without it an unknown id or a
     // non-group jid answered 200 with an empty list, which reads as "this group has no pending
     // requests" rather than "there is no such group"; Baileys answers the refusal.
-    await this.requireGroupChat(groupId, 'getGroupMembershipRequests');
+    const chat = await this.requireGroupChat(groupId, 'getGroupMembershipRequests');
+    // The library reads the page's own request store, which answers a non-admin without asking WhatsApp.
+    this.refuseNonAdmin(chat, 'getGroupMembershipRequests', groupId);
     return withPage(this.host, 'getGroupMembershipRequests', async () => {
       const raw = await this.client().getGroupMembershipRequests(groupId);
       // Raw page-context store objects: wids can arrive as {_serialized} OR {$1} (the #747
@@ -1030,7 +1055,10 @@ export class WwebjsGroups {
   ): Promise<ParticipantOperationResult[]> {
     // Resolved first, like the list above: the page reads the group's metadata without checking it
     // exists, so an unknown or non-group id rejected there and answered 500 instead of 404.
-    await this.requireGroupChat(groupId, op);
+    const chat = await this.requireGroupChat(groupId, op);
+    // Naming nobody takes every pending request from the page's own store, which answers a non-admin with an empty
+    // list, as the read above does. Named requesters get the server's per-requester answer.
+    if (!participants) this.refuseNonAdmin(chat, op, groupId);
     const options = {
       // Qualified like every other participant write in this file: the service blesses a bare phone
       // number, and the page maps requesterIds straight through `createWid` (Injected/Utils.js) —

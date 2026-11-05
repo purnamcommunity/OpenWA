@@ -223,6 +223,7 @@ test('archive-only media previews inline from the media route; a plain omitted m
     waMessageId: `wamid.${id}`,
     body: '',
     type,
+    mediaPath: archived ? `chat-media/${id}` : null,
     metadata: { media: { mimetype: 'image/jpeg', filename: `${id}.jpg`, omitted: true, sizeBytes: 10, archived } },
   });
   const fetched: string[] = [];
@@ -258,6 +259,59 @@ test('archive-only media previews inline from the media route; a plain omitted m
   }
 });
 
+test('an archived marker whose stored copy retention deleted keeps the download button and fetches nothing', async () => {
+  // Retention deletes the archived copy and clears `mediaPath`, while a row an older gateway purged keeps `archived`.
+  // A fetch for such a bubble could only 404, spending the media route's per-minute budget the live previews share.
+  const media = (
+    id: string,
+    type: ChatMessageView['type'],
+    mimetype: string,
+    mediaPath: string | null,
+  ): ChatMessageView => ({
+    ...PROMPT,
+    id,
+    waMessageId: `wamid.${id}`,
+    body: '',
+    type,
+    mediaPath,
+    metadata: { media: { mimetype, filename: `${id}.bin`, omitted: true, sizeBytes: 10, archived: true } },
+  });
+  const fetched: string[] = [];
+  const fetchOriginal = globalThis.fetch;
+  const createOriginal = URL.createObjectURL;
+  const revokeOriginal = URL.revokeObjectURL;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    fetched.push(String(input));
+    return new Response(new Blob(['x'], { type: 'image/jpeg' }), { status: 200 });
+  }) as typeof fetch;
+  URL.createObjectURL = () => 'blob:archived';
+  URL.revokeObjectURL = () => {};
+  try {
+    const { container } = renderThread('viewer', [
+      media('purged-image', 'image', 'image/jpeg', null),
+      media('purged-voice', 'voice', 'audio/ogg; codecs=opus', null),
+      media('kept', 'image', 'image/jpeg', 'chat-media/kept'),
+    ]);
+    await rtl.waitFor(() => {
+      assert.ok(container.querySelector('[data-wa-message-id="wamid.kept"] img.chat-image-media'), 'no preview');
+    });
+    await rtl.act(() => new Promise(resolve => setTimeout(resolve, 0)));
+    assert.deepEqual(
+      fetched.map(url => url.split('/').slice(-2).join('/')),
+      ['wamid.kept/media'],
+      'a bubble with no stored copy was fetched',
+    );
+    for (const id of ['purged-image', 'purged-voice']) {
+      const button = container.querySelector(`[data-wa-message-id="wamid.${id}"] button.message-media-omitted`);
+      assert.ok(button, `${id} lost its download button`);
+    }
+  } finally {
+    globalThis.fetch = fetchOriginal;
+    URL.createObjectURL = createOriginal;
+    URL.revokeObjectURL = revokeOriginal;
+  }
+});
+
 test('an archived image is observed against the thread scroller and saved under its own name, or one unique to its message', async () => {
   // ArchivedMediaPreview is covered on its own; this pins what the thread hands it. The scroll container
   // as observer root keeps the lazy-load lead from being clipped to the container's own box, the stored
@@ -268,6 +322,7 @@ test('an archived image is observed against the thread scroller and saved under 
     waMessageId: `wamid.${id}`,
     body: '',
     type: 'image',
+    mediaPath: `chat-media/${id}`,
     metadata: { media: { mimetype: 'image/jpeg', filename, omitted: true, sizeBytes: 10, archived: true } },
   });
   const roots: unknown[] = [];
@@ -413,6 +468,7 @@ test('an archived sticker previews as an image and an archived voice note as aud
     waMessageId: `wamid.${id}`,
     body: '',
     type,
+    mediaPath: `chat-media/${id}`,
     metadata: { media: { mimetype, filename: `${id}.bin`, omitted: true, sizeBytes: 10, archived: true } },
   });
   const fetchOriginal = globalThis.fetch;
@@ -436,6 +492,39 @@ test('an archived sticker previews as an image and an archived voice note as aud
     URL.revokeObjectURL = revokeOriginal;
   }
 });
+
+// An image or sticker whose bytes came with the message opens the media viewer from the keyboard as from a click,
+// the way an archived preview does: a control of its own in the tab order, opened with Enter or Space.
+for (const [role, type] of [
+  ['operator', 'image'],
+  ['viewer', 'image'],
+  ['operator', 'sticker'],
+] as const) {
+  test(`an inline ${type} is a control that Enter and Space open in the viewer (${role} key)`, () => {
+    const opened: string[] = [];
+    const message: ChatMessageView = {
+      ...PROMPT,
+      id: `db-${type}`,
+      waMessageId: `wamid.${type}`,
+      body: '',
+      type,
+      metadata: { media: { mimetype: 'image/png', data: 'iVBORw0KGgo=' } },
+    };
+    const { container } = renderThread(role, [message], CHAT, { onOpenImage: id => opened.push(id) });
+    const image = container.querySelector<HTMLImageElement>('img.chat-image-media');
+    assert.ok(image, `the inline ${type} did not render`);
+    rtl.fireEvent.click(image);
+    assert.deepEqual(opened, [message.id], 'a click did not open the viewer');
+
+    assert.equal(image.tabIndex, 0, `the ${type} is not in the tab order (tabIndex ${image.tabIndex})`);
+    assert.equal(image.getAttribute('role'), 'button', `the ${type} is not exposed as a control`);
+    assert.equal(image.getAttribute('aria-haspopup'), 'dialog');
+    rtl.fireEvent.keyDown(image, { key: 'Enter' });
+    rtl.fireEvent.keyDown(image, { key: ' ' });
+    rtl.fireEvent.keyDown(image, { key: 'a' });
+    assert.deepEqual(opened, [message.id, message.id, message.id], 'Enter or Space did not open the viewer');
+  });
+}
 
 // The message actions appear on hover, so a keyboard user reaches them through the bubble: one tab stop
 // for the thread (the focused message, else the newest) and the arrow keys between messages.
@@ -1905,4 +1994,132 @@ test('the first bubble of a run from one side starts a run, and a new day starts
     wrapper.classList.contains('run-start'),
   );
   assert.deepEqual(runStarts, [true, false, false], 'one side on one day is a single run');
+});
+
+const OMITTED_DOCUMENT: ChatMessageView = {
+  ...PROMPT,
+  id: 'big',
+  waMessageId: 'wamid.big',
+  body: '',
+  type: 'document',
+  metadata: { media: { mimetype: 'application/pdf', filename: 'report.pdf', omitted: true, sizeBytes: 10 } },
+};
+
+/** The answer of the S3 gateway while its download pool is full. */
+const poolFull = (): Response =>
+  new Response(JSON.stringify({ statusCode: 503, message: 'Too many media downloads are in progress' }), {
+    status: 503,
+    headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
+  });
+
+/**
+ * Click the download button of OMITTED_DOCUMENT with its media route answered by `answer` (given the request's
+ * number, from 1), and run `check` while the stubs hold. A saved file is recorded by name instead of downloaded.
+ */
+async function clickDownload(
+  answer: (call: number) => Response,
+  check: (state: { container: HTMLElement; saved: string[]; calls: () => number }) => Promise<void>,
+): Promise<void> {
+  window.sessionStorage.setItem('openwa_api_key', 'key-a');
+  const fetchOriginal = globalThis.fetch;
+  const createOriginal = URL.createObjectURL;
+  const revokeOriginal = URL.revokeObjectURL;
+  const createElementOriginal = document.createElement;
+  const saved: string[] = [];
+  let calls = 0;
+  globalThis.fetch = (() => Promise.resolve(answer(++calls))) as typeof fetch;
+  URL.createObjectURL = () => 'blob:report';
+  URL.revokeObjectURL = () => {};
+  document.createElement = ((tag: string, options?: ElementCreationOptions) => {
+    const element = createElementOriginal.call(document, tag, options);
+    if (tag === 'a')
+      (element as HTMLAnchorElement).click = () => void saved.push((element as HTMLAnchorElement).download);
+    return element;
+  }) as typeof document.createElement;
+  try {
+    const { container } = renderThread('operator', [OMITTED_DOCUMENT]);
+    const button = container.querySelector('[data-wa-message-id="wamid.big"] button.message-media-omitted');
+    assert.ok(button, 'the over-budget document did not render its download button');
+    rtl.fireEvent.click(button);
+    await check({ container, saved, calls: () => calls });
+  } finally {
+    globalThis.fetch = fetchOriginal;
+    URL.createObjectURL = createOriginal;
+    URL.revokeObjectURL = revokeOriginal;
+    document.createElement = createElementOriginal;
+    window.sessionStorage.removeItem('openwa_api_key');
+  }
+}
+
+const saysUnavailable = (container: HTMLElement): boolean =>
+  container.querySelector('[data-wa-message-id="wamid.big"]')?.textContent?.includes('Media unavailable') ?? false;
+
+// On S3 the gateway refuses a media download at once while its download pool is full (503 with Retry-After), and a
+// place frees as soon as one download ends. The bytes are there: the download is tried again after the wait, and the
+// bubble never says they are unavailable.
+test('a media download refused while the download pool is full is tried again and saves the file', async () => {
+  await clickDownload(
+    call => (call === 1 ? poolFull() : new Response(new Blob(['x']), { status: 200 })),
+    async ({ container, saved, calls }) => {
+      await rtl.waitFor(() => assert.deepEqual(saved, ['report.pdf'], 'the refused download was not tried again'), {
+        timeout: 10_000,
+      });
+      assert.equal(calls(), 2);
+      assert.equal(
+        saysUnavailable(container),
+        false,
+        'the bubble says the media is unavailable after a refusal for a full download pool',
+      );
+    },
+  );
+});
+
+test('a media download answered 404 says the media is unavailable without asking again', async () => {
+  await clickDownload(
+    () =>
+      new Response(JSON.stringify({ statusCode: 404, message: 'Media not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    async ({ container, saved, calls }) => {
+      await rtl.waitFor(() => assert.ok(saysUnavailable(container), 'the bubble did not say the media is unavailable'));
+      assert.equal(calls(), 1, 'a missing file was asked for again');
+      assert.deepEqual(saved, []);
+    },
+  );
+});
+
+test('a media download waiting to retry after a refusal is cancelled on sign-out without asking again', async () => {
+  await clickDownload(
+    call => (call === 1 ? poolFull() : new Response(new Blob(['x']), { status: 200 })),
+    async ({ container, saved, calls }) => {
+      await rtl.waitFor(() => assert.equal(calls(), 1));
+      window.sessionStorage.removeItem('openwa_api_key');
+      await new Promise(resolve => setTimeout(resolve, 1_250));
+      assert.equal(calls(), 1);
+      assert.deepEqual(saved, [], 'the media file was saved after the sign-out');
+      assert.equal(saysUnavailable(container), false, 'sign-out marked the media as unavailable');
+    },
+  );
+});
+
+test('a media download whose retry is answered after sign-out saves no file', async () => {
+  const retried = new Response(new Blob(['x']), { status: 200 });
+  const readBlob = retried.blob.bind(retried);
+  let read: Promise<Blob> | undefined;
+  retried.blob = () => {
+    window.sessionStorage.removeItem('openwa_api_key');
+    return (read = readBlob());
+  };
+  await clickDownload(
+    call => (call === 1 ? poolFull() : retried),
+    async ({ saved, calls }) => {
+      await rtl.waitFor(() => assert.ok(read, 'the refused download was not tried again'), { timeout: 10_000 });
+      await read;
+      // The rest of the download after the body is read is promise jobs, all run before this timer.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      assert.equal(calls(), 2);
+      assert.deepEqual(saved, [], 'the media file was saved after the sign-out');
+    },
+  );
 });

@@ -2205,7 +2205,7 @@ describe('deployment docs describe what the entrypoint, probes and backup script
 describe('ci.yml moves the branch image tag only for the tested branch head', () => {
   type CiStep = Step & { if?: string; id?: string };
   type CiWorkflow = {
-    concurrency?: { group?: string; 'cancel-in-progress'?: boolean | string };
+    concurrency?: { group?: string; 'cancel-in-progress'?: boolean | string; queue?: string };
     jobs?: Record<string, { steps?: CiStep[] }>;
   };
   const ci = (): CiWorkflow => workflowOf('ci.yml');
@@ -2631,5 +2631,30 @@ describe.each([
     expect(holdsSecret({ env: { ALL: '${{ toJSON(secrets) }}' }, steps: [{ run: 'composer install' }] })).toBe(true);
     expect(holdsSecret({ steps: [{ run: 'x', env: { T: "${{ secrets['X'] }}" } }] })).toBe(true);
     expect(holdsSecret({ steps: [{ run: 'x', env: { T: '${{ secrets.GITHUB_TOKEN }}' } }] })).toBe(false);
+  });
+});
+
+/**
+ * release.yml serializes every tag run in one group, so two runs never interleave the channel reads and the
+ * re-points of X.Y and `latest`. GitHub keeps one pending run per group by default and cancels it when another
+ * is queued, so a third tag drops the waiting release; the workflow has to say that rather than promise a queue.
+ */
+describe('release.yml runs one release at a time and states its pending limit', () => {
+  type ReleaseWorkflow = {
+    concurrency?: { group?: string; 'cancel-in-progress'?: boolean | string; queue?: string };
+  };
+  const release = (): ReleaseWorkflow => workflowOf('release.yml') as ReleaseWorkflow;
+
+  it('uses one literal group and never cancels the running release', () => {
+    expect(release().concurrency?.group).toBe('release');
+    expect(release().concurrency?.['cancel-in-progress']).toBe(false);
+  });
+
+  it('names the one pending run the group holds, unless the group queues every run', () => {
+    if (release().concurrency?.queue === 'max') return;
+    const text = fs.readFileSync(path.join(workflowDir, 'release.yml'), 'utf8');
+    const header = text.slice(0, text.search(/^concurrency:/m));
+    expect(header).toMatch(/at most one pending run/);
+    expect(header).not.toMatch(/global queue/);
   });
 });

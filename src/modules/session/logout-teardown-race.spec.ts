@@ -141,7 +141,7 @@ describe('SessionService logout() name-scoped teardown fence', () => {
           provide: ConfigService,
           useValue: { get: jest.fn().mockImplementation(<T>(_k: string, d?: T): T => d as T) },
         },
-        { provide: LidMappingStoreService, useValue: { remember: jest.fn() } },
+        { provide: LidMappingStoreService, useValue: { remember: jest.fn(), onSecondLid: jest.fn() } },
         { provide: StatusStoreService, useValue: { ingest: jest.fn() } },
       ],
     }).compile();

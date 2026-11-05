@@ -1,9 +1,10 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, Not, Raw, Repository } from 'typeorm';
 import { LidMapping } from './lid-mapping.entity';
 import { userPart } from './wa-id';
 import { createLogger } from '../../common/services/logger.service';
+import { outsideRequest } from '../../common/services/request-context';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
 // Default cap on the in-memory lid->phone mirror. Every other long-lived map in the engine surface is
@@ -23,9 +24,40 @@ const LID_QUERY_CHUNK = 500;
  * How often a failed write is logged. A database that is down or full takes one failed statement per report
  * that has something to write (each inbound message that carries the lid, while its write keeps failing),
  * since a report held back would leave the table naming a number the contact no longer has; the warning is
- * what is bounded, to one in this interval for the whole store, with a count of the failures in between.
+ * what is bounded, to one in this interval for the whole store, with a count of the failures in between. A
+ * dropped second-lid check and a failed second-lid read are logged the same way, each on its own.
  */
 const LID_WRITE_WARN_MS = 60_000;
+
+/** How long second-lid checks are collected into one table read: a sync lands its writes over seconds. */
+const SECOND_LID_WINDOW_MS = 250;
+/** At most this many second-lid checks wait after a failed write or read, oldest dropped first. */
+const SECOND_LID_OWED_MAX = 10_000;
+/** A pair reported is not reported again for this long, among the last this many pairs. */
+const SECOND_LID_REPORTED_MS = 10 * 60_000;
+const SECOND_LID_REPORTED_MAX = 2000;
+
+/** A stored report owes a second-lid check for this phone; queued once a write of it lands. */
+interface SecondLidCheck {
+  phone: string;
+  sessionId: string | null;
+  queued: boolean;
+}
+
+/** An engine reported `newLid` for a phone the table already maps to the reported `previousLid`. */
+export interface SecondLidReport {
+  phone: string;
+  previousLid: string;
+  newLid: string;
+  sessionId: string | null;
+}
+
+/** Set a key as the newest, dropping the oldest past `max`; whether one was dropped. */
+function setNewest<V>(map: Map<string, V>, key: string, value: V, max: number): boolean {
+  map.delete(key);
+  map.set(key, value);
+  return map.size > max && map.delete(map.keys().next().value as string);
+}
 
 function chunk<T>(items: T[], size = LID_QUERY_CHUNK): T[][] {
   const out: T[][] = [];
@@ -84,7 +116,7 @@ export interface LidMappingStore {
  * forward cache.
  */
 @Injectable()
-export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
+export class LidMappingStoreService implements LidMappingStore, OnModuleInit, OnModuleDestroy {
   private readonly logger = createLogger('LidMappingStore');
   private readonly lidToPhone = new Map<string, string | null>();
   /** Origin of resident display-only mappings, bounded and evicted with the forward mirror. */
@@ -116,10 +148,12 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
    * can evict the entry inside that same window, leaving it indistinguishable from never-learned.
    * Counted per lid, so the first of two overlapping writes settling does not clear the second. The
    * latest actual report's token remains until all older writes settle, isolating their late results.
+   * It also holds the second-lid check the latest new pairing owes until a landed write queues it, for a report
+   * overlapping it.
    */
   private readonly unsettledWrites = new Map<
     string,
-    { count: number; latestReport?: object; latestOperation?: { phone: string | null } }
+    { count: number; latestReport?: object; latestOperation?: { phone: string | null }; check?: SecondLidCheck }
   >();
   /**
    * Lids a write started for while their table read was in flight. That read may have run before the
@@ -142,8 +176,25 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
    */
   private readonly failedWrites = new Set<string>();
   /** When a failed write was last logged, on {@link now}, and how many have failed since without a line. */
-  private writeWarnedAt = -Infinity;
-  private unloggedWriteFailures = 0;
+  private readonly writeWarning = { at: -Infinity, held: 0 };
+  /**
+   * Second-lid checks owed after the writes of the report that owed one failed, or its read did, or its read found
+   * the row no longer holding the phone this node still holds, until a write of that phone lands. A new check stays
+   * on its lid's {@link unsettledWrites} entry until a landed write queues it or every write of the lid has settled.
+   * Kept apart from the mapping cache and its eviction.
+   */
+  private readonly secondLidOwed = new Map<string, SecondLidCheck>();
+  private readonly secondLidDropWarning = { at: -Infinity, held: 0 };
+  private readonly secondLidReadWarning = { at: -Infinity, held: 0 };
+  /** Checks queued for the next read: phone -> lid -> its check, in the order their writes landed. */
+  private secondLidChecks = new Map<string, Map<string, SecondLidCheck>>();
+  private secondLidTimer?: ReturnType<typeof setTimeout>;
+  /** {@link SECOND_LID_WINDOW_MS}, a seam for tests. */
+  private readonly secondLidWindowMs = SECOND_LID_WINDOW_MS;
+  /** Pairs reported, keyed by phone and both lids sorted, with when on {@link now}. */
+  private readonly secondLidReported = new Map<string, number>();
+  private secondLidClosing = false;
+  private secondLidListener?: (report: SecondLidReport) => unknown;
   /** Monotonic clock in ms (a seam for tests). */
   private readonly now = (): number => performance.now();
   // 0 = unbounded (legacy behaviour). Every other long-lived map in the engine surface is bounded, so
@@ -159,6 +210,15 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
 
   async onModuleInit(): Promise<void> {
     await this.reload();
+  }
+
+  /**
+   * Stop the second-lid checks without waiting: none is read after this and a read under way ends without a
+   * report, so the checks collected in the last window before a stop go unreported.
+   */
+  onModuleDestroy(): void {
+    this.secondLidClosing = true;
+    clearTimeout(this.secondLidTimer);
   }
 
   /**
@@ -384,12 +444,24 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
       !this.unreported.has(lid) &&
       cached === phone &&
       (phone === null || !sessionId || this.seenBy.get(lid)?.has(sessionId));
+    // This report gives the lid a phone this node did not hold for it, a new or changed pairing or one only
+    // display data had, so it owes a second-lid check; a lid outside the cache cannot be told from a new one.
+    // Any other report carries the check an earlier report of the lid still owes, in flight or not, unless that
+    // check names another phone (the cache read this one back from the table since): then it owes its own.
+    const earlier = this.unsettledWrites.get(lid)?.check ?? this.secondLidOwed.get(lid);
+    const gaining =
+      phone !== null && (cached !== phone || this.unreported.has(lid) || (!!earlier && earlier.phone !== phone));
+    const owed = gaining ? { phone, sessionId: sessionId ?? null, queued: false } : earlier;
     // A negative is not cached until the table has taken it: see clear().
     if (!seen && phone !== null) this.index(lid, phone, null);
     if (phone !== null) this.failedWrites.add(lid);
     const reporters = this.seenBy.get(lid);
     const report = { phone };
     const writing = this.beginWrite(lid, report, true);
+    if (gaining) {
+      writing.check = owed; // outside the cap of owed checks while the lid's writes are unsettled
+      this.secondLidOwed.delete(lid);
+    }
     try {
       if (seen && phone !== null) {
         // A peer may have changed or revoked this row since this node counted the report. Keep the
@@ -437,6 +509,12 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
         }
         if (sessionId && this.seenBy.get(lid) === reporters) reporters.add(sessionId);
       }
+      // A check owed again after its read failed, or found the row not holding its phone, is a copy no write already in
+      // flight carries. The lid's latest report takes it when it lands with that phone; an older one could run it
+      // before a newer write moves the row.
+      const again = writing.latestReport === report ? this.secondLidOwed.get(lid) : undefined;
+      if (owed && owed.phone === phone) this.queueSecondLid(lid, owed);
+      if (again?.phone === phone) this.queueSecondLid(lid, again);
       return true;
     } catch (err) {
       this.warnWriteFailed(
@@ -444,6 +522,7 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
       );
       return false;
     } finally {
+      if (owed?.queued && writing.check === owed) writing.check = undefined; // a landed write queued it
       this.endWrite(lid, writing);
     }
   }
@@ -459,8 +538,16 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
     return writing;
   }
 
-  private endWrite(lid: string, writing: { count: number }): void {
-    if (this.unsettledWrites.get(lid) === writing && --writing.count === 0) this.unsettledWrites.delete(lid);
+  /**
+   * Once the last write of the lid settles, the latest new pairing's check, if no landed write queued it, is owed
+   * until a write of its phone lands, unless a newer report of the lid took its place. Not before: an overlapping
+   * report or negative can fail while the pairing's own write is still in flight, and that write queues the check if
+   * it lands.
+   */
+  private endWrite(lid: string, writing: { count: number; check?: SecondLidCheck }): void {
+    if (this.unsettledWrites.get(lid) !== writing || --writing.count > 0) return;
+    this.unsettledWrites.delete(lid);
+    if (writing.check && !writing.check.queued) this.oweSecondLid(lid, writing.check);
   }
 
   /**
@@ -516,17 +603,142 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
     this.absentFromTable.delete(lid);
   }
 
-  /** Log a failed write at most once per {@link LID_WRITE_WARN_MS}, counting the ones in between. */
-  private warnWriteFailed(message: string): void {
-    const now = this.now();
-    if (now - this.writeWarnedAt < LID_WRITE_WARN_MS) {
-      this.unloggedWriteFailures++;
+  /** Set the one listener told of each second-lid report; the session module audits it. */
+  onSecondLid(listener: (report: SecondLidReport) => unknown): void {
+    this.secondLidListener = listener;
+  }
+
+  /**
+   * Keep a check owed, dropping the oldest past {@link SECOND_LID_OWED_MAX}: a dropped check runs only if a report
+   * in flight already carries it.
+   */
+  private oweSecondLid(lid: string, check: SecondLidCheck): void {
+    if (setNewest(this.secondLidOwed, lid, check, SECOND_LID_OWED_MAX)) {
+      const message = `More than ${SECOND_LID_OWED_MAX} second-lid checks are owed; dropping the oldest`;
+      this.warnAtMost(this.secondLidDropWarning, message, 'dropped');
+    }
+  }
+
+  /**
+   * Queue the check a landed write carries, for one table read once {@link secondLidWindowMs} has passed. The
+   * read runs outside the request that made the report, and the write never waits for it.
+   */
+  private queueSecondLid(lid: string, check: SecondLidCheck): void {
+    if (check.queued || this.secondLidClosing) return;
+    check.queued = true;
+    if (this.secondLidOwed.get(lid) === check) this.secondLidOwed.delete(lid);
+    const lids = this.secondLidChecks.get(check.phone) ?? new Map<string, SecondLidCheck>();
+    lids.set(lid, check);
+    this.secondLidChecks.set(check.phone, lids);
+    this.secondLidTimer ??= outsideRequest(() =>
+      setTimeout(() => void this.checkSecondLids(), this.secondLidWindowMs).unref(),
+    );
+  }
+
+  /** The gateway is stopping or the data source has closed: a check neither reads nor warns. */
+  private get closed(): boolean {
+    return this.secondLidClosing || this.repo.manager?.dataSource?.isInitialized === false;
+  }
+
+  /**
+   * Read the table once for the checks collected and warn for each other engine-reported lid it maps a checked
+   * phone to: WhatsApp gave the number to someone else or moved its holder, and a chat fence entry for either
+   * lid, or for the number, now admits both. The lid the read finds is previous; of two checked together, the
+   * one whose write landed first. {@link firstReport} keeps a pair checked twice to one warning.
+   */
+  private async checkSecondLids(): Promise<void> {
+    this.secondLidTimer = undefined;
+    const checks = this.secondLidChecks;
+    this.secondLidChecks = new Map();
+    if (this.closed) return;
+    let found: Record<string, string[]>;
+    try {
+      found = await this.readLidsForPhones([...checks.keys()]);
+    } catch (err) {
+      // Owed again, for the next write of the lid that lands, unless the lid has a newer check or this node holds
+      // another phone for it by now: its next landed write then moves it off this phone or owes a fresh check.
+      for (const lids of checks.values())
+        for (const [lid, check] of lids) {
+          const cached = this.lidToPhone.get(lid);
+          if (!this.secondLidOwed.has(lid) && (cached === undefined || cached === check.phone))
+            this.oweSecondLid(lid, { ...check, queued: false });
+        }
+      // A read the closing data source cut off is not worth a line, which is only known once it has had the
+      // time to close.
+      const message = `Could not check for a second lid: ${err instanceof Error ? err.message : String(err)}`;
+      setTimeout(
+        () => this.closed || this.warnAtMost(this.secondLidReadWarning, message, 'failed'),
+        this.secondLidWindowMs,
+      ).unref();
       return;
     }
-    const unlogged = this.unloggedWriteFailures;
-    this.logger.warn(unlogged ? `${message} (${unlogged} more failed since the last warning)` : message);
-    this.writeWarnedAt = now;
-    this.unloggedWriteFailures = 0;
+    if (this.closed) return; // a read still under way at shutdown ends without a report
+    for (const [phone, lids] of checks) {
+      const queued = [...lids.keys()];
+      const held = found[phone] ?? [];
+      queued.forEach((newLid, i) => {
+        if (!held.includes(newLid)) {
+          // Its row holds another phone by now, or a conflicting display lookup marked it unreported. If this node
+          // still holds this phone for it, the row is another node's, an older write that committed last (a pool can
+          // reorder commits) or that lookup's: the next write of this phone to land checks it again.
+          const check = lids.get(newLid);
+          if (check && this.lidToPhone.get(newLid) === phone && !this.secondLidOwed.has(newLid))
+            this.oweSecondLid(newLid, { ...check, queued: false });
+          return;
+        }
+        for (const previousLid of held) {
+          // Itself, or a lid whose write landed later in this window and names this one previous.
+          if (queued.indexOf(previousLid) >= i || !this.firstReport(phone, previousLid, newLid)) continue;
+          this.reportSecondLid({ phone, previousLid, newLid, sessionId: lids.get(newLid)?.sessionId ?? null });
+        }
+      });
+    }
+  }
+
+  /** Whether a pair is reported now: not reported within {@link SECOND_LID_REPORTED_MS} among the last pairs kept. */
+  private firstReport(phone: string, a: string, b: string): boolean {
+    const key = [phone, ...[a, b].sort()].join(':');
+    const now = this.now();
+    if (now - (this.secondLidReported.get(key) ?? -Infinity) < SECOND_LID_REPORTED_MS) return false;
+    setNewest(this.secondLidReported, key, now, SECOND_LID_REPORTED_MAX);
+    return true;
+  }
+
+  private reportSecondLid(report: SecondLidReport): void {
+    const { phone, previousLid, newLid, sessionId } = report;
+    this.logger.warn('A phone number was reported under a second privacy id', {
+      sessionId: sessionId ?? undefined,
+      phone,
+      previousLid,
+      newLid,
+      action: 'second_lid_reported',
+    });
+    const listener = this.secondLidListener;
+    // A listener that throws or rejects is logged and stops no other report.
+    if (listener) {
+      void Promise.resolve()
+        .then(() => listener(report))
+        .catch(err =>
+          this.logger.warn(`Could not report a second lid: ${err instanceof Error ? err.message : String(err)}`),
+        );
+    }
+  }
+
+  /** Log a failed write at most once per {@link LID_WRITE_WARN_MS}, counting the ones in between. */
+  private warnWriteFailed(message: string): void {
+    this.warnAtMost(this.writeWarning, message, 'failed');
+  }
+
+  /** Log at most once per {@link LID_WRITE_WARN_MS} for one gate, counting the lines held back in between. */
+  private warnAtMost(gate: { at: number; held: number }, message: string, verb: string): void {
+    const now = this.now();
+    if (now - gate.at < LID_WRITE_WARN_MS) {
+      gate.held++;
+      return;
+    }
+    this.logger.warn(gate.held ? `${message} (${gate.held} more ${verb} since the last warning)` : message);
+    gate.at = now;
+    gate.held = 0;
   }
 
   /**

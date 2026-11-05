@@ -56,12 +56,18 @@ type MuteChannelRequest struct {
 	Mute bool `json:"mute"`
 }
 
-// CustomLinkPreview is a caller-supplied link preview. Nothing is fetched for these.
+// CustomLinkPreview is a caller-supplied link preview. The page is not fetched; only ThumbnailURL,
+// when set, is.
 type CustomLinkPreview struct {
 	URL string `json:"url"`
 	// Title is required — WhatsApp will not render a preview without one.
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
+	// ThumbnailURL is the preview image as an http(s) URL, fetched under the media SSRF rules; it
+	// renders the large card. At most 5 MiB.
+	ThumbnailURL string `json:"thumbnailUrl,omitempty"`
+	// ThumbnailBase64 is the preview image as base64, at most 5 MiB decoded. Wins over ThumbnailURL.
+	ThumbnailBase64 string `json:"thumbnailBase64,omitempty"`
 }
 
 // UpsertLabelRequest is a label create-or-update body. The id travels in the path, because WhatsApp

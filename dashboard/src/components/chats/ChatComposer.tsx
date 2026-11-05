@@ -11,6 +11,13 @@ import { useRole } from '../../hooks/useRole';
 import { useToast } from '../../hooks/useToast';
 import type { ScrollDirection } from '../../utils/scrollDecision';
 import { MEDIA_UPLOAD_MAX_BYTES } from '../../utils/mediaUpload';
+import { BULK_CAPTION_MAX_LENGTH, captionLength } from '../../utils/bulkMedia';
+import { isComposingKey } from '../../utils/composition';
+
+// The gateway's bound on the text of a send and of a reply, MESSAGE_TEXT_MAX_LENGTH in
+// src/modules/message/dto/send-message.dto.ts. A caption is bounded at BULK_CAPTION_MAX_LENGTH, as SendMediaMessageDto
+// bounds it.
+const MESSAGE_TEXT_MAX_LENGTH = 4096;
 
 // Map an attachment MIME type to the neutral MessageType for the optimistic outgoing bubble, so the
 // placeholder matches what the backend will persist (e.g. a PDF is `document`, not `application`).
@@ -37,6 +44,10 @@ interface ChatComposerProps {
   onMessageAppended: (direction: ScrollDirection) => void;
   /** Moves the chat to the top of the sidebar, if `sessionId` is still the session on screen. */
   onSent: (sessionId: string, chatId: string, snippet: string, sentAt: number) => void;
+  /** A send was confirmed: the placeholder `tempId` is now the thread row keyed `key` (its waMessageId ?? id). */
+  onSendConfirmed?: (tempId: string, key: string) => void;
+  /** A send was refused: `text` is what it took from the field of the thread (`sessionId`, `chatId`) it was typed in. */
+  onSendFailed?: (sessionId: string, chatId: string, text: string) => void;
   messageInput: string;
   setMessageInput: Dispatch<SetStateAction<string>>;
   attachment: StagedAttachment | null;
@@ -56,6 +67,8 @@ function ChatComposer({
   setReplyingTo,
   onMessageAppended,
   onSent,
+  onSendConfirmed,
+  onSendFailed,
   messageInput,
   setMessageInput,
   attachment,
@@ -69,28 +82,37 @@ function ChatComposer({
   const { appendMessage, updateMessage } = useChatMessagesActions();
   const queryClient = useQueryClient();
 
-  const [sending, setSending] = useState<boolean>(false);
+  const [sendingByThread, setSendingByThread] = useState<Record<string, number>>({});
+  const activeThreadKey = selectedSessionId && activeChat?.id ? `${selectedSessionId}\0${activeChat.id}` : '';
+  const sending = Boolean(activeThreadKey && (sendingByThread[activeThreadKey] ?? 0) > 0);
   // "[Image]" for a non-text message; an unexpected type still reads as itself rather than a raw key.
   // An `unknown` one quotes as "[Message]" on purpose: here it is a message, not a type category
   // (the chart and the webhook filter name it through messageTypeLabelKey instead).
   const typeLabel = (type: string) => `[${t(`chats.messageType.${type}`, { defaultValue: type })}]`;
   // Audio carries no caption on either engine, so text typed next to it is never sent with it.
   const attachmentIsAudio = attachment?.mimetype.startsWith('audio/') ?? false;
+  // The text a send carries is held to the gateway's bound, counted as it counts (an astral character is one), before
+  // the send instead of by a refusal.
+  const textLength = captionLength(messageInput.trim());
+  const textMax = attachment ? BULK_CAPTION_MAX_LENGTH : MESSAGE_TEXT_MAX_LENGTH;
+  const textTooLong = !attachmentIsAudio && textLength > textMax;
 
   const [showEmojiPicker, setShowEmojiPicker] = useState<boolean>(false);
   // Monotonic token invalidating an in-flight attachment FileReader: picking a second file (or
   // removing the attachment) before `onload` fires must win over the late-arriving bytes —
   // otherwise the slower read overwrites the newer pick. Same pattern as composeImageReadSeq.
   const attachmentReadSeq = useRef(0);
+  const tempSeqRef = useRef(0);
 
   // Leaving this conversation — switching to another chat, or unmounting when the room closes —
   // invalidates an in-flight read, so its late `onload` drops the bytes instead of staging them
   // against whichever chat is open by then. The attachment state itself lives in the page.
   useEffect(() => {
+    setShowEmojiPicker(false);
     return () => {
       attachmentReadSeq.current += 1;
     };
-  }, [activeChat.id]);
+  }, [selectedSessionId, activeChat.id]);
 
   // Escape dismisses the emoji picker instead of closing the conversation behind it.
   //
@@ -108,7 +130,7 @@ function ChatComposer({
   useEffect(() => {
     if (!showEmojiPicker) return;
     const dismissOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape' || event.isComposing || event.defaultPrevented) return;
+      if (event.key !== 'Escape' || isComposingKey(event) || event.defaultPrevented) return;
       if (document.querySelector('[role="dialog"], [role="menu"]')) return;
       event.preventDefault();
       setShowEmojiPicker(false);
@@ -119,6 +141,9 @@ function ChatComposer({
 
   // References
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const textInputRef = useRef<HTMLInputElement | null>(null);
+  // How the Send button was last pressed: the pointerdown's pointerType ('touch' for a tap), '' after a key on it.
+  const sendPressRef = useRef('');
 
   // Popular emojis
   const popularEmojis = [
@@ -202,16 +227,24 @@ function ChatComposer({
   // 7. Handle sending a message / media
   const handleSend = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!selectedSessionId || !activeChat || sending) return;
+    if (!selectedSessionId || !activeChat || sending || textTooLong) return;
 
     const textToSend = messageInput.trim();
     if (!textToSend && !attachment) return;
 
+    // With focus in the composer form, the field takes it before the Send button disables (it does once the text is
+    // cleared): the browser drops focus from a disabled control to the page, and the next message would be typed
+    // nowhere. Skipped when focus is outside the form, or when the Send button was last pressed by a tap: a tap focuses
+    // the button in Chromium, and a focused field raises a phone's keyboard.
+    const field = textInputRef.current;
+    if (sendPressRef.current !== 'touch' && field?.form?.contains(document.activeElement)) field.focus();
+
     // Text that cannot travel with an audio file stays in the input to be sent as its own message.
     if (!attachmentIsAudio) setMessageInput('');
-    setSending(true);
+    const threadKey = activeThreadKey;
+    setSendingByThread(prev => ({ ...prev, [threadKey]: (prev[threadKey] ?? 0) + 1 }));
 
-    const tempId = `temp_${Date.now()}`;
+    const tempId = `temp_${Date.now()}_${++tempSeqRef.current}`;
     // Mirrors the body the gateway stores: image and video keep only the caption, and a document its caption
     // or else its filename. Audio stores none; its filename stands in here because the thread hides a body
     // equal to it.
@@ -287,9 +320,13 @@ function ChatComposer({
         ...tempMessage,
         id: result.messageId || tempId.replace(/^temp_/, 'sent_'),
         waMessageId: result.messageId || undefined,
+        // The row sorts and is labelled by this; merged into an echo that came first, it would otherwise fall back to
+        // the browser clock in createdAt, which stays the placeholder's (the media viewer finds the row by it).
+        timestamp: result.timestamp,
         status: 'sent',
       };
       upsertCachedMessage(queryClient, sendKey, reconciled, { dropId: tempId });
+      onSendConfirmed?.(tempId, reconciled.waMessageId ?? reconciled.id);
 
       // Update sidebar chat list (move active chat to the top with the new snippet)
       // Named by the type the bubble uses, not the MIME major type: a PDF is a document, not "application".
@@ -299,8 +336,16 @@ function ChatComposer({
     } catch (err) {
       showErrorToast(t('chats.errors.send'), err instanceof Error ? err.message : undefined);
       updateMessage(selectedSessionId, activeChat.id, tempId, { status: 'failed' });
+      // The field was emptied as Send was pressed (text next to audio was left in it).
+      if (textToSend && !attachmentIsAudio) onSendFailed?.(selectedSessionId, activeChat.id, messageInput);
     } finally {
-      setSending(false);
+      setSendingByThread(prev => {
+        const nextCount = (prev[threadKey] ?? 0) - 1;
+        if (nextCount > 0) return { ...prev, [threadKey]: nextCount };
+        const next = { ...prev };
+        delete next[threadKey];
+        return next;
+      });
     }
   };
 
@@ -394,7 +439,9 @@ function ChatComposer({
               }
               value={messageInput}
               onChange={e => setMessageInput(e.target.value)}
-              disabled={!canWrite || sending}
+              // Never disabled by a send: it holds focus through it, and handleSend refuses a second send meanwhile.
+              disabled={!canWrite}
+              ref={textInputRef}
               className="message-text-input"
             />
             <button
@@ -411,7 +458,13 @@ function ChatComposer({
 
           <button
             type="submit"
-            disabled={!canWrite || (!messageInput.trim() && !attachment) || sending}
+            disabled={!canWrite || (!messageInput.trim() && !attachment) || sending || textTooLong}
+            onPointerDown={e => {
+              sendPressRef.current = e.pointerType;
+            }}
+            onKeyDown={() => {
+              sendPressRef.current = '';
+            }}
             className="btn-send-message"
             aria-label={t('chats.send')}
             title={t('chats.send')}
@@ -419,6 +472,10 @@ function ChatComposer({
             {sending ? <Loader2 className="animate-spin" size={22} /> : <Send size={20} strokeWidth={2.25} />}
           </button>
         </form>
+        {/* Kept mounted, unstyled while empty: a live region inserted with its text is often not announced. */}
+        <span className={textTooLong ? 'input-hint' : undefined} role="status">
+          {textTooLong ? t('common.fieldTooLong', { max: textMax, count: textLength }) : ''}
+        </span>
       </footer>
     </>
   );

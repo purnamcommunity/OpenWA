@@ -15,7 +15,7 @@
 # security-scan.yml fails once the pin differs from what the tag serves and either the tag has
 # served that image for 7 or more days, or for 3 or more days with the pin last changed 28 or more
 # days ago. Update both stages together.
-FROM --platform=$BUILDPLATFORM docker.io/node:22-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS builder
+FROM --platform=$BUILDPLATFORM docker.io/node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS builder
 
 WORKDIR /app
 
@@ -63,7 +63,7 @@ RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:
 
 # ===== Stage 2: Production =====
 # Same digest-pinned node:22-slim base as the builder stage.
-FROM docker.io/node:22-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS production
+FROM docker.io/node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS production
 
 # Run the app with production defaults from the first boot: an unset NODE_ENV selects the
 # development branch of the CORS/Swagger/DTO-error-detail/default-secret hardening (main.ts
@@ -151,12 +151,14 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # Postgres the compose file does not control, where 17 is the current default. Pinning to 16 would
 # have left every such deployment unable to back up. Verified against live 16 and 17 servers.
 #
-# The signing key is committed rather than fetched at build time. Fetched, it was the one build input
-# nothing pinned: `signed-by` attests only that the .debs match whatever that request returned, so a
-# compromised host, or a build behind a TLS-intercepting proxy whose root is in the trust store,
-# would swap the trust anchor with nothing to notice. Committed, it is reviewed once and diffable
-# forever, and it removes one of the two network calls the release build makes uncached
-# (release.yml's `no-cache-filters: production` rebuilds this stage every tag, on both platforms).
+# The signing key is committed rather than fetched at build time. Fetched, nothing pinned it:
+# `signed-by` attests only that the .debs match whatever that request returned, so a compromised
+# host, or a build behind a TLS-intercepting proxy whose root is in the trust store, would swap the
+# trust anchor with nothing to notice. Committed, it is reviewed once and diffable forever. It is not
+# the only such input: this stage re-fetches on every release build (release.yml's
+# `no-cache-filters: production` rebuilds it every tag, on both platforms), and npm and its Undici
+# below are pinned by version over TLS only, as is the amd64 Chrome for Testing archive, which has no
+# checksum.
 # Verify with `gpg --show-keys --with-fingerprint scripts/pgdg-ACCC4CF8.asc`:
 #   B97B0AFC AA1A47F0 44F244A0 7FCC7D46 ACCC4CF8, uid "PostgreSQL Debian Repository".
 #
@@ -197,7 +199,8 @@ COPY package*.json ./
 
 # Backport upstream whatsapp-web.js#201832 (id._serialized -> id.$1 normalization,
 # broken by WA Web 2.3000.x ~2026-07-14) into the installed dep at build time.
-# The patcher self-disables once whatsapp-web.js ships the fix upstream.
+# The patcher stands down once every site it writes carries the fix; a release that fixes the ids
+# another way fails the build until the backport is retired.
 # scripts/postinstall.js rides along so a bare local `npm ci` keeps working, but the
 # --ignore-scripts install below skips the hook here: the explicit fatal run right
 # after is the sole (and stricter) applier for the image.
@@ -294,7 +297,7 @@ RUN if [ "$TARGETARCH" = arm64 ]; then \
         ln -s /usr/bin/chromium /usr/local/bin/puppeteer-chrome; \
     else \
         mkdir -p /opt/puppeteer && \
-        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@156.0.8078.47' && \
+        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@156.0.8078.80' && \
         chown -R openwa:openwa /opt/puppeteer && \
         chrome_path=$(find /opt/puppeteer/chrome/linux*/chrome-linux64/chrome | head -n 1) && \
         test -n "$chrome_path" && \

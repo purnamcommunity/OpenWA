@@ -46,6 +46,13 @@ const stripEdgeQuotes = (field: string): string => field.replace(/^"/, '').repla
 const MIN_PHONE_DIGITS = 6;
 
 /**
+ * Most digits a phone number has (E.164). Spaces are formatting inside one number, so two whole numbers on one line
+ * fold into one run of digits; a run past this bound is no number anybody typed and is dropped, never sent. A leading
+ * 00 is the international exit code (no number starts with 0), dropped before measuring as the Number Checker drops it.
+ */
+const MAX_PHONE_DIGITS = 15;
+
+/**
  * A full chat id: a numeric user part (a device suffix or group hyphen allowed) on a WhatsApp
  * server. The server list is what keeps an email out; a numeric local part alone would still let
  * `12345@qq.com` through.
@@ -68,8 +75,9 @@ export function parseBulkRecipients(text: string): string[] {
         if (CHAT_ID.test(id)) seen.add(id);
         continue;
       }
-      const digits = field.replace(/[^0-9]/g, '');
-      if (digits.length >= MIN_PHONE_DIGITS) seen.add(`${digits}@c.us`);
+      let digits = field.replace(/[^0-9]/g, '');
+      if (digits.startsWith('00') && digits.length >= 12) digits = digits.slice(2);
+      if (digits.length >= MIN_PHONE_DIGITS && digits.length <= MAX_PHONE_DIGITS) seen.add(`${digits}@c.us`);
     }
   }
   return [...seen];

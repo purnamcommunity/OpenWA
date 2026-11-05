@@ -68,6 +68,49 @@ describe('ContactService', () => {
     expect(resolveContactPhone).toHaveBeenCalledWith('123@lid');
   });
 
+  describe('getContactLid', () => {
+    it('delegates to the engine', async () => {
+      const getContactLid = jest.fn().mockResolvedValue('123@lid');
+      await expect(makeService({ getContactLid }).getContactLid('s1', '628123456789')).resolves.toBe('123@lid');
+      expect(getContactLid).toHaveBeenCalledWith('628123456789');
+    });
+
+    it('lets a failed lookup through: unlike resolveContactPhone, a null here would claim "no lid"', async () => {
+      const failure = new EngineTransportError('WhatsApp did not answer the LID lookup');
+      const svc = makeService({ getContactLid: jest.fn().mockRejectedValue(failure) });
+      await expect(svc.getContactLid('s1', '628123456789')).rejects.toBe(failure);
+    });
+
+    it('throws 400 when the session is not started', () => {
+      expect(() => makeService(undefined).getContactLid('s1', '628123456789')).toThrow(BadRequestException);
+    });
+
+    // The digits of a privacy id or a group id are no phone number: the engines keep nothing but digits, so the
+    // id would be looked up as a stranger's number and answer null, or that stranger's LID.
+    it.each([
+      '234767895240796@lid',
+      '120363021234567890@g.us',
+      '123456789@newsletter',
+      'status@broadcast',
+      '6281@c.us@c.us',
+    ])('refuses %s with 400 before an engine is asked', id => {
+      const getContactLid = jest.fn();
+
+      expect(() => makeService({ getContactLid }).getContactLid('s1', id)).toThrow(BadRequestException);
+      expect(getContactLid).not.toHaveBeenCalled();
+    });
+
+    it.each(['628123456789', '+62 812-7000-8896', '628123456789@c.us', '628123456789@s.whatsapp.net', 'abc'])(
+      'hands %s to the engine, which keeps its digits',
+      async typed => {
+        const getContactLid = jest.fn().mockResolvedValue(null);
+
+        await expect(makeService({ getContactLid }).getContactLid('s1', typed)).resolves.toBeNull();
+        expect(getContactLid).toHaveBeenCalledWith(typed);
+      },
+    );
+  });
+
   it('batch-resolves profile pictures, nulling per-id failures without aborting', async () => {
     const getProfilePicture = jest
       .fn()

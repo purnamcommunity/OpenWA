@@ -461,7 +461,7 @@ const mediaMsg = (id: string, data?: string): ChatMessageView =>
   msg({ id, type: 'image', metadata: { media: { mimetype: 'image/jpeg', filename: `${id}.jpg`, data } } });
 
 test('capMediaPayloads bounds archived previews together with inline media', () => {
-  const archive = mediaMsg('old-archive');
+  const archive = { ...mediaMsg('old-archive'), mediaPath: 'media/old-archive.jpg' };
   archive.metadata!.media = { mimetype: 'image/jpeg', omitted: true, archived: true };
   const list = [archive, ...Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, 'X'))];
   const capped = capMediaPayloads(list);
@@ -782,6 +782,20 @@ test('capMediaPayloads: archived documents are download buttons, not previews, a
   const images = Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, 'X'));
   const list = [...Array.from({ length: 5 }, (_, i) => document(`d-${i}`)), ...images];
   assert.equal(capMediaPayloads(list), list, 'only the images count, and they fit');
+});
+
+// Retention deletes an archived copy and nulls the row's mediaPath, while a row an older gateway wrote can keep its
+// archived marker. Such a row is a download button, not a preview, so it takes no place a payload could hold.
+test('capMediaPayloads: an archived marker whose copy is gone is not counted', () => {
+  const purged = msg({
+    id: 'purged',
+    type: 'image',
+    mediaPath: null,
+    metadata: { media: { mimetype: 'image/jpeg', omitted: true, archived: true } },
+  });
+  const images = Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, 'X'));
+  const list = [purged, ...images];
+  assert.equal(capMediaPayloads(list), list, 'the purged row pushed a payload out');
 });
 
 test('capMediaPayloads: omitted markers that follow a full set of payloads strip none of them', () => {

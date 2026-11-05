@@ -19,6 +19,7 @@ import {
   comparePair,
   exposedSchemas,
   handToken,
+  inlineBodies,
   parseGoTypes,
   parseHandTypes,
   parseJavaTypes,
@@ -127,6 +128,32 @@ test('comparePair flags a primitive widened to a union of primitives', () => {
   const diffs = comparePair('Sample', hand, 'SampleDto', schemas.SampleDto, schemas);
   assert.ok(diffs.some(d => d.includes('"id": hand union(number,string), contract string')));
   assert.ok(diffs.some(d => d.includes('"count": hand union(int,str), contract number')));
+});
+
+test('comparePair fails a field whose hand type it cannot read instead of skipping it', () => {
+  const schema = {
+    type: 'object',
+    required: ['status'],
+    properties: { status: { type: 'string', enum: ['ready', 'failed'] } },
+  };
+  const compare = types => comparePair('Sample', types.Sample, 'SampleDto', schema, {});
+  // A union too long for one line, as prettier wraps it, with 'failed' replaced.
+  const wrapped = parseHandTypes("export interface Sample {\n  status:\n    | 'ready'\n    | 'gone';\n}\n");
+  assert.deepEqual(compare(wrapped), ['"status": hand enum(["gone","ready"]), contract enum(["failed","ready"])']);
+  // Forms no parser reduces: an alias that is not exported, a TypeScript enum, a Go type outside the known kinds.
+  for (const types of [
+    parseHandTypes("type Status = 'ready' | 'gone';\nexport interface Sample {\n  status: Status;\n}\n"),
+    parseHandTypes("export enum Status {\n  Ready = 'ready',\n}\nexport interface Sample {\n  status: Status;\n}\n"),
+  ]) {
+    assert.deepEqual(compare(types), [
+      '"status": hand type could not be read (Status), contract enum(["failed","ready"])',
+    ]);
+  }
+  assert.deepEqual(compare(parseGoTypes(['type Sample struct {\n\tStatus pb.Status `json:"status"`\n}'])), [
+    '"status": hand type could not be read (pb.Status), contract enum(["failed","ready"])',
+  ]);
+  // Go writes a time.Time as an RFC 3339 string.
+  assert.equal(parseGoTypes(['type Sample struct {\n\tAt time.Time `json:"at"`\n}']).Sample.at.token, 'string');
 });
 
 test('comparePair with namesOnly keeps the field names and drops optionality and token', () => {
@@ -615,6 +642,18 @@ function withBrandNewPayload(contract) {
   return contract;
 }
 
+/** The gate source with BrandNew mapped for the dashboard, and the dashboard floor raised to match. */
+function mapBrandNewForDashboard(source) {
+  const mapped = editSource(
+    source,
+    "  'dashboard/src/services/api.ts': {\n    AccountRestriction: 'AccountRestrictionDto',",
+    "  'dashboard/src/services/api.ts': {\n    BrandNew: 'BrandNewDto',\n    AccountRestriction: 'AccountRestrictionDto',",
+  );
+  const floor = /^ {2}'dashboard\/src\/services\/api\.ts': (\d+),$/m.exec(mapped);
+  assert.ok(floor, 'the dashboard floor in MINIMUM_MAPPED has moved: move this anchor');
+  return mapped.replace(floor[0], `  'dashboard/src/services/api.ts': ${Number(floor[1]) + 1},`);
+}
+
 test('the gate exits 0 on the repository and finds every exposed schema covered', () => {
   // Also pins the harness below: a copy that cannot run would fail the other cases for the wrong reason.
   // A pair whose target is a list (a body type that is also its response) has to reach the comparison and
@@ -625,6 +664,47 @@ test('the gate exits 0 on the repository and finds every exposed schema covered'
     run.output,
     /schema coverage: \d+ schemas sent or returned, \d+ recorded unmapped in UNMAPPED_SCHEMAS, all covered/,
   );
+});
+
+test('inlineBodies names the exposed operations that send or return an object no schema name stands for', () => {
+  const object = { type: 'object', properties: { labelId: { type: 'string' } } };
+  const openapi = {
+    paths: {
+      '/api/sessions/{sessionId}/inline': { post: { requestBody: json(object), responses: { 201: json(ref('A')) } } },
+      '/api/sessions/{sessionId}/named': { post: { requestBody: json(ref('A')), responses: { 200: json(ref('A')) } } },
+      '/api/sessions/{sessionId}/listed': { get: { responses: { 200: json({ type: 'array', items: object }) } } },
+      '/api/sessions/{sessionId}/wrapped': { get: { responses: { 200: json({ nullable: true, allOf: [ref('A')] }) } } },
+      '/api/sessions/{sessionId}/failing': { get: { responses: { 400: json(object) } } },
+      '/api/audit/inline': { post: { requestBody: json(object) } },
+    },
+  };
+  assert.deepEqual(inlineBodies(openapi, new Set(['audit'])), [
+    'POST /api/sessions/{sessionId}/inline',
+    'GET /api/sessions/{sessionId}/listed',
+  ]);
+});
+
+test('the gate exits 1 on a new inline body and on a recorded one that is gone', () => {
+  // Renaming a field of an inline body changes the contract with no hand type to compare it against.
+  const added = runGateOnCopy({
+    contract: contract => {
+      contract.paths['/api/sessions/{sessionId}/brand-new'] = {
+        post: { requestBody: json({ type: 'object', properties: { id: { type: 'string' } } }), responses: {} },
+      };
+      return contract;
+    },
+  });
+  assert.equal(added.status, 1, added.output);
+  assert.match(added.output, /POST \/api\/sessions\/\{sessionId\}\/brand-new declares an inline object/);
+
+  const named = runGateOnCopy({
+    contract: contract => {
+      contract.paths['/api/sessions/{sessionId}/channels/subscribe'].post.requestBody = json(ref('UpsertLabelDto'));
+      return contract;
+    },
+  });
+  assert.equal(named.status, 1, named.output);
+  assert.match(named.output, /INLINE_BODIES lists POST \/api\/sessions\/\{sessionId\}\/channels\/subscribe.*remove it/);
 });
 
 test('the gate exits 1 and names an exposed payload that no client maps', () => {
@@ -639,12 +719,7 @@ test('a schema that only the dashboard compares, or only an excluded pair holds,
   const dashboardOnly = runGateOnCopy({
     contract: withBrandNewPayload,
     dashboardTypes: api => `${api}\nexport interface BrandNew {\n  id: string;\n}\n`,
-    script: source =>
-      editSource(
-        source,
-        "  'dashboard/src/services/api.ts': {\n    AccountRestriction: 'AccountRestrictionDto',",
-        "  'dashboard/src/services/api.ts': {\n    BrandNew: 'BrandNewDto',\n    AccountRestriction: 'AccountRestrictionDto',",
-      ),
+    script: mapBrandNewForDashboard,
   });
   assert.match(dashboardOnly.output, /dashboard\/src\/services\/api\.ts: \d+ pairs compared, all conform/);
   assert.equal(dashboardOnly.status, 1, dashboardOnly.output);
@@ -733,6 +808,35 @@ test('an excluded pair with a looser field type is still compared by field name'
   }
 });
 
+test('the gate refuses a mapping whose size differs from its floor', () => {
+  // The floor is what makes a rewrite that drops pairs fail. Left one below its mapping, it let one Java pair go
+  // with nothing failing: AccountRestriction stays compared by the other clients, so coverage stays green too.
+  const dropped = runGateOnCopy({
+    script: source =>
+      editSource(
+        source,
+        "const JAVA_MAPPING = {\n  AccountRestriction: 'AccountRestrictionDto',\n",
+        'const JAVA_MAPPING = {\n',
+      ),
+  });
+  assert.equal(dropped.status, 1, dropped.output);
+  assert.match(dropped.output, /only \d+ mapped pairs for sdk\/java \(model\/\*\.java\) \(floor \d+\)/);
+
+  // A floor left below a grown mapping is the same hole, opened by a pair added without raising it.
+  const stale = runGateOnCopy({
+    script: source => {
+      const floor = /^ {2}'sdk\/java': (\d+),$/m.exec(source);
+      assert.ok(floor, 'the Java floor in MINIMUM_MAPPED has moved: move this anchor');
+      return source.replace(floor[0], `  'sdk/java': ${Number(floor[1]) - 1},`);
+    },
+  });
+  assert.equal(stale.status, 1, stale.output);
+  assert.match(
+    stale.output,
+    /\d+ mapped pairs for sdk\/java \(model\/\*\.java\), above its floor of \d+: raise the floor/,
+  );
+});
+
 test('the gate refuses a NAMES_ONLY entry whose pair is not excluded', () => {
   // An entry left behind after a pair is retyped and un-excluded would keep the weaker name-only comparison.
   const run = runGateOnCopy({
@@ -754,12 +858,7 @@ test('the gate and its CLI cases give the same verdicts on a CRLF checkout', () 
     lineEnding: '\r\n',
     contract: withBrandNewPayload,
     dashboardTypes: api => `${api}\nexport interface BrandNew {\n  id: string;\n}\n`,
-    script: source =>
-      editSource(
-        source,
-        "  'dashboard/src/services/api.ts': {\n    AccountRestriction: 'AccountRestrictionDto',",
-        "  'dashboard/src/services/api.ts': {\n    BrandNew: 'BrandNewDto',\n    AccountRestriction: 'AccountRestrictionDto',",
-      ),
+    script: mapBrandNewForDashboard,
   });
   assert.equal(dashboardOnly.status, 1, dashboardOnly.output);
   assert.match(dashboardOnly.output, /BrandNewDto is sent or returned by the SDKs but no client compares it/);
@@ -899,3 +998,122 @@ for (const [name, value] of [
     assert.deepEqual(comparePair('Sample', java, 'Dto', numeric, {}, false), []);
   });
 }
+
+test('resolves TypeScript export type aliases and typeof-const unions in handToken and comparePair', () => {
+  const jsSrc = readFileSync(join(gateRoot, 'sdk/javascript/src/types.ts'), 'utf8');
+  const jsTypes = parseHandTypes(jsSrc);
+  assert.equal(handToken(jsTypes.GroupInfo.owner.token, jsTypes), 'string');
+  const fakeDriftedWebhook = {
+    url: { optional: false, token: jsTypes.CreateWebhookRequest.url.token },
+    events: { optional: true, token: 'WebhookEvent[];' },
+  };
+  const fakeSchema = {
+    type: 'object',
+    required: ['url'],
+    properties: {
+      url: { type: 'string' },
+      events: { type: 'array', items: { type: 'string', enum: ['only.one.event'] } },
+    },
+  };
+  const diffs = comparePair('CreateWebhookRequest', fakeDriftedWebhook, 'CreateWebhookDto', fakeSchema, {
+    CreateWebhookDto: fakeSchema,
+  });
+  assert.ok(
+    diffs.length > 0,
+    'comparePair should gate TypeScript fields typed via export type aliases (WebhookEvent[])',
+  );
+
+  const constTupleTypes = parseHandTypes(
+    "export const KINDS = ['a', 'b'] as const;\nexport type Kind = (typeof KINDS)[number];\nexport interface Item {\n  kind: Kind;\n}\n",
+  );
+  assert.deepEqual(
+    comparePair(
+      'Item',
+      constTupleTypes.Item,
+      'ItemDto',
+      { type: 'object', required: ['kind'], properties: { kind: { type: 'string', enum: ['a', 'b'] } } },
+      {},
+    ),
+    [],
+  );
+});
+
+test('parsePythonTypes parses functional TypedDicts with comment lines, comma-bearing Literal types, and functional base classes', () => {
+  const pySrc = readFileSync(join(gateRoot, 'sdk/python/openwa/types.py'), 'utf8');
+  const pyTypes = parsePythonTypes(pySrc);
+  assert.ok(pyTypes.ListMessagesQuery, 'ListMessagesQuery should be parsed by parsePythonTypes');
+  assert.equal(pyTypes.ListMessagesQuery.direction.token, 'enum(["incoming","outgoing"])');
+  assert.equal(pyTypes.ListMessagesQuery.orderBy.token, 'enum(["createdAt","timestamp"])');
+  assert.ok(
+    pyTypes.SearchQueryParams?.match,
+    'SearchQueryParams.match (Literal["word", "contains"]) should not be dropped by parsePythonTypes',
+  );
+  assert.equal(pyTypes.SearchQueryParams.match.token, 'enum(["contains","word"])');
+  assert.ok(
+    pyTypes.SearchHit,
+    'SearchHit (subclass of functional TypedDict _SearchHitRequired) should be parsed by parsePythonTypes',
+  );
+});
+
+test('parsePythonTypes classifies bare list as unknown and types ChatHistoryMessage.mentionedIds and MessageContact.labels as array<string>', () => {
+  const pySrc = readFileSync(join(gateRoot, 'sdk/python/openwa/types.py'), 'utf8');
+  const pyTypes = parsePythonTypes(pySrc);
+  assert.equal(pyTypes.ChatHistoryMessage.mentionedIds.token, 'array<string>');
+  assert.equal(pyTypes.MessageContact.labels.token, 'array<string>');
+
+  const bareListTypes = parsePythonTypes('class Sample(TypedDict):\n    items: list\n');
+  assert.equal(bareListTypes.Sample.items.token, 'unknown');
+  const diffs = comparePair(
+    'Sample',
+    bareListTypes.Sample,
+    'SampleDto',
+    { type: 'object', required: ['items'], properties: { items: { type: 'array', items: { type: 'string' } } } },
+    {},
+  );
+  assert.deepEqual(diffs, ['"items": hand unknown, contract array<string>']);
+});
+
+test('comparePair recursively gates inline nested object fields on TypeScript interfaces', () => {
+  const openapi = JSON.parse(readFileSync(join(gateRoot, 'openapi.json'), 'utf8'));
+  const allSchemas = openapi.components.schemas;
+  const dashSrc = readFileSync(join(gateRoot, 'dashboard/src/services/api.ts'), 'utf8');
+  const dashTypes = parseHandTypes(dashSrc);
+  const bulkDiffs = comparePair(
+    'BulkMessageItem',
+    dashTypes.BulkMessageItem,
+    'BulkMessageItemDto',
+    allSchemas.BulkMessageItemDto,
+    allSchemas,
+  );
+  const historyDiffs = comparePair(
+    'EngineHistoryMessage',
+    dashTypes.EngineHistoryMessage,
+    'ChatHistoryMessageDto',
+    allSchemas.ChatHistoryMessageDto,
+    allSchemas,
+  );
+  assert.match(dashTypes.BulkMessageItem.content.token, /\bmentions\?:/);
+  assert.doesNotMatch(dashTypes.EngineHistoryMessage.media.token, /\barchived\?:/);
+  assert.deepEqual(bulkDiffs, []);
+  assert.deepEqual(historyDiffs, []);
+
+  const driftedInline = parseHandTypes('export interface Item {\n  nested: { extra?: boolean; id: string };\n}\n');
+  const inlineDiffs = comparePair(
+    'Item',
+    driftedInline.Item,
+    'ItemDto',
+    {
+      type: 'object',
+      required: ['nested'],
+      properties: {
+        nested: {
+          type: 'object',
+          required: ['id'],
+          properties: { id: { type: 'string' } },
+        },
+      },
+    },
+    {},
+  );
+  assert.ok(inlineDiffs.some(d => d.includes('nested.hand has "extra"')));
+});

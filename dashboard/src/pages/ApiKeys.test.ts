@@ -221,6 +221,24 @@ test('a native digit entry that is no chat id is still refused and names the fol
   screen.getByText('Not a chat ID or phone number: 1234');
 });
 
+// An @lid entry also admits the number mapped to it, which WhatsApp may later give to someone else.
+test('the chat field says what an @lid entry admits, only while one is listed', async () => {
+  const { screen, fireEvent } = rtl;
+  const create = await openCreate();
+  const chats = screen.getByLabelText('Chat access (optional)');
+  const lidHint = /An @lid entry also admits the phone number currently mapped to it/;
+  fireEvent.change(chats, { target: { value: '6281234\n120363000@g.us' } });
+  assert.equal(screen.queryByText(lidHint) === null, true, 'no hint without an @lid entry');
+  assert.equal(chats.getAttribute('aria-describedby'), null);
+
+  fireEvent.change(chats, { target: { value: '6281234\n99887766554433@LID' } });
+  const hint = screen.getByText(lidHint);
+  assert.ok(hint.id);
+  assert.equal(chats.getAttribute('aria-describedby'), hint.id);
+  fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'crm-bot' } });
+  assert.equal(create.disabled, false, 'the hint does not block the create');
+});
+
 test('an edit in native digits for the chat already stored sends nothing', async () => {
   const { screen, fireEvent, waitFor } = rtl;
   const save = await openEdit({ ...billingBot, allowedChats: ['6281234@c.us'] });
@@ -267,6 +285,23 @@ test('closing the dialog that shows a new key drops the secret, and Create opens
   assert.equal(screen.queryByText('owa_k1_new') === null, true, 'the previous secret is shown again');
   assert.equal(screen.getByLabelText<HTMLInputElement>('Name').value, '');
   assert.ok(screen.getByRole('button', { name: 'Create' }));
+});
+
+// The secret is shown only here. An Escape or a click beside the dialog closed it before it was copied, leaving an
+// active key nobody holds, so the dialog that shows it closes only on its Close button.
+test('a new key stays on screen through Escape and a click beside the dialog, until Close', async () => {
+  const { screen, fireEvent } = rtl;
+  const create = await openCreate();
+  fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'crm-bot' } });
+  fireEvent.click(create);
+  await screen.findByText('owa_k1_new');
+
+  fireEvent.keyDown(document, { key: 'Escape' });
+  assert.equal(screen.queryByText('owa_k1_new') === null, false, 'Escape dismissed the one-time key');
+  fireEvent.mouseDown(document.querySelector('.modal-overlay') as HTMLElement);
+  assert.equal(screen.queryByText('owa_k1_new') === null, false, 'a click beside the dialog dismissed the key');
+  fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+  assert.equal(screen.queryByRole('dialog') === null, true, 'Close left the dialog open');
 });
 
 // The gateway counts an emoji, with or without its presentation selector, as one character.

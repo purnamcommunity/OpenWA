@@ -1,6 +1,6 @@
 # OpenWA SDKs
 
-This document describes SDK 0.7.0. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
+This document describes `main`. `messages.receipts` (`Messages.Receipts` in Go) is an unreleased addition after SDK 0.9.0 and requires the corresponding server change after OpenWA 0.27.1. `contacts.lid` (`Contacts.Lid` in Go) requires OpenWA 0.27.1 or later. `setMemberLabel` (`set_member_label` in Python, `SetMemberLabel` in Go), the search `match` option, and the `thumbnailUrl` and `thumbnailBase64` fields of `customLinkPreview` require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
 
 Official client libraries for [OpenWA](https://github.com/rmyndharis/OpenWA), the
 open-source WhatsApp API Gateway. OpenWA is an independent project, not
@@ -29,8 +29,8 @@ All five SDKs expose the same fluent resource surface:
 | Resource    | Methods                                                                                                                                                                                                                                                                                                    |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sessions`  | list, get, getConfig, updateConfig, getProxy, updateProxy, create, delete, start, stop, logout, forceKill, getQrCode, requestPairingCode, cancelPairingCode, setOnlinePresence, stats                                                                                                                      |
-| `messages`  | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, sendPoll, reply, forward, react, delete, editMessage, history, reactions, pollVotes, comments, sendComment, media, pin, unpin, star, votePoll, sendBulk, batchStatus, cancelBatch, clickButton            |
-| `contacts`  | list, get, check, profilePicture, profilePictures, phone, upsert, delete, block, unblock, listBlocked                                                                                                                                                                                                      |
+| `messages`  | list, sendText, sendImage/Video/Audio/Document/Sticker, sendLocation, sendContact, sendTemplate, sendPoll, reply, forward, react, delete, editMessage, history, reactions, receipts, pollVotes, comments, sendComment, media, pin, unpin, star, votePoll, sendBulk, batchStatus, cancelBatch, clickButton  |
+| `contacts`  | list, get, check, profilePicture, profilePictures, phone, lid, upsert, delete, block, unblock, listBlocked                                                                                                                                                                                                 |
 | `groups`    | list, get, create, joinGroup, joinInfo, add/remove/promote/demoteParticipants, setSubject, setDescription, setMemberLabel, get/updateGroupSettings, leave, getPicture, setPicture, deletePicture, inviteCode, revokeInviteCode, getMembershipRequests, approveMembershipRequests, rejectMembershipRequests |
 | `webhooks`  | list, listAll, deliveryFailures, redriveDeliveryFailures, get, create, update, delete, test                                                                                                                                                                                                                |
 | `chats`     | list, markRead, markUnread, archive, pin, mute, clearMessages, delete, sendState, subscribePresence, getPresence                                                                                                                                                                                           |
@@ -183,7 +183,7 @@ handler is a `MockHandler` — no global state, no network.
 <dependency>
   <groupId>com.rmyndharis</groupId>
   <artifactId>openwa</artifactId>
-  <version>0.7.0</version>
+  <version>0.9.0</version>
 </dependency>
 ```
 
@@ -265,20 +265,24 @@ testing, retry, tracing, or metrics. See [`go/README.md`](go/README.md).
   outside local development.
 - **No automatic retries by default.** A failed request raises/throws
   immediately; wrap calls in your own backoff if you need retries (especially
-  for `429`). The injectable transport (`fetch` / `transport` / `httpClient`) is
-  the extension point for retry or observability middleware. The Go client is
-  the exception: it ships an opt-in policy (`WithRetry(DefaultRetryPolicy())`)
-  that retries idempotent requests on network errors and `429`/`5xx`, retries a
-  `POST`/`PATCH` only on `429`/`503` (never after a network error), never
-  retries a send-pacing `429` (`code: "SEND_PACING_LIMITED"`), honors
-  `Retry-After`, and rewinds request bodies —
-  still off unless you ask for it.
+  for `429`), and replay a send answered `503` only with the same
+  `Idempotency-Key`: the message may already have gone out. The injectable
+  transport (`fetch` / `transport` / `httpClient`) is the extension point for
+  retry or observability middleware. The Go client is the exception: it ships an
+  opt-in policy (`WithRetry(DefaultRetryPolicy())`) that retries idempotent
+  requests on network errors and `429`/`5xx`, retries a `POST`/`PATCH` only on
+  `429`, or on `503` when it carries an `Idempotency-Key` or the `503` carries
+  `Retry-After` (never after a network error), never retries a send-pacing `429`
+  (`code: "SEND_PACING_LIMITED"`), honors `Retry-After`, and rewinds request
+  bodies; it is still off unless you ask for it.
 - **Webhook signatures.** Every SDK verifies a delivery's `X-OpenWA-Signature`
   against the raw request body: `verifyWebhookSignature` (JavaScript),
   `verify_webhook_signature` (Python), `VerifyWebhookSignature` (Go),
   `WebhookSignature.verify` (Java) and `WebhookSignature::verify` (PHP). The
   JavaScript, Python, Go and Java SDKs also type the delivery body as
-  `WebhookDelivery`.
+  `WebhookDelivery`. The signature carries no timestamp, so dedupe on the body's
+  `idempotencyKey` (also the `X-OpenWA-Idempotency-Key` header), which the
+  gateway's retries and redrives reuse.
 - **Redirects are never followed.** A `3xx` surfaces to the caller rather than
   being followed, so the API key is never re-sent to a redirect target.
 - **Default timeout** is 30s (configurable). `0` turns it off in the JavaScript,
@@ -292,7 +296,10 @@ testing, retry, tracing, or metrics. See [`go/README.md`](go/README.md).
   up to about twice the `timeout`. A body that keeps trickling bytes is therefore
   not cut off. There a `0` still leaves PHP's `default_socket_timeout` (60s by
   default) before the response headers, and that wait ends with a Guzzle
-  exception, not `OpenWATimeoutException`; see the PHP README. Path segments (chat / message ids) are percent-encoded; a base-URL path
+  exception, not `OpenWATimeoutException`; see the PHP README. A timeout ends the
+  wait, not the call: the gateway may still complete the request, so retry a send
+  only with the same `Idempotency-Key` and re-read state before repeating any other
+  write. Path segments (chat / message ids) are percent-encoded; a base-URL path
   prefix (e.g. behind a proxy at `/v1`) is preserved.
 
 ## Development

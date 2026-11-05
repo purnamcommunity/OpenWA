@@ -334,3 +334,10 @@
   font-size: 0.8125rem;
   border-top: 1px solid var(--border);
 }
+
+.chips-suggestion-note {
+  padding: 0.5rem 0.625rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--error-text);
+}

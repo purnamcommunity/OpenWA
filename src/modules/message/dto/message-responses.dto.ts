@@ -464,3 +464,32 @@ export class MessageCommentDto {
   @ApiProperty({ description: 'True when this account posted the reply.' })
   fromMe!: boolean;
 }
+
+export class MessageReceiptParticipantDto {
+  @ApiProperty({ example: '628123456789@c.us', description: 'Participant WhatsApp ID' })
+  participant!: string;
+
+  @ApiProperty({ description: 'Unix seconds the receipt occurred.', example: 1700000010 })
+  timestamp!: number;
+}
+
+/** OpenAPI mirror of the engine `MessageReceipts` served by the receipts route. */
+export class MessageReceiptsResponseDto {
+  @ApiProperty({ type: [MessageReceiptParticipantDto], description: 'Participants who received the message' })
+  delivery!: MessageReceiptParticipantDto[];
+
+  @ApiPropertyOptional({ description: 'Number of participants remaining to receive', example: 0 })
+  deliveryRemaining?: number;
+
+  @ApiProperty({ type: [MessageReceiptParticipantDto], description: 'Participants who read the message' })
+  read!: MessageReceiptParticipantDto[];
+
+  @ApiPropertyOptional({ description: 'Number of participants remaining to read', example: 0 })
+  readRemaining?: number;
+
+  @ApiProperty({ type: [MessageReceiptParticipantDto], description: 'Participants who played the audio/voice message' })
+  played!: MessageReceiptParticipantDto[];
+
+  @ApiPropertyOptional({ description: 'Number of participants remaining to play', example: 0 })
+  playedRemaining?: number;
+}

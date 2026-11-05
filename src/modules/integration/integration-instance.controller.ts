@@ -143,6 +143,12 @@ export class IntegrationInstanceController {
   @ApiResponse({ status: 400, description: 'Validation failed, or the masked config could not be restored.' })
   @ApiResponse({ status: 403, description: "The new sessionScope is outside the key's allowedSessions." })
   @ApiResponse({ status: 404, description: "Unknown instance, or one outside the key's allowedSessions." })
+  @ApiResponse({
+    status: 409,
+    description:
+      'The body changes config while the plugin is not loaded. Nothing is written; a body without config still ' +
+      'applies enabled and sessionScope.',
+  })
   async patch(
     @Param('pluginId') pluginId: string,
     @Param('instanceId') instanceId: string,

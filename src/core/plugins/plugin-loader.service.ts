@@ -15,7 +15,7 @@ import {
   PluginStatus,
   PluginType,
 } from './plugin.interfaces';
-import { PluginStorageService } from './plugin-storage.service';
+import { PluginStorageService, type RegistryWriteOptions } from './plugin-storage.service';
 import { PluginHostServices } from './plugin-host-services';
 import type { PluginConversationMappingPort } from './plugin-host-ports';
 import { PluginCapabilityContext } from './plugin-capability-context';
@@ -493,20 +493,25 @@ export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap
     return this.pluginStorage.getPluginEntry(pluginId)?.builtIn ?? false;
   }
 
-  uninstallPlugin(pluginId: string): Promise<void> {
+  uninstallPlugin(pluginId: string): Promise<{ registryEntryKept: boolean }> {
     return this.uninstaller.uninstallPlugin(pluginId);
   }
 
-  updatePluginConfig(pluginId: string, config: Record<string, unknown>): void {
-    this.lifecycle.updatePluginConfig(pluginId, config);
+  updatePluginConfig(pluginId: string, config: Record<string, unknown>, opts?: RegistryWriteOptions): void {
+    this.lifecycle.updatePluginConfig(pluginId, config, opts);
   }
 
-  setPluginSessions(pluginId: string, sessions: string[]): PluginInstance {
-    return this.lifecycle.setPluginSessions(pluginId, sessions);
+  setPluginSessions(pluginId: string, sessions: string[], opts?: RegistryWriteOptions): PluginInstance {
+    return this.lifecycle.setPluginSessions(pluginId, sessions, opts);
   }
 
-  setPluginSessionConfig(pluginId: string, sessionId: string, config: Record<string, unknown>): PluginInstance {
-    return this.lifecycle.setPluginSessionConfig(pluginId, sessionId, config);
+  setPluginSessionConfig(
+    pluginId: string,
+    sessionId: string,
+    config: Record<string, unknown>,
+    opts?: RegistryWriteOptions,
+  ): PluginInstance {
+    return this.lifecycle.setPluginSessionConfig(pluginId, sessionId, config, opts);
   }
 
   /** Health across both tiers; the sandbox-routing implementation lives in PluginSandboxBridge. */

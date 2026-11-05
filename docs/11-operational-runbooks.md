@@ -632,25 +632,55 @@ docker compose run --rm --no-deps --entrypoint /app/scripts/restore.sh \
 # under a new name, as the SQLite path keeps data.pre-restore-<ts>, and an empty one takes its place.
 # The container's own POSTGRES_USER and POSTGRES_DB name the role and database the app uses. The
 # image's pg_dump 17 writes `SET transaction_timeout = 0;`, which PostgreSQL 16 rejects, so sed
-# drops that line before psql
+# drops that line before psql. It also opens the dump with \restrict, which psql reads from 13.22,
+# 14.19, 15.14, 16.10 and 17.6 on, and no 12 ever does: an older one stops there with "invalid command
+# \restrict" and loads nothing. The third command fails on such a psql before anything is renamed; a
+# postgres:16-alpine pulled before August 2025 is one. Pull it again and recreate the container on its
+# kept volume (compose: `docker compose --profile postgres pull postgres` and the `up -d` below;
+# dashboard-created: `docker pull postgres:16-alpine` and `docker rm -f openwa-postgres`, then start
+# OpenWA once so it creates the container again, and stop it), then run these commands again
 docker compose --profile postgres up -d postgres   # dashboard-created: docker start openwa-postgres
 docker exec openwa-postgres sh -c 'until pg_isready -q -U "$POSTGRES_USER"; do sleep 1; done'
+docker exec openwa-postgres sh -c 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
+  -c "\restrict openwa" -c "\unrestrict openwa"'
 docker exec openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
   -c "ALTER DATABASE \"$POSTGRES_DB\" RENAME TO \"${POSTGRES_DB}_pre_restore_$(date +%Y%m%d%H%M%S)\"" \
   -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\""'
 tar -xzOf "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz" ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
-  docker exec -i openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+  docker exec -i openwa-postgres sh -c 'psql --single-transaction -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 
 # An external PostgreSQL server: rename the upgraded database and create an empty one under the
-# DATABASE_NAME the app uses in the same way, then load the dump into it. DATABASE_URL is not an
+# DATABASE_NAME the app uses in the same way, then load the dump into it, with a psql that reads
+# \restrict as above (restore.sh refuses an older one on its PATH). DATABASE_URL is not an
 # OpenWA setting: fill in your own URL for that database, such as
 # postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD. With DATABASE_SSL=true,
 # run psql under PGSSLMODE=verify-full (require when DATABASE_SSL_REJECT_UNAUTHORIZED=false), as the
 # command restore.sh prints does; libpq's default sslmode=prefer accepts any certificate. verify-full
 # also needs PGSSLROOTCERT set to the server's CA file: libpq otherwise reads ~/.postgresql/root.crt,
-# and sslrootcert=system needs libpq 16+ and a system CA store, which the image lacks
+# and sslrootcert=system needs libpq 16+ and a system CA store, which the image lacks. One transaction:
+# a load that fails leaves nothing behind. An archive holding database.schema (a POSTGRES_SCHEMA other
+# than public) has that schema only: skip the rename and the empty database and load it into the
+# database the app uses, as restore.sh prints, as the app's role, or a member of it, that may create
+# schemas and extensions there and, when pg_trgm and unaccent live in that schema, owns them (the role
+# that created them: the app's own, or the one an earlier load ran as), or as a superuser. The same
+# goes for pgcrypto when the dump carries it, which it does only when pgcrypto lived in that schema
+# (PostgreSQL 12 or older, where the app creates it there for its ids). When another role owns the
+# schema, only a superuser can load it: the dump gives what is in it to the app's role before it
+# grants that role CREATE on the schema. After ALTER SCHEMA <schema> OWNER TO <app role>, a new
+# backup loads as that role. It moves the current copy of the schema aside as
+# <schema>_pre_restore_<time>, rows and all, and leaves the other schemas alone; pg_trgm and unaccent,
+# when they live in it, are dropped from the copy with its trigram index (idx_messages_body_trgm), and
+# such a pgcrypto with the copy's id column defaults, so the dump can create them again. A load that
+# stops at "cannot drop extension" means another schema uses them and nothing was changed; its DETAIL
+# lines name what. When that is another OpenWA deployment's idx_messages_body_trgm, drop that index and
+# load again: that deployment's contains search then reads its whole messages table until its next
+# start builds the index again, and answers 501 while it builds. Drop anything else named first and
+# recreate it after the load. Into an empty database, an extension it uses (pg_trgm, unaccent) that
+# lives in another application's schema has to exist first, and on PostgreSQL 12 or older so does a
+# pgcrypto that lived outside the app's schema, in the schema it lived in (the dump leaves that one
+# out). A pgcrypto that lived in the app's schema is created by the load: do not create it first
 tar -xzOf "$BACKUP_DIR/openwa-backup-<timestamp>.tar.gz" ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
-  psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
+  psql --single-transaction -v ON_ERROR_STOP=1 "$DATABASE_URL"
 
 # 3. Check out the previous release and rebuild the image
 git checkout v<old-version>
@@ -729,12 +759,21 @@ User-managed files outside that list (for example the project-level `.env`) must
 # scripts/backup.sh captures:
 #   - main.sqlite   — auth (API keys) + audit log   (ALWAYS SQLite; MAIN_DATABASE_NAME, default ./data/main.sqlite)
 #   - openwa.sqlite — user data                      (DATABASE_NAME, default ./data/openwa.sqlite;
-#                                                     or a pg_dump when DATABASE_TYPE=postgres)
+#                                                     or a pg_dump when DATABASE_TYPE=postgres; a
+#                                                     POSTGRES_SCHEMA other than public is dumped
+#                                                     alone, and database.schema names it; that
+#                                                     dump needs pg_dump 14 or newer, and the
+#                                                     image ships 17; loading a dump its
+#                                                     pg_dump makes needs psql 13.22, 14.19,
+#                                                     15.14, 16.10, 17.6 or newer, never a 12)
 #   - sessions/     — whatsapp-web.js state (SESSION_DATA_PATH)
 #   - baileys/      — Baileys credentials (BAILEYS_AUTH_DIR)
 #   - media/        — local media                    (STORAGE_LOCAL_PATH, archived whenever present; with
-#                                                     STORAGE_TYPE=s3 it holds only files the app could not
-#                                                     write to the bucket, so back up the bucket separately)
+#                                                     STORAGE_TYPE=s3 it holds the files the app could not
+#                                                     write to the bucket and, after a move from local
+#                                                     storage, the old local media until 14 - Migration
+#                                                     Guide (Storage Migration, Step 6) cleans it up, so
+#                                                     back up the bucket separately)
 #   - plugin-packages/ — installed plugin code from PLUGINS_DIR
 #                        (not packages in a legacy ./plugins, which the app still loads while
 #                        PLUGINS_DIR is unset; backup.sh warns about those)
@@ -934,26 +973,58 @@ docker compose down
 #    The current database is kept under a new name, as the data dir is kept in data.pre-restore-<ts>,
 #    and an empty one takes its place. The container's own POSTGRES_USER and POSTGRES_DB name the
 #    role and database the app uses. The image's pg_dump 17 writes `SET transaction_timeout = 0;`,
-#    which PostgreSQL 16 rejects, so sed drops that line before psql
+#    which PostgreSQL 16 rejects, so sed drops that line before psql. It also opens the dump with
+#    \restrict, which psql reads from 13.22, 14.19, 15.14, 16.10 and 17.6 on, and no 12 ever does: an
+#    older one stops there with "invalid command \restrict" and loads nothing. The third command fails
+#    on such a psql before anything is renamed; a postgres:16-alpine pulled before August 2025 is one.
+#    Pull it again and recreate the container on its kept volume (compose: `docker compose --profile
+#    postgres pull postgres` and the `up -d` below; dashboard-created: `docker pull postgres:16-alpine`
+#    and `docker rm -f openwa-postgres`, then start OpenWA once so it creates the container again, and
+#    stop it), then run these commands again
 docker compose --profile postgres up -d postgres   # dashboard-created: docker start openwa-postgres
 docker exec openwa-postgres sh -c 'until pg_isready -q -U "$POSTGRES_USER"; do sleep 1; done'
+docker exec openwa-postgres sh -c 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
+  -c "\restrict openwa" -c "\unrestrict openwa"'
 docker exec openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
   -c "ALTER DATABASE \"$POSTGRES_DB\" RENAME TO \"${POSTGRES_DB}_pre_restore_$(date +%Y%m%d%H%M%S)\"" \
   -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\""'
 tar -xzOf ./backups/openwa-backup-<timestamp>.tar.gz ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
-  docker exec -i openwa-postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+  docker exec -i openwa-postgres sh -c 'psql --single-transaction -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 
 #    An external PostgreSQL server: rename the current database and create an empty one under the
-#    DATABASE_NAME the app uses in the same way, then load the dump into it. DATABASE_URL is not an
+#    DATABASE_NAME the app uses in the same way, then load the dump into it, with a psql that reads
+#    \restrict as above (restore.sh refuses an older one on its PATH). DATABASE_URL is not an
 #    OpenWA setting: fill in your own URL for that database, such as
 #    postgres://<user>@<host>:5432/<database>, with the password in PGPASSWORD. With
 #    DATABASE_SSL=true, run psql under PGSSLMODE=verify-full (require when
 #    DATABASE_SSL_REJECT_UNAUTHORIZED=false), as the command restore.sh prints does; libpq's default
 #    sslmode=prefer accepts any certificate. verify-full also needs PGSSLROOTCERT set to the server's
 #    CA file: libpq otherwise reads ~/.postgresql/root.crt, and sslrootcert=system needs libpq 16+
-#    and a system CA store, which the image lacks
+#    and a system CA store, which the image lacks. One transaction: a load that fails leaves nothing
+#    behind. An archive holding database.schema (a POSTGRES_SCHEMA other than public) has that schema
+#    only: skip the rename and the empty database and load it into the database the app uses, as
+#    restore.sh prints, as the app's role, or a member of it, that may create schemas and extensions
+#    there and, when pg_trgm and unaccent live in that schema, owns them (the role that created them:
+#    the app's own, or the one an earlier load ran as), or as a superuser. The same goes for pgcrypto
+#    when the dump carries it, which it does only when pgcrypto lived in that schema (PostgreSQL 12
+#    or older, where the app creates it there for its ids). When another role owns the schema, only a
+#    superuser can load it: the dump gives what is in it to the app's role before it grants that role
+#    CREATE on the schema. After ALTER SCHEMA <schema> OWNER TO <app role>, a new backup loads as
+#    that role. It moves the current copy of the schema aside as <schema>_pre_restore_<time>, rows
+#    and all, and leaves the other schemas alone; pg_trgm and unaccent, when they live in it, are
+#    dropped from the copy with its trigram index (idx_messages_body_trgm), and such a pgcrypto with
+#    the copy's id column defaults, so the dump can create them again. A load that stops at "cannot
+#    drop extension" means another schema uses them and nothing was changed; its DETAIL lines name
+#    what. When that is another OpenWA deployment's idx_messages_body_trgm, drop that index and load
+#    again: that deployment's contains search then reads its whole messages table until its next
+#    start builds the index again, and answers 501 while it builds. Drop anything else named first
+#    and recreate it after the load. Into an empty database, an extension it uses (pg_trgm, unaccent)
+#    that lives in another application's schema has to exist first, and on PostgreSQL 12 or older so
+#    does a pgcrypto that lived outside the app's schema, in the schema it lived in (the dump leaves
+#    that one out). A pgcrypto that lived in the app's schema is created by the load: do not create
+#    it first
 tar -xzOf ./backups/openwa-backup-<timestamp>.tar.gz ./database.sql | sed '/^SET transaction_timeout = 0;$/d' |
-  psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
+  psql --single-transaction -v ON_ERROR_STOP=1 "$DATABASE_URL"
 
 # 4. Start the app and CONFIRM an existing API key still authenticates
 docker compose up -d
@@ -1100,7 +1171,9 @@ sudo certbot certificates
 
 # Restart nginx/proxy
 sudo systemctl restart nginx
-# or
+# or, for a proxy run as a compose service, as in the release compose file of 10 - DevOps &
+# Infrastructure (the shipped compose files run no proxy); add -f <file> when that file is not your
+# default compose file
 docker compose restart nginx
 
 # Verify HTTPS

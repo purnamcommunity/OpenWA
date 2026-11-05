@@ -96,8 +96,10 @@ export function capMediaPayloads(list: ChatMessageView[], keep = MEDIA_PAYLOAD_C
   let payloadCount = 0;
   const retainsMedia = (message: ChatMessageView): boolean => {
     const media = message.metadata?.media;
+    // An archived marker previews only while its copy exists (mediaPath, as ChatThread checks); retention nulls it.
     return Boolean(
-      media?.data || (media?.archived && HISTORY_MEDIA_TYPES.has(message.type) && message.type !== 'document'),
+      media?.data ||
+      (media?.archived && message.mediaPath && HISTORY_MEDIA_TYPES.has(message.type) && message.type !== 'document'),
     );
   };
   for (const m of list) if (retainsMedia(m)) payloadCount++;

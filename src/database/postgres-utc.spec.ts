@@ -4,6 +4,9 @@ import { DataSource } from 'typeorm';
 import { assertDataConnectionUtc, parseTimestampAsUtc, postgresUtcExtra, utcTimestampTypes } from './postgres-utc';
 import { buildPostgresDataSourceOptions } from './data-source';
 
+// Keep the checkout's own .env and data/.env.generated out: the CLI data sources load them on import.
+jest.mock('./load-cli-env', () => ({ loadCliEnv: jest.fn() }));
+
 // pg serialises a bound parameter through this module-level helper; there is no per-client seam, so
 // this is where the input half of the pin is observable without a server.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -252,6 +255,40 @@ describe('postgres UTC pin', () => {
       };
       await extra.onConnect({ query } as unknown as ClientBase);
       expect(query).toHaveBeenCalledWith({ text: "SET TIME ZONE 'UTC'", query_timeout: 2500 });
+    });
+
+    // PgBouncer refuses statement_timeout in the startup packet, so the pool's session settings ride in
+    // the pin's own statement, under its bound.
+    it('sets the pool statement_timeout and search_path in the same statement as the zone', async () => {
+      const query = jest.fn().mockResolvedValue({});
+      await postgresUtcExtra(2500, { statementTimeoutMs: 30000, searchPath: 'openwa,public' }).onConnect({
+        query,
+      } as unknown as ClientBase);
+      expect(query).toHaveBeenCalledTimes(1);
+      expect(query).toHaveBeenCalledWith({
+        text: "SET TIME ZONE 'UTC'; SET statement_timeout = 30000; SELECT set_config('search_path', 'openwa,public', false)",
+        query_timeout: 2500,
+      });
+    });
+
+    it.each([0, undefined, NaN])(
+      'sets no statement_timeout for %s, as pg sent none in the startup packet',
+      async value => {
+        const query = jest.fn().mockResolvedValue({});
+        const extra = postgresUtcExtra(undefined, { statementTimeoutMs: value });
+        await extra.onConnect({ query } as unknown as ClientBase);
+        expect(query).toHaveBeenCalledWith({ text: "SET TIME ZONE 'UTC'", query_timeout: 10000 });
+        expect(extra.onConnect).toBe(postgresUtcExtra().onConnect);
+      },
+    );
+
+    it('quotes a search_path value as a literal', async () => {
+      const query = jest.fn().mockResolvedValue({});
+      await postgresUtcExtra(undefined, { searchPath: "o'wa,public" }).onConnect({ query } as unknown as ClientBase);
+      expect(query).toHaveBeenCalledWith({
+        text: "SET TIME ZONE 'UTC'; SELECT set_config('search_path', 'o''wa,public', false)",
+        query_timeout: 10000,
+      });
     });
   });
 

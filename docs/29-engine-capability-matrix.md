@@ -261,7 +261,11 @@ different depths — which is what the optional marker exists to allow. wwjs rac
 `Client.getState()` round trip against a 10s timeout, because a wedged page keeps reporting
 CONNECTED. Baileys returns a local check (`status === READY && sock != null`), because its keepalive
 already emits a close event within ~35s. So a wedged wwjs page is caught here; a wedged Baileys
-socket is caught by the transport instead. No REST route: the session watchdog polls it.
+socket is caught by the transport instead. No REST route: the session watchdog polls it. One wwjs
+page it cannot tell from a healthy one: a reload whose re-inject loads the helpers but then fails to
+attach the event listeners emits no `ready`, so the probe finds the helpers and the session stays
+`READY`, sends still working, while inbound messages can stop reaching the gateway until the session
+is restarted.
 
 ### 29.4.2 Sending messages
 
@@ -324,11 +328,12 @@ socket is caught by the transport instead. No REST route: the session watchdog p
 | `blockContact`        | ✅                  | ✅🔧⁸            | ✅          |
 | `unblockContact`      | ✅                  | ✅🔧⁸            | ✅          |
 | `getBlockedContacts`  | ✅                  | ✅               | ✅          |
-| `checkNumberExists`   | ✅                  | ✅               | ✅          |
+| `checkNumberExists`   | ✅                  | ✅               | ⚙️ internal |
 | `getNumberId`         | ✅                  | ✅               | ✅          |
 | `getPhoneNumber`      | ✅                  | ✅               | ⚙️ internal |
 | `getPushName`         | ✅                  | ✅               | ⚙️ internal |
 | `resolveContactPhone` | ✅                  | ✅               | ✅          |
+| `getContactLid`       | ✅                  | ✅               | ✅          |
 | `getProfilePicture`   | ✅                  | ✅               | ✅          |
 
 ### 29.4.6 Groups
@@ -476,27 +481,27 @@ Exposure column values:
 
 **Messaging & media** (19)
 
-| Library method                 | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `getMediaHost`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `readMessages`                 | ✅ `sendSeen`                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `refreshMediaConn`             | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `relayMessage`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `requestPlaceholderResend`     | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendMessage`                  | ✅ `sendTextMessage`, `sendImageMessage`, `sendVideoMessage`, `sendAudioMessage`, `sendDocumentMessage`, `sendStickerMessage`, `sendLocationMessage`, `sendContactMessage`, `sendPollMessage`, `sendProduct`, `replyToMessage`, `forwardMessage`, `reactToMessage`, `editMessage`, `deleteMessage`, `pinMessage`, `unpinMessage`, `postTextStatus`, `postImageStatus`, `postVideoStatus`, `postVoiceStatus`, `deleteStatus` |
-| `sendMessageAck`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendNode`                     | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendPeerDataOperationMessage` | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendPresenceUpdate`           | ✅ `sendChatState`, `setOnlinePresence`                                                                                                                                                                                                                                                                                                                                                                                     |
-| `sendRawMessage`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendReceipt`                  | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendReceipts`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendRetryRequest`             | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendUnifiedSession`           | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `sendWAMBuffer`                | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `updateMediaMessage`           | ⚙️ internal wiring                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `upsertMessage`                | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `waitForMessage`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Library method                 | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `getMediaHost`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `readMessages`                 | ✅ `sendSeen`                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `refreshMediaConn`             | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `relayMessage`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `requestPlaceholderResend`     | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendMessage`                  | ✅ `sendTextMessage`, `sendImageMessage`, `sendVideoMessage`, `sendAudioMessage`, `sendDocumentMessage`, `sendStickerMessage`, `sendLocationMessage`, `sendContactMessage`, `sendPollMessage`, `sendProduct`, `replyToMessage`, `clickButton`, `forwardMessage`, `reactToMessage`, `editMessage`, `deleteMessage`, `pinMessage`, `unpinMessage`, `postTextStatus`, `postImageStatus`, `postVideoStatus`, `postVoiceStatus`, `deleteStatus` |
+| `sendMessageAck`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendNode`                     | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendPeerDataOperationMessage` | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendPresenceUpdate`           | ✅ `sendChatState`, `setOnlinePresence`                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `sendRawMessage`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendReceipt`                  | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendReceipts`                 | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendRetryRequest`             | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendUnifiedSession`           | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `sendWAMBuffer`                | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `updateMediaMessage`           | ⚙️ internal wiring                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `upsertMessage`                | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `waitForMessage`               | 🔩 plumbing                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 **Groups** (19)
 
@@ -623,16 +628,16 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 
 **Queries** (8)
 
-| Library method                 | OpenWA exposure                                                                                                                                        |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `executeUSyncQuery`            | ❌ **not exposed**                                                                                                                                     |
-| `fetchAccountReachoutTimelock` | ⚙️ internal wiring                                                                                                                                     |
-| `fetchBlocklist`               | ✅ `getBlockedContacts`                                                                                                                                |
-| `fetchDisappearingDuration`    | ❌ **not exposed**                                                                                                                                     |
-| `fetchNewChatMessageCap`       | ❌ **not exposed**                                                                                                                                     |
-| `fetchStatus`                  | ❌ **not exposed**                                                                                                                                     |
-| `getUSyncDevices`              | ❌ **not exposed**                                                                                                                                     |
-| `onWhatsApp`                   | ✅ `getNumberId`, `checkNumberExists`, and the lookup a send to a phone number without a known LID makes first (`sendTextMessage` and the other sends) |
+| Library method                 | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `executeUSyncQuery`            | ✅ `getContactLid`, and the check that a phone number and a LID are one person, which runs when a chat id and the stored key or chat it is checked against are those two forms and the persisted mapping does not pair them yet: `getContactById`, `sendSeen`, `markUnread`, `archiveChat`, `clearChatMessages`, `deleteChat`, `muteChat`, `pinChat`, `addLabelToChat`, `removeLabelFromChat`, `replyToMessage`, `clickButton`, `forwardMessage`, `reactToMessage`, `deleteMessage`, `editMessage`, `starMessage`, `pinMessage`, `unpinMessage` |
+| `fetchAccountReachoutTimelock` | ⚙️ internal wiring                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `fetchBlocklist`               | ✅ `getBlockedContacts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `fetchDisappearingDuration`    | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `fetchNewChatMessageCap`       | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `fetchStatus`                  | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `getUSyncDevices`              | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `onWhatsApp`                   | ✅ `getNumberId`, `checkNumberExists`, and the lookup a send to a phone number without a known LID makes first (`sendTextMessage` and the other sends)                                                                                                                                                                                                                                                                                                                                                                                          |
 
 **Profile, contacts & presence** (12)
 
@@ -704,7 +709,7 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 
 | Library method                 | OpenWA exposure                                                                                                                                                                                                                                                          |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `getMessageById`               | ❌ **not exposed**                                                                                                                                                                                                                                                       |
+| `getMessageById`               | ✅ `getMessageReceipts`                                                                                                                                                                                                                                                  |
 | `getPinnedMessages`            | ❌ **not exposed**                                                                                                                                                                                                                                                       |
 | `getPollVotes`                 | ❌ **not exposed**                                                                                                                                                                                                                                                       |
 | `searchMessages`               | ❌ **not exposed**                                                                                                                                                                                                                                                       |
@@ -715,17 +720,17 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 
 **Chats** (9)
 
-| Library method   | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                          |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `archiveChat`    | ✅ `archiveChat`                                                                                                                                                                                                                                                                                                                                                                         |
-| `getChatById`    | ✅ `muteChannel`, `sendSeen`, `clearChatMessages`, `markUnread`, `deleteChat`, `sendChatState`, `getGroupInfo`, `addParticipants`, `leaveGroup`, `setGroupSubject`, `setGroupDescription`, `getGroupInviteCode`, `revokeGroupInviteCode`, `getChatLabels`, `replyToMessage`, `forwardMessage`, `reactToMessage`, `getMessageReactions`, `getChatHistory`, `deleteMessage`, `editMessage` |
-| `getChats`       | ⚙️ read via a direct page walk, not `Client.getChats`, for `getChats` and `getGroups`                                                                                                                                                                                                                                                                                                    |
-| `markChatUnread` | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                       |
-| `muteChat`       | ✅ `muteChat`                                                                                                                                                                                                                                                                                                                                                                            |
-| `pinChat`        | ✅ `pinChat`                                                                                                                                                                                                                                                                                                                                                                             |
-| `unarchiveChat`  | ✅ `archiveChat`                                                                                                                                                                                                                                                                                                                                                                         |
-| `unmuteChat`     | ✅ `muteChat`                                                                                                                                                                                                                                                                                                                                                                            |
-| `unpinChat`      | ✅ `pinChat`                                                                                                                                                                                                                                                                                                                                                                             |
+| Library method   | OpenWA exposure                                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `archiveChat`    | ✅ `archiveChat`                                                                                                                                                                                                                                                                                                                                                                                               |
+| `getChatById`    | ✅ `muteChannel`, `sendSeen`, `clearChatMessages`, `markUnread`, `deleteChat`, `sendChatState`, `getGroupInfo`, `addParticipants`, `leaveGroup`, `setGroupSubject`, `setGroupDescription`, `getGroupInviteCode`, `revokeGroupInviteCode`, `getChatLabels`, `replyToMessage`, `forwardMessage`, `reactToMessage`, `getMessageReactions`, `getMessageReceipts`, `getChatHistory`, `deleteMessage`, `editMessage` |
+| `getChats`       | ⚙️ read via a direct page walk, not `Client.getChats`, for `getChats` and `getGroups`                                                                                                                                                                                                                                                                                                                          |
+| `markChatUnread` | ❌ **not exposed**                                                                                                                                                                                                                                                                                                                                                                                             |
+| `muteChat`       | ✅ `muteChat`                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `pinChat`        | ✅ `pinChat`                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `unarchiveChat`  | ✅ `archiveChat`                                                                                                                                                                                                                                                                                                                                                                                               |
+| `unmuteChat`     | ✅ `muteChat`                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `unpinChat`      | ✅ `pinChat`                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 **Groups** (7)
 
@@ -782,7 +787,7 @@ with zero OpenWA surface. Baileys-only; whatsapp-web.js has no community API at 
 | `getBlockedContacts`           | ✅ `getBlockedContacts`                                          |
 | `getContactById`               | ✅ `getContactById`, `blockContact`, `unblockContact`            |
 | `getContactDeviceCount`        | ❌ **not exposed**                                               |
-| `getContactLidAndPhone`        | ✅ `resolveContactPhone`, `getNumberId`                          |
+| `getContactLidAndPhone`        | ✅ `resolveContactPhone`, `getNumberId`, `getContactLid`         |
 | `getContacts`                  | ⚙️ read via a direct page walk, not `Client.getContacts` (#1501) |
 | `getCountryCode`               | ❌ **not exposed**                                               |
 | `getFormattedNumber`           | ❌ **not exposed**                                               |
@@ -964,10 +969,20 @@ adapter boundary — none silently stubs.
   `status@broadcast` or a broadcast list, and a poll or a sticker to `status@broadcast` or a
   broadcast list. `ensureSendable` (`wwebjs-messaging.ts`) refuses them before the library is
   called, so nothing is sent. The Baileys adapter refuses none of them.
+- **`sendVideoMessage` and `postVideoStatus` (wwjs) depend on the page loading the video.** Before
+  the upload, WhatsApp Web loads the file into a `<video>` element and throws its own bare
+  `TimeoutError` when that load neither finishes nor fails within 20 seconds, so the send answers
+  `500` `ENGINE_PAGE_ERROR` with `TimeoutError: TimeoutError`. A file the browser cannot decode fails
+  in under a second with a named error instead. On that timeout the adapter logs
+  `video_load_timeout` with the page's visibility, the browser's `canPlayType` answer for an H.264/AAC
+  MP4 and the browser version (`wwebjs-video-load-timeout.ts`). A hidden page reproduced the timeout
+  in a test; that has not been seen in OpenWA. How to read the line: 12.4 in
+  `docs/12-troubleshooting-faq.md`. Baileys runs no browser, so it has no such step.
 - **`sendStickerMessage` — what each engine converts.** Both engines guarantee the payload really is
   WebP, but they reach it differently and they do not accept the same inputs. whatsapp-web.js passes
   `sendMediaAsSticker: true`, and `Util.formatToWebpSticker` converts `image/*` **and** `video/*`
-  (the latter via ffmpeg), rejecting anything else with `Invalid media format`. Baileys stamps
+  (the latter via ffmpeg). It throws `Invalid media format` for anything else, so the adapter refuses
+  that with a `400` before the send, as Baileys does. Baileys stamps
   `image/webp` on the payload unconditionally and transcodes nothing
   (`prepareWAMessageMedia` → `MIMETYPE_MAP.sticker`), so the adapter converts before the socket:
   WebP passes through byte-identical (preserving its sticker-pack EXIF), other raster `image/*`
@@ -978,8 +993,9 @@ adapter boundary — none silently stubs.
   whatsapp-web.js hands to the page like any other `image/*`. Sticker conversion is deliberately
   not wired to ffmpeg on the Baileys side: the binary ships only in the Docker image, so depending
   on it would make the same request succeed or fail depending on how the gateway was installed. A
-  Baileys voice note's waveform does read its audio through ffmpeg when the binary is there; without
-  it the note goes out with flat bars.
+  Baileys voice note's waveform and a Baileys video's inline preview do read their media through
+  ffmpeg when the binary is there; without it (or past the preview's 10 s deadline) the note goes
+  out with flat bars and the video without a preview.
 - **`deleteStatus` (baileys).** Baileys sends a status stanza, the revoke included, to exactly its
   `statusJidList`, so the revoke is addressed to the recipients the adapter remembered when it posted
   the status. It keeps them in memory for 24 hours, so a status this session did not post in the last
@@ -990,15 +1006,38 @@ adapter boundary — none silently stubs.
   the same engine, and the list with it.
   The `sendMessage(status@broadcast, {delete})` revoke shape is _empirically unverified_: only posting
   was live-spiked. On wwjs it calls `revokeStatusMessage(statusId)` (own status only).
+- **Status post acks (baileys).** An own status post reports no aggregate `delivered` or `read`
+  `message.ack`: the tracker in `baileys-group-ack.ts` follows group messages only, and a status post
+  has no stored row. Baileys raises each viewer's receipt through `message-receipt.update`, which the
+  gateway forwards as `message.receipt` under the chat `status@broadcast`. The viewers of a status are
+  the distinct `participant` values with `status` `read` for its id; a viewer whose read receipts are
+  off never appears among them, and the per-webhook bound on `message.receipt` applies. whatsapp-web.js
+  broadcasts a status to the account's status-privacy audience, so there is no recipient list there.
 - **`getChats` after a restart (baileys).** Baileys keeps no chat list of its own, and WhatsApp
   skips history sync on every connect after the first link, so a new engine (a process restart, a
   session stop and start, or a reconnect the gateway runs itself, as for `deleteStatus` above) starts
-  with an empty one. `GET /chats` then lists the groups, re-fetched on every connect, and every chat
-  with a persisted archive, pin or mute state (bounded by `BAILEYS_CHAT_STATE_CACHE_MAX`); any other
-  1:1 chat comes back when its next message arrives and stays out of the list until then. Rows
-  rebuilt this way carry timestamp `0` and no `lastMessage` until a message arrives. The transient
-  reconnects Baileys runs on its own keep the list. whatsapp-web.js reads WhatsApp Web's own chat
-  list and is unaffected.
+  with an empty one. On its first connect, before the socket opens, it lists every chat the gateway
+  stored a message of, groups included, with the newest stored message as `timestamp`,
+  `lastMessage` and `lastMessageType`, and names a contact the address book does not by the
+  pushname its newest received message came with. Only the rows of the account the session is
+  linked to count, so a session linked to another number does not list the chats of the one before,
+  and a row without a WhatsApp id (a pending or failed send) shows no chat, nor does a send the
+  gateway stored before it knew the account's number, which names no account. A chat with a
+  persisted archive, pin or mute state is listed too, and a chat deleted on the phone stays out
+  until a newer message arrives, for as long as its deletion mark exists: an unlink removes the
+  marks, and a chat deleted before 0.27.0 has none, so such a chat is listed again while the gateway
+  still stores its messages. Limits: the read takes the `BAILEYS_SESSION_STORE_MAX_ENTRIES` chats
+  (default 5000) with the newest rows, and a chat that holds only another account's rows, or only
+  rows without a WhatsApp id, uses a slot and lists nothing; a start waits ten seconds for the read
+  at most, and lists as it did before chats were seeded when the read takes longer; a chat with no
+  stored message (not kept under `STORE_EPHEMERAL_MESSAGES=false`, or removed by retention) and no
+  persisted state comes back when its next message arrives; `unreadCount` reads `0` until a message
+  arrives, since nothing stored records it; a contact stored under both its phone and its lid lists
+  as two rows, as the live listing keeps them; and when the chat states outgrow
+  `BAILEYS_CHAT_STATE_CACHE_MAX`, a deleted chat whose state row was not cached can show in the
+  first listing after the start, and is left out once that row is read.
+  A first link gets its chats from history sync instead. The transient reconnects Baileys runs on
+  its own keep the list. whatsapp-web.js reads WhatsApp Web's own chat list and is unaffected.
 - **`getContactStatus` / `getContactStatuses` (wwjs).** `Status.type` is the `text|image|video|voice`
   union: a voice note reads back as `voice`, and any other story type collapses to `text`.
 - **`requestPairingCode` (wwjs) for a number that already has a linked session.** Both engines
@@ -1025,7 +1064,7 @@ adapter boundary — none silently stubs.
   Baileys applies the write locally and the deleted chat would be listed again. Such a chat is not
   listed, and the four writes and a `sendSeen` without message ids resolve `false`, until a newer
   message re-creates it. A deletion synced on a reconnect is dated when it arrives, so a message
-  delivered in the same reconnect counts as older. A chat id not spelled the way the engine keys chats (`<id>@g.us`,
+  delivered in the same reconnect counts as older. A message whose second is earlier than the gateway's deletion date, because the gateway's clock runs ahead or a deletion made on the phone reaches it late, counts as older too. A send keeps the chat's disappearing timer; for a phone the gateway maps to more than one lid (a reassigned number), a send addressed to that phone alone goes without one, since the timer cannot be told apart between the two holders. A chat id not spelled the way the engine keys chats (`<id>@g.us`,
   `<lid>@lid` or a phone jid, lowercase, with no device suffix), such as `120363@G.US` or a bare
   number, is served only by a message in memory: without one, the four writes and a `sendSeen` without
   message ids resolve `false`. With no usable message, clear and delete resolve `false`, and archive
@@ -1049,12 +1088,13 @@ adapter boundary — none silently stubs.
   `setProfileStatus` is symmetric: neither engine surfaces a refusal for it.
 - **`editMessage` / `pinMessage` / `unpinMessage` refusals (baileys).** Both engines refuse what they
   can judge locally: the target must be addressable inside the given chat, and the Baileys adapter
-  additionally refuses an edit of a message the account did not send. Past those guards they diverge.
-  whatsapp-web.js reads a page-side verdict (`message.edit()` resolves `null`, `message.pin()`
-  resolves `false`) and raises a `403`; Baileys sends the edit or pin as an ordinary protocol message
-  and is never told the outcome. So a pin refused because the account is not a group admin, or an
-  edit refused because the target is not a text message, answers `403` on whatsapp-web.js and `200`
-  on Baileys.
+  additionally refuses an edit of a message the account did not send or of one with no text or caption
+  to edit (a location, sticker, poll, contact card or audio), the two edits whatsapp-web.js also
+  refuses. Past those guards they diverge. whatsapp-web.js reads a page-side verdict
+  (`message.edit()` resolves `null`, `message.pin()` resolves `false`) and raises a `403`; Baileys
+  sends the edit or pin as an ordinary protocol message and is never told the outcome. So a pin
+  refused because the account is not a group admin answers `403` on whatsapp-web.js and `200` on
+  Baileys.
 - **Inbound edits and reactions (baileys).** WhatsApp sends a contact's edit, and a reaction in some
   chats, encrypted under the secret of the message it changes, which the library does not decrypt. The
   adapter reads them with the stored copy of that message (the session's message store, bounded by
@@ -1063,19 +1103,33 @@ adapter boundary — none silently stubs.
   account makes from its own phone is applied under the account's own id, plain or encrypted.
   whatsapp-web.js receives both already decrypted from WhatsApp Web.
 - **`muteChat` addressing.** whatsapp-web.js resolves the chat before writing and answers `400` for a
-  chatId it cannot resolve; Baileys writes the app-state patch without a lookup and answers `200` for
-  a chat that does not exist. `pinChat` splits the same way.
+  chatId it cannot resolve. Baileys keys the app-state patch to the id the session holds the chat under
+  (the LID of a LID-migrated contact) and answers `200` for a chat it has never seen. A phone-number
+  chatId for a chat held under a LID is confirmed first, through the persisted mapping or the USync
+  query, and answers `400` when neither pairs the two. `pinChat` splits the same way.
 - **`getChannelById` reach and payload.** Baileys resolves any channel by JID
   (`newsletterMetadata('jid', …)`), including one the account does not follow. whatsapp-web.js 1.34.x
   exposes no per-id lookup, so the adapter scans the subscribed-channel list and returns `null` (a
   `404`) for every channel the account is not subscribed to. The `Channel` payload differs too:
-  Baileys reads `createdAt` off the newsletter metadata and whatsapp-web.js never fills it. Neither
+  Baileys fills `inviteCode`, `subscriberCount`, `verified` and `createdAt` from the newsletter metadata, while
+  whatsapp-web.js fills none of them (its `Channel` keeps that data only inside `channelMetadata`, which the adapter
+  does not read), so a channel there carries `id`, `name` and `description`. Neither
   engine fills `picture`: WhatsApp reports the channel picture as a media path, not a URL.
 - **`starMessage` (baileys).** Needs the stored key's `fromMe` — the same id means different
   messages depending on direction.
 - **`addParticipants` result shape.** wwjs returns a per-participant `{code,message}` object or a
   batch refusal string; Baileys returns per-jid `[{status}]`. Both are mapped onto the HTTP
-  `results` field; a total refusal throws.
+  `results` field; a total refusal throws. A participant whose privacy settings allow joining only by
+  invitation (code `403`) is answered differently: whatsapp-web.js sends that person a private group invite
+  message when WhatsApp allows one and the adapter reports `success: true` with a message saying the invite was
+  sent once it went out (otherwise `success: false, status: 403`), while Baileys sends nothing and reports
+  `success: false, status: 403`, so a batch made only of such participants answers `200` on wwjs when every
+  invite went out and `403` on Baileys.
+- **Group owner and group event ids (wwjs).** whatsapp-web.js folds a group's participant list to the phone
+  dialect, but the group `owner` (`getGroupInfo`, `getGroupJoinInfo`) and the actor and participant ids of group
+  events reach the adapter as WhatsApp Web holds them, which on a LID-addressed group is `<lid>@lid` even when the
+  phone is known. Baileys answers the phone form wherever it knows the phone (`ownerPn`, `authorPn`, a learned
+  mapping).
 - **`setGroupMemberAddMode` read side.** The engines disagree (Baileys boolean
   `memberAddMode`, wwjs raw WhatsApp strings — and wwjs's own type declares the opposite sense);
   both are normalized to `'all'|'admins'` at the adapter.

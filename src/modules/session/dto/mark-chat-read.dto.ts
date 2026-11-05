@@ -32,7 +32,7 @@ export const MARK_READ_MESSAGE_ID_MESSAGE = 'each messageIds entry must be a non
 export class MarkChatReadDto {
   @ApiProperty({
     maxLength: CHAT_ID_MAX_LENGTH,
-    description: "Chat ID in the active engine's native format (e.g. 1234567890@c.us on whatsapp-web.js)",
+    description: 'Chat ID in the neutral form the gateway returns, on either engine (e.g. 1234567890@c.us)',
     example: '1234567890@c.us',
   })
   @ToStrictString()

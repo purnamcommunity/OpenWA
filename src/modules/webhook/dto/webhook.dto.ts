@@ -416,7 +416,10 @@ export class WebhookDeliveryFailureDto {
   @ApiPropertyOptional({
     type: Number,
     nullable: true,
-    description: 'Last HTTP status when the failure was a non-2xx response; null for a network/timeout error.',
+    description:
+      'Last HTTP status when the failure was a non-2xx response; null for a network/timeout error, a blocked ' +
+      'destination, or a redirect (a 3xx answer is not followed, unless WEBHOOK_SSRF_PROTECT=false and ' +
+      'WEBHOOK_SSRF_REDIRECTS=true are both set, and is recorded without its status).',
     example: null,
   })
   lastStatusCode?: number | null;
@@ -429,9 +432,11 @@ export class WebhookDeliveryFailureDto {
 
   @ApiProperty({
     description:
-      'True when the row still holds the event data and can be replayed with ' +
-      '`POST /webhooks/delivery-failures/redrive`. Only terminal rows (attempts > 0) recorded while ' +
-      '`WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` > 0 are, until that window passes.',
+      'True when the row still holds the event data and its webhook still exists in the same session. Only ' +
+      'terminal rows (attempts > 0) recorded while `WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` > 0 hold it, until ' +
+      'that window passes. `POST /webhooks/delivery-failures/redrive` replays such a row while its webhook is ' +
+      'active and subscribed to the event, so a row of a disabled or unsubscribed webhook stays replayable for ' +
+      'when the webhook is switched back.',
     example: false,
   })
   replayable!: boolean;
@@ -477,6 +482,7 @@ export class RedriveWebhookDeliveriesDto {
     minimum: 1,
     maximum: 500,
   })
+  @ToStrictNumber()
   @IsOptional()
   @IsInt()
   @Min(1)
@@ -502,12 +508,19 @@ export class WebhookRedriveResultDto {
   failed!: number;
 
   @ApiProperty({
-    description: 'Rows not replayed: the webhook was removed, disabled or unsubscribed, or a plugin cancelled it.',
+    description:
+      'Selected rows not replayed: a hook cancelled the replay, or the row or its webhook changed during the call. ' +
+      'Rows of a removed, disabled or unsubscribed webhook are left out before the batch and not counted.',
     example: 0,
   })
   skipped!: number;
 
-  @ApiProperty({ description: 'Replayable rows still in scope after this call.', example: 0 })
+  @ApiProperty({
+    description:
+      'Rows the redrive would still take after this call: replayable, in scope, with an active webhook subscribed ' +
+      'to the event.',
+    example: 0,
+  })
   remaining!: number;
 }
 
@@ -516,7 +529,13 @@ export class WebhookTestResponseDto {
   @ApiProperty({ description: 'True when the receiver answered 2xx.', example: true })
   success!: boolean;
 
-  @ApiPropertyOptional({ description: 'The HTTP status the receiver answered, when it answered.', example: 200 })
+  @ApiPropertyOptional({
+    description:
+      'The HTTP status the receiver answered, when it answered. A redirect (3xx) is not followed, unless ' +
+      'WEBHOOK_SSRF_PROTECT=false and WEBHOOK_SSRF_REDIRECTS=true are both set, and is reported as an error ' +
+      'with no status.',
+    example: 200,
+  })
   statusCode?: number;
 
   @ApiPropertyOptional({ description: 'The delivery error, when the attempt failed.', example: 'timeout' })
