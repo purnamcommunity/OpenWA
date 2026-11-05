@@ -80,9 +80,10 @@ export const PAGE_RELOADING_MESSAGE =
  * Whether a page call was cut short by the page navigating away under it (WhatsApp Web reloading). Puppeteer
  * rewrites its three CDP shapes of this into 'Execution context was destroyed, most likely because of a
  * navigation.', and a call that lands on the new document before WhatsApp Web has booted dies on the missing
- * `window.require`. The page is alive and re-injecting, so unlike a death this is not reported, and a retry
- * a few seconds later succeeds. Not an HttpException, and not a failure captured inside the page, whose text
- * quotes WhatsApp Web and says nothing about our page. A page that stays without `window.require` is not
+ * `window.require`. This is not an immediate death: the caller gets a retryable response, while an
+ * execution-context failure schedules a delayed health check to confirm the page recovered. Not an
+ * HttpException, and not a failure captured inside the page, whose text quotes WhatsApp Web and says
+ * nothing about our page. A page that stays without `window.require` is not
  * hidden by this answer: it is not reported here, but the liveness probe fails outside the re-inject window
  * and the watchdog reconnects. Left unread, the same message became a false 404 or 400 at the catches that
  * fold a failed lookup into "not found", or a bare 500.
@@ -1016,6 +1017,13 @@ export class WwebjsLifecycle {
    * scheduleExecContextRecheck), because a navigation produces it on a healthy page.
    */
   reportIfPageTransportError(error: unknown, context: string): void {
+    // Navigation still answers 409, but a renderer that never recovers needs the fork's
+    // delayed health check. Keep this separate from the dead-page classifier.
+    if (isNavigationError(error)) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isExecutionContextDestroyedError(message)) this.reportDeath(error, context);
+      return;
+    }
     if (!this.isPageTransportError(error)) {
       return;
     }

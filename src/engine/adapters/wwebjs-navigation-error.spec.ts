@@ -20,7 +20,7 @@ import { EngineTransportError } from '../../common/errors/engine-transport.error
  * A call already in flight when WhatsApp Web reloads its page dies with Puppeteer's navigation error before
  * the re-inject window is stamped, so it was a bare 500, and where a catch folds a failed lookup into "not
  * found" it was a 404 or null for a group, contact or label that exists. The page is alive: nothing is
- * reported, and the answer is the retryable 409 the adapter already gives inside the window.
+ * reported immediately, and the answer is the retryable 409 the adapter already gives inside the window.
  */
 const logger = createLogger('wwebjs-navigation-error.spec');
 
@@ -79,14 +79,14 @@ describe('a call the page navigation cut short', () => {
 
   const reload = (): unknown => expect.objectContaining({ message: PAGE_RELOADING_MESSAGE });
 
-  it('withPage answers the 409 and reports nothing', async () => {
+  it('withPage answers the 409 and schedules a health check', async () => {
     const { host, reportIfPageTransportError } = makeHost({});
 
     const result = withPage(host, 'getNumberId', () => Promise.reject(navigation));
 
     await expect(result).rejects.toBeInstanceOf(EngineNotReadyError);
     await expect(result).rejects.toEqual(reload());
-    expect(reportIfPageTransportError).not.toHaveBeenCalled();
+    expect(reportIfPageTransportError).toHaveBeenCalledWith(navigation, expect.any(String));
   });
 
   it('a page the host reads as dead stays a death, whatever the message says', async () => {
@@ -113,7 +113,7 @@ describe('a call the page navigation cut short', () => {
       EngineNotReadyError,
     );
     await expect(new WwebjsGroups(host).getGroups()).rejects.toBeInstanceOf(EngineNotReadyError);
-    expect(reportIfPageTransportError).not.toHaveBeenCalled();
+    expect(reportIfPageTransportError).toHaveBeenCalledWith(navigation, expect.any(String));
   });
 
   it('a group read is not "group not found"', async () => {
@@ -165,7 +165,7 @@ describe('a call the page navigation cut short', () => {
     await expect(contacts.getContacts()).rejects.toBeInstanceOf(EngineNotReadyError);
     await expect(contacts.getProfilePicture('1@c.us')).rejects.toBeInstanceOf(EngineNotReadyError);
     await expect(contacts.getNumberId('628123')).rejects.toBeInstanceOf(EngineNotReadyError);
-    expect(reportIfPageTransportError).not.toHaveBeenCalled();
+    expect(reportIfPageTransportError).toHaveBeenCalledWith(navigation, expect.any(String));
   });
 
   it('a chat write answers the 409', async () => {

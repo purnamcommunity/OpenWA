@@ -1003,6 +1003,8 @@ describe('SessionService', () => {
         onLeaseLoss: jest.fn((fn: (ids: string[]) => Promise<void>) => (onLost = fn)),
         setEngineLiveness: jest.fn(),
         startHeartbeat: jest.fn(),
+        stopHeartbeat: jest.fn(),
+        releaseAll: jest.fn().mockResolvedValue(undefined),
       };
       Object.assign(service as unknown as Record<string, unknown>, { ownership });
       const watchdog = (service as unknown as { watchdog: { start: () => void } }).watchdog;
@@ -1012,22 +1014,26 @@ describe('SessionService', () => {
       );
       const logger = (service as unknown as { logger: { error: (...a: unknown[]) => void } }).logger;
       const error = jest.spyOn(logger, 'error').mockImplementation(() => undefined);
-      service.onApplicationBootstrap();
+      try {
+        service.onApplicationBootstrap();
 
-      enginesOf().set('ok', { destroy: jest.fn().mockResolvedValue(undefined) });
-      await onLost(['ok']);
-      expect(error).not.toHaveBeenCalled();
+        enginesOf().set('ok', { destroy: jest.fn().mockResolvedValue(undefined) });
+        await onLost(['ok']);
+        expect(error).not.toHaveBeenCalled();
 
-      enginesOf().set('g1', {
-        destroy: jest.fn().mockRejectedValue(new Error('stuck')),
-        forceDestroy: jest.fn().mockRejectedValue(new Error('kill failed')),
-      });
-      error.mockClear();
-      await onLost(['g1']);
-      const leaseLoss = error.mock.calls.find(
-        c => (c[2] as { action?: string } | undefined)?.action === 'lease_loss_teardown_failed',
-      );
-      expect(leaseLoss?.[2]).toEqual({ sessionIds: ['g1'], action: 'lease_loss_teardown_failed' });
+        enginesOf().set('g1', {
+          destroy: jest.fn().mockRejectedValue(new Error('stuck')),
+          forceDestroy: jest.fn().mockRejectedValue(new Error('kill failed')),
+        });
+        error.mockClear();
+        await onLost(['g1']);
+        const leaseLoss = error.mock.calls.find(
+          c => (c[2] as { action?: string } | undefined)?.action === 'lease_loss_teardown_failed',
+        );
+        expect(leaseLoss?.[2]).toEqual({ sessionIds: ['g1'], action: 'lease_loss_teardown_failed' });
+      } finally {
+        await service.onModuleDestroy();
+      }
     });
 
     it('is a bounded no-op for an empty id list', async () => {
@@ -11429,6 +11435,7 @@ describe('SessionService', () => {
     });
 
     it('waits the full throttle between two auto-started launches', async () => {
+      delete process.env.SESSION_AUTOSTART_THROTTLE_MS;
       process.env.AUTO_START_SESSIONS = 'true';
       (repository.find as jest.Mock).mockResolvedValue([
         { id: 'a', name: 'A' },

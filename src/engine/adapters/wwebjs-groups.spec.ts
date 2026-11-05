@@ -174,11 +174,18 @@ describe('changeAdminStatusInPage', () => {
     ]);
   });
 
-  it('refuses the batch when this account is not an admin', async () => {
-    const { jobs } = setup({ announcement: true, iAmAdmin: false, members: [{ id: wid('2000@lid') }] });
-    const outcome = await changeAdminStatusInPage(GROUP, ['2000@lid'], true);
-    expect(outcome.refused).toBe('this account is not an admin of the community');
-    expect(jobs.promoteCommunityParticipants).not.toHaveBeenCalled();
+  it.each([
+    [false, true],
+    [false, false],
+    [true, true],
+    [true, false],
+  ])('refuses a non-admin before any write job (announcement: %s, promote: %s)', async (announcement, promote) => {
+    const { jobs } = setup({ announcement, iAmAdmin: false, members: [{ id: wid('2000@lid') }] });
+    const outcome = await changeAdminStatusInPage(GROUP, ['2000@lid'], promote);
+    expect(outcome.refused).toBe(
+      announcement ? 'this account is not an admin of the community' : 'this account is not an admin of the group',
+    );
+    for (const job of Object.values(jobs)) expect(job).not.toHaveBeenCalled();
   });
 });
 

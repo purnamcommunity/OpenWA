@@ -6918,6 +6918,8 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
     pupPage: EventEmitter & { mainFrame?: () => unknown };
   };
 
+  const lifecycles: WwebjsLifecycle[] = [];
+
   const wireAdapter = (
     clientOverrides: Partial<NavFakeClient> = {},
   ): { adapter: WhatsAppWebJsAdapter; client: NavFakeClient } => {
@@ -6940,12 +6942,16 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
     // Mirror the real init order: event handlers first, puppeteer listeners after initialize().
     (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.attachPuppeteerLifecycleListeners();
+    lifecycles.push((adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle);
     return { adapter, client };
   };
 
   const navFrame = (url = 'https://web.whatsapp.com/'): { url: () => string } => ({ url: () => url });
 
   afterEach(() => {
+    for (const lifecycle of lifecycles.splice(0)) {
+      (lifecycle as unknown as { clearExecContextRecheck(): void }).clearExecContextRecheck();
+    }
     jest.useRealTimers();
   });
 
@@ -7276,6 +7282,22 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
 
       expect(adapter.getStatus()).toBe(EngineStatus.READY);
       expect(onDisconnected).not.toHaveBeenCalled();
+    });
+
+    it.each([false, true])('a navigation-cut group read answers 409 and rechecks the page (dead: %s)', async dead => {
+      const evaluate = jest.fn().mockRejectedValueOnce(new Error(EXEC_CTX));
+      if (dead) evaluate.mockRejectedValue(new Error('Protocol error: Target closed'));
+      else evaluate.mockResolvedValue(true);
+      const { adapter, onDisconnected } = wireWithPage({ evaluate });
+
+      await expect(adapter.getGroups()).rejects.toBeInstanceOf(EngineNotReadyError);
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      expect(onDisconnected).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(EXEC_CONTEXT_DESTROYED_RECHECK_MS);
+
+      expect(evaluate).toHaveBeenCalledTimes(2);
+      expect(adapter.getStatus()).toBe(dead ? EngineStatus.DISCONNECTED : EngineStatus.READY);
+      expect(onDisconnected).toHaveBeenCalledTimes(dead ? 1 : 0);
     });
 
     it('leaves a page that answers the re-check running', async () => {

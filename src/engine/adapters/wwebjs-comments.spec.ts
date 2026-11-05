@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import * as ts from 'typescript';
 import { mapPageComments, probeMessageComments, submitMessageComment, type PageComment } from './wwebjs-comments';
 
 /**
@@ -51,7 +54,28 @@ describe('the page functions close over nothing from this module', () => {
   // function into the page — from source text, with no surrounding scope. Anything safer would run
   // the body in this module's scope and reproduce nothing.
   /* eslint-disable @typescript-eslint/no-implied-eval, @typescript-eslint/no-unsafe-call */
-  const rebuild = (fn: unknown) => new Function(`return (${String(fn)})`)() as typeof fn;
+  const rebuild = (name: string): unknown => {
+    // Read the uninstrumented source: Istanbul counters are Node-only closures too, but
+    // production never ships them. Match the project's actual TypeScript compilation.
+    const root = join(__dirname, '..', '..', '..');
+    const { config } = ts.readConfigFile(join(root, 'tsconfig.json'), file => readFileSync(file, 'utf8')) as {
+      config: { compilerOptions: Record<string, unknown> };
+    };
+    const { options } = ts.convertCompilerOptionsFromJson({ ...config.compilerOptions, module: 'CommonJS' }, root);
+    const source = ts.createSourceFile(
+      'wwebjs-comments.ts',
+      readFileSync(join(__dirname, 'wwebjs-comments.ts'), 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const declaration = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+    if (!declaration) throw new Error(`Page function ${name} not found`);
+    const compiled = ts.transpileModule(declaration.getText(source).replace(/^export /, ''), {
+      compilerOptions: options,
+    }).outputText;
+    const declared = new Function(`${compiled}\n; return ${name};`)() as { toString(): string };
+    return new Function(`return (${declared.toString()})`)();
+  };
   /* eslint-enable @typescript-eslint/no-implied-eval, @typescript-eslint/no-unsafe-call */
 
   const sendable: PageRequire = (name: string) => {
@@ -63,14 +87,14 @@ describe('the page functions close over nothing from this module', () => {
   };
 
   it('probeMessageComments runs with only page globals in scope', async () => {
-    const rebuilt = rebuild(probeMessageComments) as typeof probeMessageComments;
+    const rebuilt = rebuild('probeMessageComments') as typeof probeMessageComments;
     const result = await withPageRequire(pageWith([]), () => rebuilt(PARENT));
     expect(result).toEqual({ comments: [] });
   });
 
   it('submitMessageComment runs with only page globals in scope', async () => {
     // The regression: this threw ReferenceError here while passing every direct-call test above.
-    const rebuilt = rebuild(submitMessageComment) as typeof submitMessageComment;
+    const rebuilt = rebuild('submitMessageComment') as typeof submitMessageComment;
     const result = await withPageRequire(sendable, () => rebuilt({ parentMessageId: PARENT, text: 'x' }));
     expect(result).toEqual({ sent: true, confirmed: true });
   });

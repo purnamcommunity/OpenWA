@@ -1,6 +1,8 @@
 import { BadRequestException } from '@nestjs/common';
 import { CALL_PLACEMENTS_PER_MINUTE, CallController } from './call.controller';
 import { CallService } from './call.service';
+import { EngineRegistry } from '../../engine/engine-registry.service';
+import { type IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import { CallNotFoundError } from '../../common/errors/call-not-found.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 
@@ -93,5 +95,91 @@ describe('CallController', () => {
       expect(meta('THROTTLER:LIMITmedium', 'state')).toBeUndefined();
       expect(meta('THROTTLER:LIMITmedium', 'end')).toBeUndefined();
     });
+  });
+});
+
+// Exercise controller -> service -> registry together: the fork's VoIP routes must keep
+// the session fence, boolean defaults, response shape and engine refusals after a sync.
+describe('VoIP routes through the real call service', () => {
+  const ack = { success: true };
+  const currentCall = { callId: 'CALL1', state: 'ACTIVE', isVideo: false };
+  const cases: {
+    label: string;
+    method: keyof IWhatsAppEngine;
+    run: (controller: CallController) => Promise<unknown>;
+    args: unknown[];
+    engineResult?: unknown;
+    response: unknown;
+  }[] = [
+    { label: 'warmup', method: 'ensureVoipReady', run: c => c.warmup('s1'), args: [], response: ack },
+    {
+      label: 'place voice by default',
+      method: 'placeCall',
+      run: c => c.place('s1', { chatId: '123@c.us' }),
+      args: ['123@c.us', false],
+      engineResult: 'CALL1',
+      response: { success: true, callId: 'CALL1' },
+    },
+    {
+      label: 'place video with an unconfirmed call id',
+      method: 'placeCall',
+      run: c => c.place('s1', { chatId: '123@lid', isVideo: true }),
+      args: ['123@lid', true],
+      engineResult: null,
+      response: { success: true, callId: null },
+    },
+    {
+      label: 'answer without a body',
+      method: 'answerCall',
+      run: c => c.answer('s1', 'CALL1'),
+      args: ['CALL1', false],
+      response: ack,
+    },
+    {
+      label: 'answer with an empty body',
+      method: 'answerCall',
+      run: c => c.answer('s1', 'CALL1', {}),
+      args: ['CALL1', false],
+      response: ack,
+    },
+    {
+      label: 'answer with video',
+      method: 'answerCall',
+      run: c => c.answer('s1', 'CALL1', { withVideo: true }),
+      args: ['CALL1', true],
+      response: ack,
+    },
+    { label: 'end', method: 'endCall', run: c => c.end('s1', 'CALL1'), args: ['CALL1'], response: ack },
+    {
+      label: 'state',
+      method: 'callState',
+      run: c => c.state('s1'),
+      args: [],
+      engineResult: currentCall,
+      response: currentCall,
+    },
+  ];
+
+  const controllerFor = (method?: keyof IWhatsAppEngine, operation?: jest.Mock) => {
+    const registry = new EngineRegistry();
+    if (method) registry.set('s1', { [method]: operation } as unknown as IWhatsAppEngine);
+    return new CallController(new CallService(registry));
+  };
+
+  it.each(cases)('$label preserves engine arguments and the response contract', async test => {
+    const operation = jest.fn().mockResolvedValue(test.engineResult);
+    await expect(test.run(controllerFor(test.method, operation))).resolves.toEqual(test.response);
+    expect(operation).toHaveBeenCalledTimes(1);
+    expect(operation).toHaveBeenCalledWith(...test.args);
+  });
+
+  it.each(cases)('$label refuses a session without a registered engine', async test => {
+    await expect(test.run(controllerFor())).rejects.toThrow('Session is not started');
+  });
+
+  it.each(cases)('$label propagates a refusal without reporting success', async test => {
+    const refusal = new EngineRefusedError('WhatsApp refused the operation');
+    const operation = jest.fn().mockRejectedValue(refusal);
+    await expect(test.run(controllerFor(test.method, operation))).rejects.toBe(refusal);
   });
 });

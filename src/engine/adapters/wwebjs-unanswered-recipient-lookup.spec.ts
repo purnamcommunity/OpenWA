@@ -134,12 +134,16 @@ describe('a send whose recipient lookup did not answer', () => {
       .fn()
       .mockRejectedValue(new Error('Execution context was destroyed, most likely because of a navigation.'));
     const sendMessage = jest.fn().mockRejectedValue(noLid());
-    const adapter = ready({ getNumberId, sendMessage });
+    const adapter = ready({ getNumberId, sendMessage, destroy: jest.fn().mockResolvedValue(undefined) });
 
-    const outcome = await outcomeOf(adapter.sendTextMessage('628123456789@c.us', 'hi'));
+    try {
+      const outcome = await outcomeOf(adapter.sendTextMessage('628123456789@c.us', 'hi'));
 
-    expect(outcome).toBeInstanceOf(EngineNotReadyError);
-    expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(outcome).toBeInstanceOf(EngineNotReadyError);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      await adapter.disconnect(); // cancels the delayed navigation health check
+    }
   });
 
   // The verdict the 400 is for stays as it is: the lookup answered that the number resolves to nothing.

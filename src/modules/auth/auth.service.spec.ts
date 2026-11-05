@@ -1214,7 +1214,7 @@ describe('AuthService', () => {
       await service.onModuleInit();
 
       expect(unlinkSpy).not.toHaveBeenCalled();
-      expect(bannerText()).toMatch(/\(full key in \S*data[\\/]\.api-key\)/);
+      expect(bannerText()).toMatch(/\(full key in [^\r\n]*data[\\/]\.api-key\)/);
     });
 
     it('seeds a default admin key and the written key successfully authenticates against the persisted hash', async () => {

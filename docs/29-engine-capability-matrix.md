@@ -3,7 +3,7 @@
 Three-way comparison of every capability: the **Baileys library** (`@whiskeysockets/baileys`
 7.0.0-rc14), the **whatsapp-web.js library** (1.34.7), and what **OpenWA actually exposes** through
 its adapter layer and REST API — including which "supported" cells only work because OpenWA patches
-the installed library. Coverage is total: all 124 `IWhatsAppEngine` methods (29.4), **all 152
+the installed library. Coverage is total: all 126 `IWhatsAppEngine` methods (29.4), **all 152
 Baileys + 81 whatsapp-web.js library methods** (29.5), all 34 + 31 library events (29.5.4), and all
 21 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
 
@@ -26,7 +26,7 @@ Statuses used in the tables:
 
 Two complementary views:
 
-- **29.4 — the OpenWA contract view.** Rows are the 124 `IWhatsAppEngine` methods; use it to see
+- **29.4 — the OpenWA contract view.** Rows are the 126 `IWhatsAppEngine` methods; use it to see
   what a REST caller gets per engine. Source of truth: `src/engine/engine-capability-matrix.ts`
   (per-cell `evidence` strings cite the exact library `file:symbol` inspected).
 - **29.5 — the full engine inventory.** Rows are **every method the installed libraries expose**,
@@ -38,14 +38,14 @@ Two complementary views:
 ## 29.2 Adapter architecture
 
 OpenWA never calls a WhatsApp library directly from a controller. Every session owns one engine
-instance behind the neutral `IWhatsAppEngine` interface (124 methods +
+instance behind the neutral `IWhatsAppEngine` interface (126 methods +
 `EngineEventCallbacks`), and all modules go through it:
 
 ```mermaid
 flowchart LR
     subgraph OpenWA["OpenWA"]
         API["REST API controllers"] --> SVC["Modules / services"]
-        SVC --> IF["IWhatsAppEngine - 124 methods"]
+        SVC --> IF["IWhatsAppEngine - 126 methods"]
         IF --> WA["WhatsAppWebJsAdapter"]
         IF --> BA["BaileysAdapter"]
         SVC --> STORE["OpenWA-side stores"]
@@ -232,7 +232,7 @@ opens `if (!channel) return false;` before its try, so its `false` conflates _ch
 _WhatsApp refused_, and the adapter answers 403 for both. That distinction is ours to make in our own
 adapter and involves no library change.
 
-## 29.4 Full capability matrix — the OpenWA contract view (124 methods)
+## 29.4 Full capability matrix — the OpenWA contract view (126 methods)
 
 Legend recap: **✅** supported · **✅🔧ⁿ** supported via OpenWA patch `🔧ⁿ` (29.3) ·
 **❌ gap** adapter-gap · **❌ lib** library-limitation. Column headers carry the engine-wide
@@ -447,11 +447,11 @@ answers 501.
 > Booting the VoIP stack, placing, answering, ending and reading a call all run through WhatsApp
 > Web's own VoIP stack in the page.
 
-**Totals:** 124 methods → 248 adapter cells: **213 ✅, 35 ❌** (2 adapter-gaps, 33
-library-limitations, 0 uncertain) across 34 methods. From the REST caller's side: **92** methods
-work on any engine (90 fully supported + 2 store-backed status reads), **14** are Baileys-only,
-**17** are wwjs-only (the 2 store-backed rows excluded); `sendCatalog`, unavailable on both engines,
-is not exposed. Three of the 92 (`probeLiveness`, `getPhoneNumber`, `getPushName`) are ⚙️ internal and
+**Totals:** 126 methods → 252 adapter cells: **216 ✅, 36 ❌** (2 adapter-gaps, 34
+library-limitations, 0 uncertain) across 35 methods. From the REST caller's side: **93** methods
+work on any engine (91 fully supported + 2 store-backed status reads), **14** are Baileys-only,
+**18** are wwjs-only (the 2 store-backed rows excluded); `sendCatalog`, unavailable on both engines,
+is not exposed. Three of the 93 (`probeLiveness`, `getPhoneNumber`, `getPushName`) are ⚙️ internal and
 have no route.
 
 ## 29.5 Full engine method inventory — every library method, mapped to OpenWA
@@ -888,13 +888,13 @@ OpenWA consumes events by normalizing them into `EngineEventCallbacks`; anything
 | `group_leave`               | ✅           |     | `group_update`         | ✅                                                                              |
 | `group_membership_request`  | ✅           |     |                        |                                                                                 |
 
-## 29.6 The 35 not-available cells in detail
+## 29.6 The 36 not-available cells in detail
 
 Every ❌ in 29.4, with the exact library symbol inspected (full evidence strings:
 `engine-capability-matrix.ts`). All of these throw `EngineNotSupportedError` → HTTP 501 at the
 adapter boundary — none silently stubs.
 
-### 29.6.1 Baileys adapter (20 cells)
+### 29.6.1 Baileys adapter (21 cells)
 
 | Method                  | Cause | What's missing (evidence)                                                                                                                                                                                                                                                                                                                                |
 | ----------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1154,22 +1154,22 @@ adapter boundary — none silently stubs.
 Recomputed from `engine-capability-matrix.ts`, `upstream-surface.snapshot.json`, and a scan of the
 adapter sources — re-derive the same way when anything changes:
 
-- **124** interface methods → **248** adapter cells: **213 ✅** / **35 ❌** (2 adapter-gaps, 33
-  library-limitations, 0 uncertain), spanning **34** methods.
-- Of the 213 ✅ cells, **22 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
+- **126** interface methods → **252** adapter cells: **216 ✅** / **36 ❌** (2 adapter-gaps, 34
+  library-limitations, 0 uncertain), spanning **35** methods.
+- Of the 216 ✅ cells, **22 wwjs cells carry an explicit patch dependency** (4 × 🔧² status send,
   1 × 🔧³ channel link preview, 1 × 🔧⁴ ready-sync, 1 × 🔧⁷ participant arity, 2 × 🔧⁸
   block/unblock, 1 × 🔧⁹ group description, 1 × 🔧¹² contact alternate wid, 4 × 🔧¹⁴ media send
   id, 3 × 🔧¹⁵ group invite, 1 × 🔧¹⁷ forward bundle, 1 × 🔧¹⁸ profile bundle, 2 × 🔧²⁰ private invite) and one baileys cell
   does (1 × 🔧⁶ newsletter-create parse); the whole wwjs column additionally
   depends on 🔧¹, the whole Baileys column on 🔧⁵ — so every row rests on a patch on each side,
   even though no row carries a row-level mark on both.
-- REST caller's view: **92** engine-neutral (90 + 2 store-backed status reads), **14** Baileys-only,
-  **17** wwjs-only; `sendCatalog` (unavailable on both engines) is not exposed; three of the 92
+- REST caller's view: **93** engine-neutral (91 + 2 store-backed status reads), **14** Baileys-only,
+  **18** wwjs-only; `sendCatalog` (unavailable on both engines) is not exposed; three of the 93
   (`probeLiveness`, `getPhoneNumber`, `getPushName`) are ⚙️ internal and have no route.
 - Full engine inventory (29.5), split by the exposure legend rather than lumped: Baileys **152**
   socket methods — 49 wired into interface methods, 5 internal wiring, 29 plumbing, **69 ❌ not
-  exposed** (incl. the whole 23-method community cluster); wwjs **81** Client methods — 42 wired,
-  4 internal wiring, 1 class plumbing, **34 ❌ not exposed** (26 real capabilities + 8
+  exposed** (incl. the whole 23-method community cluster); wwjs **81** Client methods — 43 wired,
+  4 internal wiring, 1 class plumbing, **33 ❌ not exposed** (25 real capabilities + 8
   session/transport settings that are not WhatsApp capabilities). The backlog is the ❌ rows minus
   those 8 settings; 🔩 plumbing is correctly never exposed.
 - Events: Baileys **34** (18 consumed / 16 dropped), wwjs **31** (18 consumed / 13 dropped).
