@@ -31,7 +31,7 @@ class StatusMediaInput {
   url?: string;
 
   @ApiPropertyOptional({
-    description: 'Base64-encoded media. Requires mimetype.',
+    description: 'Base64-encoded media.',
     example: '/9j/4AAQSkZJRg...',
   })
   @ValidateIf((media: StatusMediaInput) => media.url === undefined || media.base64 !== undefined)
@@ -40,7 +40,12 @@ class StatusMediaInput {
   @IsNotEmpty()
   base64?: string;
 
-  @ApiPropertyOptional({ description: 'MIME type. Required when sending base64.', example: 'image/jpeg' })
+  @ApiPropertyOptional({
+    description:
+      "MIME type. Optional: when omitted, the endpoint's default applies (image/jpeg, video/mp4, or " +
+      'audio/ogg; codecs=opus for a voice note).',
+    example: 'image/jpeg',
+  })
   @IsOptional()
   @ToStrictString()
   @IsString()

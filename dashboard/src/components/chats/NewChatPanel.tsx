@@ -8,6 +8,7 @@ import { useRole } from '../../hooks/useRole';
 import { useToast } from '../../hooks/useToast';
 import ChatAvatar from './ChatAvatar';
 import { normalizePhoneText, phoneQueryDigits } from '../../utils/phone';
+import { isComposingKey } from '../../utils/composition';
 
 type Mode = 'chat' | 'group';
 
@@ -169,6 +170,21 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
     if (id && openRef.current) onOpenChat(draftChat(id, '', 'individual'), sessionId);
   };
 
+  // The address book lists a contact under its phone id, while the list can keep the conversation under another id of
+  // the same person (its @lid once WhatsApp moved it to privacy-id addressing): that conversation is the one to open,
+  // as for a typed number. The lookup can take a few seconds, so the panel takes no other pick meanwhile; one that
+  // fails or finds nothing opens the contact's own chat.
+  const [openingContact, setOpeningContact] = useState<string | null>(null);
+  const handleOpenContact = async (contact: Contact) => {
+    if (openingContact !== null || checking) return;
+    setOpeningContact(contact.id);
+    const listed = findListedChat ? await findListedChat(contact.id).catch(() => null) : null;
+    if (!openRef.current) return;
+    setOpeningContact(null);
+    onOpenChat(draftChat(listed ?? contact.id, contact.name || '', 'individual'), sessionId);
+  };
+  const busy = checking || openingContact !== null;
+
   const toggleParticipant = (p: Participant) => {
     setParticipants(prev => (prev.some(x => x.id === p.id) ? prev.filter(x => x.id !== p.id) : [...prev, p]));
   };
@@ -268,7 +284,7 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
           value={query}
           onChange={e => setQuery(e.target.value)}
           onKeyDown={e => {
-            if (e.key === 'Enter' && typedNumber && !checking) {
+            if (e.key === 'Enter' && !isComposingKey(e.nativeEvent) && typedNumber && !busy) {
               e.preventDefault();
               submitTypedNumber();
             }
@@ -295,7 +311,12 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
 
       <div className="chats-list new-chat-list">
         {!isGroupMode && groupsSupported && !normalizedQuery && (
-          <button type="button" className="chat-item-card action-row" onClick={() => switchMode('group')}>
+          <button
+            type="button"
+            className="chat-item-card action-row"
+            disabled={busy}
+            onClick={() => switchMode('group')}
+          >
             <span className="chat-avatar avatar-md action-avatar">
               <Users size={22} />
             </span>
@@ -304,7 +325,7 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
         )}
 
         {typedNumber && (
-          <button type="button" className="chat-item-card action-row" disabled={checking} onClick={submitTypedNumber}>
+          <button type="button" className="chat-item-card action-row" disabled={busy} onClick={submitTypedNumber}>
             <span className="chat-avatar avatar-md action-avatar">
               {checking ? <Loader2 className="animate-spin" size={22} /> : <Phone size={22} />}
             </span>
@@ -344,13 +365,17 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
                 key={c.id}
                 className={`chat-item-card ${selected ? 'active' : ''}`}
                 aria-pressed={isGroupMode ? selected : undefined}
-                onClick={() =>
-                  isGroupMode
-                    ? toggleParticipant({ id: c.id, label })
-                    : onOpenChat(draftChat(c.id, c.name || '', 'individual'), sessionId)
-                }
+                aria-busy={openingContact === c.id || undefined}
+                disabled={!isGroupMode && busy}
+                onClick={() => (isGroupMode ? toggleParticipant({ id: c.id, label }) : void handleOpenContact(c))}
               >
-                <ChatAvatar chatId={c.id} kind="individual" />
+                {openingContact === c.id ? (
+                  <span className="chat-avatar avatar-md action-avatar">
+                    <Loader2 className="animate-spin" size={22} />
+                  </span>
+                ) : (
+                  <ChatAvatar chatId={c.id} kind="individual" />
+                )}
                 <span className="chat-item-info">
                   <span className="chat-item-name">{label}</span>
                   {phone && phone !== label && (

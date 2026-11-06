@@ -14,13 +14,10 @@
  * which is worse than no gate at all. Comparing parsed declarations against JSON schemas is
  * deterministic, and it is the same mechanism the other check-* gates trust.
  *
- * Known blind spots, so nobody reads a green run as more than it is: TypeScript type-ALIASED
- * enums (e.g. `status: SessionStatus`) resolve to their alias name and are compared by presence
- * and optionality only, so the literal sets themselves are ungated on the TS clients. Everywhere
- * else the vocabulary IS compared member by member: Python Literals, Go const blocks and Java
- * enum constants (by their `@SerializedName`, or the constant's own name when it has none, which
- * is what Gson emits; a bare `UNKNOWN` is the decode-only sentinel and is skipped), whether the
- * field carries one member or a list of them.
+ * Everywhere the vocabulary IS compared member by member: TypeScript type aliases and `as const`
+ * tuple unions, Python Literals, Go const blocks and Java enum constants (by their `@SerializedName`,
+ * or the constant's own name when it has none, which is what Gson emits; a bare `UNKNOWN` is the
+ * decode-only sentinel and is skipped), whether the field carries one member or a list of them.
  *
  * One exception, in Java only: Gson serializes an enum constant by name, i.e. as a JSON string, so
  * a NUMERIC enum cannot be modelled as a Java enum without a custom adapter: the wire would carry
@@ -29,15 +26,20 @@
  * through a record, which is why it alone runs with compareOptionality=false.
  *
  * What one comparison covers, per mapped pair: field-name sets in both directions, required vs
- * optional (hand `?` vs the schema's `required` array), and — for fields whose both sides reduce
- * to a simple token (primitive, enum literal set, array of those, null union; on the hand side, any
- * union too) — the token itself,
+ * optional (hand `?` vs the schema's `required` array), and, for fields whose contract side reduces
+ * to a simple token (primitive, enum literal set, array of those, null union), the hand token itself,
  * which is what catches `string` widened to `string | number` or a re-ordered enum growing a
- * member. Complex/nested fields are compared by presence and optionality only; that limit is
+ * member. A hand type no parser reduces to a token (an alias that is not exported, a TypeScript
+ * enum, a Go type outside the known kinds) fails such a field instead of leaving it uncompared.
+ * Complex/nested fields are compared by presence and optionality only; that limit is
  * deliberate (the hand parser stays regular), and the exclusions below record what is known to be
  * unpinned. Every mapping entry must resolve on BOTH sides — a renamed hand type or schema fails
  * loudly instead of being skipped (the vacuous-pass failure mode), and the run refuses to gate
  * fewer than 8 pairs per client for the same reason (the dashboard's mappable surface is smaller than the SDK's; exclusions are explicit and counted either way).
+ *
+ * Not read by the hand parser: the members of a type alias written as an object literal or an
+ * intersection (`type X = { ... }`, `A & B`), and of an array of inline objects. A field typed through
+ * one of them is held to presence and optionality, and the members behind it are not compared.
  *
  * Pairs that drift today live in EXCLUDED with a one-line reason, mirroring the per-advisory
  * allowlist culture of check-audit: an exclusion is a recorded decision, not a silent skip, and
@@ -57,6 +59,8 @@
  * (request bodies and 2xx responses, nested schemas included, the resources sdk/README.md declares
  * unexposed left out) must be compared by at least one of the JavaScript, Python, Go and Java
  * clients, or be recorded in UNMAPPED_SCHEMAS with a reason. The dashboard does not count towards it.
+ * An operation that declares its body inline has no schema name for a client to map, so it is
+ * recorded in INLINE_BODIES instead, and a new one fails the run.
  */
 
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
@@ -112,6 +116,8 @@ const MAPPINGS = {
     SendCommentRequest: 'SendMessageCommentDto',
     SubscribePresenceRequest: 'SubscribePresenceDto',
     MessageListResponse: 'MessageListResponseDto',
+    MessageReceiptParticipant: 'MessageReceiptParticipantDto',
+    MessageReceiptsResponse: 'MessageReceiptsResponseDto',
     MessageRecord: 'MessageListItemDto',
     MessageResponse: 'MessageResponseDto',
     MuteChannelRequest: 'MuteChannelDto',
@@ -161,6 +167,7 @@ const MAPPINGS = {
     VotePollRequest: 'VotePollDto',
     WebhookDeliveryFailure: 'WebhookDeliveryFailureDto',
     WebhookFilterCondition: 'WebhookFilterConditionDto',
+    WebhookFilters: 'WebhookFiltersDto',
     WebhookRedriveResult: 'WebhookRedriveResultDto',
     WebhookResponse: 'WebhookResponseDto',
     // Payloads that sat outside every mapping until the coverage check required one.
@@ -172,6 +179,7 @@ const MAPPINGS = {
     ChatPresence: 'ChatPresenceResponseDto',
     CheckNumberResponse: 'NumberCheckResponseDto',
     ClickButtonRequest: 'ClickButtonDto',
+    ContactLidResponse: 'ContactLidResponseDto',
     ContactPhoneResponse: 'ResolvedPhoneResponseDto',
     ContactRecord: 'ContactDto',
     ConvertMediaInput: 'ConvertMediaDto',
@@ -226,14 +234,15 @@ const MAPPINGS = {
  * Floor on the mapping SIZE per client. The per-file compared-pairs guard above cannot see a
  * rewrite that silently DROPS entries (protection shrinks while everything stays green: a rewrite
  * once lost four conforming pairs and the run still passed). Raising these floors as pairs are
- * added makes the shrink loud.
+ * added makes the shrink loud. Each must EQUAL its mapping's size, and the run fails when it does
+ * not: a floor left below its mapping let that many pairs be dropped with nothing failing.
  */
 const MINIMUM_MAPPED = {
-  'sdk/javascript/src/types.ts': 118,
+  'sdk/javascript/src/types.ts': 128,
   'dashboard/src/services/api.ts': 22,
-  'sdk/python/openwa/types.py': 130,
-  'sdk/go': 131,
-  'sdk/java': 135,
+  'sdk/python/openwa/types.py': 139,
+  'sdk/go': 140,
+  'sdk/java': 145,
 };
 
 /** Known drift, deliberately not gated yet — each line is a to-adjudicate follow-up. */
@@ -316,6 +325,19 @@ const UNMAPPED_SCHEMAS = {
   StatusDeletedResponseDto: 'every client discards the {message} body of DELETE status and returns nothing',
 };
 
+/**
+ * Exposed operations that send or return an object declared inline (an `@ApiBody({ schema })`) rather
+ * than through a named schema. No hand type can be mapped to it, so renaming one of its fields
+ * changes the contract with no comparison to notice. Each is recorded with its reason; a new one
+ * fails the run, and so does an entry whose operation names its schema now. Naming the DTO in the
+ * controller gates it.
+ */
+const INLINE_BODIES = {
+  'POST /api/sessions/{sessionId}/labels/chat/{chatId}': 'the body {labelId} is declared inline in label.controller.ts',
+  'POST /api/sessions/{sessionId}/channels/subscribe':
+    'the body {inviteCode} is declared inline in channel.controller.ts',
+};
+
 // UpdateWebhookRequest is mapped on the three clients that declare it as a named type. The
 // JavaScript SDK spells it `Partial<CreateWebhookRequest> & { active?: boolean }`, a type ALIAS
 // rather than an interface, which the hand parser does not read; mapping it there would fail as a
@@ -363,6 +385,8 @@ const PYTHON_MAPPING = {
   SendCommentRequest: 'SendMessageCommentDto',
   SubscribePresenceRequest: 'SubscribePresenceDto',
   MessageListResponse: 'MessageListResponseDto',
+  MessageReceiptParticipant: 'MessageReceiptParticipantDto',
+  MessageReceiptsResponse: 'MessageReceiptsResponseDto',
   MessageRecord: 'MessageListItemDto',
   MessageResponse: 'MessageResponseDto',
   MuteChannelRequest: 'MuteChannelDto',
@@ -376,6 +400,7 @@ const PYTHON_MAPPING = {
   ReactMessageRequest: 'ReactMessageDto',
   ReplyMessageRequest: 'ReplyMessageDto',
   RequestPairingCodeRequest: 'RequestPairingCodeDto',
+  SearchHit: 'SearchHitDto',
   SendAudioRequest: 'SendAudioMessageDto',
   SendBulkRequest: 'SendBulkMessageDto',
   SendChatStateRequest: 'SendChatStateDto',
@@ -427,6 +452,7 @@ const PYTHON_MAPPING = {
   ChatPresence: 'ChatPresenceResponseDto',
   CheckNumberResponse: 'NumberCheckResponseDto',
   ClickButtonRequest: 'ClickButtonDto',
+  ContactLidResponse: 'ContactLidResponseDto',
   ContactPhoneResponse: 'ResolvedPhoneResponseDto',
   ContactRecord: 'ContactDto',
   ConvertedMedia: 'ConvertedMediaResponseDto',
@@ -501,6 +527,8 @@ const GO_MAPPING = {
   SendCommentRequest: 'SendMessageCommentDto',
   SubscribePresenceRequest: 'SubscribePresenceDto',
   MessageListResponse: 'MessageListResponseDto',
+  MessageReceiptParticipant: 'MessageReceiptParticipantDto',
+  MessageReceiptsResponse: 'MessageReceiptsResponseDto',
   MessageRecord: 'MessageListItemDto',
   MessageResponse: 'MessageResponseDto',
   MuteChannelRequest: 'MuteChannelDto',
@@ -564,10 +592,12 @@ const GO_MAPPING = {
   ChatPresence: 'ChatPresenceResponseDto',
   CheckNumberResponse: 'NumberCheckResponseDto',
   ClickButtonRequest: 'ClickButtonDto',
+  ContactLidResponse: 'ContactLidResponseDto',
   ContactPhoneResponse: 'ResolvedPhoneResponseDto',
   ContactRecord: 'ContactDto',
   ConvertMediaInput: 'ConvertMediaDto',
   ConvertedMedia: 'ConvertedMediaResponseDto',
+  CustomLinkPreview: 'CustomLinkPreviewDto',
   GroupPictureResponse: 'GroupPictureResponseDto',
   GroupSettings: ['GroupSettingsResponseDto', 'GroupSettingsDto'],
   HealthResponse: 'HealthCheckResponseDto',
@@ -646,6 +676,8 @@ const JAVA_MAPPING = {
   SendCommentRequest: 'SendMessageCommentDto',
   SubscribePresenceRequest: 'SubscribePresenceDto',
   MessageListResponse: 'MessageListResponseDto',
+  MessageReceiptParticipant: 'MessageReceiptParticipantDto',
+  MessageReceiptsResponse: 'MessageReceiptsResponseDto',
   MessageRecord: 'MessageListItemDto',
   MessageResponse: 'MessageResponseDto',
   MuteChannelRequest: 'MuteChannelDto',
@@ -709,10 +741,12 @@ const JAVA_MAPPING = {
   CheckNumberResponse: 'NumberCheckResponseDto',
   ClickButtonRequest: 'ClickButtonDto',
   Contact: 'ChatHistoryContactDto',
+  ContactLidResponse: 'ContactLidResponseDto',
   ContactPhoneResponse: 'ResolvedPhoneResponseDto',
   ContactRecord: 'ContactDto',
   ConvertMediaRequest: 'ConvertMediaDto',
   ConvertedMedia: 'ConvertedMediaResponseDto',
+  CustomLinkPreview: 'CustomLinkPreviewDto',
   GroupPictureResponse: 'GroupPictureResponseDto',
   GroupSettings: ['GroupSettingsResponseDto', 'GroupSettingsDto'],
   HealthResponse: 'HealthCheckResponseDto',
@@ -750,10 +784,25 @@ const JAVA_MAPPING = {
 
 // ── hand-type parsing (declarations follow the regular formatting of the two files) ──
 
+const memberContext = new WeakMap();
+let lastAliases = {};
+
 export function parseHandTypes(source) {
   source = source.replace(/\r\n/g, '\n');
   const types = {};
   const parents = {};
+  const constArrays = {};
+  for (const [, name, body] of source.matchAll(/export const (\w+)\s*=\s*\[([\s\S]*?)\]\s*as const;/g)) {
+    const items = [...body.matchAll(/'([^']*)'|"([^"]*)"/g)].map(m => `'${m[1] ?? m[2]}'`);
+    if (items.length) constArrays[name] = items.join(' | ');
+  }
+  const aliases = {};
+  for (const [, name, raw] of source.matchAll(/export type (\w+)\s*=\s*([^{;]+);/g)) {
+    const rhs = raw.trim();
+    const typeofMatch = rhs.match(/^\(\s*typeof\s+(\w+)\s*\)\s*\[number\]$/);
+    aliases[name] = typeofMatch && constArrays[typeofMatch[1]] ? constArrays[typeofMatch[1]] : rhs;
+  }
+  lastAliases = { ...lastAliases, ...aliases };
   const iface = /export interface (\w+)(?: extends (\w+))? \{([\s\S]*?)\n\}/g;
   for (const [, name, parent, body] of source.matchAll(iface)) {
     types[name] = parseMembers(body);
@@ -764,6 +813,10 @@ export function parseHandTypes(source) {
   // CreatedApiKey (extends ApiKey) can never conform.
   for (const [name, parent] of Object.entries(parents)) {
     if (types[parent]) types[name] = { ...types[parent], ...types[name] };
+  }
+  const ctx = { types, aliases };
+  for (const members of Object.values(types)) {
+    memberContext.set(members, ctx);
   }
   return types;
 }
@@ -789,6 +842,11 @@ function parseMembers(body) {
           depth = countUnbalanced(m[3]);
           buffer = m[3];
         }
+        continue;
+      }
+      // A union too long for one line, as prettier wraps it: each `| member` line continues the field above.
+      if (field && cleaned.startsWith('|')) {
+        members[field].token = `${members[field].token} ${cleaned}`.trim();
         continue;
       }
     }
@@ -825,10 +883,19 @@ const sortEnumMembers = members =>
       });
 const enumToken = members => `enum(${JSON.stringify(sortEnumMembers(members))})`;
 
-export function handToken(text, types, depth = 0) {
-  const t = text.trim().replace(/;$/, '');
-  if (t.endsWith('[]')) return `array<${handToken(t.slice(0, -2), types, depth)}>`;
+export function handToken(text, types = {}, depth = 0, aliases = lastAliases) {
+  const t = text
+    .trim()
+    .replace(/;$/, '')
+    .replace(/^\|\s*/, '')
+    .trim();
+  if (t.endsWith('[]')) return `array<${handToken(t.slice(0, -2), types, depth, aliases)}>`;
+  const arrMatch = t.match(/^Array<([\s\S]+)>$/);
+  if (arrMatch) return `array<${handToken(arrMatch[1], types, depth, aliases)}>`;
   if (/^(string|number|boolean|unknown|any)$/.test(t)) return t;
+  if (aliases && aliases[t] && depth < MAX_DEPTH) {
+    return handToken(aliases[t], types, depth + 1, aliases);
+  }
   const literals = [...t.matchAll(/'([^']*)'|"([^"]*)"/g)].map(m => m[1] ?? m[2]);
   // Unquoted numeric literals (font enums like 0|1|2|6) count too.
   const numerics = [...t.matchAll(/(?<![\w.'"])(-?\d+(?:\.\d+)?)(?![\w.])/g)].map(m => Number(m[1]));
@@ -841,19 +908,26 @@ export function handToken(text, types, depth = 0) {
       .filter(p => p && p !== 'undefined');
     const nullable = parts.includes('null');
     const rest = parts.filter(p => p !== 'null');
-    if (nullable && rest.length === 1) return `${handToken(rest[0], types, depth)}|null`;
+    if (nullable && rest.length === 1) return `${handToken(rest[0], types, depth, aliases)}|null`;
     // A nullable literal union ('a' | 'b' | null) is the enum of its literals with a null arm.
-    const inner = nullable && rest.length > 1 ? handToken(rest.join(' | '), types, depth) : '';
+    const inner = nullable && rest.length > 1 ? handToken(rest.join(' | '), types, depth, aliases) : '';
     if (inner.startsWith('enum(')) return `${inner}|null`;
     return `union(${rest
-      .map(p => handToken(p, types, depth))
+      .map(p => handToken(p, types, depth, aliases))
+      .sort()
+      .join(',')})`;
+  }
+  if (t.startsWith('{') && t.endsWith('}') && depth < MAX_DEPTH) {
+    const inlineMembers = parseMembers(t.slice(1, -1).replace(/;\s*/g, ';\n'));
+    return `object(${Object.entries(inlineMembers)
+      .map(([f, v]) => `${f}${v.optional ? '?' : ''}:${handToken(v.token, types, depth + 1, aliases)}`)
       .sort()
       .join(',')})`;
   }
   const ref = types[t];
   if (ref && depth < MAX_DEPTH) {
     return `object(${Object.entries(ref)
-      .map(([f, v]) => `${f}${v.optional ? '?' : ''}:${handToken(v.token, types, depth + 1)}`)
+      .map(([f, v]) => `${f}${v.optional ? '?' : ''}:${handToken(v.token, types, depth + 1, aliases)}`)
       .sort()
       .join(',')})`;
   }
@@ -947,7 +1021,7 @@ export function parseObjectToken(token) {
   return members;
 }
 
-/** Fields whose both sides reduce to a primitive/enum/array/null-union get token-level diffing.
+/** Fields whose contract side reduces to a primitive/enum/array/null-union get token-level diffing.
  *  `array<enum(...)>` counts: an array of enum members is exactly as comparable as a bare one, and
  *  leaving it out silently ungated every vocabulary that travels as a list, the webhook event set
  *  above all, on every client at once. So does a null arm after an enum or an array: a nullable
@@ -956,6 +1030,16 @@ function isSimpleToken(token) {
   return /^(string|number|boolean|unknown|any)(\|null)?$|^enum\(\[[\s\S]*\]\)(\|null)?$|^array<((string|number|boolean)(\|null)?|enum\(\[[\s\S]*\]\))>(\|null)?$/.test(
     token,
   );
+}
+
+function resolveObjectSchema(node, schemas) {
+  if (!node || typeof node !== 'object') return null;
+  if (node.$ref) return schemas[node.$ref.split('/').pop()] ?? null;
+  if (Array.isArray(node.allOf) && node.allOf.length === 1 && node.allOf[0].$ref) {
+    return schemas[node.allOf[0].$ref.split('/').pop()] ?? null;
+  }
+  if (node.type === 'object' && node.properties) return node;
+  return null;
 }
 
 /**
@@ -973,6 +1057,7 @@ export function comparePair(
   namesOnly = false,
 ) {
   const diffs = [];
+  const ctx = memberContext.get(handMembers);
   const schemaFields = parseObjectToken(schemaToken(schema, schemas));
   for (const [field, handInfo] of Object.entries(handMembers)) {
     const sField = schemaFields[field];
@@ -987,10 +1072,30 @@ export function comparePair(
       );
       continue;
     }
+    const rawHand = handInfo.token.trim().replace(/;$/, '');
+    if (rawHand.startsWith('{') && rawHand.endsWith('}')) {
+      const subSchema = resolveObjectSchema(schema?.properties?.[field], schemas);
+      if (subSchema) {
+        const inlineMembers = parseMembers(rawHand.slice(1, -1).replace(/;\s*/g, ';\n'));
+        if (ctx) memberContext.set(inlineMembers, ctx);
+        for (const subDiff of comparePair(
+          `${handName}.${field}`,
+          inlineMembers,
+          `${schemaName}.${field}`,
+          subSchema,
+          schemas,
+          compareOptionality,
+          namesOnly,
+        )) {
+          diffs.push(`${field}.${subDiff}`);
+        }
+        continue;
+      }
+    }
     if (isSimpleToken(sField.token)) {
       let hand = isSimpleToken(handInfo.token)
         ? handInfo.token
-        : handToken(handInfo.token, { [handName]: handMembers });
+        : handToken(handInfo.token, ctx?.types ?? { [handName]: handMembers }, 0, ctx?.aliases ?? lastAliases);
       let contract = sField.token;
       if (!compareOptionality) {
         // Java (the only such client) cannot express non-null references — strip null arms on
@@ -1009,9 +1114,15 @@ export function comparePair(
         }
       }
       const absorbs = handInfo.absorbsNull && contract === `${hand}|null`;
-      // A union never equals a simple contract token, so it is drift, not a shape too complex to read.
-      if (hand !== contract && !absorbs && (isSimpleToken(hand) || hand.startsWith('union('))) {
-        diffs.push(`"${field}": hand ${hand}, contract ${contract}`);
+      // Any other hand token is drift. One no parser could reduce (an alias that is not exported, an enum, a
+      // type outside the known kinds) fails too: skipping it left the field uncompared while the run passed.
+      if (hand !== contract && !absorbs) {
+        const read = isSimpleToken(hand) || /^(?:union\(|object\(|array<|dict$|object$)/.test(hand);
+        diffs.push(
+          read
+            ? `"${field}": hand ${hand}, contract ${contract}`
+            : `"${field}": hand type could not be read (${hand || 'empty'}), contract ${contract}`,
+        );
       }
     }
   }
@@ -1035,6 +1146,7 @@ export function parsePythonTypes(source) {
   const joined = [];
   let carry = '';
   for (const line of source.split('\n')) {
+    if (line.trim().startsWith('#')) continue;
     carry = carry ? carry + ' ' + line.trim() : line;
     let depth = 0;
     for (const ch of carry) {
@@ -1061,7 +1173,7 @@ export function parsePythonTypes(source) {
     const members = {};
     // The bracket-joining preprocessing above collapses the dict to ONE line, so fields are
     // delimited by the next `"key":` (lookahead), not by newlines.
-    for (const f of body.matchAll(/"([^"]+)"\s*:\s*(".*?"|[^,]+?)(?=\s*,?\s*(?:\}|$)|\s*,\s*"[^"]+"\s*:)/g)) {
+    for (const f of body.matchAll(/"([^"]+)"\s*:\s*([\s\S]+?)(?=\s*,?\s*(?:\}|$)|\s*,\s*"[^"]+"\s*:)/g)) {
       // Optional[...] stays verbatim: the comparator reads it as `T|null` (nullability), distinct
       // from optionality. Only total=False / NotRequired mark a member optional.
       let token = f[2].trim().replace(/,$/, '');
@@ -1075,7 +1187,7 @@ export function parsePythonTypes(source) {
     }
     dicts[name] = members;
   }
-  const blocks = [...source.matchAll(/class (\w+)\(([^)]*)\):\n([\s\S]*?)(?=\nclass |\n[A-Z]\w+ = |\n*$)/g)];
+  const blocks = [...source.matchAll(/class (\w+)\(([^)]*)\):\n([\s\S]*?)(?=\nclass |\n_?[A-Z]\w+ = |\n*$)/g)];
   // A subclass never re-mentions TypedDict — accept any class whose base chain reaches one
   // (fixpoint: a class is rooted when a base is itself a rooted class).
   const basesOf = Object.fromEntries(
@@ -1087,7 +1199,10 @@ export function parsePythonTypes(source) {
         .filter(x => x && x !== 'TypedDict' && !x.includes('=')),
     ]),
   );
-  let rooted = new Set(blocks.filter(([, , b]) => /(^|\W)TypedDict(\W|$)/.test(b)).map(([, n]) => n));
+  let rooted = new Set([
+    ...Object.keys(dicts),
+    ...blocks.filter(([, , b]) => /(^|\W)TypedDict(\W|$)/.test(b)).map(([, n]) => n),
+  ]);
   let grew = true;
   while (grew) {
     grew = false;
@@ -1189,6 +1304,7 @@ function pythonToken(text, resolve, depth = 0) {
     if (t === 'int' || t === 'float') return 'number';
     if (t === 'bool') return 'boolean';
     if (t === 'Any') return 'any';
+    if (t === 'list' || t === 'List') return 'unknown';
     const lit = t.match(/^Literal\[(.+)\]$/s);
     if (lit) {
       // Quoted members are string enums; bare members are the numeric ones (a status font, a pin
@@ -1226,7 +1342,16 @@ export function parseGoTypes(sources) {
   const structs = {};
   const scalarAliases = {};
   const constGroups = {};
-  const kindMap = { string: 'string', int: 'number', int64: 'number', float64: 'number', bool: 'boolean', any: 'any' };
+  // A time.Time marshals to an RFC 3339 string.
+  const kindMap = {
+    string: 'string',
+    int: 'number',
+    int64: 'number',
+    float64: 'number',
+    bool: 'boolean',
+    any: 'any',
+    'time.Time': 'string',
+  };
 
   for (const source of sources) {
     for (const [, name, underlying] of source.matchAll(/^type (\w+) (string|int|int64|float64|bool|any)$/gm)) {
@@ -1477,6 +1602,27 @@ export function exposedSchemas(openapi, unexposed) {
   return seen;
 }
 
+/** The exposed operations whose request body or 2xx response holds an object no schema name stands for. */
+export function inlineBodies(openapi, unexposed) {
+  const inline = node =>
+    Boolean(node) &&
+    typeof node === 'object' &&
+    !node.$ref &&
+    (Boolean(node.properties) || Object.values(node).some(inline));
+  const found = [];
+  for (const [path, item] of Object.entries(openapi.paths)) {
+    if (isUnexposedPath(path, unexposed)) continue;
+    for (const [verb, operation] of Object.entries(item)) {
+      if (!operation || typeof operation !== 'object') continue;
+      const success = Object.entries(operation.responses ?? {}).filter(([status]) => status.startsWith('2'));
+      if (inline(operation.requestBody) || success.some(([, response]) => inline(response))) {
+        found.push(`${verb.toUpperCase()} ${path}`);
+      }
+    }
+  }
+  return found;
+}
+
 /**
  * What stands between the exposed schemas and a green run: a schema no client compares and
  * UNMAPPED_SCHEMAS does not record, and a record that no longer describes anything.
@@ -1618,6 +1764,12 @@ if (isDirectRun) {
         `  only ${Object.keys(client.mapping).length} mapped pairs for ${client.label} (floor ${client.floor}) — entries were dropped`,
       );
       failures++;
+    } else if (Object.keys(client.mapping).length > client.floor) {
+      const mapped = Object.keys(client.mapping).length;
+      fileResults.push(
+        `  ${mapped} mapped pairs for ${client.label}, above its floor of ${client.floor}: raise the floor`,
+      );
+      failures++;
     }
     if (fileCompared < 8) {
       fileResults.push(`  only ${fileCompared} pairs compared for ${client.label} — vacuous-pass guard`);
@@ -1632,7 +1784,8 @@ if (isDirectRun) {
     }
   }
 
-  const exposed = exposedSchemas(openapi, unexposedResources(readFileSync(`${REPO_ROOT}sdk/README.md`, 'utf8')));
+  const unexposed = unexposedResources(readFileSync(`${REPO_ROOT}sdk/README.md`, 'utf8'));
+  const exposed = exposedSchemas(openapi, unexposed);
   const comparedSchemas = new Set(
     CLIENTS.filter(c => c.sdk)
       .flatMap(c => Object.entries(c.mapping).filter(([handName]) => !c.excluded[handName]))
@@ -1644,6 +1797,24 @@ if (isDirectRun) {
   );
   for (const line of uncovered) console.log(`  ${line}`);
   failures += uncovered.length;
+
+  const inline = inlineBodies(openapi, unexposed);
+  const inlineProblems = [
+    ...inline
+      .filter(operation => !(operation in INLINE_BODIES))
+      .map(
+        operation =>
+          `${operation} declares an inline object no client can map: name its DTO in the controller, or record it in INLINE_BODIES with a reason`,
+      ),
+    ...Object.keys(INLINE_BODIES)
+      .filter(operation => !inline.includes(operation))
+      .map(operation => `INLINE_BODIES lists ${operation}, which no longer declares an inline object: remove it`),
+  ];
+  console.log(
+    `inline bodies: ${inline.length} declared, ${Object.keys(INLINE_BODIES).length} recorded in INLINE_BODIES, ${inlineProblems.length ? 'FAILURES' : 'all recorded'}`,
+  );
+  for (const line of inlineProblems) console.log(`  ${line}`);
+  failures += inlineProblems.length;
 
   console.log(
     failures

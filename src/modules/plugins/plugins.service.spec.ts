@@ -388,7 +388,7 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
     let calls = 0;
     jest.spyOn(loader, 'uninstallPlugin').mockImplementation(() => {
       calls++;
-      return calls === 1 ? firstDone : Promise.resolve();
+      return (calls === 1 ? firstDone : Promise.resolve()).then(() => ({ registryEntryKept: false }));
     });
 
     const p1 = service.uninstall('svc-plg');
@@ -1058,7 +1058,8 @@ describe('PluginsService: disable an engine plugin', () => {
 
 /**
  * Recovery for a plugin the gateway still has a registry entry for but whose code is gone — the
- * state the loader announces on every boot ("Reinstall it — its config and stored data are kept").
+ * state the loader announces on every boot ("Reinstall it: its config and stored data are kept, unless an
+ * uninstall stopped part-way").
  *
  * Under the shipped layout `plugins.dir` IS `<dataDir>/plugins`, so a plugin's package directory and
  * its `ctx.storage` directory are the same path. `ctx.storage` is created eagerly the first time the

@@ -218,12 +218,17 @@ class GroupJoinInfo(TypedDict):
 
 
 class CustomLinkPreview(TypedDict):
-    """A caller-supplied link preview. Nothing is fetched for these."""
+    """A caller-supplied link preview. The page is not fetched; only thumbnailUrl, when given, is."""
 
     url: str
     # Required -- WhatsApp will not render a preview without a title.
     title: str
     description: NotRequired[str]
+    # Preview image as an http(s) URL, fetched under the media SSRF rules; renders the large card.
+    # At most 5 MiB.
+    thumbnailUrl: NotRequired[str]
+    # Preview image as base64, at most 5 MiB decoded. Wins over thumbnailUrl.
+    thumbnailBase64: NotRequired[str]
 
 
 # ── Session ───────────────────────────────────────────────────────
@@ -390,9 +395,10 @@ class SendTextRequest(TypedDict):
     # whatsapp-web.js builds one in-page by default, while on Baileys a preview is OPT-IN -- it needs
     # True, because generating one is a blocking outbound fetch per URL.
     linkPreview: NotRequired[bool]
-    # Attach a preview you supply yourself instead of one fetched from the URL. Nothing is fetched,
-    # so this works even for a URL the gateway cannot reach. Baileys only -- whatsapp-web.js takes a
-    # boolean and answers 501. Cannot be combined with linkPreview=False.
+    # Attach a preview you supply yourself instead of one fetched from the URL. The page is not
+    # fetched, so this works even for a URL the gateway cannot reach; only thumbnailUrl, when given,
+    # is. Baileys only -- whatsapp-web.js takes a boolean and answers 501. Cannot be combined with
+    # linkPreview=False.
     customLinkPreview: NotRequired[CustomLinkPreview]
     # Quote an earlier message, turning this send into a reply. Engine-specific: whatsapp-web.js
     # matches the serialized message id, Baileys the raw key id of a message it has already stored.
@@ -623,7 +629,7 @@ class MessageContact(TypedDict, total=False):
     verifiedName: str
     verifiedLevel: int
     isBlocked: bool
-    labels: list
+    labels: list[str]
 
 
 class ChatHistoryPoll(TypedDict):
@@ -650,7 +656,7 @@ ChatHistoryMessage = TypedDict(
         "isStatusBroadcast": NotRequired[bool],
         "ephemeralDuration": NotRequired[int],
         "author": NotRequired[Jid],
-        "mentionedIds": NotRequired[list],
+        "mentionedIds": NotRequired[list[str]],
         "call": NotRequired[MessageCall],
         "isLidSender": NotRequired[bool],
         "senderPhone": NotRequired[Optional[str]],
@@ -722,6 +728,22 @@ class CommentRecord(TypedDict):
     body: NotRequired[str | None]
     revoked: bool
     fromMe: bool
+
+
+class MessageReceiptParticipant(TypedDict):
+    participant: Jid
+    timestamp: int
+
+
+class MessageReceiptsResponse(TypedDict):
+    """Who received, read and played a message the account sent (whatsapp-web.js only)."""
+
+    delivery: list[MessageReceiptParticipant]
+    deliveryRemaining: NotRequired[int]
+    read: list[MessageReceiptParticipant]
+    readRemaining: NotRequired[int]
+    played: list[MessageReceiptParticipant]
+    playedRemaining: NotRequired[int]
 
 
 # ── Bulk ──────────────────────────────────────────────────────────
@@ -857,6 +879,12 @@ class ProfilePicturesResponse(TypedDict):
 class ContactPhoneResponse(TypedDict):
     contactId: Jid
     phone: str | None
+
+
+class ContactLidResponse(TypedDict):
+    number: str
+    # The <lid>@lid WhatsApp holds for the number, or None when it holds none (an unregistered number answers the same).
+    lid: str | None
 
 
 # ── Group ─────────────────────────────────────────────────────────
@@ -1077,9 +1105,10 @@ class WebhookDeliveryFailure(TypedDict):
     lastError: str
     # ISO timestamp of when the failure was first recorded.
     createdAt: str
-    # True when the row still holds the event data and can be replayed with
-    # WebhooksResource.redrive_delivery_failures: a terminal row (attempts > 0) recorded while the
-    # gateway's WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS is above 0, until that window passes.
+    # True when the row still holds the event data and its webhook still exists in the same session: a
+    # terminal row (attempts > 0) recorded while the gateway's WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS is
+    # above 0, until that window passes. WebhooksResource.redrive_delivery_failures replays it while that
+    # webhook is active and subscribed to the event.
     replayable: bool
 
 
@@ -1107,9 +1136,10 @@ class WebhookRedriveResult(TypedDict):
     enqueued: int
     # Replays that failed again; their rows stay, with attempts raised by one.
     failed: int
-    # Rows not replayed: the webhook was removed, disabled or unsubscribed, or a plugin cancelled it.
+    # Selected rows not replayed: a hook cancelled the replay, or the row or its webhook changed during the
+    # call. Rows of a removed, disabled or unsubscribed webhook are left out before the batch and not counted.
     skipped: int
-    # Replayable rows still in scope after this call.
+    # Rows the redrive would still take after this call: replayable, in scope, with an active subscribed webhook.
     remaining: int
 
 
@@ -1553,8 +1583,11 @@ class _SearchQueryRequired(TypedDict):
 
 
 # `match` is "word" (the server default: whole words) or "contains" (any part
-# of a word, ignoring case and accents; needs a term of 3+ characters, and a
-# server with SEARCH_CONTAINS_ENABLED=true, else 501).
+# of a word, ignoring case and accents). "contains" needs
+# SEARCH_CONTAINS_ENABLED=true and a finished index build on the server (501
+# otherwise) and at least one term of 3+ characters with at most 64 characters
+# across its terms (400 otherwise); it ranks the 1000 most recently stored
+# matches, so `total` is at most 1000.
 _SearchQueryOptional = TypedDict(
     "_SearchQueryOptional",
     {

@@ -123,6 +123,22 @@ export class WwebjsContacts {
   }
 
   /**
+   * {@link withPage} for a lookup about someone else. A command that outran Puppeteer's protocol budget got no
+   * answer either way, and is no page death, so it is a 503 like the other contact reads give, not the raw
+   * timeout as a 500.
+   */
+  private async askPage<T>(context: string, op: () => Promise<T>): Promise<T> {
+    try {
+      return await withPage(this.host, context, op);
+    } catch (error) {
+      if (isProtocolTimeout(error)) {
+        throw new EngineTransportError(`WhatsApp Web did not answer the ${context} lookup in time`);
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Map a raw whatsapp-web.js contact to the library-agnostic {@link Contact}. The id is read
    * through {@link readWid} so both the `_serialized` and post-rename `$1` shapes resolve; a
    * contact with no readable id returns null so callers can skip it instead of dereferencing
@@ -281,7 +297,7 @@ export class WwebjsContacts {
    */
   async lookupNumberId(number: string): Promise<string | null> {
     this.host.ensureReady();
-    const numberId = await withPage(this.host, 'getNumberId', () => this.client().getNumberId(number));
+    const numberId = await this.askPage('getNumberId', () => this.client().getNumberId(number));
     // Read both property names: a WA Web build that renamed `_serialized` would otherwise make
     // every number look unregistered — and checkNumberExists below reports exactly that.
     return readWid(numberId) ?? null;
@@ -316,6 +332,13 @@ export class WwebjsContacts {
 
   async resolveContactPhone(contactId: string): Promise<string | null> {
     this.host.ensureReady();
+    // Only a privacy id needs the page. A phone id already carries its number, as it does on Baileys, and handing
+    // it to getContactLidAndPhone would run an existence query for that number (the page asks WhatsApp when it
+    // holds no LID): the check `GET contacts/check/{number}` reserves for OPERATOR keys, run for any key through
+    // this route. Any other kind names no phone at all.
+    const parsed = parseWaId(contactId);
+    if (parsed.kind === 'user') return parsed.userPart.replace(/\D/g, '') || null;
+    if (parsed.kind !== 'lid') return null;
     // Queried one id at a time: the batch form is prone to "Evaluation failed" and rate-limiting
     // (whatsapp-web.js #3857/#3969). `pn` is the phone JID (`<digits>@c.us`) when the account knows
     // the mapping. An empty/absent pn RESOLVES to null (a definitive "no mapping" answer); a thrown
@@ -326,6 +349,19 @@ export class WwebjsContacts {
     const [result] = await this.client().getContactLidAndPhone([contactId]);
     const pn = result?.pn;
     return pn ? pn.replace(/@c\.us$/i, '').replace(/\D/g, '') || null : null;
+  }
+
+  /**
+   * The `<lid>@lid` WhatsApp Web holds for a phone number, or null when it holds none, which an unregistered
+   * number answers too. When the page does not know the LID it asks WhatsApp, so this can send a query.
+   */
+  async getContactLid(number: string): Promise<string | null> {
+    this.host.ensureReady();
+    const phone = userPart(number).replace(/\D/g, '');
+    if (!phone) return null;
+    const [result] = await this.askPage('getContactLid', () => this.client().getContactLidAndPhone([`${phone}@c.us`]));
+    const lid = result?.lid;
+    return typeof lid === 'string' && parseWaId(lid).kind === 'lid' ? `${userPart(lid)}@lid` : null;
   }
 
   async upsertContact(contactId: string, firstName: string, lastName = ''): Promise<void> {
@@ -351,6 +387,8 @@ export class WwebjsContacts {
     this.host.ensureReady();
     await withPage(this.host, 'blockContact', async () => {
       const contact = await this.client().getContactById(contactId);
+      // The contact acts through its own client, which getClient's readiness check never sees again.
+      this.host.ensureReady();
       await contact.block();
     });
     this.host.logger.debug('Blocked contact', { contactId });
@@ -364,7 +402,7 @@ export class WwebjsContacts {
    */
   async getBlockedContacts(): Promise<string[]> {
     this.host.ensureReady();
-    const contacts = await withPage(this.host, 'getBlockedContacts', () => this.client().getBlockedContacts());
+    const contacts = await this.askPage('getBlockedContacts', () => this.client().getBlockedContacts());
     const ids = contacts.map(c => readWid(c.id as unknown as SerializedWid)).filter((id): id is string => Boolean(id));
     return [...new Set(ids)];
   }
@@ -373,6 +411,7 @@ export class WwebjsContacts {
     this.host.ensureReady();
     await withPage(this.host, 'unblockContact', async () => {
       const contact = await this.client().getContactById(contactId);
+      this.host.ensureReady();
       await contact.unblock();
     });
     this.host.logger.debug('Unblocked contact', { contactId });

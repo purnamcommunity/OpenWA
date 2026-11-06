@@ -124,6 +124,16 @@
   white-space: nowrap;
 }
 
+/* The row's message, which some actions use to name what happened: wraps under the action. */
+.logs-page .action .log-message {
+  display: block;
+  margin-top: 0.25rem;
+  font-weight: 400;
+  color: var(--text-secondary);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .logs-page .api-key {
   font-family: monospace;
   font-size: 0.8125rem;

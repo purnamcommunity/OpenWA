@@ -48,6 +48,8 @@ describe('GroupService', () => {
       ["the account's own 1:1 jid", '628123456789@c.us'],
       ['a lid', '99887766@lid'],
       ['a channel', '120363000000000000@newsletter'],
+      ['a 1:1 jid with a group domain appended', '628123456789@c.us@g.us'],
+      ['a device jid with a group domain appended', '628123456789:5@c.us@g.us'],
     ])('refuses %s', (_label, id) => {
       const e = engine();
       const svc = makeService(e);
@@ -85,6 +87,10 @@ describe('GroupService', () => {
       ['a 1:1 jid', '628123456789@c.us'],
       ['a lid', '99887766@lid'],
       ['a channel', '120363000000000000@newsletter'],
+      // Baileys reads the domain after the first `@`, so a second one is refused wherever it sits.
+      ['a 1:1 jid with a group domain appended', '628123456789@c.us@g.us'],
+      ['a protocol-dialect jid with a group domain appended', '628123456789@s.whatsapp.net@g.us'],
+      ['a device jid with a group domain appended', '628123456789:5@c.us@g.us'],
     ])('refuses %s before it reaches the engine', (_label, id) => {
       const setGroupMemberLabel = jest.fn().mockResolvedValue(undefined);
       const svc = makeService({ setGroupMemberLabel });
@@ -104,7 +110,7 @@ describe('GroupService', () => {
       expect(setGroupMemberLabel).toHaveBeenNthCalledWith(2, '120363000000000001@g.us', '');
     });
 
-    it.each(['120363000000000001@G.US', ' 120363000000000001@g.us '])(
+    it.each(['120363000000000001@G.US', ' 120363000000000001@g.us ', '120363000000000001:5@g.us'])(
       'hands the engine the group id %j in the form Baileys relays to a group',
       async id => {
         const setGroupMemberLabel = jest.fn().mockResolvedValue(undefined);

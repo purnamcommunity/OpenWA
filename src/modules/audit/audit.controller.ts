@@ -23,8 +23,8 @@ export class AuditController {
   })
   @ApiQuery({ name: 'sessionId', required: false })
   @ApiQuery({ name: 'apiKeyId', required: false })
-  @ApiQuery({ name: 'limit', required: false, type: Number })
-  @ApiQuery({ name: 'offset', required: false, type: Number })
+  @ApiQuery({ name: 'limit', required: false, type: 'integer' })
+  @ApiQuery({ name: 'offset', required: false, type: 'integer' })
   @ApiResponse({ status: 200, description: 'Paginated list of audit logs', type: AuditListResponseDto })
   @ApiResponse({ status: 400, description: 'action or severity is repeated or not one of the listed values' })
   async findAll(

@@ -290,11 +290,19 @@ export interface SendTextRequest {
    */
   linkPreview?: boolean;
   /**
-   * Attach a preview you supply yourself instead of one fetched from the URL. Nothing is fetched, so
-   * this works even for a URL the gateway cannot reach. **Baileys only** — whatsapp-web.js takes a
-   * boolean and answers 501. Cannot be combined with `linkPreview: false`.
+   * Attach a preview you supply yourself instead of one fetched from the URL. The page is not
+   * fetched, so this works even for a URL the gateway cannot reach. `thumbnailUrl` (fetched under the
+   * media SSRF rules) or `thumbnailBase64` (wins when both are set) adds an image, at most 5 MiB,
+   * rendered as the large card. **Baileys only** — whatsapp-web.js takes a boolean and answers 501.
+   * Cannot be combined with `linkPreview: false`.
    */
-  customLinkPreview?: { url: string; title: string; description?: string };
+  customLinkPreview?: {
+    url: string;
+    title: string;
+    description?: string;
+    thumbnailUrl?: string;
+    thumbnailBase64?: string;
+  };
   /**
    * Quote an earlier message, turning this send into a reply. Engine-specific: whatsapp-web.js
    * matches the serialized message id, Baileys the raw message key id of a message it has already
@@ -733,6 +741,21 @@ export interface CommentRecord {
   fromMe: boolean;
 }
 
+export interface MessageReceiptParticipant {
+  participant: Jid;
+  /** Unix timestamp in seconds. */
+  timestamp: number;
+}
+
+export interface MessageReceiptsResponse {
+  delivery: MessageReceiptParticipant[];
+  deliveryRemaining?: number;
+  read: MessageReceiptParticipant[];
+  readRemaining?: number;
+  played: MessageReceiptParticipant[];
+  playedRemaining?: number;
+}
+
 // ── Bulk ──────────────────────────────────────────────────────────
 
 export type BulkMessageType = 'text' | 'image' | 'video' | 'audio' | 'document';
@@ -826,7 +849,11 @@ export interface ContactRecord {
   id: Jid;
   /** The name from the account's own addressbook. Absent for a contact that was never saved. */
   name?: string;
-  /** MSISDN digits, without a leading + or any separators. */
+  /**
+   * MSISDN digits, without a leading + or any separators, for a `<phone>@c.us` contact. For a `<lid>@lid`
+   * contact it depends on the engine: Baileys carries the phone's digits when the phone is known and an empty
+   * string when it is not; whatsapp-web.js carries the lid's digits, which are not a phone number.
+   */
   number: string;
   /** The name the contact set on their own account. Both engines emit this as `pushName`. */
   pushName?: string;
@@ -876,6 +903,16 @@ export interface ContactPhoneResponse {
   phone: string | null;
 }
 
+export interface ContactLidResponse {
+  /** The number exactly as supplied in the path. */
+  number: string;
+  /**
+   * The `<lid>@lid` WhatsApp holds for the number, or `null` when it holds none. An unregistered number answers
+   * `null` too; `contacts.check` tells the two apart.
+   */
+  lid: string | null;
+}
+
 // ── Group ─────────────────────────────────────────────────────────
 
 export interface GroupParticipant {
@@ -911,7 +948,7 @@ export interface GroupInfo {
   locked?: boolean;
   /** Who may add participants. Absent when the engine did not report it. */
   memberAddMode?: 'all' | 'admins';
-  owner?: Jid | null;
+  owner?: Jid;
   /** Unix timestamp in seconds. */
   createdAt?: number;
   participants: GroupParticipant[];
@@ -1140,9 +1177,10 @@ export interface WebhookDeliveryFailure {
   /** ISO timestamp of when the row was recorded. */
   createdAt: string;
   /**
-   * True when the row still holds the event data and can be replayed with
-   * {@link WebhooksResource.redriveDeliveryFailures}: a terminal row (`attempts > 0`) recorded while the
-   * gateway's `WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` is above 0, until that window passes.
+   * True when the row still holds the event data and its webhook still exists in the same session: a terminal
+   * row (`attempts > 0`) recorded while the gateway's `WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS` is above 0, until
+   * that window passes. {@link WebhooksResource.redriveDeliveryFailures} replays it while that webhook is active
+   * and subscribed to the event.
    */
   replayable: boolean;
 }
@@ -1169,9 +1207,12 @@ export interface WebhookRedriveResult {
   enqueued: number;
   /** Replays that failed again; their rows stay, with attempts raised by one. */
   failed: number;
-  /** Rows not replayed: the webhook was removed, disabled or unsubscribed, or a plugin cancelled it. */
+  /**
+   * Selected rows not replayed: a hook cancelled the replay, or the row or its webhook changed during the call.
+   * Rows of a removed, disabled or unsubscribed webhook are left out before the batch and not counted.
+   */
   skipped: number;
-  /** Replayable rows still in scope after this call. */
+  /** Rows the redrive would still take after this call: replayable, in scope, with an active subscribed webhook. */
   remaining: number;
 }
 
@@ -1549,8 +1590,10 @@ export interface SendProductRequest {
 
 /**
  * How `q` matches: `word` (the server default) matches whole words; `contains` matches any part of a
- * word, ignoring case and accents, and needs at least one term of 3+ characters and a server with
- * `SEARCH_CONTAINS_ENABLED=true` (501 otherwise).
+ * word, ignoring case and accents. `contains` needs `SEARCH_CONTAINS_ENABLED=true` and a finished index
+ * build on the server (501 otherwise) and at least one term of 3+ characters with at most 64 characters
+ * across its terms (400 otherwise); it ranks the 1000 most recently stored matches, so `total` is at
+ * most 1000.
  */
 export type SearchMatch = 'word' | 'contains';
 

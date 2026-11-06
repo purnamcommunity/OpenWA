@@ -1,6 +1,6 @@
 # rmyndharis-openwa
 
-This document describes SDK 0.7.0. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
+This document describes `main`. `messages.receipts` is an unreleased addition after SDK 0.9.0 and requires the corresponding server change after OpenWA 0.27.1. `contacts.lid` requires OpenWA 0.27.1 or later. `groups.set_member_label`, the `match` key of the search query, and the `thumbnailUrl` and `thumbnailBase64` keys of `CustomLinkPreview` require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
 
 Official Python SDK for [OpenWA](https://github.com/rmyndharis/OpenWA), the open-source WhatsApp API Gateway. OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or Meta.
 
@@ -57,8 +57,10 @@ client = OpenWAClient(base_url="…", api_key="…", transport=httpx.MockTranspo
 `GET /search` is wrapped as `client.search.search(params)`. Only `q` is required;
 the rest (`match`, `sessionId`, `chatId`, `direction`, `type`, `from`, `dateFrom`,
 `dateTo`, `limit`, `offset`) are optional. `dateFrom` / `dateTo` are epoch-ms.
-`match` is `word` (the default) or `contains`, which the server answers with 501
-unless it sets `SEARCH_CONTAINS_ENABLED=true`.
+`match` is `word` (the default) or `contains`, which needs `SEARCH_CONTAINS_ENABLED=true`
+and a finished index build on the server (501 otherwise) and at least one term of 3+
+characters with at most 64 characters across its terms (400 otherwise); it ranks the
+1000 most recently stored matches, so `total` is at most 1000.
 The active search provider (built-in DB full-text, or a plugin) answers; if none
 is configured the server returns 501.
 
@@ -80,8 +82,9 @@ to sessions or chats, so read it with `get`.
 A non-2xx response raises a typed `OpenWAApiError` subclass — `OpenWAAuthError` (401),
 `OpenWAForbiddenError` (403), `OpenWANotFoundError` (404), `OpenWAConflictError` (409),
 `OpenWARateLimitError` (429), `OpenWANotImplementedError` (501), `OpenWAServiceUnavailableError`
-(503) — each carrying `.status` and the parsed `.body`. A timeout raises `OpenWATimeoutError`. 503
-means the gateway could not complete the request right now: the path to WhatsApp failed, the gateway
+(503) — each carrying `.status` and the parsed `.body`. A timeout raises `OpenWATimeoutError`,
+though the gateway may still complete the request: retry a send only with the same `Idempotency-Key`.
+503 means the gateway could not complete the request right now: the path to WhatsApp failed, the gateway
 is draining or short of a dependency, or, on Baileys, WhatsApp throttled (code 429) or timed out
 (code 408) the request. Back off and retry later instead of at once, because repeating a throttled
 request straight away prolongs the throttle; a catalog 503 can persist because WhatsApp may never
@@ -94,13 +97,15 @@ the failure breaker's cooldown (`SEND_PACING_BREAKER_COOLDOWN_MS`, 15 minutes by
 run of send failures, otherwise up to the next UTC day. Every API error also exposes the response
 `.headers`. A 503 does not always prove a write was never carried out: when WhatsApp timed out, the
 change may still have been applied, so re-read the state before repeating it. A throttle on a send
-or a single write is the exception: it was turned away before it ran, so nothing was sent or
-applied, and a keyed send frees its `Idempotency-Key`. A group settings update with several fields
-applies them one at a time, so a 503 on a later field, a throttle included, leaves the earlier ones
-applied; its message lists them after `already applied:`, so re-read the settings before retrying,
-or send one field per request. In a routed deployment a forward that fails before reaching the owner
-node answers 503, one that fails after the request reached it answers 502 or 504, and a 503 from the
-owner itself is relayed unchanged.
+or a single write was turned away before it ran, so nothing was sent or applied; a send also sent
+nothing when its recipient lookup failed, its connection closed before the message was written, or
+its media or preview image URL could not be fetched through the session's proxy. Each of these frees
+a keyed send's `Idempotency-Key`. A group settings update with several fields applies them one at a
+time, so a 503 on a later field, a throttle included, leaves the earlier ones applied; its message
+lists them after `already applied:`, so re-read the settings before retrying, or send one field per
+request. In a routed deployment a forward that fails before reaching the owner node answers 503, one
+that fails after the request reached it answers 502 or 504, and a 503 from the owner itself is
+relayed unchanged.
 
 ```python
 from openwa import OpenWANotFoundError
@@ -118,7 +123,9 @@ except OpenWANotFoundError as e:
   a redirect target). Path segments are percent-encoded; a base-URL path prefix (e.g. behind a
   reverse proxy) is preserved.
 - Escape hatch for endpoints the SDK does not wrap:
-  `client.request(method, path, query=…, body=…)`.
+  `client.request(method, path, query=…, body=…, idempotency_key=…)`. A path with a `.` or `..` segment (also after an
+  encoded slash, as in `..%2F`), or one that does not begin with `/`, raises `ValueError` before anything is sent. An id
+  with a `.` or `..` part between slashes, such as `../x`, is refused the same way.
 
 ## Receiving webhooks
 
@@ -148,6 +155,11 @@ def openwa_webhook():
     return "OK", 200
 ```
 
+The signature covers the body only and carries no timestamp, so a captured delivery still verifies
+when it is sent again. Dedupe on `delivery["idempotencyKey"]` (also the `X-OpenWA-Idempotency-Key`
+header): the gateway's own retries and an operator's redrive of a failed delivery reuse it, so a key
+you have already handled is the same event arriving again.
+
 ## Releasing
 
 Publishing to PyPI is done by the
@@ -170,7 +182,7 @@ rejects the upload, so configure it first.
 Cutting a release:
 
 1. Bump `version` in `pyproject.toml` and land it on `main`.
-2. Tag that commit `py-sdk-v<version>` (e.g. `py-sdk-v0.7.0`) and push the tag.
+2. Tag that commit `py-sdk-v<version>` (e.g. `py-sdk-v0.9.0`) and push the tag.
    The SDK has its own version line — the monorepo's `v*` tags are the app
    version and never trigger an SDK publish.
 3. The workflow re-runs the test suite, builds the sdist and wheel, and

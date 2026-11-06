@@ -132,6 +132,32 @@ test('a number shorter than seven digits keeps Add disabled in any script', asyn
   }
 });
 
+// A number has at most 15 digits (E.164): more is two numbers run together or a typo, refused before any lookup. The
+// 00 prefix is not part of the number.
+test('a number longer than fifteen digits keeps Add disabled and Enter checks nothing', async () => {
+  const field = await openMemberField();
+  for (const value of [
+    '+6281234567890123',
+    `+${native('6281234567890123', 0x0660)}`,
+    '+62 812 3456 789 +62 812 3456 790',
+  ]) {
+    rtl.fireEvent.change(field, { target: { value } });
+    assert.equal(addButton().disabled, true, `${value} enables Add`);
+    rtl.fireEvent.submit(field.closest('form')!);
+  }
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(checked, []);
+});
+
+test('a 00 prefix does not count toward the fifteen digits', async () => {
+  const field = await openMemberField();
+  rtl.fireEvent.change(field, { target: { value: '00628123456789012' } });
+  assert.equal(addButton().disabled, false, 'fifteen digits after 00 keep Add disabled');
+  rtl.fireEvent.click(addButton());
+  await rtl.waitFor(() => assert.equal(added.length, 1));
+  assert.deepEqual(checked, ['628123456789012']);
+});
+
 test('Enter submits a number typed in native digits', async () => {
   const field = await openMemberField();
   rtl.fireEvent.change(field, { target: { value: native('628123456789', 0x0966) } });

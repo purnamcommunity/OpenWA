@@ -219,6 +219,35 @@ test('archived media forwards cancellation through fetch and the response body',
   await assert.rejects(bytes, { name: 'AbortError' });
 });
 
+test('a refused media download carries the Retry-After seconds it was sent, and none without the header', async () => {
+  const refuse = (headers: Record<string, string>) => {
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ statusCode: 503, message: 'Too many media downloads are in progress' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json', ...headers },
+        }),
+      )) as typeof fetch;
+  };
+  refuse({ 'Retry-After': '3' });
+  await assert.rejects(
+    sessionApi.getMessageMediaBlob('s1', '100@c.us', 'WA1'),
+    (err: Error & { status?: number; retryAfterSeconds?: number }) => {
+      assert.equal(err.status, 503);
+      assert.equal(err.retryAfterSeconds, 3);
+      return true;
+    },
+  );
+  refuse({});
+  await assert.rejects(
+    sessionApi.getMessageMediaBlob('s1', '100@c.us', 'WA1'),
+    (err: Error & { retryAfterSeconds?: number }) => {
+      assert.equal('retryAfterSeconds' in err, false);
+      return true;
+    },
+  );
+});
+
 test('the contact list walks past the 1000 contacts one response carries', async () => {
   const { contactApi } = await import('./api.ts');
   const requested: string[] = [];

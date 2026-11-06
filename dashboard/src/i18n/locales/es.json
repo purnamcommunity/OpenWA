@@ -38,6 +38,8 @@
     "optional": "opcional",
     "fieldTooLong": "Limitado a {{max}} caracteres (ahora {{count}}).",
     "language": "Idioma",
+    "changeLanguage": "Cambiar idioma",
+    "joinedName": "{{first}}, {{second}}",
     "back": "Atrás",
     "next": "Siguiente",
     "previous": "Anterior",
@@ -208,7 +210,8 @@
       "delete": "Error al eliminar el mensaje",
       "clickButton": "Error al pulsar el botón",
       "fileTooLarge": "El archivo es demasiado grande (máx. 18 MB)",
-      "searchHitSessionNotReady": "La sesión de este mensaje no está conectada"
+      "searchHitSessionNotReady": "La sesión de este mensaje no está conectada",
+      "searchHitChatNotListed": "No se encontró el chat de este mensaje en la lista"
     },
     "loadMessagesError": "No se pudieron cargar los mensajes. Revisa los registros del servidor.",
     "messageStatus": {
@@ -604,6 +607,7 @@
     "session": "Sesión",
     "events": "Eventos",
     "noEvents": "Selecciona al menos un evento.",
+    "urlInvalid": "Usa una dirección completa con http:// o https://, por ejemplo https://example.com/webhook.",
     "available": "Eventos disponibles",
     "saveChanges": "Guardar cambios",
     "filters": {
@@ -615,6 +619,7 @@
       "badge_many": "{{count}} filtros",
       "addCondition": "Añadir condición",
       "removeCondition": "Eliminar condición",
+      "removeValue": "Quitar {{value}}",
       "caseSensitive": "Distinguir mayúsculas",
       "contactPlaceholder": "Número o ID de WhatsApp...",
       "textPlaceholder": "Texto a buscar...",
@@ -664,6 +669,7 @@
       "updateFailed": "Error al actualizar el webhook: {{message}}",
       "testOk": "Prueba de webhook exitosa. Estado: {{status}}",
       "testFailed": "Prueba de webhook fallida: {{message}}",
+      "testStatus": "el receptor respondió HTTP {{status}}",
       "testError": "Error al probar el webhook: {{message}}"
     },
     "actions": {
@@ -735,6 +741,7 @@
     "modalTitle": "Crear clave API",
     "createdTitle": "Clave API creada",
     "createdHint": "Copia esta clave ahora. No podrás verla de nuevo.",
+    "copyKey": "Copiar clave",
     "namePlaceholder": "ej., Clave de producción",
     "nameTooShort": "Usa al menos 3 caracteres.",
     "rolesTitle": "Referencia de roles",
@@ -812,6 +819,7 @@
     "chats": {
       "label": "Acceso a chats (opcional)",
       "hint": "Un chat por línea: un ID de grupo que termina en @g.us, un ID de contacto que termina en @c.us o @lid, o un número de teléfono. Déjalo vacío para todos los chats. Una clave restringida a chats solo puede usar las rutas abiertas a ese tipo de clave; su acceso por el WebSocket de eventos y MCP se limita a esos chats.",
+      "lidHint": "Una entrada @lid también admite el número de teléfono que tiene asignado ahora. Si ese número pasa a otra persona, esta clave puede llegar a ella: revisa la clave cuando un contacto cambie de número.",
       "invalid": "No es un ID de chat ni un número de teléfono: {{value}}",
       "tooMany": "Demasiados chats ({{count}}): una clave puede listar como máximo {{max}}."
     },
@@ -960,6 +968,7 @@
     },
     "sendFailed": "Error al enviar el mensaje",
     "notOnWhatsApp": "Este número no está registrado en WhatsApp",
+    "tooLong": "Más de {{max}} dígitos no es un solo número de teléfono. Introduce un solo número.",
     "batch": {
       "status": {
         "pending": "Pendiente",
@@ -1046,6 +1055,7 @@
       "phonePlaceholder": "ej., 919876543210 o 6281234567890",
       "check": "Verificar",
       "checking": "Verificando...",
+      "tooLong": "Más de {{max}} dígitos no es un solo número de teléfono. Comprueba un número cada vez.",
       "autoPrefix": "Añadir automáticamente el prefijo <strong>+91</strong> a los números de 10 dígitos (los de 12 dígitos se mantienen tal cual)",
       "silent": "<strong>Totalmente silencioso:</strong> esta consulta se hace directamente en el registro de cuentas de WhatsApp. El contacto no recibe ninguna notificación, sonido ni mensaje.",
       "resultTitle": "Resultado de la verificación",
@@ -1109,6 +1119,7 @@
       "tenDigitAdded": "({{ten}} de diez dígitos → +91 añadido)",
       "tenDigitAddedPreserved": "({{ten}} de diez dígitos → +91 añadido, {{twelve}} de doce dígitos sin cambios)",
       "tooMany": "Demasiados números: {{parsed}} detectados, como máximo {{max}} por lote. Quita {{excess}} para iniciar.",
+      "tooLong": "Omitidos, más de {{max}} dígitos (no es un solo número): {{count}}. Pon cada número en su propia línea.",
       "start": "Iniciar verificación por lotes",
       "stop": "Detener verificación",
       "export": "Exportar resultados (CSV)",
@@ -1341,6 +1352,7 @@
       "installed": "Plugin instalado",
       "installFailed": "Error en la instalación",
       "uninstalled": "Plugin desinstalado",
+      "uninstalledWithWarning": "Plugin desinstalado, con una advertencia",
       "uninstallFailed": "Error al desinstalar",
       "enableFailedTitle": "Error al activar",
       "disableFailedTitle": "Error al desactivar",

@@ -152,3 +152,43 @@ export async function mutationTargetsForeignRowPersisted(
   );
   return mutationTargetsForeignRow(row, source, jid => phones.get(jid) ?? null);
 }
+
+/**
+ * Whether a delivery or read receipt naming `chatId` provably belongs to another chat than the stored row of the
+ * message it names. Baileys relays a peer's receipt under the peer's own chat with every id the stanza lists, and
+ * checks none of them against that chat, so a receipt from one chat could otherwise move another chat's message.
+ *
+ * A receipt for a message the account sent to a broadcast list comes from each recipient's own chat, and one for a
+ * list message an earlier version filed under the list from its sender's chat: neither is foreign. A lid and a
+ * phone with no reported pairing prove nothing either. A receipt only ever moves delivery state forward, and
+ * refusing it would leave the account's messages to a lid-addressed contact at sent.
+ */
+export function receiptTargetsForeignRow(
+  row: StoredMessageRef,
+  chatId: string,
+  resolveLid?: (jid: string) => string | null,
+): boolean {
+  if (isOwnBroadcast(row) || receivedThroughList(row, chatId, resolveLid)) return false;
+  const stored = entityOf(row.chatId);
+  const named = entityOf(chatId);
+  if (stored && named && stored.kind !== named.kind && isPerson(stored.kind) && isPerson(named.kind)) {
+    if (!resolveLid?.(stored.kind === 'lid' ? row.chatId : chatId)) return false;
+  }
+  return provablyDifferent(row.chatId, chatId, resolveLid);
+}
+
+/** {@link receiptTargetsForeignRow} with the lids it compares resolved through reported directory data. */
+export async function receiptTargetsForeignRowPersisted(
+  row: StoredMessageRef,
+  chatId: string,
+  resolveLid?: (jid: string) => Promise<string | null>,
+): Promise<boolean> {
+  if (!resolveLid) return receiptTargetsForeignRow(row, chatId);
+  const phones = new Map<string, string | null>();
+  await Promise.all(
+    [...new Set([row.chatId, row.author, chatId])].map(async jid => {
+      if (jid && parseWaId(jid).kind === 'lid') phones.set(jid, await resolveLid(jid).catch(() => null));
+    }),
+  );
+  return receiptTargetsForeignRow(row, chatId, jid => phones.get(jid) ?? null);
+}

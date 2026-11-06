@@ -4,17 +4,25 @@ import {
   BadRequestException,
   ConflictException,
   HttpException,
+  InternalServerErrorException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import { PluginLoaderService, PluginStatus, PluginType, resolvePluginEntryPath } from '../../core/plugins';
+import {
+  PluginLoaderService,
+  PluginRegistryWriteError,
+  PluginStatus,
+  PluginType,
+  resolvePluginEntryPath,
+} from '../../core/plugins';
 import { pluginUpdateBackupDirName, pluginUpdateStagingDirName } from '../../core/plugins';
 import type { PluginConfigSchema } from '../../core/plugins';
 import { PluginDto } from './dto/plugin.dto';
 import { redactSecretConfig, restoreSecretConfig } from './redact-config';
 import { restorableConfig } from '../../core/plugins/plugin-activation';
+import { PluginUninstallingError } from '../../core/plugins/plugin-uninstaller';
 import { parsePluginPackage } from './plugin-installer';
 import { assertDownloadSha256, assertPluginInstallUrl, fetchSafeBuffer } from './plugin-download';
 import { annotateCatalog, CatalogEntry, CatalogPlugin, isCatalogEntry } from './catalog';
@@ -30,6 +38,12 @@ const CATALOG_MAX_BYTES = 1 * 1024 * 1024;
  * around the download calls).
  */
 const logger = createLogger('PluginsService');
+
+/** A change the plugin registry could not store is answered as not applied, like any other refused change. */
+function notApplied(error: unknown): { success: boolean; message: string } {
+  if (error instanceof PluginRegistryWriteError) return { success: false, message: error.message };
+  throw error;
+}
 
 /** A plugin can host provisioned instances iff it declares an ingress route AND the webhook:ingress
  *  permission — mirrors IntegrationInstanceController.assertIngressCapable. */
@@ -127,7 +141,7 @@ export class PluginsService {
   }
 
   enable(id: string): Promise<{ success: boolean; message: string }> {
-    return this.serialize(id, () => this.enableInner(id));
+    return this.serialize(id, () => this.enableInner(id).catch(notApplied));
   }
 
   private async enableInner(id: string): Promise<{ success: boolean; message: string }> {
@@ -151,6 +165,8 @@ export class PluginsService {
       this.pluginLoader.setOperatorEnabled(id, true);
       return { success: true, message: `Plugin ${id} enabled successfully` };
     } catch (error) {
+      // Running, but the decision could not be stored: stop it again, or it would run now and not after a restart.
+      if (error instanceof PluginRegistryWriteError) await this.pluginLoader.disablePlugin(id).catch(() => undefined);
       return {
         success: false,
         message: error instanceof Error ? error.message : String(error),
@@ -159,7 +175,7 @@ export class PluginsService {
   }
 
   disable(id: string): Promise<{ success: boolean; message: string }> {
-    return this.serialize(id, () => this.disableInner(id));
+    return this.serialize(id, () => this.disableInner(id).catch(notApplied));
   }
 
   private async disableInner(id: string): Promise<{ success: boolean; message: string }> {
@@ -202,9 +218,11 @@ export class PluginsService {
       return { success: true, message: `Plugin ${id} is not enabled` };
     }
 
+    // The decision is stored before the plugin stops: one that cannot be stored refuses the disable (see
+    // notApplied) with the plugin still running, as the answer says. A failed stop keeps the stored decision.
+    this.pluginLoader.setOperatorEnabled(id, false);
     try {
       await this.pluginLoader.disablePlugin(id);
-      this.pluginLoader.setOperatorEnabled(id, false);
       return { success: true, message: `Plugin ${id} disabled successfully` };
     } catch (error) {
       return {
@@ -223,8 +241,10 @@ export class PluginsService {
     // is fenced with @RequireUnscopedKey, so only an unrestricted key can reach this — a scoped key
     // must never be allowed to delete another tenant's activation by sending [] or its own session.
     try {
-      this.pluginLoader.setPluginSessions(id, sessions);
+      this.pluginLoader.setPluginSessions(id, sessions, { mustPersist: true });
     } catch (error) {
+      if (error instanceof PluginRegistryWriteError) throw new InternalServerErrorException(error.message);
+      if (error instanceof PluginUninstallingError) throw new ConflictException(error.message);
       throw new BadRequestException(error instanceof Error ? error.message : String(error));
     }
     return this.findOne(id);
@@ -239,13 +259,15 @@ export class PluginsService {
 
     try {
       // The dashboard PUTs the whole (redacted) config back, so a sentinel secret means "unchanged":
-      // restore the stored value instead of overwriting the real secret with the mask.
-      const merged = restoreSecretConfig(config, plugin.config, plugin.manifest.configSchema, {
-        mergedOverStored: true,
-      });
-      this.pluginLoader.updatePluginConfig(id, merged);
+      // restore the stored value instead of overwriting the real secret with the mask. From the stored
+      // config, not the runtime one: a built-in's runtime config carries its env-derived settings, and
+      // restoring a mask from those would store them over every later .env change.
+      const stored = this.pluginLoader.getRegistryEntry(id)?.config ?? {};
+      const merged = restoreSecretConfig(config, stored, plugin.manifest.configSchema, { mergedOverStored: true });
+      this.pluginLoader.updatePluginConfig(id, merged, { mustPersist: true });
       return { success: true, message: `Plugin ${id} configuration updated` };
     } catch (error) {
+      if (error instanceof PluginUninstallingError) throw new ConflictException(error.message);
       return {
         success: false,
         message: error instanceof Error ? error.message : String(error),
@@ -280,9 +302,10 @@ export class PluginsService {
         restorableConfig(existing, config, plugin.manifest, plugin.config),
         plugin.manifest.configSchema,
       );
-      this.pluginLoader.setPluginSessionConfig(id, sessionId, merged);
+      this.pluginLoader.setPluginSessionConfig(id, sessionId, merged, { mustPersist: true });
       return { success: true, message: `Plugin ${id} configuration for session ${sessionId} updated` };
     } catch (error) {
+      if (error instanceof PluginUninstallingError) throw new ConflictException(error.message);
       return {
         success: false,
         message: error instanceof Error ? error.message : String(error),
@@ -711,10 +734,27 @@ export class PluginsService {
     }
 
     try {
-      await this.pluginLoader.uninstallPlugin(id);
+      const { registryEntryKept } = await this.pluginLoader.uninstallPlugin(id);
+      if (registryEntryKept) {
+        // The plugin has no card left on the Plugins page, so the answer names the call that removes the entry.
+        return {
+          success: true,
+          message:
+            `Plugin ${id} uninstalled, but the plugin registry could not be written: registry.json keeps its entry, ` +
+            'emptied of config, sessions and the enable decision, reported at startup as a plugin with no code ' +
+            `until DELETE /api/plugins/${id} is repeated once the registry is writable`,
+        };
+      }
       return { success: true, message: `Plugin ${id} uninstalled successfully` };
     } catch (error) {
-      throw new BadRequestException(error instanceof Error ? error.message : String(error));
+      // Raised only by the write that empties the entry, before anything is removed, so nothing was applied.
+      if (error instanceof PluginRegistryWriteError) throw new InternalServerErrorException(error.message);
+      // The cause tells the controller whether the failure came after the entry was emptied (it audits that one).
+      // With options, Nest drops the body's `error` field unless the description is passed too.
+      throw new BadRequestException(error instanceof Error ? error.message : String(error), {
+        cause: error,
+        description: 'Bad Request',
+      });
     }
   }
 

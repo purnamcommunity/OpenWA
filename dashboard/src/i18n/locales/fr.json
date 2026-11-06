@@ -40,6 +40,8 @@
     "optional": "optionnel",
     "fieldTooLong": "Limité à {{max}} caractères ({{count}} actuellement).",
     "language": "Langue",
+    "changeLanguage": "Changer de langue",
+    "joinedName": "{{first}}, {{second}}",
     "back": "Retour",
     "next": "Suivant",
     "previous": "Précédent",
@@ -208,7 +210,8 @@
       "delete": "Échec de la suppression du message",
       "clickButton": "Échec du clic sur le bouton",
       "fileTooLarge": "Le fichier est trop volumineux (max 18 Mo)",
-      "searchHitSessionNotReady": "La session de ce message n'est pas connectée"
+      "searchHitSessionNotReady": "La session de ce message n'est pas connectée",
+      "searchHitChatNotListed": "La discussion de ce message est introuvable dans la liste"
     },
     "loadMessagesError": "Impossible de charger les messages. Vérifiez les journaux du serveur.",
     "messageStatus": {
@@ -604,6 +607,7 @@
     "session": "Session",
     "events": "Événements",
     "noEvents": "Sélectionnez au moins un événement.",
+    "urlInvalid": "Saisissez une adresse complète en http:// ou https://, par exemple https://example.com/webhook.",
     "available": "Événements disponibles",
     "saveChanges": "Enregistrer les modifications",
     "filters": {
@@ -615,6 +619,7 @@
       "badge_many": "{{count}} filtres",
       "addCondition": "Ajouter une condition",
       "removeCondition": "Supprimer la condition",
+      "removeValue": "Retirer {{value}}",
       "caseSensitive": "Sensible à la casse",
       "contactPlaceholder": "Numéro ou identifiant WhatsApp...",
       "textPlaceholder": "Texte à rechercher...",
@@ -664,6 +669,7 @@
       "updateFailed": "Échec de la mise à jour du webhook : {{message}}",
       "testOk": "Test du webhook réussi ! Statut : {{status}}",
       "testFailed": "Test du webhook échoué : {{message}}",
+      "testStatus": "le destinataire a répondu HTTP {{status}}",
       "testError": "Impossible de tester le webhook : {{message}}"
     },
     "actions": {
@@ -785,6 +791,7 @@
     "modalTitle": "Créer une clé API",
     "createdTitle": "Clé API créée",
     "createdHint": "Copiez cette clé maintenant. Vous ne pourrez plus la revoir.",
+    "copyKey": "Copier la clé",
     "namePlaceholder": "ex : Clé de Production",
     "nameTooShort": "Utilisez au moins 3 caractères.",
     "rolesTitle": "Référence des rôles",
@@ -862,6 +869,7 @@
     "chats": {
       "label": "Accès aux discussions (facultatif)",
       "hint": "Une discussion par ligne : un ID de groupe se terminant par @g.us, un ID de contact se terminant par @c.us ou @lid, ou un numéro de téléphone. Laissez vide pour toutes les discussions. Une clé limitée à des discussions ne peut utiliser que les routes ouvertes à ce type de clé ; son accès par le WebSocket des événements et MCP reste limité à ces discussions.",
+      "lidHint": "Une entrée @lid admet aussi le numéro de téléphone qui lui est actuellement associé. Si ce numéro passe à quelqu'un d'autre, cette clé peut l'atteindre : vérifiez la clé quand un contact change de numéro.",
       "invalid": "Ni un ID de discussion ni un numéro de téléphone : {{value}}",
       "tooMany": "Trop de discussions ({{count}}) : une clé peut en lister au plus {{max}}."
     },
@@ -1010,6 +1018,7 @@
     },
     "sendFailed": "Échec de l'envoi du message",
     "notOnWhatsApp": "Ce numéro n'est pas enregistré sur WhatsApp",
+    "tooLong": "Plus de {{max}} chiffres ne forment pas un seul numéro. Saisissez un seul numéro.",
     "batch": {
       "status": {
         "pending": "En attente",
@@ -1046,6 +1055,7 @@
       "phonePlaceholder": "ex. : 919876543210 ou 6281234567890",
       "check": "Vérifier",
       "checking": "Vérification...",
+      "tooLong": "Plus de {{max}} chiffres ne forment pas un seul numéro. Vérifiez un numéro à la fois.",
       "autoPrefix": "Préfixer automatiquement par <strong>+91</strong> les numéros à 10 chiffres (les numéros à 12 chiffres restent inchangés)",
       "silent": "<strong>Totalement silencieux :</strong> cette requête interroge directement le registre des numéros enregistrés de WhatsApp. Le contact ne reçoit ni notification, ni son, ni message.",
       "resultTitle": "Résultat de la vérification",
@@ -1109,6 +1119,7 @@
       "tenDigitAdded": "({{ten}} à dix chiffres → +91 ajouté)",
       "tenDigitAddedPreserved": "({{ten}} à dix chiffres → +91 ajouté, {{twelve}} à douze chiffres sans changement)",
       "tooMany": "Trop de numéros : {{parsed}} détectés, {{max}} maximum par exécution. Retirez-en {{excess}} pour démarrer.",
+      "tooLong": "Ignorés, plus de {{max}} chiffres (pas un seul numéro) : {{count}}. Mettez chaque numéro sur sa propre ligne.",
       "start": "Démarrer la vérification par lot",
       "stop": "Arrêter la vérification",
       "export": "Exporter les résultats (CSV)",
@@ -1341,6 +1352,7 @@
       "installed": "Plugin installé",
       "installFailed": "Échec de l'installation",
       "uninstalled": "Plugin désinstallé",
+      "uninstalledWithWarning": "Plugin désinstallé, avec un avertissement",
       "uninstallFailed": "Échec de la désinstallation",
       "enableFailedTitle": "Échec de l'activation",
       "disableFailedTitle": "Échec de la désactivation",

@@ -19,7 +19,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { Validate } from 'class-validator';
-import { ToStrictArray, ToStrictBoolean, ToStrictString } from '../../../common/utils/strict-boolean';
+import { ToStrictArray, ToStrictBoolean, ToStrictNumber, ToStrictString } from '../../../common/utils/strict-boolean';
 import {
   BATCH_ID_MAX_LENGTH,
   CHAT_ID_MAX_LENGTH,
@@ -180,6 +180,7 @@ class BulkMessageOptionsDto {
     minimum: 1000,
     maximum: 60000,
   })
+  @ToStrictNumber()
   @IsOptional()
   @IsNumber()
   @Min(1000)
@@ -222,6 +223,8 @@ export class SendBulkMessageDto {
   @ToStrictArray()
   @IsArray()
   @ArrayMaxSize(BULK_MESSAGES_MAX)
+  // @ValidateNested accepts an entry that is itself an array, and its inner items escape both the cap and the checks.
+  @IsObject({ each: true })
   @ValidateNested({ each: true })
   @Type(() => BulkMessageItemDto)
   messages!: BulkMessageItemDto[];

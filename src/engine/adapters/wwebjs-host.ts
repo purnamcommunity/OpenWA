@@ -59,12 +59,15 @@ export function requireClient(host: WwebjsEngineHost): Client {
  * navigated under the call, and return for any other error. A call already in flight when WhatsApp Web
  * reloads dies with Puppeteer's navigation error before the window is stamped, so it would otherwise be a
  * bare 500, or, where a catch folds a failed lookup into "not found", a 404 for a group, contact or label
- * that exists. A navigation is not a death: nothing is reported.
+ * that exists. A navigation schedules a delayed health check without reporting an immediate death.
  */
-export function rethrowIfNavigation(host: WwebjsEngineHost, error: unknown): void {
-  // A page the host already reads as dead is reported as dead, whatever the message says.
-  if (isNavigationError(error) && !host.isPageTransportError(error))
+export function rethrowIfNavigation(host: WwebjsEngineHost, error: unknown, context = 'page navigation'): void {
+  // The lifecycle never reads a navigation-shaped error as a dead page, so with it this is the navigation test alone;
+  // a host that does read one as dead keeps it a death. A page that really died reports through the death listeners.
+  if (isNavigationError(error) && !host.isPageTransportError(error)) {
+    host.reportIfPageTransportError(error, context);
     throw new EngineNotReadyError(PAGE_RELOADING_MESSAGE);
+  }
 }
 
 /**
@@ -80,7 +83,7 @@ export async function withPage<T>(host: WwebjsEngineHost, context: string, op: (
   try {
     return await op();
   } catch (error) {
-    rethrowIfNavigation(host, error);
+    rethrowIfNavigation(host, error, context);
     if (host.isPageTransportError(error)) {
       host.reportIfPageTransportError(error, context);
       throw new EngineTransportError(`Transport died during ${context}`);

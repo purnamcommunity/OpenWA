@@ -24,6 +24,7 @@ import { SendIdempotencyKey } from './entities/send-idempotency-key.entity';
 import { SendIdempotencyService } from './idempotency/send-idempotency.service';
 import { SendIdempotencyInterceptor } from './idempotency/send-idempotency.interceptor';
 import * as sessionWriteScope from '../../common/utils/session-write-scope';
+import type { SendTextMessageDto } from './dto';
 
 // The real function, held before any test spies on the module export.
 const realCaptureSessionWrites = sessionWriteScope.captureSessionWrites;
@@ -285,6 +286,92 @@ describe('MessageSendService', () => {
         undefined,
         { customPreview: { url: 'https://example.com', title: 'Example', description: 'A site' } },
       );
+    });
+
+    // The engine decodes plain base64 only, and a URL next to a base64 is not fetched, as on the media routes.
+    it('hands the engine a preview image as plain base64, dropping a URL beside it', async () => {
+      const input = {
+        chatId: '628123456789@c.us',
+        text: 'see https://example.com',
+        customLinkPreview: {
+          url: 'https://example.com',
+          title: 'Example',
+          thumbnailUrl: 'https://cdn.example/a.png',
+          thumbnailBase64: 'data:image/png;base64,AAAA',
+        },
+      };
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { sessionId: 'sess-1', input, type: 'text' },
+      });
+
+      await service.sendText('sess-1', input);
+
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith(
+        '628123456789@c.us',
+        'see https://example.com',
+        undefined,
+        {
+          customPreview: { url: 'https://example.com', title: 'Example', thumbnailBase64: 'AAAA' },
+        },
+      );
+    });
+
+    // The DTO's @IsOptional lets an explicit null through, so the service reads it as absent too.
+    it('sends a preview whose image fields are null as one without an image', async () => {
+      const input = {
+        chatId: '628123456789@c.us',
+        text: 'see https://example.com',
+        customLinkPreview: { url: 'https://example.com', title: 'Example', thumbnailUrl: null, thumbnailBase64: null },
+      } as unknown as SendTextMessageDto;
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { sessionId: 'sess-1', input, type: 'text' },
+      });
+
+      await service.sendText('sess-1', input);
+
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith(
+        '628123456789@c.us',
+        'see https://example.com',
+        undefined,
+        { customPreview: { url: 'https://example.com', title: 'Example' } },
+      );
+    });
+
+    it('refuses a preview image over the thumbnail cap with a 413, before reaching the engine', async () => {
+      const input = {
+        chatId: '628123456789@c.us',
+        text: 'hi',
+        customLinkPreview: {
+          url: 'https://example.com',
+          title: 'Example',
+          thumbnailBase64: Buffer.alloc(5 * 1024 * 1024 + 1).toString('base64'),
+        },
+      };
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { sessionId: 'sess-1', input, type: 'text' },
+      });
+
+      await expect(service.sendText('sess-1', input)).rejects.toBeInstanceOf(PayloadTooLargeException);
+      expect(mockEngine.sendTextMessage).not.toHaveBeenCalled();
+    });
+
+    // The MCP tool calls this without the ValidationPipe, so the service holds the URL rule too.
+    it('refuses a preview image URL that is not http(s), before reaching the engine', async () => {
+      const input = {
+        chatId: '628123456789@c.us',
+        text: 'hi',
+        customLinkPreview: { url: 'https://example.com', title: 'Example', thumbnailUrl: 'file:///etc/passwd' },
+      };
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { sessionId: 'sess-1', input, type: 'text' },
+      });
+
+      await expect(service.sendText('sess-1', input)).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockEngine.sendTextMessage).not.toHaveBeenCalled();
     });
 
     // Suppressing the preview and supplying one are opposite requests; guessing which was meant
@@ -690,6 +777,32 @@ describe('MessageSendService', () => {
           vars: { customer: { toString: 1 } as unknown as string },
         }),
       ).rejects.toThrow(new BadRequestException("Variable 'customer' cannot be rendered as text"));
+      expect(mockEngine.sendTextMessage).not.toHaveBeenCalled();
+    });
+
+    it('answers a 400 and stores nothing for a template that renders to no text, as send-text does', async () => {
+      (templateService.resolve as jest.Mock).mockResolvedValue(mockTemplate({ body: '{{customer}}' }));
+
+      await expect(
+        service.sendTemplate('sess-1', { chatId: 'test@c.us', templateId: 'tpl-1', vars: { customer: '' } }),
+      ).rejects.toThrow(new BadRequestException('Rendered template is empty'));
+      expect(repository.save).not.toHaveBeenCalled();
+      expect(mockEngine.sendTextMessage).not.toHaveBeenCalled();
+    });
+
+    it('answers a 400 for a template whose header, body and footer all render empty', async () => {
+      (templateService.resolve as jest.Mock).mockResolvedValue(
+        mockTemplate({ header: '{{a}}', body: '{{b}}', footer: '{{c}}' }),
+      );
+
+      await expect(
+        service.sendTemplate('sess-1', {
+          chatId: 'test@c.us',
+          templateId: 'tpl-1',
+          vars: { a: '', b: '', c: '' },
+        }),
+      ).rejects.toThrow(new BadRequestException('Rendered template is empty'));
+      expect(repository.save).not.toHaveBeenCalled();
       expect(mockEngine.sendTextMessage).not.toHaveBeenCalled();
     });
 
@@ -1591,6 +1704,70 @@ describe('MessageSendService', () => {
       });
 
       expect(assertSendAllowed).toHaveBeenCalledWith('sess-1', 'to@c.us', { whilePreparing: true });
+    });
+
+    const pendingRow = (): unknown => ((repository.create as jest.Mock).mock.calls as unknown[][])[0][0];
+    const forwardIt = (svc: MessageSendService = service) =>
+      svc.forward('sess-1', { fromChatId: '628111@c.us', toChatId: 'to@c.us', messageId: 'wa-src' });
+
+    it('stores a poll it finds under the lid form of the source chat, with its options', async () => {
+      const poll = { name: 'Lunch?', options: ['yes', 'no'], allowMultipleAnswers: false };
+      (repository.findOne as jest.Mock).mockImplementation(({ where }: { where: { chatId: FindOperator<string> } }) =>
+        Promise.resolve(
+          (where.chatId.value as unknown as string[]).includes('999@lid')
+            ? { type: 'poll', body: 'Lunch?', metadata: { poll, quotedMessage: { id: 'q', body: 'x' } } }
+            : null,
+        ),
+      );
+      const store = {
+        findPhoneForLid: jest.fn().mockResolvedValue(null),
+        findLidsForPhone: jest.fn((phone: string) => Promise.resolve(phone === '628111' ? ['999'] : [])),
+      } as unknown as LidMappingStoreService;
+      const withStore = new MessageSendService(
+        repository as Repository<Message>,
+        sessionService as unknown as SessionService,
+        engines,
+        hookManager as HookManager,
+        templateService as unknown as TemplateService,
+        inertPacing(),
+        undefined,
+        undefined,
+        store,
+      );
+
+      await forwardIt(withStore);
+
+      expect(pendingRow()).toMatchObject({ chatId: 'to@c.us', type: 'poll', body: 'Lunch?', metadata: { poll } });
+      expect(pendingRow()).not.toHaveProperty('metadata.quotedMessage');
+    });
+
+    // A media row always carries a media field (an empty bubble otherwise), and an archive pointer names the source
+    // row's file, which this row does not have.
+    it.each([
+      [
+        'archived',
+        { media: { mimetype: 'image/jpeg', omitted: true, archived: true, sizeBytes: 10 } },
+        { mimetype: 'image/jpeg', omitted: true, sizeBytes: 10 },
+      ],
+      ['missing', null, { mimetype: '', omitted: true }],
+    ])('stores media the source row holds no bytes for (%s) as the omitted marker', async (_how, metadata, media) => {
+      (repository.findOne as jest.Mock).mockResolvedValue({ type: 'image', body: 'the caption', metadata });
+
+      await forwardIt();
+
+      expect((pendingRow() as { metadata: unknown }).metadata).toEqual({ media });
+    });
+
+    it.each([
+      ['was deleted', () => (repository.findOne as jest.Mock).mockResolvedValue({ type: 'revoked', body: '' })],
+      ['cannot be read', () => (repository.findOne as jest.Mock).mockRejectedValue(new Error('db down'))],
+    ])('stores the placeholder and still forwards when the stored message %s', async (_why, arrange) => {
+      arrange();
+
+      await forwardIt();
+
+      expect(pendingRow()).toMatchObject({ type: 'forward', body: '[Forwarded]' });
+      expect(mockEngine.forwardMessage).toHaveBeenCalledWith('628111@c.us', 'to@c.us', 'wa-src');
     });
   });
 

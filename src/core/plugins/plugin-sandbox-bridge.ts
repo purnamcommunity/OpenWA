@@ -20,6 +20,7 @@ import { countMetaValues, metaText } from './sandbox-log-meta';
 import { makeOnWebhookSubscribe } from './webhook-subscribe.util';
 import { registerPluginSearchProvider, unregisterPluginSearchProvider } from './search-provider-registration.util';
 import { INGRESS_DISPATCH_TIMEOUT_MS } from '../../modules/integration/integration.constants';
+import { ingressDeliveryVerified, isQueryBorne } from '../../modules/integration/ingress-signature';
 import type { IngressJobData } from '../../modules/queue/processors/ingress.processor';
 
 /** Time budget for a sandboxed plugin's hook handler before the chain proceeds without it. */
@@ -204,7 +205,15 @@ export class PluginSandboxBridge {
     // The verdict is the one recorded at admission: a plugin update can change the route's scheme while
     // a delivery waits, and it must not relabel a payload nobody authenticated. A delivery admitted before
     // the verdict was recorded reads the route as it stands. Missing/hot-swapped route metadata fails closed.
-    const verified = !!route && (d.payload.admission?.verified ?? route.signature.scheme !== 'none');
+    // A recorded verdict is still withdrawn for a query-borne delivery on a signing route: earlier releases recorded
+    // those as verified, though no signature covers the query.
+    const recorded = d.payload.admission?.verified;
+    const verified =
+      !!route &&
+      (recorded === undefined
+        ? ingressDeliveryVerified(route.signature.scheme, d.payload.rawBody, d.payload.query)
+        : recorded &&
+          (route.signature.scheme === 'shared-secret' || !isQueryBorne(d.payload.rawBody, d.payload.query)));
     const instance = await this.hostServices.getPluginInstancePort().resolve(d.pluginId, d.instanceId);
     // The live door and the reconciler refuse an unknown or disabled instance; a queued job, a retry,
     // the inline fallback and a redrive all land here instead, so the same rule is enforced once more.
@@ -382,8 +391,11 @@ export class PluginSandboxBridge {
       onUnresponsive,
     );
     this.sandboxHosts.set(pluginId, host);
+    // The worker keeps this config as its base until a config-change arrives, and a save made while the
+    // plugin is still enabling is not pushed (it is not ENABLED yet). Every save replaces plugin.config.
+    const loadedConfig = plugin.config;
     try {
-      await host.load(mainPath, { pluginId, config: plugin.config }, SANDBOX_LIFECYCLE_TIMEOUT_MS);
+      await host.load(mainPath, { pluginId, config: loadedConfig }, SANDBOX_LIFECYCLE_TIMEOUT_MS);
       await host.runLifecycle('onLoad', SANDBOX_LIFECYCLE_TIMEOUT_MS);
       await host.runLifecycle('onEnable', SANDBOX_LIFECYCLE_TIMEOUT_MS);
     } catch (error) {
@@ -395,6 +407,9 @@ export class PluginSandboxBridge {
       await host.terminate().catch(() => undefined);
       throw error;
     }
+    // After onEnable, never during it: the worker runs messages concurrently, so a push mid-enable would run
+    // onConfigChange before onEnable finished.
+    if (plugin.config !== loadedConfig) host.sendConfigChange(plugin.config);
   }
 
   /**
@@ -636,9 +651,13 @@ export class PluginSandboxBridge {
   // a manifest without 'search:provide' is denied there — the wire declaration is untrusted input, and
   // this bridge bypasses the capability router that gates the ctx.* capabilities.
   private buildSearchProviderRegistrar(pluginId: string, plugin: PluginInstance): () => void {
+    // One declaration per worker. Plugin code can post the message itself, and every repeat would take the active
+    // provider back in auto mode, or log the denial again.
+    let declared = false;
     return (): void => {
       const liveHost = this.sandboxHosts.get(pluginId);
-      if (!liveHost) return;
+      if (!liveHost || declared) return;
+      declared = true;
       registerPluginSearchProvider({
         pluginId,
         label: `${plugin.manifest.name} (plugin)`,

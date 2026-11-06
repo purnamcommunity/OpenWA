@@ -63,6 +63,14 @@ interface BulkMessageContent {
 }
 
 /**
+ * The type a bulk item is reported and stored as: an audio item flagged ptt is a voice note, so the send
+ * hooks and the stored row say 'voice', as they do for a single voice send.
+ */
+function messageTypeOf(type: string, content: BulkMessageContent): string {
+  return type === 'audio' && content.audio?.ptt ? 'voice' : type;
+}
+
+/**
  * Resolve a batch's terminal status, in precedence order:
  *  - cancelled (cancelBatch flipped the flag) → CANCELLED. Must win over the in-memory PROCESSING
  *    status set at the start of processBatch, which would otherwise be saved back over the cancellation.
@@ -177,13 +185,17 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
    * because the two cannot diverge: only the engine holder can send.
    */
   async onApplicationBootstrap(): Promise<void> {
+    // Ids first, then one whole row at a time: an unfinished row still holds its media payloads, and a run that
+    // crashed with many of them must not need room for all at once, nor for a live peer's.
     const unfinished = await this.batchRepository.find({
+      select: { id: true, sessionId: true },
       where: { status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]) },
     });
     const orphaned = await this.ownedByThisNode(unfinished);
     let failed = 0;
-    for (const batch of orphaned) {
-      if (await this.failOrphanedBatch(batch)) failed++;
+    for (const { id } of orphaned) {
+      const batch = await this.batchRepository.findOne({ where: { id } });
+      if (await this.failOrphanedBatch(batch ?? { id })) failed++;
     }
     if (failed > 0) {
       this.logger.warn(`Marked ${failed} orphaned unfinished batch(es) FAILED on startup (interrupted by a restart)`);
@@ -261,14 +273,17 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
    */
   async reapProcessingBatches(sessionId: string, reason: string, manager?: EntityManager): Promise<number> {
     const repository = manager?.getRepository(MessageBatch) ?? this.batchRepository;
+    // Ids first, as at boot: the payloads are read one row at a time, and never for a batch left alone.
     const unfinished = (
       await repository.find({
+        select: { id: true },
         where: { status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]), sessionId },
       })
     ).filter(batch => !this.processingBatches.has(batch.id));
     let failed = 0;
-    for (const batch of unfinished) {
-      if (await this.failOrphanedBatch(batch, false, repository)) failed++;
+    for (const { id } of unfinished) {
+      const batch = await repository.findOne({ where: { id } });
+      if (await this.failOrphanedBatch(batch ?? { id }, false, repository)) failed++;
     }
     if (failed > 0) {
       this.logger.warn(`Marked ${failed} unfinished batch(es) FAILED for session ${sessionId} (${reason})`);
@@ -655,7 +670,11 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       // decide; a rewritten chatId is ignored, the item always goes to its own msg.chatId.
       const gate = await this.hookManager.execute(
         'message:sending',
-        { sessionId: batch.sessionId, input: { ...content, chatId: msg.chatId }, type: msg.type },
+        {
+          sessionId: batch.sessionId,
+          input: { ...content, chatId: msg.chatId },
+          type: messageTypeOf(msg.type, content),
+        },
         { sessionId: batch.sessionId, source: 'BulkMessageService' },
       );
       if (!gate.continue) {
@@ -757,7 +776,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
             sessionId: batch.sessionId,
             error: sanitized.message,
             input: { ...content, chatId: msg.chatId },
-            type: msg.type,
+            type: messageTypeOf(msg.type, content),
           },
           { sessionId: batch.sessionId, source: 'BulkMessageService' },
         );
@@ -1075,8 +1094,6 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     // media item (audio carries none). Other keys on the item were never delivered.
     const media = type === 'text' ? undefined : content[type as 'image' | 'video' | 'audio' | 'document'];
     const body = type === 'text' ? content.text : type === 'audio' ? undefined : content.caption;
-    // A bulk audio item flagged ptt is a voice note; store it in the 'voice' bucket like inbound PTT.
-    const persistType = type === 'audio' && content.audio?.ptt ? 'voice' : type;
     try {
       await this.messageService.saveOutgoingMessage(
         sessionId,
@@ -1084,7 +1101,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
           waMessageId: result.id,
           chatId,
           body: body ?? '',
-          type: persistType,
+          type: messageTypeOf(type, content),
           timestamp: result.timestamp,
           status: MessageStatus.SENT,
           metadata: media

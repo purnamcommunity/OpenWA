@@ -839,7 +839,9 @@ describe('MessageProjector (inbound projection)', () => {
         releaseHook();
         await drain();
 
-        expect(updatesAfterInsert()).toEqual([[{ ...where, type: Not('revoked') }, { body: 'second fix' }]]);
+        expect(updatesAfterInsert()).toEqual([
+          [{ ...where, type: Not('revoked'), body: Or(Not('second fix'), IsNull()) }, { body: 'second fix' }],
+        ]);
         expect(webhookService.dispatch).toHaveBeenCalledWith(SESSION_ID, 'message.edited', expect.anything());
       });
 
@@ -965,7 +967,9 @@ describe('MessageProjector (inbound projection)', () => {
         releaseHook();
         await drain();
 
-        expect(updatesAfterInsert()).toEqual([[{ ...where, type: Not('revoked') }, { body: 'genuine edit' }]]);
+        expect(updatesAfterInsert()).toEqual([
+          [{ ...where, type: Not('revoked'), body: Or(Not('genuine edit'), IsNull()) }, { body: 'genuine edit' }],
+        ]);
       });
 
       it('keeps a reaction from another chat out of the message while its row is not written', async () => {
@@ -1219,7 +1223,10 @@ describe('MessageProjector (inbound projection)', () => {
         { ...guarded, body: Or(Not('late'), IsNull()) },
         { body: 'late' },
       );
-      expect(messageRepository.update).toHaveBeenCalledWith(guarded, { body: 'later' });
+      expect(messageRepository.update).toHaveBeenCalledWith(
+        { ...guarded, body: Or(Not('later'), IsNull()) },
+        { body: 'later' },
+      );
     });
 
     // The table holds one row per id, which may be another chat's message. The engines refuse a REST call
@@ -1285,7 +1292,10 @@ describe('MessageProjector (inbound projection)', () => {
           fromMe: true,
         });
 
-        expect(messageRepository.update).toHaveBeenCalledWith({ ...where, type: Not('revoked') }, { body: 'edited' });
+        expect(messageRepository.update).toHaveBeenCalledWith(
+          { ...where, type: Not('revoked'), body: Or(Not('edited'), IsNull()) },
+          { body: 'edited' },
+        );
       });
     });
 
@@ -1548,7 +1558,9 @@ describe('MessageProjector (inbound projection)', () => {
         releaseA();
         await flush();
 
-        expect(updatesAfterS()).toEqual([[{ ...whereS, type: Not('revoked') }, { body: 'fixed' }]]);
+        expect(updatesAfterS()).toEqual([
+          [{ ...whereS, type: Not('revoked'), body: Or(Not('fixed'), IsNull()) }, { body: 'fixed' }],
+        ]);
         expect(webhookService.dispatch).toHaveBeenCalledWith(
           SESSION_ID,
           'message.sent',
@@ -1586,7 +1598,9 @@ describe('MessageProjector (inbound projection)', () => {
         releaseA();
         await flush();
 
-        expect(updatesAfterS()).toEqual([[{ ...whereS, type: Not('revoked') }, { body: 'fixed' }]]);
+        expect(updatesAfterS()).toEqual([
+          [{ ...whereS, type: Not('revoked'), body: Or(Not('fixed'), IsNull()) }, { body: 'fixed' }],
+        ]);
       });
 
       it('stores reactions that arrived before the row, without announcing them again', async () => {
@@ -2136,12 +2150,14 @@ describe('MessageProjector (inbound projection)', () => {
   });
 
   describe('handleMessageAck payload', () => {
-    it('carries the chat the engine named, on the socket and on both webhook events', () => {
+    it('carries the chat the engine named, on the socket and on both webhook events', async () => {
       const engine = makeEngine();
       engines.set(SESSION_ID, engine);
 
       projector.handleMessageAck(SESSION_ID, engine, 'M1', 'delivered', '120363000@g.us');
       projector.handleMessageAck(SESSION_ID, engine, 'M2', 'failed', '120363000@g.us');
+      // An ack that names its chat is announced once the stored row has been read.
+      for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
 
       const expected = { id: 'M1', messageId: 'M1', status: 'delivered', ack: 2, chatId: '120363000@g.us' };
       expect(eventsGateway.emitMessageAck).toHaveBeenCalledWith(SESSION_ID, expected);

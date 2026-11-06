@@ -1,4 +1,4 @@
-import { useRef, useState, type ReactNode } from 'react';
+import { memo, useCallback, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertCircle,
@@ -78,56 +78,53 @@ interface ChatSidebarProps {
   };
 }
 
-// LEFT SIDEBAR: session switcher, header actions, Chats/Channels/Status tab bar, search, quick filters,
-// and the per-tab lists. The page owns all queries/state; this component renders them and reports
-// interactions up.
-function ChatSidebar({
-  sessions,
-  pickerSessions,
-  selectedSessionId,
-  onSelectSession,
-  activeTab,
-  onSwitchTab,
-  searchQuery,
-  onSearchQueryChange,
-  onComposeStatus,
-  formatChatTime,
-  messageSearch,
-  onNewChat,
-  newChatPanel,
-  chatsTab,
-  channelsTab,
-  statusTab,
-}: ChatSidebarProps) {
-  const { t } = useTranslation();
-  // Posting a status needs an operator key; a read-only key would only reach a 403.
-  const { canWrite, scoped } = useRole();
-  const [showMessageSearch, setShowMessageSearch] = useState(false);
-  const searchRef = useRef<HTMLInputElement | null>(null);
+interface ChatListRowProps {
+  chat: Chat;
+  active: boolean;
+  pictureUrl?: string | null;
+  formatChatTime: (timestamp?: number) => string;
+  /** The day the list was drawn on (Date.toDateString), which decides Today and Yesterday in the time. */
+  today: string;
+  onSelectChat: (chat: Chat) => void;
+  rowActions?: ChatRowActions;
+  menuOpen: boolean;
+  onMenuOpenChange: (chatId: string, open: boolean) => void;
+}
 
-  const formatLastMessageSnippet = (chat: Chat) => chat.lastMessage || '';
-
-  // Row markup for the Chats list: a plain function (not memoized) since it closes over
-  // render-scoped props (chatsTab.activeChatId, chatsTab.pictures) that already change every
-  // render.
-  const renderChatRow = (chat: Chat) => {
-    const isActive = chatsTab.activeChatId === chat.id;
-    return (
+// One row of the chat list, with its menu for a group or a 1:1 chat. Drawn again only when what it shows changes, so
+// a keystroke in the composer or a message for another chat leaves every other row alone, however long the list.
+// The page's row actions are new functions on each of its renders, and a closed menu runs none of them (it asks for
+// what it needs once open, see ChatRowMenu), so their identity counts only for the row whose menu is open, which then
+// follows the page: a contact the address book now holds turns Save into Rename.
+const ChatListRow = memo(
+  function ChatListRow({
+    chat,
+    active,
+    pictureUrl,
+    formatChatTime,
+    onSelectChat,
+    rowActions,
+    menuOpen,
+    onMenuOpenChange,
+  }: ChatListRowProps) {
+    const { t } = useTranslation();
+    const onOpenChange = useCallback((open: boolean) => onMenuOpenChange(chat.id, open), [onMenuOpenChange, chat.id]);
+    const snippet = chat.lastMessage || '';
+    const card = (
       <div
-        key={chat.id}
         role="button"
         tabIndex={0}
-        aria-current={isActive ? 'true' : undefined}
-        className={`chat-item-card ${isActive ? 'active' : ''} ${chat.unreadCount !== 0 ? 'unread' : ''}`}
-        onClick={() => chatsTab.onSelectChat(chat)}
+        aria-current={active ? 'true' : undefined}
+        className={`chat-item-card ${active ? 'active' : ''} ${chat.unreadCount !== 0 ? 'unread' : ''}`}
+        onClick={() => onSelectChat(chat)}
         onKeyDown={e => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            chatsTab.onSelectChat(chat);
+            onSelectChat(chat);
           }
         }}
       >
-        <ChatAvatar chatId={chat.id} pictureUrl={chatsTab.pictures?.[chat.id]} kind={chat.kind} />
+        <ChatAvatar chatId={chat.id} pictureUrl={pictureUrl} kind={chat.kind} />
 
         <div className="chat-item-info">
           <div className="chat-item-top">
@@ -145,9 +142,8 @@ function ChatSidebar({
           <div className="chat-item-bottom">
             {/* An empty snippet with a timestamp is a message with no text (a voice note, a sticker,
                 an uncaptioned photo), not an empty chat. */}
-            <span className="chat-item-snippet" title={formatLastMessageSnippet(chat)}>
-              {formatLastMessageSnippet(chat) ||
-                (!chat.timestamp && <span className="no-message">{t('chats.noMessageYet')}</span>)}
+            <span className="chat-item-snippet" title={snippet}>
+              {snippet || (!chat.timestamp && <span className="no-message">{t('chats.noMessageYet')}</span>)}
             </span>
             {(chat.muted || chat.pinned) && (
               <span className="chat-item-flags">
@@ -178,7 +174,61 @@ function ChatSidebar({
         </div>
       </div>
     );
-  };
+    if (!rowActions || (chat.kind !== 'group' && chat.kind !== 'individual')) return card;
+    return (
+      <div className="chat-item-wrap has-menu">
+        {card}
+        <ChatRowMenu chat={chat} actions={rowActions} open={menuOpen} onOpenChange={onOpenChange} />
+      </div>
+    );
+  },
+  (a, b) =>
+    a.chat === b.chat &&
+    a.active === b.active &&
+    a.pictureUrl === b.pictureUrl &&
+    a.formatChatTime === b.formatChatTime &&
+    a.today === b.today &&
+    a.onSelectChat === b.onSelectChat &&
+    a.menuOpen === b.menuOpen &&
+    a.onMenuOpenChange === b.onMenuOpenChange &&
+    (b.menuOpen ? a.rowActions === b.rowActions : !a.rowActions === !b.rowActions),
+);
+
+// LEFT SIDEBAR: session switcher, header actions, Chats/Channels/Status tab bar, search, quick filters,
+// and the per-tab lists. The page owns all queries/state; this component renders them and reports
+// interactions up.
+function ChatSidebar({
+  sessions,
+  pickerSessions,
+  selectedSessionId,
+  onSelectSession,
+  activeTab,
+  onSwitchTab,
+  searchQuery,
+  onSearchQueryChange,
+  onComposeStatus,
+  formatChatTime,
+  messageSearch,
+  onNewChat,
+  newChatPanel,
+  chatsTab,
+  channelsTab,
+  statusTab,
+}: ChatSidebarProps) {
+  const { t } = useTranslation();
+  // Posting a status needs an operator key; a read-only key would only reach a 403.
+  const { canWrite, scoped } = useRole();
+  const [showMessageSearch, setShowMessageSearch] = useState(false);
+  const searchRef = useRef<HTMLInputElement | null>(null);
+
+  // The one row whose menu is open (opening another closes it), drawn again as the page's actions change.
+  const [menuChatId, setMenuChatId] = useState<string | null>(null);
+  const onMenuOpenChange = useCallback(
+    (chatId: string, open: boolean) => setMenuChatId(current => (open ? chatId : current === chatId ? null : current)),
+    [],
+  );
+  // Read on every render of the list, so the rows' Today and Yesterday move on with the first render of a new day.
+  const today = new Date().toDateString();
 
   if (newChatPanel) {
     return <aside className="chats-sidebar">{newChatPanel}</aside>;
@@ -343,16 +393,20 @@ function ChatSidebar({
               </span>
             </div>
           ) : (
-            chatsTab.chats.map(chat =>
-              chatsTab.rowActions && (chat.kind === 'group' || chat.kind === 'individual') ? (
-                <div key={chat.id} className="chat-item-wrap has-menu">
-                  {renderChatRow(chat)}
-                  <ChatRowMenu chat={chat} actions={chatsTab.rowActions} />
-                </div>
-              ) : (
-                renderChatRow(chat)
-              ),
-            )
+            chatsTab.chats.map(chat => (
+              <ChatListRow
+                key={chat.id}
+                chat={chat}
+                active={chatsTab.activeChatId === chat.id}
+                pictureUrl={chatsTab.pictures?.[chat.id]}
+                formatChatTime={formatChatTime}
+                today={today}
+                onSelectChat={chatsTab.onSelectChat}
+                rowActions={chatsTab.rowActions}
+                menuOpen={menuChatId === chat.id}
+                onMenuOpenChange={onMenuOpenChange}
+              />
+            ))
           )}
         </div>
       )}

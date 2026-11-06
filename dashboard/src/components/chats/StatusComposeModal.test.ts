@@ -273,3 +273,16 @@ test('a picked font is posted under its own id', async () => {
   await waitFor(() => assert.equal(posted.length, 1));
   assert.equal((posted[0] as { font?: number }).font, 2);
 });
+
+// Text or Image is a choice between two toggle buttons; which one is chosen is exposed, not only drawn.
+test('the status kind toggle says which kind is chosen', () => {
+  const { screen, fireEvent } = rtl;
+  render();
+  const text = screen.getByRole('button', { name: 'Text' });
+  const image = screen.getByRole('button', { name: 'Image' });
+  assert.equal(text.getAttribute('aria-pressed'), 'true', 'the chosen kind is not exposed as pressed');
+  assert.equal(image.getAttribute('aria-pressed'), 'false');
+  fireEvent.click(image);
+  assert.equal(image.getAttribute('aria-pressed'), 'true');
+  assert.equal(text.getAttribute('aria-pressed'), 'false');
+});

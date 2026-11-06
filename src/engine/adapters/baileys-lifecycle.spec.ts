@@ -55,6 +55,7 @@ describe('BaileysLifecycle unlink cleanup', () => {
     } as unknown as BaileysLifecycleHost;
     const sock = {
       user: { id: '628999:1@s.whatsapp.net' },
+      authState: { creds: { me: { id: '628999:1@s.whatsapp.net' }, account: {} } },
       query: jest.fn().mockResolvedValue({ tag: 'iq' }),
       generateMessageTag: () => 'tag-1',
       end: jest.fn(),
@@ -198,6 +199,7 @@ describe('BaileysLifecycle proxy fetch dispatcher', () => {
     const engine = new BaileysLifecycle(host);
     engine.sock = {
       user: { id: '628999:1@s.whatsapp.net' },
+      authState: { creds: { me: { id: '628999:1@s.whatsapp.net' }, account: {} } },
       query: jest.fn().mockResolvedValue({ tag: 'iq' }),
       generateMessageTag: () => 'tag-1',
       end: jest.fn(),

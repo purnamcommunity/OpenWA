@@ -217,9 +217,12 @@ export class GroupService {
    *
    * The member label uses it too: Baileys relays that label as a message to whatever jid it is given, so
    * a 1:1 id would send a group protocol message to a person.
+   *
+   * One `@` only: the kind is read after the last one, while Baileys reads the domain after the first, so
+   * `628123456789@c.us@g.us` passed here as a group and Baileys relayed it on its 1:1 path.
    */
   private assertGroupId(groupId: string): void {
-    if (chatKind(groupId) !== 'group') {
+    if (chatKind(groupId) !== 'group' || groupId.indexOf('@') !== groupId.lastIndexOf('@')) {
       throw new BadRequestException(`${groupId} is not a group id`);
     }
   }
@@ -227,7 +230,7 @@ export class GroupService {
   /** Read the group's picture URL, or null when it has none. Groups reuse the profile-picture read. */
   getGroupPicture(sessionId: string, groupId: string): Promise<string | null> {
     this.assertGroupId(groupId);
-    return this.getEngine(sessionId).getProfilePicture(groupId);
+    return this.getEngine(sessionId).getProfilePicture(toNeutralJid(groupId));
   }
 
   setGroupPicture(sessionId: string, groupId: string, dto: SetGroupPictureDto): Promise<void> {
@@ -238,12 +241,12 @@ export class GroupService {
       requireMimetypeForBase64: true,
       checkUrl: true,
     });
-    return this.getEngine(sessionId).setGroupPicture(groupId, media);
+    return this.getEngine(sessionId).setGroupPicture(toNeutralJid(groupId), media);
   }
 
   deleteGroupPicture(sessionId: string, groupId: string): Promise<void> {
     this.assertGroupId(groupId);
-    return this.getEngine(sessionId).deleteGroupPicture(groupId);
+    return this.getEngine(sessionId).deleteGroupPicture(toNeutralJid(groupId));
   }
 
   /** Read the group's announce/locked/ephemeral/member-add settings; 404s (via getGroupInfo) when unknown. */

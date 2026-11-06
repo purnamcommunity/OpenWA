@@ -1,6 +1,7 @@
 import { Controller, Post, Get, Param, Body, Query, Res, HttpCode, HttpStatus, StreamableFile } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery, ApiBody } from '@nestjs/swagger';
 import type { Response } from 'express';
+import { retryAfterWhenBusy, storedFileAttachment } from '../../common/storage/storage-transfer';
 import { MessageService } from './message.service';
 import { BulkMessageService } from './bulk-message.service';
 import {
@@ -32,6 +33,7 @@ import {
   MessageCommentDto,
   MessageReactionDto,
   PollVoteDto,
+  MessageReceiptsResponseDto,
 } from './dto/message-responses.dto';
 import {
   SendLocationDto,
@@ -62,6 +64,8 @@ import {
   BULK_MEDIA_TOO_LARGE_413,
   MEDIA_URL_PROXY_503,
   MESSAGE_NOT_FOUND_404,
+  PREVIEW_IMAGE_PROXY_503,
+  PREVIEW_IMAGE_TOO_LARGE_413,
   QUOTED_MESSAGE_NOT_FOUND_404,
   RECIPIENT_UNREACHABLE_400,
   SEND_503,
@@ -106,8 +110,8 @@ export class MessageController {
     description:
       'Filter by sender. A phone also matches group messages via the author field and any lid that resolves to it.',
   })
-  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Max messages to return (default 50)' })
-  @ApiQuery({ name: 'offset', required: false, type: Number, description: 'Offset for pagination' })
+  @ApiQuery({ name: 'limit', required: false, type: 'integer', description: 'Max messages to return (default 50)' })
+  @ApiQuery({ name: 'offset', required: false, type: 'integer', description: 'Offset for pagination' })
   @ApiQuery({
     name: 'inlineMedia',
     required: false,
@@ -222,7 +226,8 @@ export class MessageController {
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiResponse({ status: 404, description: QUOTED_MESSAGE_NOT_FOUND_404 })
   @ApiResponse({ status: 501, description: `${CUSTOM_LINK_PREVIEW_501} ${QUOTED_SEND_501}` })
-  @ApiResponse({ status: 503, description: SEND_503 })
+  @ApiResponse({ status: 413, description: PREVIEW_IMAGE_TOO_LARGE_413 })
+  @ApiResponse({ status: 503, description: `${PREVIEW_IMAGE_PROXY_503} ${SEND_503}` })
   async sendText(@Param('sessionId') sessionId: string, @Body() dto: SendTextMessageDto): Promise<MessageResponseDto> {
     return this.messageService.sendText(sessionId, dto);
   }
@@ -525,7 +530,9 @@ export class MessageController {
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({
     status: 201,
-    description: 'Message forwarded',
+    description:
+      "Message forwarded. `messageId` is the forwarded copy's id, or an empty string when the engine could not " +
+      'read it back.',
     type: MessageResponseDto,
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
@@ -646,7 +653,7 @@ export class MessageController {
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'chatId', description: 'Chat ID (e.g. 1234567890@c.us or groupId@g.us)' })
-  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Max messages to return (default 50)' })
+  @ApiQuery({ name: 'limit', required: false, type: 'integer', description: 'Max messages to return (default 50)' })
   @ApiQuery({
     name: 'includeMedia',
     required: false,
@@ -825,6 +832,49 @@ export class MessageController {
     return this.messageService.sendMessageComment(sessionId, chatId, messageId, dto.text);
   }
 
+  @ChatScoped('fenced')
+  @Get(':chatId/:messageId/receipts')
+  @ApiOperation({ summary: 'Get delivery and read receipts for a specific message' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'chatId', description: 'Chat ID containing the message' })
+  @ApiParam({
+    name: 'messageId',
+    description: 'Full serialized ID of a message this account sent, as the send routes return it',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Message delivery and read receipts with timestamps',
+    type: MessageReceiptsResponseDto,
+  })
+  @ApiResponse({ status: 400, description: 'Session not active' })
+  @ApiResponse({
+    status: 403,
+    description:
+      'The message was received, not sent by this account (only its own messages carry receipts), or the ' +
+      "API key's role, session or chat scope, or IP allow-list does not allow this operation.",
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({
+    status: 404,
+    description:
+      'No such message in this chat: the id is not a full serialized message id, WhatsApp Web no longer ' +
+      'holds the message, or the message belongs to another chat.',
+  })
+  @ApiResponse({ status: 501, description: ENGINE_NOT_SUPPORTED_501 })
+  @ApiResponse({
+    status: 503,
+    description:
+      'The whatsapp-web.js page connection died mid-read, so nothing could be read. Retry once the ' +
+      'session is ready again.',
+  })
+  async getReceipts(
+    @Param('sessionId') sessionId: string,
+    @Param('chatId') chatId: string,
+    @Param('messageId') messageId: string,
+  ) {
+    return this.messageService.getMessageReceipts(sessionId, chatId, messageId);
+  }
+
   // Three path segments, so it never collides with `:chatId/history` (two) regardless of
   // declaration order — Nest/Express match on segment count first.
   @ChatScoped('fenced')
@@ -848,22 +898,25 @@ export class MessageController {
       '(the gateway stores none of those bytes, though on whatsapp-web.js the own-send echo may), or ' +
       'the message is not in this gateway’s history.',
   })
+  @ApiResponse({
+    status: 503,
+    description:
+      'On S3 storage, the gateway already has 50 media downloads open across the status and chat media ' +
+      'routes. Retry once the Retry-After header (1 second) has passed.',
+  })
   async getChatMedia(
     @Param('sessionId') sessionId: string,
     @Param('chatId') chatId: string,
     @Param('messageId') messageId: string,
     @Res({ passthrough: true }) res: Response,
   ): Promise<StreamableFile> {
-    const { buffer, mimetype } = await this.messageService.getChatMedia(sessionId, chatId, messageId);
+    const { mimetype, ...source } = await this.messageService
+      .getChatMedia(sessionId, chatId, messageId)
+      .catch(retryAfterWhenBusy(res));
     // attachment + nosniff together: the mimetype is already reduced to an inert set, and forcing a
     // download means even a mistake there cannot render as active content on the API origin. The
     // dashboard renders chat media from the inline copy, so nothing depends on inline display here.
-    res.set({
-      'Content-Type': mimetype,
-      'X-Content-Type-Options': 'nosniff',
-      'Content-Disposition': 'attachment',
-    });
-    return new StreamableFile(buffer);
+    return storedFileAttachment(res, source, mimetype);
   }
 
   // ========== Delete Message ==========
@@ -1027,7 +1080,9 @@ export class MessageController {
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({
     status: 200,
-    description: 'Message edited',
+    description:
+      'Message edited. Both fields describe the edited message, not the edit: `messageId` is its id and ' +
+      '`timestamp` the time it was originally sent.',
     type: MessageResponseDto,
   })
   @ApiResponse({
@@ -1037,9 +1092,9 @@ export class MessageController {
   @ApiResponse({
     status: 403,
     description:
-      'The engine refused the edit. The Baileys adapter refuses a message the account did not send; ' +
-      'whatsapp-web.js reads the refusal from the page, which also covers a message that is not text. ' +
-      'Past its own guard the Baileys engine has no acceptance signal and answers 200.',
+      'The engine refused the edit. Both engines refuse a message the account did not send and one with no ' +
+      'text or caption to edit (a location, sticker, poll, contact card or audio); whatsapp-web.js reads the ' +
+      'refusal from the page. Past its own guards the Baileys engine has no acceptance signal and answers 200.',
   })
   @ApiResponse({ status: 404, description: 'Message not found' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })

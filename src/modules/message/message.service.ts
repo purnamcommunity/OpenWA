@@ -1,6 +1,7 @@
 import { Injectable, BadRequestException, NotFoundException, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, ObjectLiteral, Repository } from 'typeorm';
+import { Readable } from 'stream';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import type { IWhatsAppEngine, PollVote } from '../../engine/interfaces/whatsapp-engine.interface';
 import { MessageProjector } from '../session/message-projector.service';
@@ -162,6 +163,12 @@ export function spendInlineMediaBudget(messages: Message[], budgetBytes: number)
  * what the budget keeps instead of every payload on the page.
  */
 const MESSAGE_LIST_READ_CHUNK_MIN_BYTES = 1024 * 1024;
+
+/** The phone digits of a user JID (`<digits>@c.us` or `@s.whatsapp.net`), as a one-item list, or none. */
+function bareUserDigits(id: string): string[] {
+  const { kind, userPart } = parseWaId(id);
+  return kind === 'user' && /^\d+$/.test(userPart) ? [userPart] : [];
+}
 
 /** Pin window applied when the caller does not choose one — WhatsApp's own default of 24h. */
 export const DEFAULT_PIN_DURATION_SECONDS = 86400;
@@ -414,7 +421,10 @@ export class MessageService implements PluginMessagePort {
       // within the (sessionId, createdAt)-narrowed scan exactly as the from-only filter did, so the
       // OR costs nothing the old plan didn't already pay. No new index: per-session narrowing
       // dominates selectivity and a single btree cannot serve an OR across two columns anyway.
-      const froms = await this.resolveJidCandidates(from);
+      const candidates = await this.resolveJidCandidates(from);
+      // An API send stored by an earlier version names the account by its bare phone digits, so a filter on the
+      // account's JID still matches those rows.
+      const froms = [...new Set([...candidates, ...candidates.flatMap(bareUserDigits)])];
       narrow('(message.from IN (:...froms) OR message.author IN (:...authorFroms))', {
         froms,
         authorFroms: froms,
@@ -608,6 +618,11 @@ export class MessageService implements PluginMessagePort {
     return engine.getMessageReactions(chatId, messageId);
   }
 
+  async getMessageReceipts(sessionId: string, chatId: string, messageId: string) {
+    const engine = this.getEngine(sessionId);
+    return engine.getMessageReceipts(chatId, messageId);
+  }
+
   /**
    * Replies posted on a community announcement. The thread is not part of the chat's messages, so
    * this is the only read that surfaces it — see `MessageComment`.
@@ -645,12 +660,15 @@ export class MessageService implements PluginMessagePort {
     sessionId: string,
     chatId: string,
     messageId: string,
-  ): Promise<{ buffer: Buffer; mimetype: string }> {
+  ): Promise<{ stream: Readable; size?: number; mimetype: string }> {
     const chatIds = await this.resolveJidCandidates(chatId);
     const media = await this.chatMediaArchive?.getMedia(sessionId, chatIds, messageId);
     if (media && this.storageService) {
       try {
-        return { buffer: await this.storageService.getFile(media.path), mimetype: inertMimetype(media.mimetype) };
+        // Streamed, not read whole: an archived video can be as large as CHAT_MEDIA_ARCHIVE_MAX_BYTES.
+        // A missing or unreadable file rejects here, before anything is answered.
+        const { stream, size } = await this.storageService.openFile(media.path);
+        return { stream, size, mimetype: inertMimetype(media.mimetype) };
       } catch (error) {
         // The row outlived its file: the retention purge (or a concurrent delete) removed it
         // between the DB read and this read. Not a server fault — try the inline copy instead.
@@ -683,7 +701,8 @@ export class MessageService implements PluginMessagePort {
     ) {
       throw new NotFoundException('No media stored for this message');
     }
-    return { buffer: Buffer.from(inline.data, 'base64'), mimetype: inertMimetype(inline.mimetype) };
+    const bytes = Buffer.from(inline.data, 'base64');
+    return { stream: Readable.from([bytes]), size: bytes.length, mimetype: inertMimetype(inline.mimetype) };
   }
 
   /** Maximum messages a single getChatHistory call may request from the engine. */

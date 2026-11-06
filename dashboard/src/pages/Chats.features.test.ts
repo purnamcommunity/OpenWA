@@ -347,7 +347,7 @@ function installFetchStub(): void {
       }
       if (failLidPhones || failingLidIds.has(id)) return Promise.resolve(jsonResponse({ message: 'busy' }, 503));
       if (garbleLidPhones) return Promise.resolve(jsonResponse({ contactId: id, phone: 15550009999 }));
-      return Promise.resolve(jsonResponse({ contactId: id, phone: lidPhones[id] ?? null }));
+      return gated('phone', () => jsonResponse({ contactId: id, phone: lidPhones[id] ?? null }));
     }
     if (method === 'GET' && path.startsWith(`${base}/contacts/check/`)) {
       return gated('check', () =>
@@ -870,6 +870,128 @@ test('an answer about a privacy id that the page cannot read does not stop a cha
   assert.ok(!screen.queryByText('Could not check the number'), 'a failed lookup was shown as a failed number check');
 });
 
+// The address book lists a contact under its phone id, as both engines answer it, while the list keeps the
+// conversation of a contact that moved to privacy-id addressing under its @lid. Picking the contact opens that
+// conversation, as typing its number does, and the replies that arrive under the @lid are in the room on screen.
+
+/** Open the New chat panel and pick a contact by the start of its row's name. */
+async function pickContact(container: HTMLElement, name: string): Promise<void> {
+  const { screen, fireEvent, within } = rtl;
+  fireEvent.click(screen.getByRole('button', { name: 'New chat' }));
+  const panel = container.querySelector('.new-chat-panel') as HTMLElement;
+  fireEvent.click(await within(panel).findByRole('button', { name: new RegExp(`^${name}`) }));
+}
+
+test('a saved contact whose conversation the list holds under a privacy id opens that conversation', async () => {
+  const { screen, waitFor, within } = rtl;
+  listExtra = true;
+  lidPhones[LID_CHAT.id] = CONTACT.number;
+  const { container } = renderPage();
+  await screen.findByText('Lia');
+  const before = listedChatCards(container);
+  await pickContact(container, 'Bob');
+
+  await waitFor(() => assert.ok(container.querySelector('.room-header'), 'the chat did not open'));
+  await within(container.querySelector('.room-header') as HTMLElement).findByText('Lia');
+  assert.equal(listedChatCards(container), before, 'a second chat was added beside the one the list holds');
+
+  // The reply comes under the id the conversation is kept under.
+  const socket = lastSocket();
+  assert.ok(socket, 'expected the page to have opened a socket');
+  socket.receive('message', {
+    type: 'event',
+    timestamp: new Date(1_700_002_000_000).toISOString(),
+    payload: {
+      event: 'message.received',
+      sessionId: SESSION.id,
+      data: {
+        id: 'wamid.lia.reply',
+        chatId: LID_CHAT.id,
+        from: LID_CHAT.id,
+        to: 'me',
+        body: 'reply under the lid',
+        type: 'text',
+        fromMe: false,
+        timestamp: 1_700_001_700,
+      },
+    },
+  });
+  await within(container.querySelector('.room-messages') as HTMLElement).findByText('reply under the lid');
+});
+
+test('a saved contact with no conversation in the list opens its own chat, also when a lookup fails', async () => {
+  const { screen, waitFor, within } = rtl;
+  listExtra = true;
+  failLidPhones = true;
+  const { container } = renderPage();
+  await screen.findByText('Lia');
+  await pickContact(container, 'Bob');
+
+  await waitFor(() => assert.ok(container.querySelector('.room-header'), 'the chat did not open'));
+  await within(container.querySelector('.room-header') as HTMLElement).findByText('Bob');
+});
+
+test('while a contact is looked up the panel takes no other pick, and the contact picked opens', async () => {
+  const { screen, fireEvent, waitFor, within } = rtl;
+  listExtra = true;
+  lidPhones[LID_CHAT.id] = CONTACT.number;
+  const release = hold('phone');
+  const { container } = renderPage();
+  await screen.findByText('Lia');
+  await pickContact(container, 'Bob');
+
+  const panel = container.querySelector('.new-chat-panel') as HTMLElement;
+  const bob = within(panel).getByRole('button', { name: /^Bob/ });
+  const alice = within(panel).getByRole('button', { name: /^Alice/ });
+  await waitFor(() => assert.equal(bob.getAttribute('aria-busy'), 'true', 'the contact being looked up shows no sign'));
+  assert.equal(alice.matches(':disabled'), true, 'another contact can be picked during the lookup');
+  fireEvent.click(alice);
+  assert.ok(!container.querySelector('.room-header'), 'a second pick opened a chat during the lookup');
+  // A group form opened now would be thrown away by the chat the lookup opens.
+  const newGroup = within(panel).getByRole('button', { name: 'New group' });
+  assert.equal(newGroup.matches(':disabled'), true, 'New group can be picked during the lookup');
+  fireEvent.click(newGroup);
+  assert.equal(
+    within(panel).queryByLabelText('Search participants or enter a number') === null,
+    true,
+    'the group form opened',
+  );
+
+  release();
+  await waitFor(() => assert.ok(container.querySelector('.room-header'), 'the chat did not open'));
+  await within(container.querySelector('.room-header') as HTMLElement).findByText('Lia');
+});
+
+// A chat opened once a lookup answers commits outside any user event, so effects that run after its commit can land a
+// task later, after the browser drew the room and after a send bound to that render could run. The composer swaps in
+// the opened chat's draft before then: the room is never drawn with the text typed in the chat before it.
+test('a chat opened after a lookup is drawn with its own draft, not the text typed in the chat before it', async () => {
+  const { screen, fireEvent, waitFor, within } = rtl;
+  listExtra = true;
+  lidPhones[LID_CHAT.id] = CONTACT.number;
+  const { container } = renderPage();
+  await screen.findByText('Lia');
+  fireEvent.click(within(container.querySelector('.chats-sidebar') as HTMLElement).getByText('Alice'));
+  await within(container.querySelector('.room-header') as HTMLElement).findByText('Alice');
+  const composerSelector = 'input[placeholder="Type a message..."]';
+  fireEvent.change(container.querySelector(composerSelector) as HTMLInputElement, { target: { value: 'for alice' } });
+
+  // A mutation callback runs as a microtask, so it reads the page as the commit that drew Lia's room left it.
+  let drawnWith: string | null | undefined;
+  const observer = new MutationObserver(() => {
+    if (drawnWith !== undefined || !container.querySelector('.room-header')?.textContent?.includes('Lia')) return;
+    drawnWith = container.querySelector<HTMLInputElement>(composerSelector)?.value ?? null;
+  });
+  observer.observe(container, { childList: true, subtree: true, characterData: true });
+  try {
+    await pickContact(container, 'Bob');
+    await waitFor(() => assert.notEqual(drawnWith, undefined, 'the chat did not open'));
+  } finally {
+    observer.disconnect();
+  }
+  assert.equal(drawnWith, '', 'the room was drawn with the draft of the chat open before it');
+});
+
 // ── A phone number inside a sentence is placed in a left-to-right isolate: its plus sign and spaces are neutral to
 // the bidi algorithm, so in a right-to-left sentence the digit groups would be shown in reverse order. ──
 
@@ -1321,6 +1443,31 @@ test('an open session deleted with no status frame gives way once the page is sh
   await waitFor(() => assert.equal(selectedSessionName(container), SECOND_SESSION.name));
   assert.equal(sessionReads(), reads + 1, 'showing the page did not read the session list once');
   assert.equal(container.querySelector('.room-header') === null, true, "the deleted session's chat stayed open");
+});
+
+test('an open session deleted with its group dialog up asks the next session nothing about that group', async () => {
+  const { screen, waitFor, act } = rtl;
+  listSecond = true;
+  listGroup = true;
+  const { container } = renderPage();
+  await openGroupInfo();
+  const before = fetchCalls.length;
+
+  mainDeleted = true;
+  act(() => void document.dispatchEvent(new window.Event('visibilitychange')));
+  await waitFor(() => assert.equal(selectedSessionName(container), SECOND_SESSION.name));
+  await settle();
+  assert.equal(screen.queryByRole('dialog') === null, true, "the deleted session's group dialog stayed open");
+  const group = encodeURIComponent(GROUP.id);
+  const asked = fetchCalls
+    .slice(before)
+    .map(c => c.path)
+    .filter(
+      path =>
+        path.startsWith(`/api/sessions/${SECOND_SESSION.id}/`) &&
+        (path.includes(`/groups/${group}`) || path.includes(`/contacts/${group}/`)),
+    );
+  assert.deepEqual(asked, [], 'the next session was asked about the group the dialog had open');
 });
 
 test('the session list read at load does not undo a newer list a status frame read before it answered', async () => {
@@ -2888,6 +3035,17 @@ test("a row's menu closes on a press outside it and stays open for a press insid
   assert.ok(!container.querySelector('.chat-row-menu-popover'), 'a press outside left the menu open');
 });
 
+test("a row's menu leaves an Escape the input method processed alone and closes on a plain Escape", async () => {
+  const { screen, fireEvent } = rtl;
+  const { container } = renderPage();
+  await screen.findByText('Alice');
+  fireEvent.click(screen.getByRole('button', { name: 'Actions for Alice' }));
+  fireEvent.keyDown(document, { key: 'Escape', keyCode: 229 });
+  assert.ok(container.querySelector('.chat-row-menu-popover'), 'an Escape the input method processed closed the menu');
+  fireEvent.keyDown(document, { key: 'Escape' });
+  assert.ok(!container.querySelector('.chat-row-menu-popover'), 'Escape left the menu open');
+});
+
 test("the room's menu closes on a press outside it and on Escape, and Escape leaves the room open", async () => {
   const { screen, fireEvent, waitFor } = rtl;
   const { container } = renderPage();
@@ -2904,6 +3062,8 @@ test("the room's menu closes on a press outside it and on Escape, and Escape lea
 
   fireEvent.click(trigger);
   assert.ok(menuOpen());
+  fireEvent.keyDown(document, { key: 'Escape', keyCode: 229 });
+  assert.ok(menuOpen(), 'an Escape the input method processed closed the menu');
   fireEvent.keyDown(document, { key: 'Escape' });
   assert.ok(!menuOpen(), 'Escape left the menu open');
   assert.ok(container.querySelector('.room-header'), 'Escape closed the room along with the menu');

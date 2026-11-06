@@ -225,6 +225,16 @@ class MessagesResource
     }
 
     /**
+     * Get who received, read and played a message the account sent. whatsapp-web.js only; Baileys answers 501.
+     *
+     * @return array<string,mixed>
+     */
+    public function receipts(string $sessionId, string $chatId, string $messageId): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($messageId)}/receipts") ?? [];
+    }
+
+    /**
      * Pin a message in its chat.
      *
      * @param array<string,mixed> $body chatId, messageId and an optional durationSeconds of
@@ -282,15 +292,16 @@ class MessagesResource
     /** @return array<string,mixed> */
     public function sendBulk(string $sessionId, array $body): array
     {
-        // Rebuild each array layer so referenced maps, items and lists stay untouched.
+        // Rebuild each array layer so referenced maps, items and lists stay untouched. array_values keeps a
+        // filtered list a JSON array: json_encode writes one with key gaps as an object, which the gateway refuses.
         if (isset($body['messages']) && is_array($body['messages'])) {
             $body = array_merge($body, [
-                'messages' => array_map(static function ($item) {
+                'messages' => array_values(array_map(static function ($item) {
                     if (is_array($item) && isset($item['variables']) && is_array($item['variables'])) {
                         return array_merge($item, ['variables' => (object) $item['variables']]);
                     }
                     return $item;
-                }, $body['messages']),
+                }, $body['messages'])),
             ]);
         }
         if (isset($body['options']) && is_array($body['options'])) {

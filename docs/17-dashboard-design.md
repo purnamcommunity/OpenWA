@@ -690,8 +690,8 @@ that toggles one attribute on `<html>` and lets the CSS do the rest. The value i
 - **Mode** — `light | dark | system`. `system` removes `data-theme` so a `prefers-color-scheme`
   media query in the global CSS takes over; otherwise `data-theme="light|dark"` is set explicitly.
 
-The sidebar footer button cycles light → dark → system, its label naming the mode a click
-selects; there is no
+The sidebar footer button cycles light → dark → system; its accessible name starts with the mode it
+shows and then names the mode a click selects ("System, Switch to Light"); there is no
 picker popover and no `ThemeProvider` context wrapper — it's a hook consumed directly where needed.
 An earlier accent-palette picker (seven palettes via `data-palette`) was removed for
 maintainability; the legacy `openwa_palette` storage key and the attribute are cleaned up on load.

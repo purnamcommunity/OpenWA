@@ -8,6 +8,7 @@ import { bindModalA11y } from './modalA11y.ts';
 interface FakeEvent {
   key: string;
   shiftKey?: boolean;
+  isComposing?: boolean;
   defaultPrevented: boolean;
   propagationStopped: boolean;
   preventDefault(): void;
@@ -143,6 +144,17 @@ test('Escape closes the dialog and stops propagation', () => {
   doc.dispatchKey(event);
   assert.equal(closed, 1);
   assert.equal(event.propagationStopped, true);
+  unbind();
+});
+
+test('an Escape that ends an IME composition is left to the field', () => {
+  const { doc, card } = makeWorld();
+  let closed = 0;
+  const unbind = bindModalA11y(doc as never, card as never, () => closed++);
+  const event = { ...makeKeyEvent('Escape'), isComposing: true };
+  doc.dispatchKey(event);
+  assert.equal(closed, 0);
+  assert.equal(event.propagationStopped, false);
   unbind();
 });
 

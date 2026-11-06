@@ -358,6 +358,56 @@ while IFS= read -r entry; do
 done < <(tar -tzf "$ARCHIVE")
 tar -xzf "$ARCHIVE" -C "$STAGE"
 
+# backup.sh names the schema of a dump that holds one PostgreSQL schema only (POSTGRES_SCHEMA other than
+# public) in database.schema, and that dump loads differently: into the database the app uses, never in
+# place of it. An archive without the file holds the whole database and restores as it always has. The
+# name goes into the printed SQL, so one the app would refuse stops the restore before anything is written.
+PG_DUMP_SCHEMA=""
+if [ -f "$STAGE/database.sql" ] && [ -f "$STAGE/database.schema" ]; then
+  PG_DUMP_SCHEMA="$(tr -d '\r\n' <"$STAGE/database.schema")"
+  if ! openwa_pg_schema_valid "$PG_DUMP_SCHEMA"; then
+    log "ERROR: the archive's database.schema does not name a PostgreSQL schema the app accepts: $PG_DUMP_SCHEMA"
+    exit 1
+  fi
+fi
+
+# pg_dump from 13.22, 14.19, 15.14, 16.10 and 17.6 on (the image ships 17) opens a plain dump with \restrict, a psql
+# meta-command no older psql knows, and no 12: such a psql stops there with "invalid command \restrict" and loads
+# nothing. The printed load runs the psql on PATH, so one that cannot read this dump stops the restore before
+# anything is written. Only the psql on PATH is checked, read without the load's arguments (Debian's
+# pg_wrapper may pick another client by them); with none, the printed text names the versions. The runbook's
+# load into the built-in openwa-postgres container runs that container's psql, not this one, so the refusal
+# also names the way that load needs: this restore run in the image, whose psql reads the dump.
+psql_reads_restrict() {
+  local re='\) ([0-9]+)\.?([0-9]*)'
+  [[ $1 =~ $re ]] || return 1
+  local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]:-0}"
+  case "$major" in
+    13) [ "$minor" -ge 22 ] ;;
+    14) [ "$minor" -ge 19 ] ;;
+    15) [ "$minor" -ge 14 ] ;;
+    16) [ "$minor" -ge 10 ] ;;
+    17) [ "$minor" -ge 6 ] ;;
+    *) [ "$major" -ge 18 ] ;;
+  esac
+}
+PSQL_RESTRICT=""
+if [ -f "$STAGE/database.sql" ] && grep -q '^\\restrict ' "$STAGE/database.sql"; then
+  PSQL_RESTRICT="psql 13.22, 14.19, 15.14, 16.10, 17.6 or newer (no 12)"
+  if command -v psql >/dev/null 2>&1; then
+    PSQL_VERSION="$(psql --version 2>&1 || true)"
+    if ! psql_reads_restrict "$PSQL_VERSION"; then
+      log "ERROR: the archive's PostgreSQL dump opens with \\restrict, which this psql cannot read: $PSQL_VERSION"
+      log "       the load needs $PSQL_RESTRICT; nothing has been restored yet. Install a newer"
+      log "       PostgreSQL client or put one first on PATH (the image ships 17), then re-run"
+      log "       The runbook's load into the built-in openwa-postgres container runs that container's psql,"
+      log "       not this one: for it, run this restore in the image instead, whose psql reads the dump, as"
+      log "       docs/11-operational-runbooks.md (Restore from Backup) shows for the openwa-data volume"
+      exit 1
+    fi
+  fi
+fi
+
 # Targets resolve exactly like the app: an explicit environment value, then ./.env, then the
 # dashboard's .env.generated, else the app's ./data defaults under OPENWA_DATA_DIR. They may
 # legitimately live outside it, where the environment or ./.env says so (see archive_target). The
@@ -649,9 +699,29 @@ fi
 
 if [ -f "$STAGE/database.sql" ]; then
   cp "$STAGE/database.sql" "$DATA_DIR/database.sql"
-  log "Postgres dump present: load it into an EMPTY database, as docs/11-operational-runbooks.md"
-  log "(Restore from Backup, step 3) shows for the built-in openwa-postgres container. For an external"
-  log "server, with DATABASE_URL set to your own URL for that database:"
+  if [ -n "$PG_DUMP_SCHEMA" ]; then
+    log "Postgres dump of schema $PG_DUMP_SCHEMA (POSTGRES_SCHEMA) present. It holds that schema only: load it into"
+    log "the database the app uses, without renaming or recreating it, as the app's role, or a member of it, that may"
+    log "create schemas and extensions there and, when pg_trgm and unaccent live in that schema, owns them (the role"
+    log "that created them: the app's own, or the one an earlier load ran as), or as a superuser. The same goes for"
+    log "pgcrypto when the dump carries it, which it does only when pgcrypto lived in that schema (PostgreSQL 12 or"
+    log "older, where the app creates it there for its ids). When another role owns the schema, only a superuser can"
+    log "load it: the dump gives what is in it to the app's role before it grants that role CREATE on the schema."
+    log "After ALTER SCHEMA $PG_DUMP_SCHEMA OWNER TO <the app's role>, a new backup loads as that role. Other schemas"
+    log "in that database are left alone, and a schema $PG_DUMP_SCHEMA"
+    log "already in it is first moved aside as ${PG_DUMP_SCHEMA}_pre_restore_<time>, rows and all; pg_trgm and"
+    log "unaccent, when they live in it, are dropped from the copy with its trigram index (idx_messages_body_trgm), and"
+    log "such a pgcrypto with the copy's id column defaults, so the dump can create them again. A load that"
+    log "stops at 'cannot drop extension' means another schema uses them, and its DETAIL lines name what. When that"
+    log "is another OpenWA deployment's idx_messages_body_trgm, drop that index and load again: that deployment's"
+    log "contains search then reads its whole messages table until its next start builds the index again, and"
+    log "answers 501 while it builds. Drop anything else named first and recreate it after the load. One"
+    log "transaction: a load that fails changes nothing. With DATABASE_URL set to your own URL for that database:"
+  else
+    log "Postgres dump present: load it into an EMPTY database, as docs/11-operational-runbooks.md"
+    log "(Restore from Backup, step 3) shows for the built-in openwa-postgres container. For an external"
+    log "server, with DATABASE_URL set to your own URL for that database:"
+  fi
   # psql defaults to sslmode=prefer, which falls back to plaintext and takes any certificate, so the
   # printed command asks for the TLS mode the app uses. The restore is already done: a TLS line the
   # scripts cannot parse leaves the check on rather than stopping it.
@@ -668,7 +738,7 @@ if [ -f "$STAGE/database.sql" ]; then
       fi
     fi
   fi
-  log "  sed '/^SET transaction_timeout = 0;\$/d' $DATA_DIR/database.sql | ${PSQL_SSL}psql -v ON_ERROR_STOP=1 \"\$DATABASE_URL\""
+  log "  sed '/^SET transaction_timeout = 0;\$/d' $DATA_DIR/database.sql | ${PSQL_SSL}psql --single-transaction -v ON_ERROR_STOP=1 \"\$DATABASE_URL\""
   if [ -n "$PSQL_UNREAD" ]; then
     log "($PSQL_UNREAD could not be read from the configuration, so the command takes the stricter setting)"
   fi
@@ -678,6 +748,9 @@ if [ -f "$STAGE/database.sql" ]; then
     log "and a system CA store, which the image lacks)"
   fi
   log "(sed drops a setting this image's pg_dump 17 writes and PostgreSQL 16 rejects)"
+  if [ -n "$PSQL_RESTRICT" ]; then
+    log "(the load needs $PSQL_RESTRICT: the dump opens with \\restrict, where an older one stops and loads nothing)"
+  fi
 fi
 
 log "Restore complete. Start the app and confirm an existing API key still authenticates."

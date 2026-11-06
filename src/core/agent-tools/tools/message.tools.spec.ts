@@ -379,6 +379,34 @@ describe('messageTools', () => {
     expect(sendText).not.toHaveBeenCalled();
   });
 
+  it('forwards a preview image, and refuses an image URL that is not http(s)', async () => {
+    const sendText = jest.fn().mockResolvedValue({ id: 'm1' });
+    const tools = makeTools({ sendText } as unknown as MessageService);
+    const preview = { url: 'https://example.com/launch', title: 'We just launched' };
+
+    await run(tools.get('MessageSendText')!, {
+      sessionId: 's1',
+      chatId: '628111@c.us',
+      text: 'see https://example.com/launch',
+      customLinkPreview: { ...preview, thumbnailUrl: 'https://cdn.example/a.jpg' },
+    });
+    expect(sendText).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ customLinkPreview: { ...preview, thumbnailUrl: 'https://cdn.example/a.jpg' } }),
+    );
+
+    sendText.mockClear();
+    await expect(
+      run(tools.get('MessageSendText')!, {
+        sessionId: 's1',
+        chatId: '628111@c.us',
+        text: 'see https://example.com/launch',
+        customLinkPreview: { ...preview, thumbnailUrl: 'file:///etc/passwd' },
+      }),
+    ).rejects.toBeDefined();
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
   it('tags a sticker too, now that both adapters carry the list', async () => {
     // Excluded when this tool set was written, because neither adapter built a mention list for a
     // sticker. Both do now, and the route has always accepted the field, so withholding it here

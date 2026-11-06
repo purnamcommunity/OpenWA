@@ -499,6 +499,13 @@ export type HookEvent =
 timestamps and so on), never the stored `proxyUrl` or `config`; `session:deleted` carries
 `{ id, name, phone, pushName }`.
 
+`webhook:delivered` fires after every successful POST (a queued job, the direct path, or the direct fallback
+after a failed queue add). `webhook:after` is legacy: it fires only after a successful direct or fallback POST,
+always with `success: true`. `webhook:error` fires when a dispatch did not deliver: retries exhausted, a job
+that stalled out, a dispatch shed or refused before sending, or a failed queue add. It is not always final: a
+failed queue add is followed by a direct fallback, and a shed dispatch stays in the outbox for a later replay
+under a new `deliveryId`, so either can still end in `webhook:delivered`.
+
 ### Hook context and result
 
 ```typescript
@@ -614,16 +621,30 @@ phase, waits included, is capped at 10 s; a plugin still running at the cap is t
 process. New enables are refused once teardown starts. A disable that arrives while the same plugin is
 still being disabled (shutdown overlapping a REST disable, an uninstall or an update unload) joins the
 running teardown, so `onDisable` runs once; an unload that joins this way gets no worker-side `onUnload`.
-`uninstallPlugin` disables + unloads, deletes the plugin's directory and its `ctx.storage` data dir, and
-drops the registry entry last (built-ins are protected and cannot be uninstalled). A package or storage
-folder that cannot be removed fails the uninstall and leaves the entry, so the same call can be repeated.
-The unload path
+`uninstallPlugin` first stores the plugin's registry entry emptied of its config, session activation,
+per-session config and enable decision, then disables + unloads, deletes the plugin's directory and its
+`ctx.storage` data dir, and drops the entry last (built-ins are protected and cannot be uninstalled). A
+`registry.json` that cannot take the first write refuses the uninstall with nothing changed. A package or
+storage folder that cannot be removed fails the uninstall and leaves the emptied entry, so the same call can
+be repeated, and a package left behind boots disabled, configured only by what its enabled integration
+instances project onto it at boot (see below); such a failure is still audited, as
+`plugin_uninstalled` with `partial: true` and the error. When only the final delete fails, the answer is a
+success that says the emptied entry stayed and names the call to repeat: a reinstall of the id gets nothing
+back from that entry, a restart only reports it as a plugin with no code, and the same call removes it once the
+registry is writable. While the unload runs, a config, per-session config or session-activation write to the
+plugin is refused, so none lands in the emptied entry: the plugin API answers it `409`, and an integration
+instance projection records the warn audit row of any binding it could not apply. The unload path
 dispatches `onUnload`: for a sandboxed plugin it runs in the worker between `onDisable` and terminate
 (a plain disable does NOT fire `onUnload`; disable is reversible and its cleanup hook is `onDisable`).
 Uninstall also hands every chat the plugin had taken over back to the bot. The plugin's integration
 instances, with their encrypted secrets, and its stored deliveries stay in the database, so a reinstall finds
-its provider webhooks still pointing at live instance ids; remove an instance for good with
-`DELETE /api/integration/plugins/:pluginId/instances/:instanceId`, which works with the plugin gone.
+its provider webhooks still pointing at live instance ids. They also outlive the emptied registry entry: every
+boot that loads the id (after a reinstall, or with a package a part-way uninstall left behind) projects every
+enabled instance back onto the plugin and into `registry.json`, its config into
+the per-session config of its scope (a wildcard instance's into the base config, secrets included) and its
+scope into the session activation. Remove an instance for good, before the reinstall when it should start
+with none of them, with `DELETE /api/integration/plugins/:pluginId/instances/:instanceId`, which works with
+the plugin gone.
 
 **Context.** `PluginCapabilityContext.createPluginContext` (`src/core/plugins/plugin-capability-context.ts`) builds the `PluginContext` (§19.4): a per-plugin logger,
 `registerHook` (wrapped with the per-session activation gate), `registerWebhook`, the live

@@ -747,16 +747,25 @@ describe('WebhookService', () => {
       (configService.get as jest.Mock).mockImplementation((key: string, def?: unknown) =>
         key === 'webhook.failurePayloadRetentionHours' ? 24 : def,
       );
-      (failureRepository.find as jest.Mock)
-        .mockResolvedValueOnce([{ id: 'f1' }, { id: 'f2' }])
-        .mockResolvedValueOnce([{ id: 'f2' }]);
+      const page = [
+        { id: 'f1', webhookId: 'w1', sessionId: 's1' },
+        { id: 'f2', webhookId: 'w1', sessionId: 's1' },
+      ];
+      (failureRepository.find as jest.Mock).mockResolvedValueOnce(page).mockResolvedValueOnce([{ id: 'f2' }]);
+      (repository.find as jest.Mock).mockResolvedValue([{ id: 'w1', sessionId: 's1' }]);
 
       const out = await service.listDeliveryFailures({});
 
       expect(out).toEqual([
-        { id: 'f1', replayable: false },
-        { id: 'f2', replayable: true },
+        { ...page[0], replayable: false },
+        { ...page[1], replayable: true },
       ]);
+      // The webhooks of the rows that hold a payload are read once, id and session only.
+      expect(repository.find).toHaveBeenCalledTimes(1);
+      expect(repository.find).toHaveBeenCalledWith({
+        select: { id: true, sessionId: true },
+        where: { id: In(['w1']) },
+      });
       const second = ((failureRepository.find as jest.Mock).mock.calls as unknown[][])[1][0] as {
         select: Record<string, boolean>;
         where: Record<string, unknown>;

@@ -1,4 +1,10 @@
-import { BadRequestException, Injectable, OnApplicationShutdown, ServiceUnavailableException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  OnApplicationShutdown,
+  OnModuleInit,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -14,11 +20,15 @@ import {
   FfmpegSpawnError,
   killRunningConversions,
   probeFfmpeg,
+  removeStaleConversionDirs,
   runFfmpeg,
   videoEncodeArgs,
   voiceEncodeArgs,
 } from './ffmpeg';
 import type { ConvertMediaDto } from './dto/convert-media.dto';
+
+/** Youngest leftover conversion directory the start-up sweep removes. */
+const STALE_CONVERSION_DIR_MIN_AGE_MS = 60 * 60 * 1000;
 
 /** What a conversion produced, in the same url-or-base64 vocabulary the send endpoints speak. */
 export interface ConvertedMedia {
@@ -31,7 +41,7 @@ export interface ConvertedMedia {
 }
 
 @Injectable()
-export class MediaConversionService implements OnApplicationShutdown {
+export class MediaConversionService implements OnModuleInit, OnApplicationShutdown {
   private readonly logger = createLogger('MediaConversionService');
   /**
    * Result of the binary probe. Only a successful probe is kept: a failure can be a timeout or a
@@ -55,6 +65,18 @@ export class MediaConversionService implements OnApplicationShutdown {
   ) {
     const concurrency = this.configService.get<number>('mediaConversion.concurrency', 2);
     this.ffmpegGate = new ConcurrencyLimiter(concurrency, concurrency * 4);
+  }
+
+  /**
+   * Clear what a previous process killed mid-conversion left in the temp dir. Not awaited, so a slow or
+   * failing temp dir never holds up the boot. Twice the conversion timeout, and never under an hour, is older
+   * than any conversion still running under the same settings in a process that shares the temp dir.
+   */
+  onModuleInit(): void {
+    const timeoutMs = this.configService.get<number>('mediaConversion.timeoutMs', 60_000);
+    void removeStaleConversionDirs(Math.max(STALE_CONVERSION_DIR_MIN_AGE_MS, 2 * timeoutMs), (message, error) =>
+      this.logger.warn(message, { error: String(error) }),
+    );
   }
 
   /**

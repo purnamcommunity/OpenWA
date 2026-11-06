@@ -4,6 +4,7 @@ import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import type { Server } from 'http';
 import { EventEmitter } from 'events';
+import { Readable } from 'stream';
 import { MessageController } from './message.controller';
 import { MessageService } from './message.service';
 import { BulkMessageService } from './bulk-message.service';
@@ -113,7 +114,10 @@ describe('MessageController - message-time selection', () => {
  * controller passed every suite in the repo.
  */
 describe('MessageController — stored media download', () => {
-  const getChatMedia = jest.fn().mockResolvedValue({ buffer: Buffer.from('GIF89a'), mimetype: 'image/gif' });
+  // A fresh stream per call: the service hands over an opened file, which can be read once.
+  const getChatMedia = jest.fn(() =>
+    Promise.resolve({ stream: Readable.from([Buffer.from('GIF89a')]), size: 6, mimetype: 'image/gif' }),
+  );
   const controller = new MessageController(
     { getChatMedia } as unknown as MessageService,
     {} as unknown as BulkMessageService,
@@ -162,7 +166,8 @@ describe('MessageController — stored media download', () => {
     const body = await controller.getChatMedia('session-1', '628123@c.us', 'msg-1', res);
 
     expect(body).toBeInstanceOf(StreamableFile);
-    expect(body.getStream().read()).toEqual(Buffer.from('GIF89a'));
+    expect(body.getHeaders().length).toBe(6);
+    expect(Buffer.concat(await body.getStream().toArray())).toEqual(Buffer.from('GIF89a'));
   });
 });
 
@@ -441,12 +446,24 @@ describe('MessageController - caller-supplied batch ids', () => {
 // MessageService.getEngine() answers 400 for a session with no live engine; clients generated from
 // the OpenAPI contract need it declared on the read routes too.
 describe('MessageController OpenAPI error responses', () => {
-  it.each(['getChatHistory', 'getReactions'])('%s declares 400', method => {
+  it.each(['getChatHistory', 'getReactions', 'getReceipts'])('%s declares 400', method => {
     const responses = Reflect.getMetadata(
       'swagger/apiResponse',
       Object.getOwnPropertyDescriptor(MessageController.prototype, method)!.value as object,
     ) as Record<string, unknown>;
     expect(Object.keys(responses)).toContain('400');
+  });
+
+  it('getReceipts delegates to messageService.getMessageReceipts', async () => {
+    const getMessageReceipts = jest.fn().mockResolvedValue({ delivery: [], read: [], played: [] });
+    const ctrl = new MessageController(
+      { getMessageReceipts } as unknown as MessageService,
+      {} as unknown as BulkMessageService,
+      new ChatScopeService(),
+    );
+    const res = await ctrl.getReceipts('s1', 'c1', 'm1');
+    expect(getMessageReceipts).toHaveBeenCalledWith('s1', 'c1', 'm1');
+    expect(res).toEqual({ delivery: [], read: [], played: [] });
   });
 
   // An unknown message answers 404 (MessageNotFoundError), which these routes declare on its own, so

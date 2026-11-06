@@ -35,6 +35,7 @@ import {
 } from '../../utils/chatMessages';
 import { shouldFetchOlderMessages } from '../../utils/scrollDecision';
 import { keepsSameKey } from '../../utils/authLifecycle';
+import { retryThrottled } from '../../utils/fetchAllPages';
 import ArchivedMediaPreview, { type ArchivedMediaKind } from './ArchivedMediaPreview';
 import MessageBody from './MessageBody';
 
@@ -278,7 +279,15 @@ function ChatThread({
       let objectUrl: string | null = null;
       const sameKey = keepsSameKey();
       try {
-        const blob = await sessionApi.getMessageMediaBlob(sessionId, activeChat.id, messageId);
+        // A 429 and the 503 of a full S3 download pool are refusals to try again, as the archived previews do.
+        const blob = await retryThrottled(
+          () => {
+            if (!sameKey()) throw new DOMException('Aborted', 'AbortError');
+            return sessionApi.getMessageMediaBlob(sessionId, activeChat.id, messageId);
+          },
+          1000,
+          [429, 503],
+        );
         if (!sameKey()) return;
         objectUrl = URL.createObjectURL(blob);
         const link = document.createElement('a');
@@ -293,6 +302,7 @@ function ChatThread({
           return next;
         });
       } catch {
+        if (!sameKey()) return;
         // 404 covers every "there are no bytes" case the route documents (URL-based send, media
         // download disabled, over the inbound cap). Say so on the bubble rather than failing mutely.
         setMediaFetch(prev => ({ ...prev, [messageId]: 'failed' }));
@@ -607,7 +617,8 @@ function ChatThread({
               // `archived` marks a copy MESSAGE_INLINE_MEDIA=archive moved off the row once the archive
               // store held it: the bubble rendered inline before, so it previews inline still, fetched
               // lazily from the same route. Documents keep the button (there is nothing to preview),
-              // and so does a plain over-budget marker, see ArchivedMediaPreview for why.
+              // and so does a plain over-budget marker, see ArchivedMediaPreview for why. So does a marker
+              // with no `mediaPath`: retention deleted the archived copy, and the fetch would only 404.
               const previewKind: ArchivedMediaKind | null =
                 msg.type === 'image' || msg.type === 'sticker'
                   ? 'image'
@@ -617,7 +628,7 @@ function ChatThread({
                       ? 'audio'
                       : null;
               const waMessageId = msg.waMessageId;
-              if (mediaInfo.archived && previewKind && sessionId && waMessageId) {
+              if (mediaInfo.archived && msg.mediaPath && previewKind && sessionId && waMessageId) {
                 return (
                   <ArchivedMediaPreview
                     key={`${sessionId}:${activeChat.id}:${waMessageId}`}
@@ -641,6 +652,8 @@ function ChatThread({
             switch (msg.type) {
               case 'image':
               case 'sticker':
+                // A control of its own, as an archived preview is (ArchivedMediaPreview): the bubble's keys only move
+                // between messages, so without this the viewer opens for a pointer alone.
                 return (
                   <div className="message-media-image">
                     <img
@@ -649,7 +662,16 @@ function ChatThread({
                       className="chat-image-media"
                       ref={measureMedia}
                       onLoad={onMediaLoad}
+                      role="button"
+                      aria-haspopup="dialog"
+                      tabIndex={0}
                       onClick={() => onOpenImage(msg.id)}
+                      onKeyDown={event => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          onOpenImage(msg.id);
+                        }
+                      }}
                     />
                   </div>
                 );

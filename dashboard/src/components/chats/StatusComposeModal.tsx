@@ -197,12 +197,18 @@ function StatusComposeModal({ sessionId, onClose, onPosted }: Props) {
       }
     >
       <div className="compose-type-toggle">
-        <button type="button" className={composeType === 'text' ? 'active' : ''} onClick={() => setComposeType('text')}>
+        <button
+          type="button"
+          className={composeType === 'text' ? 'active' : ''}
+          aria-pressed={composeType === 'text'}
+          onClick={() => setComposeType('text')}
+        >
           {t('chats.status.composeText')}
         </button>
         <button
           type="button"
           className={composeType === 'image' ? 'active' : ''}
+          aria-pressed={composeType === 'image'}
           onClick={() => setComposeType('image')}
         >
           {t('chats.status.composeImage')}
