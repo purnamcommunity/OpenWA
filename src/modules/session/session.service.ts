@@ -50,6 +50,7 @@ import {
   resolveReconnectConfig,
 } from './session-engine-lifecycle.service';
 import { SessionOwnershipService } from './session-ownership.service';
+import { sessionNotFound } from './session-id.pipe';
 import { paginate, ListOptions, resolveListWindow } from '../../common/utils/paginate';
 import { ListingMemo } from '../../common/utils/listing-memo';
 import { isTransientDbError, isUniqueViolation } from '../../common/utils/db-errors';
@@ -70,6 +71,7 @@ import { chatKind, parseWaId } from '../../engine/identity/wa-id';
 import { Message, MessageDirection } from '../message/entities/message.entity';
 import { ServerShuttingDownException, SessionStoppedException } from './session-engine-controls';
 import { phoneKey } from './message-mutation-guard';
+import { ownAccountIds } from '../../engine/adapters/baileys-stored-chat-previews.service';
 // Type-only: the module binds this class to PLUGIN_SESSION_PORT with a `useExisting` alias, which
 // TypeScript does not check, so `implements` is what keeps the two in step.
 import type { PluginSessionPort } from '../../core/plugins/plugin-host-ports';
@@ -145,6 +147,8 @@ export interface SessionListOptions extends ListOptions {
  */
 interface StopRequest {
   kind: 'stop' | 'delete';
+  /** The stamp of the stop mark set with this request. Each request of a session holds a mark of its own. */
+  mark?: number;
   /** From one sequence shared by every session, so a number is never issued twice. */
   seq: number;
   state: 'pending' | 'taken' | 'withdrawn';
@@ -620,7 +624,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   async findOne(id: string): Promise<Session> {
     const session = await this.sessionRepository.findOne({ where: { id } });
     if (!session) {
-      throw new NotFoundException(`Session with id '${id}' not found`);
+      throw sessionNotFound(id);
     }
     return this.attachRuntimeState(session);
   }
@@ -684,7 +688,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         .where('session.id = :id', { id })
         .getRawOne<{ config: string | null }>();
       if (!row) {
-        throw new NotFoundException(`Session with id '${id}' not found`);
+        throw sessionNotFound(id);
       }
       const stored = row.config;
       const config = { ...((stored ? JSON.parse(stored) : null) as Record<string, unknown> | null) };
@@ -739,6 +743,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return projectSessionProxy(session);
   }
 
+  /**
+   * The row a delete is about to remove, read first for its audit record. Nothing is marked or taken down yet, so a
+   * database failure here deleted nothing and answers the retryable 503 the delete's own claim answers.
+   */
+  findOneForDelete(id: string): Promise<Session> {
+    return this.checkedBefore('delete', id, () => this.findOne(id));
+  }
+
   /** Record removal + engine retirement + credential purge: owned by the lifecycle service. */
   async delete(id: string): Promise<void> {
     // Set the tearing-down mark SYNCHRONOUSLY, before the ownership fence's awaited query. The
@@ -767,7 +779,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         }
         // A failed write took nothing down, so the mark is dropped and the request withdrawn as for a failed claim.
         await this.keepDownForDelete(id, stops, ownsClaim).catch((error: unknown) => {
-          this.engineLifecycle.clearStopping(id);
+          this.dropStopMark(id, request);
           this.withdrawStop(request);
           throw error;
         });
@@ -775,6 +787,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         // it found it and withdraws its request, so a start it overlapped does not take it for a stop.
         await this.engineLifecycle
           .delete(id, {
+            mark: request.mark,
             ownsClaim,
             onRemoving: () => {
               this.takeStop(request);
@@ -796,10 +809,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // The row survived. A claim left on it lapses with nothing to renew it, and a peer would then
       // adopt and restart the session the operator was deleting.
       if (claimed) await this.releaseAfterTeardown(id, ownsClaim);
-      this.discardStopMarkForMissingSession(id, error);
+      this.discardStopMarkForMissingSession(id, request, error);
+      this.engineLifecycle.settleStopping(id, request.mark);
       throw error;
     }
     await this.leaveDelete(id, request, ownsClaim);
+    this.engineLifecycle.settleStopping(id, request.mark);
   }
 
   /**
@@ -847,7 +862,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     try {
       claimed = await ownership.claim(id, onClaimed);
     } catch (error) {
-      this.engineLifecycle.clearStopping(id);
+      this.dropStopMark(id, request);
       this.withdrawStop(request);
       this.logger.warn(`Could not claim session ${id} for the delete; nothing was deleted`, {
         sessionId: id,
@@ -859,7 +874,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     if (claimed) return;
     this.withdrawStop(request);
     // The claim is a conditional UPDATE, so an id with no row matches nothing too: answer its 404.
-    await this.findOne(id);
+    try {
+      await this.checkedBefore('delete', id, () => this.findOne(id));
+    } catch (error) {
+      // The delete set its stop mark before it knew whether the row exists: a read that fails leaves nothing to guard.
+      this.dropStopMark(id, request);
+      throw error;
+    }
     throw new ConflictException(`Session ${id} is running on another node`);
   }
 
@@ -938,9 +959,36 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * The stop request set on the same tick needs nothing here: the read or claim that answered 404
    * withdrew it, and a withdrawn request goes when its call returns.
    */
-  private discardStopMarkForMissingSession(id: string, error: unknown): void {
+  private discardStopMarkForMissingSession(id: string, request: StopRequest, error: unknown): void {
     if (!(error instanceof NotFoundException)) return;
-    this.engineLifecycle.clearStopping(id);
+    this.dropStopMark(id, request);
+    this.engineLifecycle.clearFinishedStops(id);
+  }
+
+  /**
+   * A database failure while a start, stop or delete is still deciding whether it may act (the reads behind its 404 and
+   * its 409) has launched, stopped and deleted nothing, so it answers the retryable 503 a failed claim write does
+   * rather than a 500. Anything else comes back as it was: a refusal (an HttpException, whose text can quote an id
+   * that spells a driver message) and a statement the database rejected, which a retry cannot fix. Never
+   * ServerShuttingDownException: boot auto-start and the takeover sweep stop on that one.
+   */
+  private unavailableIfDatabaseDown(error: unknown, verb: 'start' | 'stop' | 'delete', id: string): unknown {
+    if (error instanceof HttpException || !isTransientDbError(error)) return error;
+    const done = { start: 'started', stop: 'stopped', delete: 'deleted' }[verb];
+    this.logger.warn(`Could not check session ${id} for the ${verb}; nothing was ${done}`, {
+      sessionId: id,
+      action: `session_${verb}_check_failed`,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return new ServiceUnavailableException(`Session ${id} could not be checked for the ${verb}; nothing was ${done}`);
+  }
+
+  private async checkedBefore<T>(verb: 'start' | 'stop' | 'delete', id: string, read: () => Promise<T>): Promise<T> {
+    try {
+      return await read();
+    } catch (error) {
+      throw this.unavailableIfDatabaseDown(error, verb, id);
+    }
   }
 
   /**
@@ -961,9 +1009,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // in-flight start() can tell a stop that happened from one that did not; one left standing
     // cancels that start and leaves the session down with nothing to restart it.
     const heldElsewhere = await this.ownership?.isHeldByOtherNode(id).catch((error: unknown) => {
-      this.engineLifecycle.clearStopping(id);
+      this.dropStopMark(id, request);
       this.withdrawStop(request);
-      throw error;
+      throw this.unavailableIfDatabaseDown(error, request.kind, id);
     });
     if (heldElsewhere) {
       this.withdrawStop(request);
@@ -991,10 +1039,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       holders.delete(id);
       if (holders.size >= max) {
         // Same answer the failed claim below would give, so the cap does not mask a 404 or a 409.
-        await this.findOne(id);
-        if (await this.ownership.isHeldByOtherNode(id)) {
-          throw new ConflictException(`Session ${id} is running on another node`);
-        }
+        const ownership = this.ownership;
+        await this.checkedBefore('start', id, async () => {
+          await this.findOne(id);
+          if (await ownership.isHeldByOtherNode(id)) {
+            throw new ConflictException(`Session ${id} is running on another node`);
+          }
+        });
         throw new BadRequestException(`Maximum concurrent sessions reached (${max})`);
       }
     }
@@ -1063,7 +1114,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       throw new ServiceUnavailableException(`Session ${id} could not be claimed for the start; nothing was started`);
     }
     if (claimed) return;
-    await this.findOne(id);
+    await this.checkedBefore('start', id, () => this.findOne(id));
     throw new ConflictException(`Session ${id} is running on another node`);
   }
 
@@ -1150,10 +1201,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // the request withdrawn as for a failed ownership read; a failed read took nothing down either,
       // and the lifecycle has already dropped the mark, so only the request is withdrawn.
       session = await this.engineLifecycle.stop(id, {
+        mark: request.mark,
         afterRead: () => {
           this.takeStop(request);
           return this.keepDown(id).catch((error: unknown) => {
-            this.engineLifecycle.clearStopping(id);
+            this.dropStopMark(id, request);
             this.withdrawStop(request);
             throw error;
           });
@@ -1166,10 +1218,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // would adopt the row and start the session the operator just stopped. A released claim is
       // not adopted. The foreign-node 409 keeps its claim (it is the peer's), and so does a 404.
       if (error instanceof BadGatewayException) await this.releaseAfterTeardown(id);
-      this.discardStopMarkForMissingSession(id, error);
+      this.discardStopMarkForMissingSession(id, request, error);
       throw error;
     } finally {
       this.endStop(id, request);
+      this.engineLifecycle.settleStopping(id, request.mark);
     }
     // Handed back on the way out so a peer can pick it up immediately rather than waiting for the
     // lease to lapse. Stop is the deliberate end of this process's ownership — but a start() that
@@ -1304,8 +1357,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
   private markStopping(id: string, kind: StopRequest['kind']): StopRequest {
     const request = this.requestStop(id, kind);
-    this.engineLifecycle.markStopping(id);
+    request.mark = this.engineLifecycle.markStopping(id);
     return request;
+  }
+
+  /** Drop the stop mark this request set. The marks of other stops and deletes of the session stay. */
+  private dropStopMark(id: string, request: StopRequest): void {
+    this.engineLifecycle.clearStopping(id, request.mark);
   }
 
   /** Issue a stop request for the session; the caller withdraws, takes and ends exactly this one. */
@@ -1640,7 +1698,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
     const authors = await this.groupAuthors(id, chatId, messageIds);
     return engine
-      .sendSeen(chatId, messageIds, authors, this.storedLastMessage(id, chatId, { receivedOnly: true }))
+      .sendSeen(chatId, messageIds, authors, this.storedLastMessage(id, chatId, engine, { receivedOnly: true }))
       .finally(() => this.chatListings.drop(id));
   }
 
@@ -1675,7 +1733,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.markUnread(chatId, this.storedLastMessage(id, chatId)).finally(() => this.chatListings.drop(id));
+    return engine
+      .markUnread(chatId, this.storedLastMessage(id, chatId, engine))
+      .finally(() => this.chatListings.drop(id));
   }
 
   /**
@@ -1683,15 +1743,26 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * holds none for the chat itself (Baileys after a restart, #1891). The lookup runs only when the
    * engine calls it, and covers every id form of the chat (the GET messages filter's rules).
    *
+   * Only the account `engine` is linked to counts, as in the chat list: the table outlives an unlink, so
+   * a session linked to another number still holds the rows of the one before, and a key naming one of
+   * those names a message the linked phone never held. The engine knows the account from its credentials
+   * (`sessions.phone` is a control flag that an unlink clears), and it is the engine that builds the
+   * write from the answer, so it is asked, not whichever engine the registry holds by then. A received
+   * message names the account in `to`, a sent one in `from`; with no account known, none is answered.
+   *
    * A received group message counts only with its sender, which the key needs; `receivedOnly` asks
    * for the newest received message, the one a read receipt acknowledges.
    */
   private storedLastMessage(
     sessionId: string,
     chatId: string,
+    engine: IWhatsAppEngine,
     { receivedOnly = false }: { receivedOnly?: boolean } = {},
   ): StoredChatMessageLookup {
     return async () => {
+      const linkedPhone = engine.getPhoneNumber();
+      if (!linkedPhone) return null;
+      const own = In(ownAccountIds(linkedPhone));
       const expanded = await resolveJidCandidates(chatId, {
         resolveLid: lid => this.lidMappingStore.findPhoneForLid(lid),
         lidsForPhone: phone => this.lidMappingStore.findLidsForPhone(phone),
@@ -1702,14 +1773,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         waMessageId: Not(IsNull()),
         timestamp: Not(IsNull()),
       };
-      const received = { ...base, direction: MessageDirection.INCOMING };
+      const received = { ...base, direction: MessageDirection.INCOMING, to: own };
+      const sent = { ...base, direction: MessageDirection.OUTGOING, from: own };
       const where: FindOptionsWhere<Message>[] =
         parseWaId(chatId).kind === 'group'
-          ? [
-              { ...received, author: Not(IsNull()) },
-              ...(receivedOnly ? [] : [{ ...base, direction: MessageDirection.OUTGOING }]),
-            ]
-          : [receivedOnly ? received : base];
+          ? [{ ...received, author: Not(IsNull()) }, ...(receivedOnly ? [] : [sent])]
+          : receivedOnly
+            ? [received]
+            : [received, sent];
       const row = await this.messageRepository.findOne({
         where,
         order: { timestamp: 'DESC', createdAt: 'DESC' },
@@ -1760,7 +1831,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
     const cutoff = new Date();
     const ok = await engine
-      .clearChatMessages(chatId, this.storedLastMessage(id, chatId))
+      .clearChatMessages(chatId, this.storedLastMessage(id, chatId, engine))
       .finally(() => this.chatListings.drop(id));
     if (ok) await this.purgeStoredChat(id, chatId, cutoff);
     return ok;
@@ -1776,7 +1847,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const engine = this.requireEngine(id);
 
     return engine
-      .archiveChat(chatId, archive, this.storedLastMessage(id, chatId))
+      .archiveChat(chatId, archive, this.storedLastMessage(id, chatId, engine))
       .finally(() => this.chatListings.drop(id));
   }
 
@@ -1810,7 +1881,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
     const cutoff = new Date();
     const ok = await engine
-      .deleteChat(chatId, this.storedLastMessage(id, chatId))
+      .deleteChat(chatId, this.storedLastMessage(id, chatId, engine))
       .finally(() => this.chatListings.drop(id));
     if (ok) await this.purgeStoredChat(id, chatId, cutoff);
     return ok;

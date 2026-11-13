@@ -1,4 +1,5 @@
 import { SessionErrorStore } from './session-error-store.service';
+import { LoggerService } from '../../common/services/logger.service';
 import { SessionRestrictionStore } from './session-restriction-store.service';
 import { PresenceStore } from './presence-store.service';
 import { Test, TestingModule } from '@nestjs/testing';
@@ -22,6 +23,7 @@ import { ConfigService } from '@nestjs/config';
 import { SessionService, AUTOSTART_SHUTDOWN_WAIT_MS, AUTOSTART_THROTTLE_MS } from './session.service';
 import { SessionOwnershipService } from './session-ownership.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
+import { AuditAction } from '../audit/entities/audit-log.entity';
 import {
   SESSION_DELETE_BATCH_MIN_SQLITE,
   SESSION_DELETE_BATCH_SIZE_POSTGRES,
@@ -134,6 +136,9 @@ function chainableQuery(): Record<string, jest.Mock> {
   }
   return query;
 }
+
+/** The number the mock engine is linked to; the stored-message lookups keep only the rows that name it. */
+const OWN_PHONE = '628444';
 
 describe('SessionService', () => {
   let service: SessionService;
@@ -256,6 +261,7 @@ describe('SessionService', () => {
       getContactStatuses: jest.fn().mockResolvedValue([]),
       getChatHistory: jest.fn().mockResolvedValue([]),
       getContactById: jest.fn().mockResolvedValue(null),
+      getPhoneNumber: jest.fn().mockReturnValue(OWN_PHONE),
     };
 
     engineFactory = {
@@ -2865,7 +2871,7 @@ describe('SessionService', () => {
       ownership.isHeldByOtherNode.mockRejectedValue(new Error('Connection terminated unexpectedly'));
       const stopping = (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
 
-      await expect(call(service)).rejects.toThrow('Connection terminated unexpectedly');
+      await expect(call(service)).rejects.toBeInstanceOf(ServiceUnavailableException);
 
       expect(stopping.has('sess-uuid-1')).toBe(false);
     });
@@ -3213,7 +3219,7 @@ describe('SessionService', () => {
             jest
               .spyOn(ownership, 'isHeldByOtherNode')
               .mockRejectedValueOnce(new Error('Connection terminated unexpectedly')),
-          'Connection terminated unexpectedly',
+          ServiceUnavailableException,
         ],
         [
           'refused for a live peer',
@@ -5692,6 +5698,55 @@ describe('SessionService', () => {
       expect(result.lastError).toMatch(/^Reconnecting after a dropped connection \(attempt 5, down for /);
     });
 
+    // The attempt count says a session is stuck, not where. The engine reports how far the connection that
+    // closed last had got, and the sentence naming it is what an operator without the logs gets to read.
+    it.each([
+      ['connecting', 'The last connection closed before it reached WhatsApp.'],
+      ['registration', 'The last connection closed while the session waited to be linked.'],
+      ['linked', 'The last connection closed right after the link was accepted.'],
+      ['login_unconfirmed', 'The last connection closed before WhatsApp confirmed the login.'],
+      ['login_confirmed', 'The last connection closed after WhatsApp confirmed the login, before the session opened.'],
+      ['open', 'The last connection had opened before it closed.'],
+    ] as const)('adds where the last connection closed to lastError: %s', async (stage, sentence) => {
+      const callbacks = await startAndCapture();
+      const sessionErrors = (service as unknown as { sessionErrors: SessionErrorStore }).sessionErrors;
+      const now = jest.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+      try {
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          callbacks.onReconnecting?.(attempt, 60_000, { stage, statusCode: 428, aliveMs: 30_000 });
+        }
+      } finally {
+        now.mockRestore();
+      }
+
+      expect(sessionErrors.get('sess-uuid-1')).toBe(
+        `Reconnecting after a dropped connection (attempt 5, down for 0s). ${sentence}`,
+      );
+    });
+
+    it('names the stage and the close code on the loop warning, and neither when the engine gave none', async () => {
+      const callbacks = await startAndCapture();
+      const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+      const loopWarnings = (): Array<Record<string, unknown>> =>
+        (warn.mock.calls as Array<[string, Record<string, unknown> | undefined]>)
+          .filter(call => call[1]?.action === 'reconnect_loop')
+          .map(call => call[1] as Record<string, unknown>);
+      try {
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          callbacks.onReconnecting?.(attempt, 60_000, { stage: 'login_unconfirmed', statusCode: 428, aliveMs: 30_000 });
+        }
+        for (let attempt = 6; attempt <= 10; attempt++) callbacks.onReconnecting?.(attempt, 60_000);
+
+        const [withContext, without] = loopWarnings();
+        expect(withContext).toMatchObject({ attempts: 5, stage: 'login_unconfirmed', statusCode: 428 });
+        expect(without).toMatchObject({ attempts: 10 });
+        expect(without).not.toHaveProperty('stage');
+        expect(without).not.toHaveProperty('statusCode');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
     it('keeps lastError current on every attempt past the fifth, while the alert stays on its cadence', async () => {
       const callbacks = await startAndCapture();
       (webhookService.dispatch as jest.Mock).mockClear();
@@ -6013,6 +6068,68 @@ describe('SessionService', () => {
       );
       (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ status: SessionStatus.READY }));
       expect((await service.findOne('sess-uuid-1')).restriction).toEqual(timelock);
+    });
+
+    // WhatsApp asking for a passkey reaches the session while it still shows its QR, and no status change
+    // comes with it: the restriction is the only channel that tells the API, the dashboard and a webhook
+    // consumer. The engine reports it once per socket, so the dedupe keeps every later scan quiet.
+    describe('a passkey requirement while linking', () => {
+      const passkey = { kind: 'passkey_required' as const, code: 'passkey_prologue_request' };
+
+      it('is announced once, served on the session while it waits at its QR, and not announced again', async () => {
+        const callbacks = await startAndCapture();
+        (webhookService.dispatch as jest.Mock).mockClear();
+
+        callbacks.onAccountRestriction?.(passkey);
+        callbacks.onAccountRestriction?.(passkey);
+
+        const restrictionDispatches = ((webhookService.dispatch as jest.Mock).mock.calls as unknown[][]).filter(
+          c => c[1] === 'session.restriction',
+        );
+        expect(restrictionDispatches).toEqual([
+          [
+            'sess-uuid-1',
+            'session.restriction',
+            {
+              sessionId: 'sess-uuid-1',
+              active: true,
+              kind: 'passkey_required',
+              code: 'passkey_prologue_request',
+              expiresAt: null,
+            },
+          ],
+        ]);
+        expect(eventsGateway.emitSessionRestriction).toHaveBeenCalledTimes(1);
+        (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ status: SessionStatus.QR_READY }));
+        expect((await service.findOne('sess-uuid-1')).restriction).toEqual(passkey);
+      });
+
+      it('is lifted, with the same webhook a lifted block gets, when a link finally completes', async () => {
+        const callbacks = await startAndCapture();
+        callbacks.onAccountRestriction?.(passkey);
+        (webhookService.dispatch as jest.Mock).mockClear();
+
+        callbacks.onReady?.('628123', 'Tester');
+
+        expect(webhookService.dispatch).toHaveBeenCalledWith('sess-uuid-1', 'session.restriction', {
+          sessionId: 'sess-uuid-1',
+          active: false,
+          kind: 'passkey_required',
+          code: 'passkey_prologue_request',
+          expiresAt: null,
+        });
+        (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ status: SessionStatus.READY }));
+        expect((await service.findOne('sess-uuid-1')).restriction).toBeNull();
+      });
+
+      it('moves no status: the session keeps showing the QR it is waiting on', async () => {
+        const callbacks = await startAndCapture();
+        (repository.update as jest.Mock).mockClear();
+
+        callbacks.onAccountRestriction?.(passkey);
+
+        expect(repository.update).not.toHaveBeenCalled();
+      });
     });
 
     // Detection must not move the session's status: a timelocked account is still connected and
@@ -6390,13 +6507,13 @@ describe('SessionService', () => {
       }
     });
 
-    // The audit row is a disconnect side effect like the webhook and the socket emit, so it belongs
-    // behind the SAME post-await identity fence. Superseding before the call would only exercise the
-    // wiring's entry check, which would pass wherever the emit sat — so supersede the engine while
-    // the handler is parked on its session reload, the one window that discriminates the placement.
-    it('does not audit an unlink from an engine superseded during the async session reload', async () => {
+    // A terminal unlink needs neither the row nor a live engine, so an engine superseded while the handler is
+    // parked on its session reload still has its unlink audited, once, at the post-await fence, and the binding
+    // cleared. Every effect that belongs to the live engine stays behind that fence: no DISCONNECTED write, no
+    // reconnect.
+    it('audits an unlink from an engine superseded during the async session reload without its live effects', async () => {
       const callbacks = await startAndCapture();
-      jest
+      const scheduleReconnect = jest
         .spyOn(lifecycle as unknown as { scheduleReconnect: (id: string, s: unknown) => void }, 'scheduleReconnect')
         .mockImplementation(() => {});
       let resolveReload!: (value: Session | null) => void;
@@ -6416,8 +6533,11 @@ describe('SessionService', () => {
       resolveReload(createMockSession({ status: SessionStatus.READY }));
       await handled;
 
-      expect(auditService.logWarn).not.toHaveBeenCalled();
-      expect(repository.update).not.toHaveBeenCalledWith('sess-uuid-1', { phone: null });
+      expect(auditService.logWarn).toHaveBeenCalledTimes(1);
+      expect(auditService.logWarn).toHaveBeenCalledWith(AuditAction.SESSION_DISCONNECTED, expect.anything());
+      expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', { phone: null });
+      expect(repository.update).not.toHaveBeenCalledWith('sess-uuid-1', { status: SessionStatus.DISCONNECTED });
+      expect(scheduleReconnect).not.toHaveBeenCalled();
     });
 
     it('ignores onReady from an engine that was torn down (post-stop window)', async () => {
@@ -9592,6 +9712,9 @@ describe('SessionService', () => {
   // ── the stored newest message a chat write falls back to (#1891) ──
 
   describe('stored last message lookup', () => {
+    /** The spellings of the engine's number a stored row can name its own side by. */
+    const ownIds = [`${OWN_PHONE}@c.us`, `${OWN_PHONE}@s.whatsapp.net`, OWN_PHONE];
+
     beforeEach(async () => {
       (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
       (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
@@ -9635,7 +9758,10 @@ describe('SessionService', () => {
         waMessageId: Not(IsNull()),
         timestamp: Not(IsNull()),
       };
-      expect(whereOf()).toEqual([base]);
+      expect(whereOf()).toEqual([
+        { ...base, direction: MessageDirection.INCOMING, to: In(ownIds) },
+        { ...base, direction: MessageDirection.OUTGOING, from: In(ownIds) },
+      ]);
       expect(messageRepository.findOne).toHaveBeenCalledWith(
         expect.objectContaining({ order: { timestamp: 'DESC', createdAt: 'DESC' } }),
       );
@@ -9670,8 +9796,8 @@ describe('SessionService', () => {
         timestamp: Not(IsNull()),
       };
       expect(whereOf()).toEqual([
-        { ...base, direction: MessageDirection.INCOMING, author: Not(IsNull()) },
-        { ...base, direction: MessageDirection.OUTGOING },
+        { ...base, direction: MessageDirection.INCOMING, to: In(ownIds), author: Not(IsNull()) },
+        { ...base, direction: MessageDirection.OUTGOING, from: In(ownIds) },
       ]);
     });
 
@@ -9722,7 +9848,7 @@ describe('SessionService', () => {
 
     it('for a read receipt, takes only a received message', async () => {
       await expect(lookupOf('sendSeen', () => service.sendSeen('sess-uuid-1', '123@c.us'))).resolves.toBeNull();
-      expect(whereOf()).toEqual([expect.objectContaining({ direction: MessageDirection.INCOMING })]);
+      expect(whereOf()).toEqual([expect.objectContaining({ direction: MessageDirection.INCOMING, to: In(ownIds) })]);
     });
 
     // The query itself, on a real database: the id-form `In`, the group sender rule and the ordering.
@@ -9740,7 +9866,19 @@ describe('SessionService', () => {
           direction: MessageDirection,
           timestamp: number,
           author?: string,
-        ) => ({ sessionId: 'sess-uuid-1', chatId, waMessageId, direction, timestamp, author, from: 'a', to: 'b' });
+        ) => {
+          const sent = direction === MessageDirection.OUTGOING;
+          return {
+            sessionId: 'sess-uuid-1',
+            chatId,
+            waMessageId,
+            direction,
+            timestamp,
+            author,
+            from: sent ? `${OWN_PHONE}@c.us` : chatId,
+            to: sent ? chatId : `${OWN_PHONE}@c.us`,
+          };
+        };
         await messages.insert([
           row('123@c.us', 'OUT', MessageDirection.OUTGOING, 100),
           row('999@lid', 'IN', MessageDirection.INCOMING, 200),

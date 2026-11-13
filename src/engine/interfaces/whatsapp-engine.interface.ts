@@ -136,6 +136,13 @@ export interface IncomingMessage {
   author?: string;
   /** WIDs @mentioned in the message (empty/absent when none). Surfaced for command targeting. */
   mentionedIds?: string[];
+  /**
+   * True when the sender forwarded this message rather than writing it. Absent (never `false`) for a
+   * message that was not forwarded, so consumers can treat the key's presence as the signal.
+   */
+  isForwarded?: boolean;
+  /** How many times the message has been forwarded; WhatsApp flags a widely forwarded one at 5 or more. Set with `isForwarded`. */
+  forwardingScore?: number;
   /** Set for `call` (call_log) messages: video vs voice, and whether an incoming call went unanswered. */
   call?: {
     video: boolean;
@@ -939,13 +946,17 @@ export interface IncomingCallEvent {
  *  - `tos_block` / `proxy_block` (whatsapp-web.js) — a connection-level refusal: WhatsApp Web drops
  *    the socket and the engine cannot stay linked at all. Derived from the `WAState` the library
  *    reports on its `disconnected` event, which is the only channel that carries it.
+ *  - `passkey_required` (Baileys): WhatsApp wants a passkey (a WebAuthn assertion) before it completes
+ *    a link, and the engine cannot produce one, so the link never completes. Reported when the
+ *    `passkey_prologue_request` notification arrives, which happens after the scan or the pairing code
+ *    and before any status change: the session keeps showing its QR.
  *
  * That difference is load-bearing for clearing: a `reachout_timelock` can only be resolved by an
  * explicit lift signal, whereas a connection-scoped kind is disproved the moment the session reaches
  * READY again — the block would have prevented that.
  */
 export interface AccountRestriction {
-  kind: 'reachout_timelock' | 'tos_block' | 'proxy_block';
+  kind: 'reachout_timelock' | 'tos_block' | 'proxy_block' | 'passkey_required';
   /**
    * The engine's own token for the cause, kept verbatim so an operator can search for it and so a
    * new upstream value is surfaced rather than flattened: the `WAState` string on whatsapp-web.js
@@ -1080,6 +1091,31 @@ export interface InboundReceipt {
   settled: Promise<InboundOutcome | undefined>;
 }
 
+/**
+ * How far a connection had got when it closed. The close code alone does not say: a `428` is what a
+ * session waiting for its QR, a login WhatsApp never answered and a session that had been open for a
+ * day all report.
+ * - `connecting`: the connection to WhatsApp never opened: no network, a failing proxy, a refused upgrade or
+ *   the connecting deadline. Nothing was exchanged, so it says nothing about the login.
+ * - `registration`: no device is linked; the connection was waiting for a QR scan or a pairing code.
+ * - `linked`: the link was accepted on this connection. WhatsApp then asks for a restart (close 515).
+ * - `login_unconfirmed`: the connection opened, a linked device's login was sent and WhatsApp had not confirmed it.
+ * - `login_confirmed`: WhatsApp confirmed the login and the session had not opened yet. In between the
+ *   engine stores and uploads its pre-keys and activates the connection.
+ * - `open`: the session was open.
+ */
+export type ConnectionCloseStage =
+  'connecting' | 'registration' | 'linked' | 'login_unconfirmed' | 'login_confirmed' | 'open';
+
+/** What the engine knows about the connection whose close a reconnect attempt follows. */
+export interface ReconnectContext {
+  stage: ConnectionCloseStage;
+  /** The close's status code, when it carried one. */
+  statusCode?: number;
+  /** How long the closed connection had existed, in milliseconds. */
+  aliveMs: number;
+}
+
 export interface EngineEventCallbacks {
   onQRCode?: (qr: string) => void;
   onReady?: (phone: string, pushName: string) => void;
@@ -1136,9 +1172,15 @@ export interface EngineEventCallbacks {
   onMessageReceipt?: (event: MessageReceiptEvent) => void;
   /**
    * `actor.fromMe` says whether the account itself made the revoke (from its phone). Only an engine that
-   * receives the raw protocol message can say; whatsapp-web.js leaves it out.
+   * receives the raw protocol message can say; whatsapp-web.js leaves it out. The payload of a status post's
+   * delete names no sender, so there `actor.participant` is the neutral id of the contact who sent it. For a
+   * group revoke a member sent, `actor.participant` is that member's neutral id and `actor.admin` whether the
+   * group's roster shows them an admin, undefined when the engine did not read it or it could not say.
    */
-  onMessageRevoked?: (message: RevokedMessage, actor?: { fromMe: boolean }) => void;
+  onMessageRevoked?: (
+    message: RevokedMessage,
+    actor?: { fromMe: boolean; participant?: string; admin?: boolean },
+  ) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
   onMessageEdited?: (message: EditedMessage) => void;
   /**
@@ -1188,11 +1230,13 @@ export interface EngineEventCallbacks {
    * needs to tell a one-second blip from a session that has been down for an hour, which the status
    * alone cannot: the engine reports INITIALIZING for the whole episode, exactly as it does for a
    * session that has never been paired.
+   * `context` describes the connection whose close led to this attempt. It is absent when the attempt
+   * follows a connect that failed before a connection existed.
    *
    * Optional: an engine that hands every drop to its consumer instead of retrying internally
    * (whatsapp-web.js does) simply never invokes this, because that consumer already has the drop.
    */
-  onReconnecting?: (attempt: number, nextDelayMs: number) => void;
+  onReconnecting?: (attempt: number, nextDelayMs: number, context?: ReconnectContext) => void;
   onStateChanged?: (state: EngineStatus) => void;
   /**
    * Fired when the engine needs an operator action to keep the session healthy — currently only the
@@ -1430,7 +1474,13 @@ export interface MessageOperationsCapability {
    */
   getMessageReceipts(chatId: string, messageId: string): Promise<MessageReceipts>;
 
-  deleteMessage(chatId: string, messageId: string, forEveryone?: boolean): Promise<void>;
+  /**
+   * Delete a message. Resolves the id the engine keys the deleted message by, when it reports one, so the caller can
+   * clear the stored copy under that id too: whatsapp-web.js resolves the serialized id of the message it found, which
+   * differs from the id it was given when that was the bare key id of a message it keys by the serialized id. An engine
+   * that keys the message by the id it was given (Baileys) resolves nothing.
+   */
+  deleteMessage(chatId: string, messageId: string, forEveryone?: boolean): Promise<string | void>;
 
   /**
    * Edit the body of a text message. Only the account's OWN messages can be edited; engines reject
@@ -1910,9 +1960,10 @@ export interface StoredChatMessage {
 }
 
 /**
- * Reads the newest stored message of the chat a write is for, across the chat's id forms. Engines
- * call it only when they know no message of the chat themselves, so a lookup costs nothing when it is
- * not needed; it resolves null when the gateway stored none.
+ * Reads the newest stored message of the chat a write is for, across the chat's id forms, among the rows
+ * of the account the engine is linked to. Engines call it only when they know no message of the chat
+ * themselves, so a lookup costs nothing when it is not needed; it resolves null when the gateway stored
+ * none.
  */
 export type StoredChatMessageLookup = () => Promise<StoredChatMessage | null>;
 

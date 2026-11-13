@@ -117,11 +117,15 @@ const PROTOCOL_NOISE_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Whether two ids provably name different chats or people. Each side is a jid plus the other-dialect
- * twin WhatsApp may send beside it (`remoteJidAlt`, `participantAlt`), compared neutralised, so a lid
- * the session can resolve matches its phone number. A lid it cannot resolve may still be the phone
- * number on the other side, so that pair is never called different, and neither is a side with no id:
- * a caller that drops on a mismatch fails open.
+ * Whether two ids provably name different chats or people. Each side is a jid plus the other-dialect twin WhatsApp may
+ * send beside it (`remoteJidAlt`, `participantAlt`), compared as `toNeutralJid` writes them, so a lid that function
+ * resolves matches its phone number. The adapter's own resolves only the account's lid. A side that carries a phone
+ * number of its own is compared by it: a lid sent with its sender's number differs from another number exactly as that
+ * number would, so a contact whose number changed, sending its lid and the new number against a message kept under the
+ * old number only, reads as somebody else, as the same change sent by number does. A lid with no number beside it that
+ * `toNeutralJid` cannot resolve may still be the phone number on the other side, so that pair is never called
+ * different, and neither is a side with no id: a caller that drops on a mismatch fails open there, which still lets a
+ * sender known only by such a lid through.
  */
 export function differentWaIds(
   a: ReadonlyArray<string | null | undefined>,
@@ -132,8 +136,24 @@ export function differentWaIds(
   const y = b.filter((j): j is string => !!j).map(toNeutralJid);
   if (!x.length || !y.length || x.some(j => y.includes(j))) return false;
   const lidGap = (p: string[], q: string[]): boolean =>
-    p.some(j => j.endsWith('@lid')) && !q.some(j => j.endsWith('@lid')) && q.some(j => j.endsWith('@c.us'));
+    p.some(j => j.endsWith('@lid')) &&
+    !p.some(j => j.endsWith('@c.us')) &&
+    !q.some(j => j.endsWith('@lid')) &&
+    q.some(j => j.endsWith('@c.us'));
   return !lidGap(x, y) && !lidGap(y, x);
+}
+
+/**
+ * The ids a message key names its chat by, for {@link differentWaIds}. On a key of the account's own
+ * message Baileys fills `remoteJidAlt` from the sender's addressing, which is the account itself rather
+ * than the chat, so it is left out there (as mayChange and recordKeyLidMappings leave it out).
+ */
+export function keyChatIds(key: {
+  remoteJid?: string | null;
+  remoteJidAlt?: string | null;
+  fromMe?: boolean | null;
+}): Array<string | null | undefined> {
+  return [key.remoteJid, key.fromMe === true ? undefined : key.remoteJidAlt];
 }
 
 /**
@@ -201,6 +221,12 @@ function mediaSubMessage(normalized: NonNullable<WAMessage['message']>) {
     normalized.documentMessage ??
     normalized.stickerMessage
   );
+}
+
+/** A group member as the roster shows them: every id form they are listed under, and whether they are an admin. */
+export interface GroupMember {
+  ids: string[];
+  admin: boolean;
 }
 
 export interface BaileysEventsHost {
@@ -271,6 +297,16 @@ export interface BaileysEventsHost {
    * a group message keeps no aggregate ack.
    */
   readGroupRoster?(groupId: string): Promise<string[][] | null>;
+  /**
+   * The same members, each with whether the roster shows them an admin. Null when the roster cannot be read; a group
+   * delete of someone else's message is then applied as an admin's.
+   */
+  readGroupMembers?(groupId: string): Promise<GroupMember[] | null>;
+  /**
+   * The same members from the cached group metadata alone: never a query, so it answers at once, and null when the
+   * cache holds none (nothing read yet, expired, or switched off by `BAILEYS_GROUP_METADATA_CACHE_TTL_MS=0`).
+   */
+  peekGroupMembers?(groupId: string): GroupMember[] | null;
   /** The phone user part the session knows for a lid, or null; no network read. */
   resolvePhone?(jid: string): string | null;
   /** The currently-registered onGroupEvent callback, if any (assigned at initialize()). */
@@ -463,8 +499,8 @@ export class BaileysEvents {
   /**
    * The members of a group other than this account, or null when the roster is unavailable. A row is this
    * account's when any of its ids is, or when a lid in it is one the session knows the account's phone number
-   * for (the lid fallback of {@link selfMatcher} resolves nothing in the adapter, and credentials without a
-   * `user.lid` leave a lid-only row with nothing else to be recognised by).
+   * for ({@link selfMatcher} matches a lid only against the credentials' own `user.lid`, so credentials without
+   * one leave a lid-only row with nothing else to be recognised by).
    */
   private async readMemberRoster(groupId: string): Promise<string[][] | null> {
     const roster = await this.host.readGroupRoster?.(groupId);
@@ -514,7 +550,11 @@ export class BaileysEvents {
     }
   }
 
-  /** Apply a history delete to the raw cache without announcing a live message event. */
+  /**
+   * Apply a history delete to the raw cache without announcing a live message event. A group delete of someone
+   * else's message is applied as an admin's without reading the roster: it says who is an admin now, not when a
+   * delete synced from history was made, and refusing a former admin's delete would keep the withdrawn text.
+   */
   async applyHistoryRevoke(target: WAMessageKey, envelope: WAMessageKey): Promise<WAMessageKey | undefined> {
     if (!target.id) return undefined;
     const generation = this.storeGeneration;
@@ -665,7 +705,7 @@ export class BaileysEvents {
     const neutral = (jid: string): string => this.host.toNeutralJid(jid);
     return (
       (first.fromMe === true) !== (key.fromMe === true) ||
-      differentWaIds([first.remoteJid, first.remoteJidAlt], [key.remoteJid, key.remoteJidAlt], neutral) ||
+      differentWaIds(keyChatIds(first), keyChatIds(key), neutral) ||
       (key.fromMe !== true &&
         differentWaIds([first.participant, first.participantAlt], [key.participant, key.participantAlt], neutral))
     );
@@ -799,10 +839,11 @@ export class BaileysEvents {
   /**
    * Whether an edit or delete sent under `envelope` may change the chat preview of the message keyed
    * `key`. The preview is that chat's own, so only the author is judged: the account's message changes
-   * only by the account, a group member's only by that member, and a group delete comes from anyone,
-   * as an admin may delete. The change may name a message the store does not hold (a history-synced or
-   * an evicted one), which targetsForeignMessage then lets through for the session to judge; the
-   * preview is judged here instead. Ids that cannot be compared (a lid nothing resolves, against a
+   * only by the account, a group member's only by that member, and a group delete (`isDelete`) comes from
+   * anyone, as an admin may delete, unless the roster shows its sender is no admin (see judgeGroupDelete),
+   * where the caller passes `isDelete` false. The change may name a message the store does not hold (a
+   * history-synced or an evicted one), which targetsForeignMessage then lets through for the session to
+   * judge; the preview is judged here instead. Ids that cannot be compared (a lid nothing resolves, against a
    * phone) are not called different, as in readsAsForeign.
    */
   private previewAuthor(
@@ -810,18 +851,13 @@ export class BaileysEvents {
     isDelete: boolean,
     resolve: (jid: string) => string | null,
   ): (key: WAMessageKey) => boolean {
-    const neutral = (jid: string): string => {
-      const phone = parseWaId(jid).kind === 'lid' ? resolve(jid) : null;
-      return phone ? `${phone}@c.us` : this.host.toNeutralJid(jid);
-    };
     return key => {
       if (isDelete && parseWaId(key.remoteJid ?? '').kind === 'group') return true;
       if ((key.fromMe === true) !== (envelope.fromMe === true)) return false;
-      return (
-        key.fromMe === true ||
-        !key.participant ||
-        !differentWaIds([key.participant, key.participantAlt], [envelope.participant, envelope.participantAlt], neutral)
-      );
+      if (key.fromMe === true || !key.participant) return true;
+      const authors = [key.participant, key.participantAlt];
+      const senders = [envelope.participant, envelope.participantAlt];
+      return !differentWaIds(authors, senders, this.authorNeutral(authors, senders, resolve));
     };
   }
 
@@ -1070,19 +1106,29 @@ export class BaileysEvents {
         opts.releasePreparation();
       },
     };
+    const group = remoteJid.endsWith('@g.us');
+    // A group delete a member sent counts as an admin's unless the roster shows they are none; then it is held to its
+    // author, as a one-to-one delete is, unless every copy of its target this adapter knows reads as theirs.
+    const verdict =
+      revoke && group && msg.key.fromMe !== true
+        ? await this.judgeGroupDelete(remoteJid, targetId, msg.key)
+        : undefined;
+    const admin = verdict?.admin;
+    const own = verdict?.own === true;
+    if (opts.generation !== this.storeGeneration) return;
     if (
       (reaction || revoke || edit) &&
       (await this.targetsForeignMessage(
         targetId,
         msg.key,
-        edit || (revoke && !remoteJid.endsWith('@g.us')),
+        edit || (revoke && (!group || (admin === false && !own))),
         reaction ? 'reaction' : undefined,
         inbound,
       ))
     )
       return;
     if (opts.generation !== this.storeGeneration) return;
-    const apply = () => this.applyMessageChange(b, msg, normalizedRoot, contentType, opts);
+    const apply = () => this.applyMessageChange(b, msg, normalizedRoot, contentType, { ...opts, admin, own });
     // Waiting for an original must not occupy the preparation queue. Once it answers, take a new
     // turn before the remaining directory reads, so mixed change kinds still reach callbacks in order.
     if (parked) await this.prepareMessageChange(targetId, { ...opts, ticket: undefined }, apply);
@@ -1094,7 +1140,15 @@ export class BaileysEvents {
     msg: WAMessage,
     normalizedRoot: WAMessage['message'],
     contentType: string,
-    opts: { generation: number; ticket?: InboundTicket; yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R> },
+    opts: {
+      generation: number;
+      ticket?: InboundTicket;
+      yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>;
+      /** For a group delete a member sent, whether the roster shows them an admin (see judgeGroupDelete). */
+      admin?: boolean;
+      /** Whether every copy of the target this adapter knows reads as the sender's (see judgeGroupDelete). */
+      own?: boolean;
+    },
   ): Promise<void> {
     const remoteJid = msg.key.remoteJid!;
     const chatJid = baileysChatJid(remoteJid, msg.key.participant, msg.key.fromMe === true);
@@ -1117,11 +1171,16 @@ export class BaileysEvents {
           body: '',
           timestamp: toUnixSeconds(msg.messageTimestamp),
         };
+        // A member the roster shows is no admin deletes only their own message: the group exemption is off for them,
+        // except for copies this adapter reads as theirs, whose ids may not be comparable. The chat preview may hold
+        // another copy (a history-synced message is never stored here), so it follows the roster alone.
+        const anyAuthor = opts.admin !== false || opts.own === true;
+        const previewAny = opts.admin !== false;
         // While the target is still being processed, the store change waits for it and lands after
         // this delete is announced, and a repeat delivery may already hold the content in the store:
         // record the delete now, checked against the target's own key.
         const target = this.inboundInFlight.get(revoked.id);
-        if (target && this.mayChange(target.key, msg.key, true)) {
+        if (target && this.mayChange(target.key, msg.key, anyAuthor)) {
           this.markDeletedForEveryone(revoked.id);
         }
         // The stored copy keeps its key, so a late re-delivery is still recognised and a delete
@@ -1130,11 +1189,11 @@ export class BaileysEvents {
         const resolveStored = await this.reportedPhones(storedKey, target?.key, msg.key);
         if (opts.generation !== this.storeGeneration) return;
         const currentTarget = this.inboundInFlight.get(revoked.id) ?? target;
-        if (currentTarget && this.mayChange(currentTarget.key, msg.key, true, resolveStored)) {
+        if (currentTarget && this.mayChange(currentTarget.key, msg.key, anyAuthor, resolveStored)) {
           this.markDeletedForEveryone(revoked.id);
         }
         const storedChatJid =
-          storedKey?.remoteJid && this.mayChange(storedKey, msg.key, true, resolveStored)
+          storedKey?.remoteJid && this.mayChange(storedKey, msg.key, anyAuthor, resolveStored)
             ? baileysChatJid(storedKey.remoteJid, storedKey.participant, storedKey.fromMe === true)
             : undefined;
         await this.recordPreviewChange(
@@ -1144,20 +1203,33 @@ export class BaileysEvents {
           'revoked',
           opts.generation,
           msg.key,
-          true,
+          previewAny,
           resolveStored,
           storedChatJid,
         );
         if (opts.generation !== this.storeGeneration) return;
         this.changeStoredMessage(pm.key?.id, stored =>
-          this.mayChange(stored.key, msg.key, true, resolveStored) ? { ...stored, message: null } : null,
+          this.mayChange(stored.key, msg.key, anyAuthor, resolveStored) ? { ...stored, message: null } : null,
         );
+        // The payload of a status post's delete names no sender (its chat is the status chat), and the stored copy
+        // judged above may be gone, which lets any delete through: the session holds it to the poster of the story.
+        const sender = remoteJid === 'status@broadcast' ? keyParticipant(msg.key) : undefined;
+        // Who sent a group delete, and what the roster said of them, for the session to judge the row it names.
+        const member =
+          msg.key.fromMe !== true && msg.key.participant && remoteJid.endsWith('@g.us')
+            ? { participant: this.host.toNeutralJid(msg.key.participant), admin: opts.admin }
+            : {};
         // Behind the reactions and edits of the message that wait for its emit, never for the message itself:
         // the delete keeps it from being emitted, and they were made before it.
         this.announceWhenHandedOn(
           revoked.id,
           opts.ticket,
-          () => this.host.getOnMessageRevoked()?.(revoked, { fromMe: msg.key.fromMe === true }),
+          () =>
+            this.host.getOnMessageRevoked()?.(revoked, {
+              fromMe: msg.key.fromMe === true,
+              ...member,
+              ...(sender ? { participant: this.host.toNeutralJid(sender) } : {}),
+            }),
           true,
         );
         return;
@@ -1693,23 +1765,52 @@ export class BaileysEvents {
     }
   }
 
-  /** Whether a change arriving under `key` names a message other than the one `original` is. */
-  private readsAsForeign(original: WAMessageKey, key: WAMessageKey, checkAuthor: boolean, kind?: 'reaction'): boolean {
+  /**
+   * How {@link differentWaIds} writes the two ids of one author comparison. `resolve` maps a lid to the phone number the
+   * gateway holds a reported pairing for. A pairing bridges a lid and a phone number, so a lid is resolved only against
+   * a side that carries no lid: with the other side known by a number, a lid that is provably another person's reads as
+   * such. Two lids are compared as they are, whatever the table says of either, because resolving one of them would
+   * turn it into a number that the other, a lid with no number beside it, may still be (see differentWaIds). A lid the
+   * table cannot map stays unresolved, and the comparison fails open on it.
+   */
+  private authorNeutral(
+    a: Array<string | null | undefined>,
+    b: Array<string | null | undefined>,
+    resolve?: (jid: string) => string | null,
+  ): (jid: string) => string {
+    const hasLid = (jids: Array<string | null | undefined>): boolean =>
+      jids.some(jid => !!jid && parseWaId(jid).kind === 'lid');
+    const bridge = resolve && !(hasLid(a) && hasLid(b)) ? resolve : undefined;
+    return jid => {
+      const phone = bridge && parseWaId(jid).kind === 'lid' ? bridge(jid) : null;
+      return phone ? `${phone}@c.us` : this.host.toNeutralJid(jid);
+    };
+  }
+
+  /**
+   * Whether a change arriving under `key` names a message other than the one `original` is. The chats are compared as
+   * the adapter writes them; `resolve` serves the comparison of the authors (see authorNeutral), since a group delete,
+   * the one change judged with it, names a group.
+   */
+  private readsAsForeign(
+    original: WAMessageKey,
+    key: WAMessageKey,
+    checkAuthor: boolean,
+    kind?: 'reaction',
+    resolve?: (jid: string) => string | null,
+  ): boolean {
     const broadcast = kind === 'reaction' && !!original.remoteJid?.endsWith('@broadcast');
     if (broadcast && original.fromMe === true) return false;
-    const originalChats = [original.remoteJid, original.remoteJidAlt];
+    const originalChats = keyChatIds(original);
     if (broadcast && original.remoteJid !== 'status@broadcast') originalChats.push(original.participant);
     const neutral = (jid: string): string => this.host.toNeutralJid(jid);
+    const authors = [original.participant, original.participantAlt];
+    const senders = [key.participant, key.participantAlt];
     return (
-      differentWaIds(originalChats, [key.remoteJid, key.remoteJidAlt], neutral) ||
+      differentWaIds(originalChats, keyChatIds(key), neutral) ||
       (checkAuthor &&
         ((original.fromMe === true) !== (key.fromMe === true) ||
-          (key.fromMe !== true &&
-            differentWaIds(
-              [original.participant, original.participantAlt],
-              [key.participant, key.participantAlt],
-              neutral,
-            ))))
+          (key.fromMe !== true && differentWaIds(authors, senders, this.authorNeutral(authors, senders, resolve)))))
     );
   }
 
@@ -1746,12 +1847,9 @@ export class BaileysEvents {
   }
 
   /**
-   * Whether an edit or delete sent under `envelope` may change the stored message `target`. Baileys
-   * checks neither the chat nor the sender of either (Utils/process-message.js), so the stored copy
-   * changes only for one from the same chat and from the message's author. A group admin may delete
-   * anyone's message, which nothing here can verify, so a group delete skips the author check.
-   * Compare raw identities and incoming alt pairs. A stored LID/phone pair matches only through a
-   * reported directory lookup; own-message senderAlt is not proof of the recipient's phone.
+   * The phone number the gateway holds a reported pairing for, by lid, over the lids that the keys name as their chat or
+   * participant. A pairing it holds only as a display lookup is not reported and maps nothing. Never rejects: a lookup
+   * that fails maps nothing.
    */
   private async reportedPhones(...keys: Array<WAMessageKey | undefined>): Promise<(jid: string) => string | null> {
     const lids = new Set(
@@ -1769,6 +1867,16 @@ export class BaileysEvents {
     return jid => pairs.get(userPart(jid)) ?? null;
   }
 
+  /**
+   * Whether an edit or delete sent under `envelope` may change the stored message `target`. Baileys
+   * checks neither the chat nor the sender of either (Utils/process-message.js), so the stored copy
+   * changes only for one from the same chat and from the message's author. A group admin may delete
+   * anyone's message, so a group delete (`isDelete`) skips the author check; the caller passes `isDelete`
+   * false for one whose sender the roster shows is no admin, unless every copy it judges reads as the sender's
+   * (see judgeGroupDelete).
+   * Compare raw identities and incoming alt pairs. A stored LID/phone pair matches only through a
+   * reported directory lookup (`resolve`); own-message senderAlt is not proof of the recipient's phone.
+   */
   private mayChange(
     target: WAMessageKey,
     envelope: WAMessageKey,
@@ -1797,6 +1905,70 @@ export class BaileysEvents {
     if (!overlap(chat(target), chat(envelope))) return false;
     const inGroup = chat(target).some(jid => parseWaId(jid).kind === 'group');
     return (isDelete && inGroup) || overlap(author(target), author(envelope));
+  }
+
+  /**
+   * What this adapter can tell of who sent a group delete. `admin`: whether the group's roster shows them an admin, who
+   * alone may delete someone else's message there, as WhatsApp clients honour it; undefined when it cannot say (no
+   * roster, a failed or late read, a sender it does not list), and the delete then counts as an admin's, as it always
+   * has. `own`: whether every copy of the message the delete names that this adapter knows, stored or being
+   * processed, reads as the sender's. Those copies are then judged without the author check, in ids that cannot be
+   * compared too. It says nothing of the session's row, which may be another member's under a reused id, so the
+   * roster verdict goes on to the session whenever it is read.
+   *
+   * The roster is read only where it decides something: not for a settled message every copy of which reads as the
+   * sender's. A settled message waits for the cached group metadata, or a query within BAILEYS_QUERY_BUDGET_MS. One
+   * still being processed here, or held by the session for its row, whoever's it reads as, can be announced at any
+   * moment, and its delete has to be recorded before that (see markDeletedForEveryone), so it takes the cached
+   * metadata as it stands and never waits: with none (not read yet, expired, or switched off) the roster cannot say.
+   * A delivery that reuses the id of a stored message of another chat or sender does not count as such a message.
+   * A roster that has not seen a promotion yet refuses that admin's delete, and the message is kept.
+   */
+  private async judgeGroupDelete(
+    groupJid: string,
+    targetId: string | null | undefined,
+    envelope: WAMessageKey,
+  ): Promise<{ admin?: boolean; own: boolean } | undefined> {
+    if (!targetId) return undefined;
+    // The copy being processed is taken before the store is read, as readTarget does: one that settles while the read
+    // is out has left the map, and may have been stored after the read began.
+    const before = this.inboundInFlight.get(targetId);
+    const stored = await this.readStoredMessage(targetId, 'checking whose message a group delete names');
+    const after = this.inboundInFlight.get(targetId);
+    const copies = [before?.key, stored?.key, after?.key].filter((key): key is WAMessageKey => !!key);
+    // A sender known by a lid and an author known by a number are taken for one person unless the gateway holds a
+    // reported pairing for the lid that names another number: with one, the copy is not theirs and the roster is read.
+    const resolve = await this.reportedPhones(...copies, envelope);
+    const own = copies.length > 0 && copies.every(key => !this.readsAsForeign(key, envelope, true, undefined, resolve));
+    // A delivery that reuses the id of a stored message of another chat or sender is stopped as a repeat before it
+    // downloads or emits anything (see processInboundMessage), so it does not make that stored message one to judge
+    // from the cache alone.
+    const live = [before, after].filter(entry => entry && !(stored && this.namesAnotherMessage(stored.key, entry.key)));
+    const held = live.length > 0 || this.outcomesPending.has(targetId);
+    if (own && !held) return { own };
+    try {
+      let members: GroupMember[] | null | undefined;
+      if (held) members = this.host.peekGroupMembers?.(groupJid);
+      else {
+        const read = this.host.readGroupMembers?.(groupJid);
+        if (!read) return { own };
+        members = await withQueryDeadline(
+          read,
+          BAILEYS_QUERY_BUDGET_MS,
+          'WhatsApp did not answer the group metadata query in time',
+        );
+      }
+      const neutral = (jid: string): string => this.host.toNeutralJid(jid);
+      const sender = [envelope.participant, envelope.participantAlt].filter((jid): jid is string => !!jid).map(neutral);
+      return { own, admin: members?.find(member => member.ids.some(jid => sender.includes(neutral(jid))))?.admin };
+    } catch (err) {
+      this.host.logger.warn('Could not read the group roster to check a delete; applying it', {
+        groupId: groupJid,
+        msgId: envelope.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { own };
+    }
   }
 
   handleMessagesUpdate(updates: BaileysMessageUpdate[]): void {
@@ -1885,7 +2057,10 @@ export class BaileysEvents {
 
   /**
    * Matches any jid of this account, in either dialect and from any of its devices (user parts are
-   * compared). Answers false for everything while the account's own id is unknown.
+   * compared). Answers false for everything while the account's own id is unknown. A lid matches only the
+   * credentials' own `user.lid`: identity is not derived from the session's lid mapping, so credentials
+   * without one match no lid, and a caller that must still recognise the account's lid checks the reported
+   * pairs itself (see readMemberRoster).
    */
   private selfMatcher(): (jid: string | null | undefined) => boolean {
     const selfJid = this.host.normalizedSelfJid();
@@ -1899,12 +2074,7 @@ export class BaileysEvents {
       if (!jid) return false;
       const { kind, userPart: user } = parseWaId(jid);
       if (kind === 'user') return user === phone;
-      if (kind !== 'lid') return false;
-      if (lidUser !== undefined) return user === lidUser;
-      // Creds carrying no `user.lid` leave nothing to compare a lid-addressed jid against, and every
-      // such comparison would answer false. Fall back to the session's own lid to phone mapping,
-      // which the store learns from the same traffic.
-      return userPart(this.host.toNeutralJid(jid)) === phone;
+      return kind === 'lid' && user === lidUser;
     };
   }
 
@@ -1929,14 +2099,7 @@ export class BaileysEvents {
     // revoke or reaction aimed at a message of another chat is. Fails open like those: a store that
     // cannot be read, or ids that cannot be compared, report the RSVP as before.
     const stored = await this.readStoredMessage(eventKey.id, 'reading the event an RSVP answers');
-    if (
-      stored &&
-      differentWaIds(
-        [stored.key.remoteJid, stored.key.remoteJidAlt],
-        [envelope.remoteJid, envelope.remoteJidAlt],
-        jid => this.host.toNeutralJid(jid),
-      )
-    ) {
+    if (stored && differentWaIds(keyChatIds(stored.key), keyChatIds(envelope), jid => this.host.toNeutralJid(jid))) {
       this.host.logger.warn('Dropping an event response sent in a chat other than its event', {
         msgId: eventKey.id,
         responseMessageId: envelope.id,
@@ -2056,8 +2219,8 @@ export class BaileysEvents {
     if (!selfJid) {
       return; // no own id to report as the joining participant
     }
-    // Without the lid fallback inside selfMatcher, a group this session created by a lid-addressed
-    // actor would be reported as a join of itself.
+    // With credentials that carry no `user.lid`, selfMatcher matches no lid, so a group this session
+    // created that names it by lid alone is reported as a join of itself.
     const isSelf = this.selfMatcher();
     for (const group of Array.isArray(groups) ? groups : []) {
       // Live, whatsapp-web.js emits no group.join when the session created the group, so that entry is
@@ -2735,6 +2898,8 @@ export class BaileysEvents {
         isCatalogShare: isBaileysCatalogShare(normalized),
         ephemeralDuration: context.ephemeralDuration,
         mentionedJids: context.mentionedJids,
+        isForwarded: context.isForwarded,
+        forwardingScore: context.forwardingScore,
         backgroundArgb: context.backgroundArgb,
         font: context.font,
       },

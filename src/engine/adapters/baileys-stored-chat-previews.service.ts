@@ -25,6 +25,16 @@ export interface StoredChatPreview {
 }
 
 /**
+ * Every spelling a stored row can name an account's own side by (`to` of a received message, `from` of a
+ * sent one): its JID in either dialect, and the bare digits of an API send stored before 0.27.0. The `me`
+ * placeholder of a send stored before the number was known names no account and is not among them. Every
+ * reader that keeps only the rows of the account a session is linked to takes its spellings from here.
+ */
+export function ownAccountIds(phone: string): string[] {
+  return [`${phone}@c.us`, `${phone}@s.whatsapp.net`, phone];
+}
+
+/**
  * Read port over the neutral `messages` table for a Baileys engine that starts with no chats: WhatsApp
  * resyncs no chat list to a device it already linked, so after a restart the stored rows are the only
  * record of a 1:1 chat with no persisted state. Kept to this one read so the engine never writes there.
@@ -32,11 +42,12 @@ export interface StoredChatPreview {
 export interface StoredChatPreviewSource {
   /**
    * The newest stored message of each of the session's chats, newest chat first, from the `limit` chats
-   * with the newest rows (0: all). Only rows of the account in `ownIds` count: the table outlives an
-   * unlink, so a session linked to another number still holds the rows of the one before. A row counts
-   * when the account's side of it (`to` of a received message, `from` of a sent one) is one of those
-   * spellings. The limit is applied before that check, to keep the scan on the index: a chat that holds
-   * only another account's rows, or rows without a WhatsApp id, uses a slot and lists nothing.
+   * with the newest rows (0: all). Only rows of the account in `ownIds` (see {@link ownAccountIds}) count:
+   * the table outlives an unlink, so a session linked to another number still holds the rows of the one
+   * before. A row counts when the account's side of it (`to` of a received message, `from` of a sent one)
+   * is one of those spellings. The limit is applied before that check, to keep the scan on the index: a
+   * chat that holds only another account's rows, or rows without a WhatsApp id, uses a slot and lists
+   * nothing.
    */
   latestPerChat(sessionId: string, ownIds: string[], limit: number): Promise<StoredChatPreview[]>;
 }
@@ -64,7 +75,17 @@ export class StoredChatPreviewService implements StoredChatPreviewSource {
   async latestPerChat(sessionId: string, ownIds: string[], limit: number): Promise<StoredChatPreview[]> {
     if (!ownIds.length) return [];
     const driver = this.repo.manager.connection.driver;
-    const lastStored = this.repo.manager.connection.options.type === 'postgres' ? 'w."id"' : 'w."rowid"';
+    const isPostgres = this.repo.manager.connection.options.type === 'postgres';
+    const lastStored = isPostgres ? 'w."id"' : 'w."rowid"';
+    // SQLite has no composite index on (sessionId, chatId, direction, timestamp), so between the two
+    // indexes that each match two of this subquery's three equalities, it picks
+    // IDX_messages_session_direction_timestamp_id (sessionId, direction) over
+    // IDX_messages_session_chat_timestamp_id (sessionId, chatId) and then filters chatId per row,
+    // scanning every row of the session with this direction once per candidate chat. A unary plus
+    // makes the comparison an expression a bare-column index cannot serve, which steers SQLite onto
+    // the chatId index instead, the one `w` below already uses. PostgreSQL has no such index choice
+    // to steer and no unary `+` on a varchar column, so the hint is SQLite only.
+    const nDirection = isPostgres ? 'n."direction"' : '+n."direction"';
     const table = this.repo.metadata.tablePath
       .split('.')
       .map(part => driver.escape(part))
@@ -73,7 +94,7 @@ export class StoredChatPreviewService implements StoredChatPreviewSource {
       `SELECT m."chatId", m."waMessageId", m."direction", m."author", m."timestamp", m."body", m."type",
          (
            SELECT n."chatName" FROM ${table} n
-           WHERE n."sessionId" = :sessionId AND n."chatId" = c."chatId" AND n."direction" = :incoming
+           WHERE n."sessionId" = :sessionId AND n."chatId" = c."chatId" AND ${nDirection} = :incoming
              AND n."to" IN (:...ownIds) AND n."chatName" IS NOT NULL AND n."timestamp" IS NOT NULL
            ORDER BY n."timestamp" DESC
            LIMIT 1

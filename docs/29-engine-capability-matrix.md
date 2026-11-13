@@ -5,7 +5,7 @@ Three-way comparison of every capability: the **Baileys library** (`@whiskeysock
 its adapter layer and REST API — including which "supported" cells only work because OpenWA patches
 the installed library. Coverage is total: all 126 `IWhatsAppEngine` methods (29.4), **all 152
 Baileys + 81 whatsapp-web.js library methods** (29.5), all 34 + 31 library events (29.5.4), and all
-21 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
+23 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
 
 ## 29.1 How to read this matrix
 
@@ -50,8 +50,8 @@ flowchart LR
         IF --> BA["BaileysAdapter"]
         SVC --> STORE["OpenWA-side stores"]
     end
-    WA --> WLIB["whatsapp-web.js 1.34.7<br/>+ 18 OpenWA patches"]
-    BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc14<br/>+ 3 OpenWA patches"]
+    WA --> WLIB["whatsapp-web.js 1.34.7<br/>+ 19 OpenWA patches"]
+    BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc14<br/>+ 4 OpenWA patches"]
     WLIB --> WEB["WhatsApp Web<br/>headless Chromium"]
     BLIB --> WAS["WhatsApp servers<br/>browser-free socket"]
     WA -.->|"not-available"| E["EngineNotSupportedError<br/>HTTP 501"]
@@ -128,7 +128,7 @@ wrong interface method. Those three remain reader-verified.
 
 ## 29.3 Install-time patches OpenWA applies to the libraries
 
-OpenWA ships twenty-one exact, self-disabling source transforms over the installed engines. Each runs at
+OpenWA ships twenty-three exact, self-disabling source transforms over the installed engines. Each runs at
 `npm install` (`scripts/postinstall.js`) and again in the Docker production stage. A recognized repaired
 source shape makes the patcher a no-op. Every image transform fails on an unknown shape. The Puppeteer
 compatibility transform also fails a source install; the other transforms run with `--best-effort` there.
@@ -140,7 +140,7 @@ it is missing as it starts (`src/engine/adapters/engine-patch-status.ts`; 🔧¹
 check described below). The report is diagnostic, not preventive: startup continues, so a session
 reaching READY is not evidence that every patch landed. See docs/12 for the operator procedure.
 
-### 29.3.1 The twenty-one patches
+### 29.3.1 The twenty-three patches
 
 | #    | Patcher                                                    | Library target                                     | What it repairs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Stand-down predicate                                                                                                                                                                                                                                                                                                                                                  |
 | ---- | ---------------------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -165,11 +165,13 @@ reaching READY is not evidence that every patch landed. See docs/12 for the oper
 | 🔧¹⁸ | `scripts/patch-wwebjs-pushname-bundle.js`                  | whatsapp-web.js `Client.js`                        | From build 2.3000.1050428120 `WAWebSetPushnameConnAction` ships in the lazy bundle WhatsApp Web loads only when a human opens their profile drawer, so on a headless page `window.require` answers `undefined` for it and `Client.setDisplayName()` fails reading `.setPushname` off `undefined`: every profile-name change answered an opaque `500`. The patch calls `WAWebProfileDrawerLoadableRequireBundle.requireBundle()` inside the method when the action is still missing; a page that already holds the bundle pays nothing, and a page reload drops it, so the check runs on every rename. `setPushname(pushname, onDismiss)` keeps its shape. It stands down once the installed tree loads the bundle itself (wwebjs/whatsapp-web.js#201950 does, through `JSResourceForInteraction`).                                                                                                                                                                                                                                                                                                                                                 | exact-shape match; unknown shape fails the build.                                                                                                                                                                                                                                                                                                                     |
 | 🔧¹⁹ | `scripts/patch-wwebjs-puppeteer.js`                        | whatsapp-web.js `Client.js`                        | Use Puppeteer 25 browser connection getters so destroy closes Chromium and logout removes authentication only after closure.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Both exact replacements must match; an unknown or partial shape aborts installation. Stands down when upstream carries both changes.                                                                                                                                                                                                                                  |
 | 🔧²⁰ | `scripts/patch-wwebjs-invite-message.js`                   | whatsapp-web.js `GroupChat.js`, `Client.js`        | From build 2.3000.1052144417 `sendGroupInviteMessage` lives in `WAWebChatSendGroupInviteMessage`, in the lazy bundle WhatsApp Web loads only when a human opens the private-invite flow, and it takes one options object `{caption, chat_, code, exp, gid, name, thumb}` where whatsapp-web.js passes seven arguments. The patch loads the bundle with `JSResourceForInteraction('WAWebGroupsV4InviteFlow.react').load()` while the module is missing and passes the object, so `addParticipants` and `createGroup` invite a participant WhatsApp refused to add directly instead of failing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| 🔧²² | `scripts/patch-wwebjs-text-status.js`                      | whatsapp-web.js `Client.js`, `Contact.js`          | From build 2.3000.1053820627 `WAWebContactStatusBridge` no longer has `setMyStatus` or `getStatus`, so `Client.setStatus()` and `Contact.getAbout()` threw in the page. The About text now lives in `WAWebContactTextStatusBridge` (`setTextStatus(text, emoji, duration)`, `getTextStatus(wid)`); the patch calls those, and writes the new text onto the own contact as WhatsApp Web does. | exact-shape match; remove once upstream stops using a bare `pipe` there.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| 🔧²¹ | `scripts/patch-baileys-media-stream.js`                    | Baileys `lib/Utils/messages-media.js`              | `downloadEncryptedContent` wires the HTTP body into the decrypting stream with a bare `fetched.pipe(output)`: `pipe` forwards no errors and leaves no `'error'` listener on the body. When the inbound download deadline (`MEDIA_DOWNLOAD_TIMEOUT_MS`) or byte cap destroys the stream it was handed, the body stays open, and a later HTTP/2 reset (`NGHTTP2_PROTOCOL_ERROR`, `NGHTTP2_INTERNAL_ERROR`) or `ECONNRESET` is emitted with no listener and exits the process with `TypeError: terminated`. Ties the two streams together in both directions: a body error destroys the output, and closing the output destroys the body.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | exact-shape match; remove once upstream stops using a bare `pipe` there.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 ### 29.3.2 Which matrix rows depend on which patch
 
-This is the patch visibility the matrix cells refer to. Every patch is engine-specific (18 on wwjs,
-3 on Baileys), and **no row carries a row-level patch mark on both engines**. The two column-wide
+This is the patch visibility the matrix cells refer to. Every patch is engine-specific (19 on wwjs,
+4 on Baileys), and **no row carries a row-level patch mark on both engines**. The two column-wide
 patches are a separate matter: 🔧¹ underwrites every wwjs cell and 🔧⁵ every baileys cell, so in
 that sense every row does depend on a patch on each side. "Patch-dependent" below means a patch
 this row needs specifically, which is marked in the row; the patches that cover events or a whole
@@ -197,6 +199,8 @@ class of sends rather than a row (🔧¹⁰, 🔧¹¹, 🔧¹³, 🔧¹⁶) are 
 | 🔧¹⁸ profile bundle         | `setProfileName` on **wwjs**. Without it every profile-name change answers an opaque `500`, because the page action it calls is not loaded on a headless page. Row-marked.                                                                                                                                                                                                                                                                                                                                                                                       |
 | 🔧²⁰ private invite         | `addParticipants`, `createGroup` on **wwjs**, for a participant whose privacy settings refuse a direct add. Without it that participant is neither added nor invited, and the call fails in the page. Row-marked.                                                                                                                                                                                                                                                                                                                                                |
 | 🔧¹² pairing refresh        | No row. Baileys linking by QR or pairing code: notification ACKs go out before login, retired registration secrets rotate and the current QR re-renders without spending a ref. Once a pairing code was requested (`creds.me` set) the QR timer stops, so running out of refs no longer ends that socket, as it does upstream.                                                                                                                                                                                                                                   |
+| 🔧²² About text bridge      | `setProfileStatus` on **wwjs**. Without it every call answers a bare `500` on WhatsApp Web builds from 2.3000.1053820627. |
+| 🔧²¹ media download stream  | No row. Every **baileys** inbound media message: without it a download abandoned at `MEDIA_DOWNLOAD_TIMEOUT_MS` or the byte cap can crash the whole gateway when its HTTP/2 stream is later reset, taking every session offline until the restart. No cell's outcome changes; the process survives instead.                                                                                                                                                                                                                                              |
 
 Rows that are ✅ on **both** engines where one side is patch-dependent: `initialize` (🔧⁴ wwjs),
 `sendTextMessage` (🔧³ wwjs), `postTextStatus` / `postImageStatus` / `postVideoStatus` /
@@ -220,7 +224,7 @@ the channel cluster. Four of them — `acceptChannelAdminInvite`, `revokeChannel
 `demoteChannelAdmin`, `deleteChannel` — catch **only** `ServerStatusCodeError` and rethrow everything
 else, which is the behaviour we would want and the same shape as `deleteProfilePicture`. The
 indiscriminate `catch (ignoredError) { return false; }` appears **once**, in
-`transferChannelOwnership` (`Client.js:2627`).
+`transferChannelOwnership` (`Client.js`).
 
 So it is not a house style, and the one method carrying it is the one OpenWA answers 501 for and
 never invokes (29.6.2). The patch would repair a path our code does not take. It is also not an
@@ -261,11 +265,14 @@ different depths — which is what the optional marker exists to allow. wwjs rac
 `Client.getState()` round trip against a 10s timeout, because a wedged page keeps reporting
 CONNECTED. Baileys returns a local check (`status === READY && sock != null`), because its keepalive
 already emits a close event within ~35s. So a wedged wwjs page is caught here; a wedged Baileys
-socket is caught by the transport instead. No REST route: the session watchdog polls it. One wwjs
-page it cannot tell from a healthy one: a reload whose re-inject loads the helpers but then fails to
-attach the event listeners emits no `ready`, so the probe finds the helpers and the session stays
-`READY`, sends still working, while inbound messages can stop reaching the gateway until the session
-is restarted.
+socket is caught by the transport instead. No REST route: the session watchdog polls it. A wwjs
+reload whose re-inject loads the helpers but then fails to attach the event listeners emits no
+`ready`. The ready-sync patch (🔧⁴) resets its `eventsAttached` marker whenever a page without the
+helpers starts attaching, so the probe does not take the helpers alone as a recovered reload: the
+session stays `READY`, sends still working, until the 3-minute recovery bound after the reload has
+passed, and the watchdog then restarts it after two failed probes in a row. An install whose patch is
+missing or still the earlier version cannot tell that page from a healthy one, and inbound messages
+can stop reaching the gateway until the session is restarted.
 
 ### 29.4.2 Sending messages
 
@@ -943,6 +950,7 @@ adapter boundary — none silently stubs.
 
 ✅ means works end-to-end — but these rows carry behavioral differences worth knowing:
 
+- **1:1 sends prefer a resolved LID on both engines.** A phone-number destination can be sent to the contact's `@lid` when the engine already knows it or obtains it from a lookup, including for a cold, unsaved contact on the first send. Baileys uses `getLIDForPN` (which can query WhatsApp); whatsapp-web.js uses `getNumberId`. WhatsApp can reject phone-addressed sends to LID-migrated accounts with ack `463` (missing privacy token), so a successful number check does not force phone addressing. If no LID is resolved, the existing phone-addressed fallback applies. The linked account's own phone may show a first message to an unsaved contact under an unnamed id; see [troubleshooting](./12-troubleshooting-faq.md#issue-a-first-outbound-message-appears-under-an-unnamed-id).
 - **`clickButton` (Baileys), native-flow is unverified.** Classic `buttonsMessage` /
   `templateMessage` / `listMessage` prompts go through Baileys' `buttonReply` / `listReply`
   helpers. A native-flow `interactiveMessage` prompt is answered with the same template
@@ -1028,12 +1036,14 @@ adapter boundary — none silently stubs.
   marks, and a chat deleted before 0.27.0 has none, so such a chat is listed again while the gateway
   still stores its messages. Limits: the read takes the `BAILEYS_SESSION_STORE_MAX_ENTRIES` chats
   (default 5000) with the newest rows, and a chat that holds only another account's rows, or only
-  rows without a WhatsApp id, uses a slot and lists nothing; a start waits ten seconds for the read
-  at most, and lists as it did before chats were seeded when the read takes longer; a chat with no
-  stored message (not kept under `STORE_EPHEMERAL_MESSAGES=false`, or removed by retention) and no
-  persisted state comes back when its next message arrives; `unreadCount` reads `0` until a message
-  arrives, since nothing stored records it; a contact stored under both its phone and its lid lists
-  as two rows, as the live listing keeps them; and when the chat states outgrow
+  rows without a WhatsApp id, uses a slot and lists nothing; on PostgreSQL a start waits ten seconds
+  for the read at most, and lists as it did before chats were seeded when the read takes longer, while
+  on SQLite the read is one synchronous statement that holds the event loop until it ends, so the
+  start waits for all of it; a chat with no stored message (not kept under
+  `STORE_EPHEMERAL_MESSAGES=false`, or removed by retention) and no persisted state comes back when
+  its next message arrives; `unreadCount` reads `0` until a message arrives, since nothing stored
+  records it; a contact stored under both its phone and its lid lists as two rows, as the live
+  listing keeps them; and when the chat states outgrow
   `BAILEYS_CHAT_STATE_CACHE_MAX`, a deleted chat whose state row was not cached can show in the
   first listing after the start, and is left out once that row is read.
   A first link gets its chats from history sync instead. The transient reconnects Baileys runs on
@@ -1051,7 +1061,12 @@ adapter boundary — none silently stubs.
   refused. Link by QR when the session of that number must stay up.
 - **`archiveChat` / `clearChatMessages` / `deleteChat` / `sendSeen` / `markUnread` (baileys).** The
   four `chatModify` actions (archive, clear, delete, unread) are keyed to the chat's newest message:
-  the one the session holds in memory, else the newest one the gateway stored (#1891). The patch is
+  the one the session holds in memory, else the newest one the gateway stored (#1891). Only the rows
+  of the account the session is linked to count, as in the chat list above: a stored message names
+  that account in `to` when it was received and in `from` when it was sent, so a session linked to
+  another number never keys a write to a message of the one before. A send stored before the gateway
+  knew the account's number names no account and keys nothing, and no stored message is used while
+  the engine reports no number. The patch is
   indexed by the same jid as that message's key: a message in memory under the jid it arrived with,
   a stored one under the lid its row is filed under, or the chat's only reported lid, else a lid the
   session's cache holds for it, else its phone jid; an own group message goes without its participant.
@@ -1147,7 +1162,11 @@ adapter boundary — none silently stubs.
   the all-groups listing (Baileys runs one on its own and `GET /groups` another), a write to it
   through the API, and every reconnect drop the cached list early. A member added without the adapter
   receiving the event gets the group's messages once the entry expires or its client asks for a
-  retry. whatsapp-web.js has no counterpart: the page keeps the member list itself.
+  retry. The same list backs the check of a member's delete of another member's message: with `0`,
+  the delete of a settled message that is not provably the member's own makes one query (up to the
+  30 second query budget), and a delete of a message still being processed or stored is decided from
+  the cached list alone and let through when it holds none. whatsapp-web.js has no counterpart: the
+  page keeps the member list itself.
 
 ## 29.8 Snapshot summary
 
@@ -1180,7 +1199,7 @@ adapter sources — re-derive the same way when anything changes:
   list it cannot repopulate; and `rejectCall`, whose `Call.reject()` resolves while the caller's
   phone keeps ringing (all in 29.6.2). Each answers 501 on wwjs. `.d.ts` presence
   is not capability, and only a live call distinguishes the two.
-- **21** install-time patches (18 whatsapp-web.js + 3 Baileys), all exact and self-disabling.
+- **23** install-time patches (19 whatsapp-web.js + 4 Baileys), all exact and self-disabling.
 - **0 phantom-support rows** — every `not-available` cell throws at the adapter boundary.
 - Remaining adapter-gaps (fixable in this repo, ranked): **#1** `getChannelMessages` (Baileys —
   fetch is one line, `BinaryNode`→`ChannelMessage` parser is the work); **#2** `subscribeToChannel`

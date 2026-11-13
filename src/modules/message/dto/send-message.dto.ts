@@ -43,6 +43,9 @@ export const CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH = 1024;
 // (src/core/agent-tools/tools/message.tools.ts) so MCP and REST enforce the same limit.
 export const MESSAGE_TEXT_MAX_LENGTH = 4096;
 
+// The same for a media send's filename, shared with the agent-tool schemas of the five media tools.
+export const MEDIA_FILENAME_MAX_LENGTH = 255;
+
 /**
  * Caps for the ids a caller chooses: a chat id and a bulk batch id. Both end up in a btree index
  * (the message chat indexes, UNIQUE(sessionId, batchId)), and PostgreSQL refuses an index entry past
@@ -299,12 +302,12 @@ export class SendMediaMessageDto {
     description:
       "Filename for the media. Only rendered on document sends — defaults to 'file' when omitted (a URL-based document send on whatsapp-web.js first derives the URL basename)",
     example: 'image.jpg',
-    maxLength: 255,
+    maxLength: MEDIA_FILENAME_MAX_LENGTH,
   })
   @IsOptional()
   @ToStrictString()
   @IsString()
-  @MaxLength(255)
+  @MaxLength(MEDIA_FILENAME_MAX_LENGTH)
   filename?: string;
 
   @ApiPropertyOptional({
