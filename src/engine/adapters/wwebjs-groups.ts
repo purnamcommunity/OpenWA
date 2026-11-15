@@ -170,7 +170,12 @@ export async function changeAdminStatusInPage(
   type Job = (chatId: Wid, wids: Wid[], isLid: boolean) => Promise<JobAnswer>;
   type PageWindow = {
     require(name: 'WAWebWidFactory'): { asUserWidOrThrow(wid: Wid): Wid };
-    require(name: 'WAWebUserPrefsMeUser'): { isMeAccount(wid: Wid): boolean };
+    // isMeAccount left WhatsApp Web around build 2.3000.1054670094; the two getters remain.
+    require(name: 'WAWebUserPrefsMeUser'): {
+      isMeAccount?: (wid: Wid) => boolean;
+      getMaybeMePnUser?: () => Wid | undefined;
+      getMaybeMeLidUser?: () => Wid | undefined;
+    };
     require(name: 'WAWebCollections'): { Chat: { get(wid: Wid): { groupMetadata?: Metadata } | undefined } };
     require(name: 'WAWebGroupModifyParticipantsJob'): {
       promoteGroupParticipants: Job;
@@ -213,6 +218,9 @@ export async function changeAdminStatusInPage(
 
   const Wids = w.require('WAWebWidFactory');
   const Me = w.require('WAWebUserPrefsMeUser');
+  const myIds = new Set([ser(Me.getMaybeMePnUser?.()), ser(Me.getMaybeMeLidUser?.())].filter((k): k is string => !!k));
+  const isMe = (wid: Wid): boolean =>
+    typeof Me.isMeAccount === 'function' ? Me.isMeAccount(wid) : myIds.has(ser(wid) ?? '');
   const participants = md.participants;
   const toAct: Array<{ index: number; member: Member; keys: string[] }> = [];
   for (let index = 0; index < participantIds.length; index++) {
@@ -225,7 +233,7 @@ export async function changeAdminStatusInPage(
     entry.member = true;
     if (Boolean(member.isAdmin) === promote) {
       entry.code = 'unchanged';
-    } else if (Me.isMeAccount(member.id)) {
+    } else if (isMe(member.id)) {
       entry.code = 'self';
     } else if (!promote && member.isSuperAdmin) {
       entry.code = 'creator';

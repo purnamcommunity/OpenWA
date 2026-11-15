@@ -48,7 +48,8 @@ describe('changeAdminStatusInPage', () => {
     };
     const modules: Record<string, unknown> = {
       WAWebWidFactory: { asUserWidOrThrow: (w: unknown) => w },
-      WAWebUserPrefsMeUser: { isMeAccount: (w: { _serialized: string }) => w._serialized === ME },
+      // As the current WhatsApp Web build has it: no isMeAccount, only the two getters.
+      WAWebUserPrefsMeUser: { getMaybeMePnUser: () => wid(ME), getMaybeMeLidUser: () => undefined },
       WAWebCollections: {
         Chat: {
           get: (w: { _serialized: string }) =>
