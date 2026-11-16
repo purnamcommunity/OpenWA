@@ -1,7 +1,7 @@
 /**
  * Post-install hook (npm `postinstall`).
  *
- * Twenty-four conditional steps, each skipped when its target is absent so the hook is a no-op where the
+ * Twenty-five conditional steps, each skipped when its target is absent so the hook is a no-op where the
  * piece is missing (the Docker builder stage copies package*.json long before any source):
  *
  *   1. `npm ci` inside dashboard/ when dashboard/ exists — the dashboard carries its own lockfile and
@@ -57,11 +57,14 @@
  *      newsletter-create parse fix.
  *  22. `node scripts/patch-baileys-pairing.js --best-effort` when present, preserving pre-login
  *      notification ACKs and refreshing pairing credentials. A partial patch remains fatal.
- *      Steps 20-23 are the Baileys patches. Every patcher runs whenever its script is present,
+ *      Steps 20-24 are the Baileys patches. Every patcher runs whenever its script is present,
  *      whatever ENGINE_TYPE is set to.
  *  23. `node scripts/patch-baileys-media-stream.js --best-effort` when present, so an abandoned
  *      inbound media download cannot crash the process.
- *  24. `node scripts/patch-wwebjs-puppeteer.js` when present. Browser teardown must use the
+ *  24. `node scripts/patch-baileys-status-ack.js --best-effort` when present, decoding and
+ *      acknowledging the top-level `<status>` stanza, so its status is delivered and the server stops
+ *      ending the stream over it.
+ *  25. `node scripts/patch-wwebjs-puppeteer.js` when present. Browser teardown must use the
  *      connected getter required by Puppeteer 25; an unknown source shape aborts the install.
  *      This list is the order `planSteps` plans, which `scripts/postinstall.spec.js` pins
  *      against the patchers on disk.
@@ -307,6 +310,15 @@ function planSteps(root, env = process.env) {
       name: 'Baileys media download stream fix (scripts/patch-baileys-media-stream.js --best-effort)',
       command: process.execPath,
       args: [baileysMediaStreamPatcher, '--best-effort'],
+      options: { stdio: 'inherit', cwd: root, env: cleanEnv },
+    });
+  }
+  const baileysStatusAckPatcher = path.join(root, 'scripts', 'patch-baileys-status-ack.js');
+  if (fs.existsSync(baileysStatusAckPatcher)) {
+    steps.push({
+      name: 'Baileys status stanza ack (scripts/patch-baileys-status-ack.js --best-effort)',
+      command: process.execPath,
+      args: [baileysStatusAckPatcher, '--best-effort'],
       options: { stdio: 'inherit', cwd: root, env: cleanEnv },
     });
   }

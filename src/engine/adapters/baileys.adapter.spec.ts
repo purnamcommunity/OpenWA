@@ -2920,6 +2920,14 @@ describe('BaileysAdapter inbound fan-out', () => {
       const mapped = (onHistoryMessages.mock.calls as Array<[IncomingMessage[]]>)[0][0];
       expect(mapped.map(m => m.id)).toEqual(['TEXT']);
     });
+
+    it('wires onPollVote through the BaileysEvents host', async () => {
+      const onPollVote = jest.fn();
+      const adapter = newAdapter();
+      await adapter.initialize({ onPollVote });
+      const { events } = adapter as unknown as { events: { host: { getOnPollVote: () => unknown } } };
+      expect(events.host.getOnPollVote()).toBe(onPollVote);
+    });
   });
 
   it('surfaces inbound @mentions as neutral mentionedIds (contextInfo.mentionedJid)', async () => {
@@ -10397,7 +10405,7 @@ describe('BaileysAdapter link preview', () => {
     expect(sentContent()).not.toHaveProperty('linkPreview');
   });
 
-  // Previews are OPT-IN on this engine: generation means a blocking outbound fetch per URL before
+  // Previews are OPT-IN on this engine: generation means a blocking outbound fetch of the first URL before
   // the message can go out (a bulk campaign carrying a slow URL would stall on every message), and
   // the documented engine default is that Baileys builds none.
   it('suppresses generation for a plain send, and for a send that says nothing about previews', async () => {

@@ -316,13 +316,15 @@ class UpdateSessionProxyRequest(TypedDict, total=False):
 class SessionConfig(TypedDict):
     """A session's effective runtime configuration.
 
-    ``None`` on ``maxReconnectAttempts`` means unlimited -- not unset. ``autoRejectCalls`` works on
+    ``None`` on ``maxReconnectAttempts`` means unlimited -- not unset; ``None`` on ``linkPreview``
+    means the engine's own default. ``autoRejectCalls`` works on
     Baileys only: whatsapp-web.js stores the flag but cannot reject a call, so calls keep ringing there.
     """
 
     autoRejectCalls: bool
     maxReconnectAttempts: int | None
     reconnectBaseDelay: int
+    linkPreview: bool | None
 
 
 class UpdateSessionConfigRequest(TypedDict, total=False):
@@ -330,12 +332,15 @@ class UpdateSessionConfigRequest(TypedDict, total=False):
 
     Send ``None`` for ``maxReconnectAttempts`` to restore unlimited retries, which no in-range number
     can express. ``autoRejectCalls`` works on Baileys only: whatsapp-web.js stores the flag but cannot
-    reject a call, so calls keep ringing there.
+    reject a call, so calls keep ringing there. ``linkPreview`` is the preview of a send-text or
+    send-template that sets neither ``linkPreview`` nor ``customLinkPreview``; ``None`` restores the
+    engine's default.
     """
 
     autoRejectCalls: bool | None
     maxReconnectAttempts: int | None
     reconnectBaseDelay: int | None
+    linkPreview: bool | None
 
 
 class CreateSessionRequest(TypedDict):
@@ -395,7 +400,8 @@ class SendTextRequest(TypedDict):
     mentions: NotRequired[list[str]]
     # Controls the URL preview. False suppresses it on both engines. Otherwise the engines differ:
     # whatsapp-web.js builds one in-page by default, while on Baileys a preview is OPT-IN -- it needs
-    # True, because generating one is a blocking outbound fetch per URL.
+    # True, because generating one is a blocking outbound fetch of the first URL in the text. Unset,
+    # the session's linkPreview config applies when one is set (OpenWA 0.30.3 or later).
     linkPreview: NotRequired[bool]
     # Attach a preview you supply yourself instead of one fetched from the URL. The page is not
     # fetched, so this works even for a URL the gateway cannot reach; only thumbnailUrl, when given,

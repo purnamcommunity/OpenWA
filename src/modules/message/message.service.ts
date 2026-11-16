@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { In, ObjectLiteral, Repository } from 'typeorm';
 import { Readable } from 'stream';
 import { EngineRegistry } from '../../engine/engine-registry.service';
-import type { IWhatsAppEngine, PollVote } from '../../engine/interfaces/whatsapp-engine.interface';
+import type { IncomingMessage, IWhatsAppEngine, PollVote } from '../../engine/interfaces/whatsapp-engine.interface';
 import { MessageProjector } from '../session/message-projector.service';
 import { SendTextMessageDto, SendMediaMessageDto, SendAudioMessageDto, MessageResponseDto } from './dto';
 import { SendTemplateMessageDto } from './dto/send-template.dto';
@@ -13,7 +13,14 @@ import { HookManager, applySendingGate } from '../../core/hooks';
 import { SendPacingService } from './send-pacing.service';
 import { createLogger } from '../../common/services/logger.service';
 import { resolveJidCandidates as expandJidCandidates } from '../../engine/identity/jid-candidates';
-import { parseWaId } from '../../engine/identity/wa-id';
+import {
+  SERIALIZED_MESSAGE_ID,
+  authorOfMessageId,
+  chatOfPage,
+  messageIdByAuthor,
+  messageIdInChat,
+  parseWaId,
+} from '../../engine/identity/wa-id';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { ChatMediaArchiveService } from '../chat-media/chat-media-archive.service';
 import { StorageService, isMissingObjectError } from '../../common/storage/storage.service';
@@ -169,6 +176,12 @@ function bareUserDigits(id: string): string[] {
   const { kind, userPart } = parseWaId(id);
   return kind === 'user' && /^\d+$/.test(userPart) ? [userPart] : [];
 }
+
+/**
+ * How many ids one stored-row lookup of a chat history asks for. A deep page holds up to 2000 entries and each
+ * goes by one id per form of its chat, which together can pass the bind limit of a single statement.
+ */
+const STORED_ID_LOOKUP_CHUNK = 500;
 
 /** Pin window applied when the caller does not choose one — WhatsApp's own default of 24h. */
 export const DEFAULT_PIN_DURATION_SECONDS = 86400;
@@ -736,9 +749,92 @@ export class MessageService implements PluginMessagePort {
     const ceiling = deep ? MessageService.MAX_DEEP_CHAT_HISTORY_LIMIT : MessageService.MAX_CHAT_HISTORY_LIMIT;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), ceiling) : 50;
     const media = deep ? false : includeMedia;
-    return signal
+    const page = await (signal
       ? engine.getChatHistory(chatId, safeLimit, media, undefined, signal)
-      : engine.getChatHistory(chatId, safeLimit, media);
+      : engine.getChatHistory(chatId, safeLimit, media));
+    await this.nameDeletedByStoredId(sessionId, chatId, page);
+    return page;
+  }
+
+  /**
+   * Report each deleted message of a history page under the id its stored row has. The engine names it as its
+   * delete notice does, and a notice can write a person's chat by phone number where the stored row has the
+   * lid, or the reverse, and in a group it can do the same to the author. The other forms tried are the ones
+   * the lid mapping knows, the one the engine holds the chat under, the ones the ids of the page itself use
+   * for the chat, and the account's own id for a message it sent and deleted. An id changes only to one a
+   * stored row has. Best effort: the page stays as the engine gave it when the store cannot be read.
+   */
+  async nameDeletedByStoredId(sessionId: string, chatId: string, page: IncomingMessage[]): Promise<void> {
+    const deleted = page.filter(message => message.type === 'revoked');
+    if (deleted.length === 0) return;
+    try {
+      const chats = new Set(await this.resolveJidCandidates(chatId));
+      const held = chatOfPage(page);
+      if (held) chats.add(held);
+      for (const message of page) {
+        const chat = SERIALIZED_MESSAGE_ID.exec(message.id)?.[2];
+        if (chat) chats.add(chat);
+      }
+      // Every other id the same message can go by, per deleted entry: a person's chat in its other form, and
+      // in a group the author in theirs, as the lid mapping knows it. A channel's ids have one form.
+      const otherForms = await this.otherFormsOfAuthors(deleted.map(message => authorOfMessageId(message.id)));
+      const others = new Map<IncomingMessage, string[]>();
+      for (const message of deleted) {
+        const forms = new Set([...chats].map(chat => messageIdInChat(message.id, chat)));
+        const author = authorOfMessageId(message.id);
+        if (author) {
+          for (const other of otherForms(author)) forms.add(messageIdByAuthor(message.id, other));
+          // The entry carries the fields of the delete notice, not of the message, so its `author` and
+          // `from` name whoever deleted it: in a group that can be an admin. Only a message the account
+          // both sent and deleted is known to be by `from`.
+          if (message.fromMe && message.id.startsWith('true_')) {
+            forms.add(messageIdByAuthor(message.id, message.from));
+          }
+        }
+        forms.delete(message.id);
+        if (forms.size > 0) others.set(message, [...forms]);
+      }
+      const wanted = [...new Set([...others].flatMap(([message, forms]) => [message.id, ...forms]))];
+      const stored = new Set<string>();
+      for (let from = 0; from < wanted.length; from += STORED_ID_LOOKUP_CHUNK) {
+        const rows = await this.messageRepository.find({
+          select: { waMessageId: true },
+          where: { sessionId, waMessageId: In(wanted.slice(from, from + STORED_ID_LOOKUP_CHUNK)) },
+        });
+        for (const row of rows) stored.add(row.waMessageId);
+      }
+      for (const [message, forms] of others) {
+        if (!stored.has(message.id)) message.id = forms.find(id => stored.has(id)) ?? message.id;
+      }
+    } catch (error) {
+      this.logger.warn('Could not match the deleted messages of a chat history to their stored rows', {
+        sessionId,
+        chatId,
+        error: String(error),
+      });
+    }
+  }
+
+  /**
+   * The other id forms of the authors given, as the lid mapping knows them: a phone number for a lid, the lids
+   * of a phone number. Two batched reads however many authors there are, so a page of a busy group costs no
+   * more than a short one.
+   */
+  private async otherFormsOfAuthors(authors: (string | undefined)[]): Promise<(author: string) => string[]> {
+    const parts = { lid: new Set<string>(), phone: new Set<string>() };
+    for (const author of authors) {
+      if (!author) continue;
+      const { kind, userPart } = parseWaId(author);
+      parts[kind === 'lid' ? 'lid' : 'phone'].add(userPart);
+    }
+    const phones = parts.lid.size > 0 ? await this.lidMappingStore.phonesForLidsPersisted([...parts.lid]) : {};
+    const lids = parts.phone.size > 0 ? await this.lidMappingStore.lidsForPhonesPersisted([...parts.phone]) : {};
+    // Looked up by the user part, so every spelling of one author (a device suffix, a hosted dialect) gets them.
+    return author => {
+      const { kind, userPart } = parseWaId(author);
+      if (kind !== 'lid') return (lids[userPart] ?? []).map(lid => `${lid}@lid`);
+      return phones[userPart] ? [`${phones[userPart]}@c.us`] : [];
+    };
   }
 
   // ========== Delete Message ==========

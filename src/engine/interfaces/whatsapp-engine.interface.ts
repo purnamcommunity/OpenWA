@@ -869,11 +869,13 @@ export interface PollVoteEvent {
   /** Neutral id of the voter (the account itself when it voted from its phone). */
   voterId: string;
   /**
-   * The option texts now selected, exactly as they appear on the poll (the same strings `vote-poll`
-   * takes). An option the engine could not name is left out.
+   * The option texts now selected, capped to 32 options of 1024 characters like poll creation options
+   * (the same strings `vote-poll` takes when within WhatsApp's limits). Baileys drops the whole vote
+   * when any option hash does not match the poll; whatsapp-web.js omits individual unnamed options and
+   * skips a non-empty vote only when none can be named.
    */
   selectedOptions: string[];
-  /** The poll's question, when the creation message is available to read it from. */
+  /** The poll's question, when the creation message is available (truncated to 1024 characters). */
   pollName?: string;
   /** Unix seconds the voter changed the selection (sender clock). */
   timestamp: number;
@@ -1191,7 +1193,8 @@ export interface EngineEventCallbacks {
   /**
    * Fired each time a voter changes their selection on a poll (consumers emit `poll.vote`). Each event
    * carries that voter's whole current selection, so consumers replace what they hold for the voter
-   * rather than adding to it. whatsapp-web.js only: Baileys never fires it.
+   * rather than adding to it. Baileys requires the poll creation message (and its secret) to remain in
+   * the session message store.
    */
   onPollVote?: (event: PollVoteEvent) => void;
   /**
@@ -1398,7 +1401,8 @@ export interface MessagingCapability {
    *
    * `linkPreview: false` suppresses the URL preview on BOTH engines. Otherwise the two differ:
    * whatsapp-web.js builds one in-page by default, while on Baileys a preview is OPT-IN — only
-   * `linkPreview: true` produces one, because generating it is a blocking outbound fetch per URL.
+   * `linkPreview: true` produces one, because generating it is a blocking outbound fetch of the
+   * first URL in the text.
    */
   sendTextMessage(
     chatId: string,

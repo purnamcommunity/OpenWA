@@ -195,14 +195,16 @@ export interface GroupJoinInfo {
 /**
  * A session's effective runtime configuration.
  *
- * Only `maxReconnectAttempts` is nullable, and `null` there means UNLIMITED — not "unset". The
- * server always reports a concrete `reconnectBaseDelay` and `autoRejectCalls`.
+ * `null` on `maxReconnectAttempts` means UNLIMITED — not "unset"; `null` on `linkPreview` means the
+ * engine's own default. The server always reports a concrete `reconnectBaseDelay` and `autoRejectCalls`.
  */
 export interface SessionConfig {
   /** Baileys only: whatsapp-web.js stores the flag but cannot reject a call, so calls keep ringing there. */
   autoRejectCalls: boolean;
   maxReconnectAttempts: number | null;
   reconnectBaseDelay: number;
+  /** Link preview of a `send-text` or `send-template` that sets none; `null` keeps the engine's default. */
+  linkPreview: boolean | null;
 }
 
 /**
@@ -215,6 +217,11 @@ export interface UpdateSessionConfigRequest {
   autoRejectCalls?: boolean | null;
   maxReconnectAttempts?: number | null;
   reconnectBaseDelay?: number | null;
+  /**
+   * Link preview for a send-text or send-template that sets neither `linkPreview` nor `customLinkPreview`.
+   * `null` restores the engine's default.
+   */
+  linkPreview?: boolean | null;
 }
 
 /** Masked per-session proxy configuration — credentials are never returned. */
@@ -287,7 +294,8 @@ export interface SendTextRequest {
   /**
    * Controls the URL preview. `false` suppresses it on both engines. Otherwise the engines differ:
    * whatsapp-web.js builds one in-page by default, while on Baileys a preview is OPT-IN — it needs
-   * `true`, because generating one is a blocking outbound fetch per URL.
+   * `true`, because generating one is a blocking outbound fetch of the first URL in the text. Unset,
+   * the session's `linkPreview` config applies when one is set (OpenWA 0.30.3 or later).
    */
   linkPreview?: boolean;
   /**

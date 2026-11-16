@@ -5,7 +5,7 @@ import { markNothingSent } from '../../common/errors/engine-not-sent.error';
 import { mergeSentMetadata, updateMessageMetadata } from './message-metadata';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository, QueryDeepPartialEntity } from 'typeorm';
-import { SessionService } from '../session/session.service';
+import { SessionService, linkPreviewDefault } from '../session/session.service';
 import { MessageProjector } from '../session/message-projector.service';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { SendTextMessageDto, SendMediaMessageDto, SendAudioMessageDto, MessageResponseDto } from './dto';
@@ -46,6 +46,16 @@ export const DEFAULT_TEMPLATE_RENDER_MAX_CHARS = 64 * 1024;
 function isUrlPointerMetadata(metadata: Record<string, unknown> | undefined): boolean {
   const data = (metadata as { media?: { data?: unknown } } | undefined)?.media?.data;
   return typeof data === 'string' && /^https?:\/\//i.test(data);
+}
+
+/**
+ * Asking to suppress the preview AND to attach one is a contradiction, and guessing which half
+ * the caller meant would send a message they did not ask for either way.
+ */
+function assertOnePreviewChoice(dto: SendTextMessageDto): void {
+  if (dto.linkPreview === false && dto.customLinkPreview) {
+    throw new BadRequestException('linkPreview: false cannot be combined with customLinkPreview');
+  }
 }
 
 /** Persistence payload for one outbound row written by {@link MessageSendService.saveOutgoingMessage}. */
@@ -114,16 +124,13 @@ export class MessageSendService {
   ) {}
 
   async sendText(sessionId: string, dto: SendTextMessageDto): Promise<MessageResponseDto> {
-    // Asking to suppress the preview AND to attach one is a contradiction, and guessing which half
-    // the caller meant would send a message they did not ask for either way.
-    if (dto.linkPreview === false && dto.customLinkPreview) {
-      throw new BadRequestException('linkPreview: false cannot be combined with customLinkPreview');
-    }
+    assertOnePreviewChoice(dto);
     const {
       message,
       finalDto,
       engine,
       prepared: customPreview,
+      sessionLinkPreview,
     } = await this.applySendingGate(
       sessionId,
       'text',
@@ -134,12 +141,23 @@ export class MessageSendService {
         type: 'text',
         quotedMessageId: finalDto.quotedMessageId,
       }),
-      (d: SendTextMessageDto) => this.buildCustomPreview(d.customLinkPreview),
+      (d: SendTextMessageDto) => {
+        // Again on what the gate returned: a handler can rewrite the send into the same contradiction.
+        assertOnePreviewChoice(d);
+        return this.buildCustomPreview(d.customLinkPreview);
+      },
     );
 
     // Humanising "typing…" pause before the actual send (anti-automation signal). On by default;
     // SIMULATE_TYPING=false disables it.
     await this.simulateTypingIfEnabled(engine, finalDto.chatId, finalDto.text);
+
+    // The session's default fills in only when the send left the preview open: a value in the
+    // request, or a preview the caller supplied, is the caller's choice and always wins. Only a
+    // boolean is a choice: a plugin's send and a gate rewrite arrive without the DTO's rules, and
+    // the engines read anything else as unset.
+    const requested = typeof finalDto.linkPreview === 'boolean' ? finalDto.linkPreview : undefined;
+    const linkPreview = requested ?? (customPreview ? undefined : sessionLinkPreview);
 
     let result: MessageResult;
     try {
@@ -147,7 +165,7 @@ export class MessageSendService {
       // nor a preview choice keeps its two-argument shape, and one with mentions alone keeps its
       // three — trailing `undefined`s would be harmless to the engines but would rewrite the call
       // shape of every existing send for no behavioural gain.
-      const { linkPreview, quotedMessageId } = finalDto;
+      const { quotedMessageId } = finalDto;
       if (linkPreview !== undefined || customPreview || quotedMessageId) {
         result = await engine.sendTextMessage(finalDto.chatId, finalDto.text, finalDto.mentions, {
           ...(linkPreview === undefined ? {} : { linkPreview }),
@@ -188,7 +206,13 @@ export class MessageSendService {
     input: T,
     buildPending: (finalDto: T, prepared: P) => SaveOutgoingMessageData | Promise<SaveOutgoingMessageData>,
     prepare?: (finalDto: T) => P,
-  ): Promise<{ finalDto: T; engine: IWhatsAppEngine; prepared: P; message: Message }> {
+  ): Promise<{
+    finalDto: T;
+    engine: IWhatsAppEngine;
+    prepared: P;
+    message: Message;
+    sessionLinkPreview?: boolean;
+  }> {
     // Pacing runs BEFORE the plugin gate, so a send that policy forbids never reaches a plugin at
     // all — plugins should not be asked to moderate, or given the chance to rewrite, traffic that is
     // not going to be sent. The consequence is deliberate and documented in the hook contract: a
@@ -218,10 +242,18 @@ export class MessageSendService {
       lifetime.assertCurrent();
       const engine = this.getEngine(sessionId);
       const prepared = prepare?.(finalDto) as P;
-      const message = await this.saveOutgoingMessage(sessionId, await buildPending(finalDto, prepared), lifetime);
+      let sessionLinkPreview: boolean | undefined;
+      const message = await this.saveOutgoingMessage(
+        sessionId,
+        await buildPending(finalDto, prepared),
+        lifetime,
+        config => {
+          sessionLinkPreview = linkPreviewDefault(config) ?? undefined;
+        },
+      );
       lifetime.assertCurrent();
       persisted = true;
-      return { finalDto, engine, prepared, message };
+      return { finalDto, engine, prepared, message, sessionLinkPreview };
     } finally {
       release?.(persisted);
       lifetime.close();
@@ -792,11 +824,13 @@ export class MessageSendService {
     sessionId: string,
     data: SaveOutgoingMessageData,
     lifetime?: SessionWriteScope,
+    onSessionConfig?: (config: unknown) => void,
   ): Promise<Message> {
     const scope =
       lifetime ?? captureSessionWrites(this.messageRepository.manager?.connection ?? this.messageRepository, sessionId);
     try {
       const session = await this.sessionService.findOne(sessionId);
+      onSessionConfig?.(session?.config);
       // Resolved here rather than in each sender: reply and click-button build their own
       // `metadata.quotedMessage` and never reach this branch, so every OTHER quoting sender (media,
       // location, contact, poll, quoted text) used to persist an id with an empty body and the

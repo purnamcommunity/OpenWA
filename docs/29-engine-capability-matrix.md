@@ -5,7 +5,7 @@ Three-way comparison of every capability: the **Baileys library** (`@whiskeysock
 its adapter layer and REST API — including which "supported" cells only work because OpenWA patches
 the installed library. Coverage is total: all 126 `IWhatsAppEngine` methods (29.4), **all 152
 Baileys + 81 whatsapp-web.js library methods** (29.5), all 34 + 31 library events (29.5.4), and all
-23 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
+24 install-time patches (29.3). If it exists upstream or in OpenWA, it has a row here.
 
 ## 29.1 How to read this matrix
 
@@ -51,7 +51,7 @@ flowchart LR
         SVC --> STORE["OpenWA-side stores"]
     end
     WA --> WLIB["whatsapp-web.js 1.34.7<br/>+ 19 OpenWA patches"]
-    BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc14<br/>+ 4 OpenWA patches"]
+    BA --> BLIB["@whiskeysockets/baileys 7.0.0-rc14<br/>+ 5 OpenWA patches"]
     WLIB --> WEB["WhatsApp Web<br/>headless Chromium"]
     BLIB --> WAS["WhatsApp servers<br/>browser-free socket"]
     WA -.->|"not-available"| E["EngineNotSupportedError<br/>HTTP 501"]
@@ -128,7 +128,7 @@ wrong interface method. Those three remain reader-verified.
 
 ## 29.3 Install-time patches OpenWA applies to the libraries
 
-OpenWA ships twenty-three exact, self-disabling source transforms over the installed engines. Each runs at
+OpenWA ships twenty-four exact, self-disabling source transforms over the installed engines. Each runs at
 `npm install` (`scripts/postinstall.js`) and again in the Docker production stage. A recognized repaired
 source shape makes the patcher a no-op. Every image transform fails on an unknown shape. The Puppeteer
 compatibility transform also fails a source install; the other transforms run with `--best-effort` there.
@@ -140,7 +140,7 @@ it is missing as it starts (`src/engine/adapters/engine-patch-status.ts`; 🔧¹
 check described below). The report is diagnostic, not preventive: startup continues, so a session
 reaching READY is not evidence that every patch landed. See docs/12 for the operator procedure.
 
-### 29.3.1 The twenty-three patches
+### 29.3.1 The twenty-four patches
 
 | #    | Patcher                                                    | Library target                                     | What it repairs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Stand-down predicate                                                                                                                                                                                                                                                                                                                                                  |
 | ---- | ---------------------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -167,11 +167,12 @@ reaching READY is not evidence that every patch landed. See docs/12 for the oper
 | 🔧²⁰ | `scripts/patch-wwebjs-invite-message.js`                   | whatsapp-web.js `GroupChat.js`, `Client.js`        | From build 2.3000.1052144417 `sendGroupInviteMessage` lives in `WAWebChatSendGroupInviteMessage`, in the lazy bundle WhatsApp Web loads only when a human opens the private-invite flow, and it takes one options object `{caption, chat_, code, exp, gid, name, thumb}` where whatsapp-web.js passes seven arguments. The patch loads the bundle with `JSResourceForInteraction('WAWebGroupsV4InviteFlow.react').load()` while the module is missing and passes the object, so `addParticipants` and `createGroup` invite a participant WhatsApp refused to add directly instead of failing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | 🔧²² | `scripts/patch-wwebjs-text-status.js`                      | whatsapp-web.js `Client.js`, `Contact.js`          | From build 2.3000.1053820627 `WAWebContactStatusBridge` no longer has `setMyStatus` or `getStatus`, so `Client.setStatus()` and `Contact.getAbout()` threw in the page. The About text now lives in `WAWebContactTextStatusBridge` (`setTextStatus(text, emoji, duration)`, `getTextStatus(wid)`); the patch calls those, and writes the new text onto the own contact as WhatsApp Web does. | exact-shape match; remove once upstream stops using a bare `pipe` there.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | 🔧²¹ | `scripts/patch-baileys-media-stream.js`                    | Baileys `lib/Utils/messages-media.js`              | `downloadEncryptedContent` wires the HTTP body into the decrypting stream with a bare `fetched.pipe(output)`: `pipe` forwards no errors and leaves no `'error'` listener on the body. When the inbound download deadline (`MEDIA_DOWNLOAD_TIMEOUT_MS`) or byte cap destroys the stream it was handed, the body stays open, and a later HTTP/2 reset (`NGHTTP2_PROTOCOL_ERROR`, `NGHTTP2_INTERNAL_ERROR`) or `ECONNRESET` is emitted with no listener and exits the process with `TypeError: terminated`. Ties the two streams together in both directions: a body error destroys the output, and closing the output destroys the body.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | exact-shape match; remove once upstream stops using a bare `pipe` there.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| 🔧²³ | `scripts/patch-baileys-status-ack.js`                      | Baileys `lib/Socket/messages-recv.js`              | WhatsApp delivers some accounts' contact statuses as a top-level `<status>` stanza instead of `<message from="status@broadcast">`, and `makeMessagesRecvSocket` registers no handler for it, so the stanza is never acknowledged. About 50 minutes later the server ends the stream with `<stream:error><ack class="status"/></stream:error>`, which Baileys reports as `Stream Errored (ack)` with status code 500. OpenWA reconnects from that, the server redelivers the stanza as an offline node, and the loop repeats while a status is pending. Reports also describe an account that stops receiving after such a reconnect while the session reads ready. The patch routes the stanza through `processNode` and the offline queue, decodes one shaped as the status message it replaces (`from="status@broadcast"`, the poster in `participant`) so it reaches the status store, and ends every outcome in one ack with no error code. Any other shape is acknowledged undecoded, and a status that fails to decrypt is dropped, not retried. Upstream: WhiskeySockets/Baileys#2858, with fixes #2866 and #2883, neither merged.          | exact-shape match; unknown shape fails the build. A library that registers its own `CB:status` handler also fails it (the patch would send a second ack), which is the signal to retire the patch; `isApplied()` reads that state as applied.                                                                                                                                                                                                                                                                                                             |
 
 ### 29.3.2 Which matrix rows depend on which patch
 
 This is the patch visibility the matrix cells refer to. Every patch is engine-specific (19 on wwjs,
-4 on Baileys), and **no row carries a row-level patch mark on both engines**. The two column-wide
+5 on Baileys), and **no row carries a row-level patch mark on both engines**. The two column-wide
 patches are a separate matter: 🔧¹ underwrites every wwjs cell and 🔧⁵ every baileys cell, so in
 that sense every row does depend on a patch on each side. "Patch-dependent" below means a patch
 this row needs specifically, which is marked in the row; the patches that cover events or a whole
@@ -201,6 +202,7 @@ class of sends rather than a row (🔧¹⁰, 🔧¹¹, 🔧¹³, 🔧¹⁶) are 
 | 🔧¹² pairing refresh        | No row. Baileys linking by QR or pairing code: notification ACKs go out before login, retired registration secrets rotate and the current QR re-renders without spending a ref. Once a pairing code was requested (`creds.me` set) the QR timer stops, so running out of refs no longer ends that socket, as it does upstream.                                                                                                                                                                                                                                   |
 | 🔧²² About text bridge      | `setProfileStatus` on **wwjs**. Without it every call answers a bare `500` on WhatsApp Web builds from 2.3000.1053820627. |
 | 🔧²¹ media download stream  | No row. Every **baileys** inbound media message: without it a download abandoned at `MEDIA_DOWNLOAD_TIMEOUT_MS` or the byte cap can crash the whole gateway when its HTTP/2 stream is later reset, taking every session offline until the restart. No cell's outcome changes; the process survives instead.                                                                                                                                                                                                                                              |
+| 🔧²³ status stanza ack      | No row. Every **baileys** session on an account that WhatsApp delivers contact statuses to as `<status>` stanzas: without it the connection drops about every 50 minutes with `Stream Errored (ack)`, an account can stop receiving after a reconnect, and those statuses are never stored. No cell's outcome changes. A status that fails to decrypt is dropped, not retried.                                                                                                                                                                           |
 
 Rows that are ✅ on **both** engines where one side is patch-dependent: `initialize` (🔧⁴ wwjs),
 `sendTextMessage` (🔧³ wwjs), `postTextStatus` / `postImageStatus` / `postVideoStatus` /
@@ -1117,6 +1119,16 @@ adapter boundary — none silently stubs.
   delivered. A message the session sent is held the same way as one it received, and an edit the
   account makes from its own phone is applied under the account's own id, plain or encrypted.
   whatsapp-web.js receives both already decrypted from WhatsApp Web.
+- **Inbound poll votes (`poll.vote`).** Baileys no longer reads a vote itself, so the adapter does,
+  with the library's `decryptPollVote` and the secret of the poll creation message in the session's
+  message store (`BAILEYS_MESSAGE_STORE_LIMIT`), and names the selected options by their SHA-256
+  hashes. A vote is not reported when its poll is no longer in the store, when it does not
+  authenticate against that poll, when it names an option the poll does not have, or when it arrives
+  in another chat than its poll (aside from a 1:1 vote on the account's own broadcast-list poll).
+  A cleared vote that authenticates is reported with `selectedOptions: []`. Both engines cap
+  `selectedOptions` at 32 entries and option texts and `pollName` at 1024 characters, matching
+  inbound poll creation messages. Votes cast before the store held the poll are not backfilled.
+  whatsapp-web.js receives votes already decrypted from WhatsApp Web.
 - **`muteChat` addressing.** whatsapp-web.js resolves the chat before writing and answers `400` for a
   chatId it cannot resolve. Baileys keys the app-state patch to the id the session holds the chat under
   (the LID of a LID-migrated contact) and answers `200` for a chat it has never seen. A phone-number
@@ -1199,7 +1211,7 @@ adapter sources — re-derive the same way when anything changes:
   list it cannot repopulate; and `rejectCall`, whose `Call.reject()` resolves while the caller's
   phone keeps ringing (all in 29.6.2). Each answers 501 on wwjs. `.d.ts` presence
   is not capability, and only a live call distinguishes the two.
-- **23** install-time patches (19 whatsapp-web.js + 4 Baileys), all exact and self-disabling.
+- **24** install-time patches (19 whatsapp-web.js + 5 Baileys), all exact and self-disabling.
 - **0 phantom-support rows** — every `not-available` cell throws at the adapter boundary.
 - Remaining adapter-gaps (fixable in this repo, ranked): **#1** `getChannelMessages` (Baileys —
   fetch is one line, `BinaryNode`→`ChannelMessage` parser is the work); **#2** `subscribeToChannel`

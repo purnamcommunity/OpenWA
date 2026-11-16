@@ -2,8 +2,13 @@ import {
   chatKind,
   isAddressableParticipant,
   isChannelJid,
+  authorOfMessageId,
+  chatOfPage,
   isIndividualWid,
+  messageIdByAuthor,
+  messageIdInChat,
   parseWaId,
+  rememberChatOfPage,
   toNeutralJid,
   toParticipantWid,
   userPart,
@@ -211,6 +216,110 @@ describe('wa-id', () => {
     it('surfaces as an individual chat, not unknown', () => {
       expect(chatKind('628111@hosted')).toBe('individual');
       expect(chatKind('4707@hosted.lid')).toBe('individual');
+    });
+  });
+
+  describe('messageIdInChat', () => {
+    it("rewrites a person's chat to the form given, whichever way round", () => {
+      expect(messageIdInChat('false_628111222@c.us_3EB0AA', '148000111@lid')).toBe('false_148000111@lid_3EB0AA');
+      expect(messageIdInChat('true_148000111@lid_3EB0AA', '628111222@c.us')).toBe('true_628111222@c.us_3EB0AA');
+      expect(messageIdInChat('true_628111222@c.us_3EB0AA_out', '148000111@lid')).toBe('true_148000111@lid_3EB0AA_out');
+      expect(messageIdInChat('false_628111222@c.us_3EB0AA', ' 148000111@lid\n')).toBe('false_148000111@lid_3EB0AA');
+    });
+
+    it('leaves an id that names a group, a channel, a broadcast list, the status feed or no person at all', () => {
+      for (const id of [
+        'false_120363000111@g.us_3EB0AA_628111222@c.us',
+        'false_120363111222@newsletter_3EB0AA',
+        'false_1700000000@broadcast_3EB0AA_628111222@c.us',
+        'false_status@broadcast_3EB0AA_628111222@c.us',
+        'false_not a user@c.us_3EB0AA',
+      ]) {
+        expect(messageIdInChat(id, '148000111@lid')).toBe(id);
+      }
+    });
+
+    it("leaves every id when the chat given is not a person's, or would not leave a serialized id", () => {
+      const id = 'false_628111222@c.us_3EB0AA';
+      for (const chat of ['120363000111@g.us', 'status@broadcast', 'foo_bar@c.us', '628111222333:1_2@c.us', '']) {
+        expect(messageIdInChat(id, chat)).toBe(id);
+      }
+    });
+
+    it('leaves an id that is not a full serialized one', () => {
+      for (const id of [
+        '3EB0AA',
+        'false_3EB0AA',
+        'false_ORIG_3',
+        'maybe_628111222@c.us_3EB0AA',
+        'false_628111222@c.us_A_B_C',
+      ]) {
+        expect(messageIdInChat(id, '148000111@lid')).toBe(id);
+      }
+    });
+  });
+
+  describe('messageIdByAuthor', () => {
+    const GROUP = 'false_120363000111@g.us_3EB0AA';
+
+    it("rewrites a group message's author to the form given, whichever way round", () => {
+      expect(messageIdByAuthor(`${GROUP}_628111222@c.us`, '148000111@lid')).toBe(`${GROUP}_148000111@lid`);
+      expect(messageIdByAuthor(`${GROUP}_148000111@lid`, '628111222@c.us')).toBe(`${GROUP}_628111222@c.us`);
+      expect(messageIdByAuthor(`${GROUP}_148000111@lid`, '628111222:2@s.whatsapp.net')).toBe(
+        `${GROUP}_628111222:2@s.whatsapp.net`,
+      );
+      expect(authorOfMessageId(`${GROUP}_628111222@c.us`)).toBe('628111222@c.us');
+      // The hosted dialects name a person too, as an author read and as one written.
+      for (const hosted of ['628111222@hosted', '148000111@hosted.lid']) {
+        expect(authorOfMessageId(`${GROUP}_${hosted}`)).toBe(hosted);
+        expect(messageIdByAuthor(`${GROUP}_628111222@c.us`, hosted)).toBe(`${GROUP}_${hosted}`);
+      }
+    });
+
+    it('leaves an id that names no author of a group', () => {
+      for (const id of [
+        GROUP,
+        'true_628111222@c.us_3EB0AA_out',
+        'false_628999111@c.us_3EB0AA_628111222@c.us',
+        'false_status@broadcast_3EB0AA_628111222@c.us',
+        `${GROUP}_120363000222@g.us`,
+        `${GROUP}_ 628111222@c.us `,
+        `${GROUP}_628111222:1 2@c.us`,
+        `${GROUP}_628111222@C.US`,
+        `${GROUP}_1234@c.us`,
+        '3EB0AA',
+        `${GROUP}_x_y`,
+      ]) {
+        expect(messageIdByAuthor(id, '148000111@lid')).toBe(id);
+        expect(authorOfMessageId(id)).toBeUndefined();
+      }
+    });
+
+    it("leaves every id when the author given is not a person's id as an engine writes it", () => {
+      const id = `${GROUP}_628111222@c.us`;
+      for (const author of [
+        '120363000111@g.us',
+        'out',
+        'foo_bar@c.us',
+        '628111222:1_2@c.us',
+        '628111222:1 2@c.us',
+        '628111222:1:bad@c.us',
+        ' 148000111@lid',
+        '148000111@lid\n',
+        '148000111@LID',
+        '',
+      ]) {
+        expect(messageIdByAuthor(id, author)).toBe(id);
+      }
+    });
+  });
+
+  describe('chatOfPage', () => {
+    it('gives back the chat kept for that very page, and nothing for another', () => {
+      const page: unknown[] = [];
+      rememberChatOfPage(page, '148000111@lid');
+      expect(chatOfPage(page)).toBe('148000111@lid');
+      expect(chatOfPage([])).toBeUndefined();
     });
   });
 });
