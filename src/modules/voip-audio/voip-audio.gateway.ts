@@ -40,9 +40,9 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
   private readonly logger = createLogger(VoipAudioGateway.name);
   /** Which session each socket is carrying, so a disconnect closes the right bridge. */
   private readonly sessionOf = new Map<string, string>();
-  /** Sockets authenticated by a minted token are BOUND to that token's session — a token buys
-   *  audio for one line, never a pick of lines the way an API key does. */
-  private readonly boundTo = new Map<string, string>();
+  /** Each socket's handshake verdict, stored before the first await: Nest binds the frame handlers
+   *  without waiting for handleConnection, so `audio:start` must wait on this, never assume it. */
+  private readonly grants = new Map<string, Promise<AudioGrant | null>>();
 
   constructor(
     private readonly audio: VoipAudioService,
@@ -50,27 +50,34 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
     private readonly tokens: VoipAudioTokenService,
   ) {}
 
-  async handleConnection(client: Socket): Promise<void> {
+  handleConnection(client: Socket): Promise<void> {
+    const grant = this.authenticate(client);
+    this.grants.set(client.id, grant);
+    return grant.then(() => undefined);
+  }
+
+  private async authenticate(client: Socket): Promise<AudioGrant | null> {
     // Never the query string: it leaks the credential into proxy and access logs.
     const auth = client.handshake.auth as { apiKey?: string; token?: string } | undefined;
 
     // A browser presents a minted single-use token (see VoipAudioTokenService); a trusted backend
     // presents the API key. The token is checked first so a client sending both is treated as the
     // less-privileged thing it claims to be.
+    let grant: AudioGrant;
     if (auth?.token) {
       const sessionId = this.tokens.consume(auth.token);
       if (!sessionId) {
         client.emit('audio:error', { code: 'UNAUTHORIZED', message: 'invalid or expired audio token' });
         client.disconnect();
-        return;
+        return null;
       }
-      this.boundTo.set(client.id, sessionId);
+      grant = { bound: sessionId };
     } else {
       const apiKey = auth?.apiKey || (client.handshake.headers['x-api-key'] as string | undefined);
       if (!apiKey) {
         client.emit('audio:error', { code: 'UNAUTHORIZED', message: 'API key required' });
         client.disconnect();
-        return;
+        return null;
       }
       try {
         const key = await this.authService.validateApiKey(apiKey);
@@ -78,12 +85,19 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
         if (key.role !== ApiKeyRole.OPERATOR && key.role !== ApiKeyRole.ADMIN) {
           client.emit('audio:error', { code: 'FORBIDDEN', message: 'operator role required' });
           client.disconnect();
-          return;
+          return null;
         }
+        // A chat-restricted key is default-deny everywhere that is not chat-scoped; audio is not.
+        if ((key.allowedChats?.length ?? 0) > 0) {
+          client.emit('audio:error', { code: 'FORBIDDEN', message: 'a chat-restricted key cannot carry call audio' });
+          client.disconnect();
+          return null;
+        }
+        grant = { allowedSessions: key.allowedSessions?.length ? key.allowedSessions : undefined };
       } catch {
         client.emit('audio:error', { code: 'UNAUTHORIZED', message: 'invalid API key' });
         client.disconnect();
-        return;
+        return null;
       }
     }
 
@@ -95,7 +109,7 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
         message: 'this gateway has no VoIP audio device (VOIP_AUDIO_ENABLED is not set)',
       });
       client.disconnect();
-      return;
+      return null;
     }
     client.emit('audio:ready', {
       format: PCM_FORMAT,
@@ -103,12 +117,20 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
       channels: PCM_CHANNELS,
       frameBytes: FRAME_BYTES,
     });
+    return grant;
   }
 
   /** Attach this socket to a session and start pumping the call's audio both ways. */
   @SubscribeMessage('audio:start')
-  start(@ConnectedSocket() client: Socket, @MessageBody() body: { sessionId?: string }): void {
-    const bound = this.boundTo.get(client.id);
+  async start(@ConnectedSocket() client: Socket, @MessageBody() body: { sessionId?: string }): Promise<void> {
+    const grant = await this.grants.get(client.id);
+    // Gone while the handshake was checked: handleDisconnect already ran, so nothing would close a bridge opened now.
+    if (grant && !this.grants.has(client.id)) return;
+    if (!grant) {
+      client.emit('audio:error', { code: 'UNAUTHORIZED', message: 'not authenticated' });
+      return;
+    }
+    const bound = grant.bound;
     const sessionId = body?.sessionId ?? bound;
     if (!sessionId) {
       client.emit('audio:error', { code: 'BAD_REQUEST', message: 'sessionId required' });
@@ -116,6 +138,10 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
     }
     if (bound && sessionId !== bound) {
       client.emit('audio:error', { code: 'FORBIDDEN', message: 'this token is for another session' });
+      return;
+    }
+    if (grant.allowedSessions && !grant.allowedSessions.includes(sessionId)) {
+      client.emit('audio:error', { code: 'FORBIDDEN', message: 'API key not authorized for this session' });
       return;
     }
     this.sessionOf.set(client.id, sessionId);
@@ -142,14 +168,20 @@ export class VoipAudioGateway implements OnGatewayConnection, OnGatewayDisconnec
 
   handleDisconnect(client: Socket): void {
     this.release(client);
+    this.grants.delete(client.id);
   }
 
   private release(client: Socket): void {
     const sessionId = this.sessionOf.get(client.id);
     this.sessionOf.delete(client.id);
-    this.boundTo.delete(client.id);
     if (sessionId) this.audio.close(sessionId);
   }
+}
+
+/** What a socket's handshake bought: one token-bound session, or an API key's session scope. */
+interface AudioGrant {
+  bound?: string;
+  allowedSessions?: string[];
 }
 
 /** socket.io hands binary through as Buffer or ArrayBuffer depending on the client. */
