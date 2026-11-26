@@ -32,6 +32,10 @@ export const PUBLIC_PATHS = [
   '/api/ingress/{pluginId}/{instanceId}/{path}',
 ];
 
+// Single @Public() operations on paths that also host authenticated methods.
+// Clearing only the named method preserves the global X-API-Key requirement on sibling methods.
+export const PUBLIC_OPERATIONS = [{ path: '/api/auth/session', method: 'delete' }] as const;
+
 const HTTP_METHODS = ['get', 'post', 'put', 'delete', 'patch', 'options', 'head', 'trace', 'search'] as const;
 
 type PathItem = Record<string, { security?: unknown } | undefined>;
@@ -95,6 +99,11 @@ export function exemptPublicOperations(document: OpenAPIObject): OpenAPIObject {
       if (op) op.security = [];
     }
   }
+  for (const { path, method } of PUBLIC_OPERATIONS) {
+    const item = document.paths?.[path] as PathItem | undefined;
+    const op = item?.[method];
+    if (op) op.security = [];
+  }
   return document;
 }
 
@@ -124,14 +133,18 @@ const ERROR_RESPONSE: SchemaObject = {
         'SESSION_STOP_INCOMPLETE, SESSION_LOGOUT_INCOMPLETE and SESSION_FORCE_KILL_INCOMPLETE (502), ' +
         'SEND_PACING_LIMITED (429), ' +
         'ENGINE_PAGE_ERROR (500, whatsapp-web.js: WhatsApp Web threw inside the page during a send or status post), ' +
-        'IMPORT_ALREADY_RUNNING, EXPORT_IN_PROGRESS, IMPORT_WOULD_ORPHAN_ENGINES and IMPORT_NESTED_TRANSACTION (409), ' +
+        'ENGINE_PAGE_RELOADING (409, whatsapp-web.js: WhatsApp Web is reloading its page; the request is safe to repeat, except that a repeated channel delete or unsubscription that the first attempt had already applied answers 403), ' +
+        'IMPORT_ALREADY_RUNNING, EXPORT_IN_PROGRESS, IMPORT_WOULD_ORPHAN_ENGINES, IMPORT_NESTED_TRANSACTION, ' +
+        'RESTART_DATABASE_NOT_STARTED and RESTART_ALREADY_RUNNING (409), ' +
         'IDEMPOTENCY_KEY_INVALID (400), IDEMPOTENCY_KEY_REUSED (422), ' +
         'IDEMPOTENCY_KEY_IN_PROGRESS and IDEMPOTENCY_OUTCOME_UNKNOWN (409), ' +
         'POLL_OPTION_NOT_FOUND (400, whatsapp-web.js vote-poll).',
     },
     retryAfterSeconds: {
       type: 'integer',
-      description: 'With SEND_PACING_LIMITED: seconds until the session accepts sends again.',
+      description:
+        'With SEND_PACING_LIMITED: seconds until the session accepts sends again. ' +
+        'With ENGINE_PAGE_RELOADING: the interval, in seconds, to ask again at until the page is back.',
     },
     validOptions: {
       type: 'array',
@@ -268,6 +281,8 @@ export function createSwaggerConfig(): Omit<OpenAPIObject, 'paths'> {
       .addTag('audit', 'Audit log')
       .addTag('metrics', 'Prometheus metrics')
       .addTag('health', 'Health check endpoints')
+      .addTag('automation', 'Automation rules (auto-reply)')
+      .addTag('media', 'Media conversion')
       // ORDER MATTERS. Swagger UI resolves "Try it" against servers[0], substituting the variable
       // defaults — it does not consider the origin the page was served from. A templated server
       // alone therefore aimed every request at `http://localhost:2785`, so on any deployment that

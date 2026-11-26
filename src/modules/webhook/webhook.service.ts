@@ -1,13 +1,16 @@
 import { Injectable, NotFoundException, BadRequestException, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { FindManyOptions, In, IsNull, LessThan, MoreThan, Not, Repository } from 'typeorm';
+import { EntityManager, FindManyOptions, In, IsNull, LessThan, MoreThan, Not, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { Webhook } from './entities/webhook.entity';
 import { WebhookDeliveryFailure } from './entities/webhook-delivery-failure.entity';
 import { Session } from '../session/entities/session.entity';
 import { CreateWebhookDto, UpdateWebhookDto } from './dto';
 import { createLogger } from '../../common/services/logger.service';
+import { WEBHOOK_PRUNE_SHUTDOWN_WAIT_MS } from '../../common/services/shutdown-budget';
 import { resolveSessionScope } from '../../common/security/session-scope';
+import { pruneInBatches } from '../../common/utils/batched-prune';
+import { startGuardedInterval } from '../../common/utils/guarded-interval';
 import { ListOptions, resolveListWindow } from '../../common/utils/paginate';
 import { generateDeliveryId } from './utils/idempotency.util';
 import { buildDeliveryHeaders } from './utils/deliver-once';
@@ -19,11 +22,12 @@ import {
   SSRF_BLOCKED_CLIENT_MESSAGE,
   redactSsrfError,
 } from '../../common/security/ssrf-guard';
-import { WebhookDeliveryService, WebhookPayload } from './webhook-delivery.service';
+import { PreparedWebhookDelivery, WebhookDeliveryService, WebhookPayload } from './webhook-delivery.service';
 
 // Delivery-engine types (payload and queue job shapes) live on WebhookDeliveryService; re-exported
 // here so existing importers (the queue processor) keep a single stable path.
-export type { WebhookPayload, WebhookJobData } from './webhook-delivery.service';
+export type { WebhookPayload, WebhookJobData, PreparedWebhookDelivery } from './webhook-delivery.service';
+export type { OutboxOpenRow } from './webhook-outbox.service';
 
 /**
  * Upper bound on how many webhooks one session can register. One inbound event fans out to EVERY
@@ -38,11 +42,14 @@ const DEFAULT_WEBHOOK_MAX_PER_SESSION = 16;
  * listing/retention. Event delivery itself (fan-out, queueing, retries, dead-lettering) lives on
  * WebhookDeliveryService; dispatch() here is the stable facade every event producer calls.
  */
+export { WEBHOOK_PRUNE_SHUTDOWN_WAIT_MS };
+
 @Injectable()
 export class WebhookService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = createLogger('WebhookService');
-  private cleanupTimer?: ReturnType<typeof setInterval>;
-  private payloadCleanupTimer?: ReturnType<typeof setInterval>;
+  private stopPruneIntervals: Array<() => void> = [];
+  private readonly inFlightPrunes = new Set<Promise<void>>();
+  private stopped = false;
 
   constructor(
     @InjectRepository(Webhook, 'data')
@@ -69,37 +76,60 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
       this.logger.log('Webhook delivery-failure retention disabled (WEBHOOK_FAILURE_RETENTION_DAYS <= 0)');
       return;
     }
-    const runPrune = (): void => {
-      this.pruneDeliveryFailures(retentionDays)
-        .then(n => {
+    this.stopPruneIntervals.push(
+      startGuardedInterval(
+        async () => {
+          if (this.stopped) return;
+          const n = await this.trackPrune(this.pruneDeliveryFailures(retentionDays));
           if (n > 0) this.logger.log(`Pruned ${n} webhook delivery-failure(s) older than ${retentionDays} day(s)`);
-        })
-        .catch(err =>
+        },
+        24 * 60 * 60 * 1000,
+        err =>
           this.logger.error('Webhook delivery-failure cleanup failed', err instanceof Error ? err.stack : String(err)),
-        );
-    };
-    runPrune(); // prune once at startup
-    this.cleanupTimer = setInterval(runPrune, 24 * 60 * 60 * 1000);
-    this.cleanupTimer.unref?.();
+      ),
+    );
   }
 
-  onModuleDestroy(): void {
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
+  async onModuleDestroy(): Promise<void> {
+    this.stopped = true;
+    for (const stop of this.stopPruneIntervals) stop();
+    this.stopPruneIntervals = [];
+    if (this.inFlightPrunes.size === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled([...this.inFlightPrunes]),
+        new Promise<void>(resolve => {
+          timer = setTimeout(resolve, WEBHOOK_PRUNE_SHUTDOWN_WAIT_MS);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
     }
-    if (this.payloadCleanupTimer) {
-      clearInterval(this.payloadCleanupTimer);
-    }
+  }
+
+  private trackPrune<T>(promise: Promise<T>): Promise<T> {
+    const settled = promise.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.inFlightPrunes.add(settled);
+    void settled.finally(() => this.inFlightPrunes.delete(settled));
+    return promise;
   }
 
   /**
-   * Delete delivery-failure rows older than the retention window. Returns the number removed.
+   * Delete delivery-failure rows older than the retention window, a batch at a time. Returns the number removed.
    */
   async pruneDeliveryFailures(olderThanDays: number): Promise<number> {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - olderThanDays);
-    const result = await this.failureRepository.delete({ createdAt: LessThan(cutoff) });
-    return result.affected || 0;
+    return pruneInBatches({
+      repository: this.failureRepository,
+      where: { createdAt: LessThan(cutoff) },
+      stopped: () => this.stopped,
+    });
   }
 
   /**
@@ -109,11 +139,12 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
    */
   async pruneDeliveryFailurePayloads(olderThanHours: number): Promise<number> {
     const cutoff = new Date(Date.now() - olderThanHours * 60 * 60 * 1000);
-    const result = await this.failureRepository.update(
-      { payload: Not(IsNull()), createdAt: LessThan(cutoff) },
-      { payload: null },
-    );
-    return result.affected || 0;
+    return pruneInBatches({
+      repository: this.failureRepository,
+      where: { payload: Not(IsNull()), createdAt: LessThan(cutoff) },
+      clear: { payload: null },
+      stopped: () => this.stopped,
+    });
   }
 
   /**
@@ -124,22 +155,27 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
    */
   private schedulePayloadPrune(): void {
     const hours = this.configService.get<number>('webhook.failurePayloadRetentionHours', 0);
-    const runPrune = (): void => {
-      this.pruneDeliveryFailurePayloads(hours)
-        .then(n => {
-          if (n > 0) this.logger.log(`Cleared the replay payload of ${n} webhook delivery-failure(s)`);
-        })
-        .catch(err =>
+    const runPrune = async (): Promise<void> => {
+      if (this.stopped) return;
+      const n = await this.trackPrune(this.pruneDeliveryFailurePayloads(hours));
+      if (n > 0) this.logger.log(`Cleared the replay payload of ${n} webhook delivery-failure(s)`);
+    };
+    if (hours > 0) {
+      this.stopPruneIntervals.push(
+        startGuardedInterval(runPrune, 60 * 60 * 1000, err =>
           this.logger.error(
             'Webhook delivery-failure payload cleanup failed',
             err instanceof Error ? err.stack : String(err),
           ),
-        );
-    };
-    runPrune();
-    if (hours > 0) {
-      this.payloadCleanupTimer = setInterval(runPrune, 60 * 60 * 1000);
-      this.payloadCleanupTimer.unref?.();
+        ),
+      );
+    } else {
+      void runPrune().catch(err =>
+        this.logger.error(
+          'Webhook delivery-failure payload cleanup failed',
+          err instanceof Error ? err.stack : String(err),
+        ),
+      );
     }
   }
 
@@ -330,8 +366,9 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
 
   async delete(sessionId: string, id: string): Promise<void> {
     const webhook = await this.findOne(sessionId, id);
-    await this.webhookRepository.remove(webhook);
+    await this.webhookRepository.remove(webhook, { transaction: false });
     this.delivery.invalidateOptInSubscriptions(sessionId);
+    this.delivery.forgetWebhook(id);
   }
 
   async test(sessionId: string, webhookId: string): Promise<{ success: boolean; statusCode?: number; error?: string }> {
@@ -385,5 +422,62 @@ export class WebhookService implements OnModuleInit, OnModuleDestroy {
    */
   dispatch(sessionId: string, event: string, data: Record<string, unknown>): Promise<void> {
     return this.delivery.dispatch(sessionId, event, data);
+  }
+
+  /** Pre-transaction read-only phase: resolve matching webhooks and build outbox rows. */
+  prepareDeliveries(
+    sessionId: string,
+    event: string,
+    data: Record<string, unknown>,
+    options?: { throwOnLookupError?: boolean },
+  ): Promise<PreparedWebhookDelivery[]> {
+    return this.delivery.prepareDeliveries(sessionId, event, data, null, options);
+  }
+
+  /** Persist prepared outbox rows, optionally bound to the caller's database transaction. */
+  openPreparedDeliveries(
+    prepared: readonly PreparedWebhookDelivery[],
+    manager?: EntityManager,
+  ): Promise<PreparedWebhookDelivery[] | null> {
+    return this.delivery.openPrepared(prepared, manager);
+  }
+
+  /** Reconcile committed outbox rows after a mid-flight edit or REST revoke before dispatch. */
+  reconcilePreparedDeliveries(
+    committed: readonly PreparedWebhookDelivery[],
+    sessionId: string,
+    event: string,
+    finalData: Record<string, unknown>,
+    owned?: readonly PreparedWebhookDelivery[],
+  ): Promise<PreparedWebhookDelivery[]> {
+    return this.delivery.reconcilePrepared(committed, sessionId, event, finalData, owned);
+  }
+
+  /** Post-commit async dispatch phase: run webhook:before hooks and deliver/enqueue prepared rows. */
+  dispatchPreparedDeliveries(prepared: readonly PreparedWebhookDelivery[]): Promise<void> {
+    return this.delivery.dispatchPrepared(prepared);
+  }
+
+  /** Close prepared outbox rows that were suppressed before dispatch (for example, mid-flight revoke). */
+  cancelPreparedDeliveries(prepared: readonly PreparedWebhookDelivery[]): Promise<void> {
+    return this.delivery.cancelPrepared(prepared);
+  }
+
+  /** Close any still-pending message outbox rows when an engine revoke arrives. */
+  closePendingDeliveriesForMessage(
+    sessionId: string,
+    waMessageId: string,
+    shouldApply?: (payload: Record<string, unknown>) => boolean | Promise<boolean>,
+  ): Promise<void> {
+    return this.delivery.closePendingForMessage(sessionId, waMessageId, shouldApply);
+  }
+
+  /** Redact payloads on any still-pending message outbox rows when a REST delete clears a message. */
+  redactPendingDeliveriesForMessage(
+    sessionId: string,
+    waMessageId: string,
+    shouldApply?: (payload: Record<string, unknown>) => boolean | Promise<boolean>,
+  ): Promise<void> {
+    return this.delivery.redactPendingForMessage(sessionId, waMessageId, shouldApply);
   }
 }

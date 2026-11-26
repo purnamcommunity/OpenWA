@@ -88,6 +88,8 @@ interface FetchCall {
   method: string;
   path: string;
   body?: unknown;
+  // performance.now() when the stub saw the call, for a test that bounds how close two calls were.
+  at: number;
 }
 
 const fetchCalls: FetchCall[] = [];
@@ -205,7 +207,7 @@ function installFetchStub(): void {
         body = init.body;
       }
     }
-    fetchCalls.push({ method, path, body });
+    fetchCalls.push({ method, path, body, at: performance.now() });
 
     if (method === 'GET' && path === '/api/sessions') {
       if (Date.now() < listRefusedUntil) return Promise.resolve(throttled());
@@ -381,7 +383,7 @@ before(async () => {
   // RoleProvider seeds from sessionStorage; 'admin' makes canWrite true, or every action button
   // (New Session, Stop/Start, Unlink, Delete, Kill Stuck) is hidden and there is nothing to test.
   window.sessionStorage.setItem('openwa_user_role', 'admin');
-  // Deliberately NOT setting sessionStorage['openwa_api_key'] here: useWebSocket.connect() bails
+  // Deliberately NOT setting sessionStorage['openwa_api_key_id'] here: useWebSocket.connect() bails
   // with a console.warn when it's absent, so the page opens no socket. A case that drives the live
   // feed sets the key itself; the client it reaches is the socket.io double, which dials nothing.
   // Awaited, not just imported: catalogues are fetched now, so the import only starts the load and
@@ -398,7 +400,7 @@ afterEach(() => {
   // A test that failed while it held the retry pauses on a fake clock must not leave it to the next one.
   mock.timers.reset();
   rtl.cleanup();
-  window.sessionStorage.removeItem('openwa_api_key');
+  window.sessionStorage.removeItem('openwa_api_key_id');
   resetSocketDouble();
   queryClient?.clear();
   queryClient = undefined;
@@ -584,7 +586,7 @@ test('an empty list shows the empty state, and a refused create does not take it
 test('a failed refetch keeps the rows, and a search that matches none still shows the empty state', async () => {
   const { screen, fireEvent, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   holdConnect();
   renderSessions();
 
@@ -705,8 +707,8 @@ test('saving proxy settings issues PATCH /api/sessions/:id/proxy', async () => {
   });
 });
 
-// The API accepts a session proxy only from an ADMIN key, so an operator is not offered the controls.
-test('an operator key is not offered proxy writes, in the create modal or the proxy modal', async () => {
+// Proxy reads and writes require an unscoped ADMIN key, so an operator sees neither proxy creation nor the Proxy action.
+test('an operator key is not offered proxy controls and never fires GET /proxy', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
   resetFetchCalls();
   window.sessionStorage.setItem('openwa_user_role', 'operator');
@@ -721,21 +723,16 @@ test('an operator key is not offered proxy writes, in the create modal or the pr
     await waitFor(() => assert.equal(screen.queryByRole('dialog') === null, true));
 
     const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
-    fireEvent.click(within(qrCard).getByRole('button', { name: 'Proxy' }));
-    const dialog = await screen.findByRole('dialog');
-    await waitFor(() => assert.ok(findFetchCall('GET', '/api/sessions/sess-qr-1/proxy')));
-    const toggle = (await within(dialog).findByRole('checkbox')) as HTMLInputElement;
-    assert.equal(toggle.disabled, true);
-    assert.equal(within(dialog).queryByRole('button', { name: 'Save' }) === null, true);
+    assert.equal(within(qrCard).queryByRole('button', { name: 'Proxy' }) === null, true);
+    assert.equal(findFetchCall('GET', '/api/sessions/sess-qr-1/proxy'), undefined);
   } finally {
     window.sessionStorage.setItem('openwa_user_role', 'admin');
   }
 });
 
-// Creating a session and changing its proxy are refused for any session-scoped key, admin included,
-// so neither is offered; the proxy settings stay readable.
-test('a session-scoped admin key is offered neither New Session nor a proxy Save', async () => {
-  const { screen, fireEvent, within, waitFor } = rtl;
+// Creating a session and reading or changing its proxy require an unscoped key, so a session-scoped admin sees neither.
+test('a session-scoped admin key is offered neither New Session nor Proxy and never fires GET /proxy', async () => {
+  const { screen, within } = rtl;
   resetFetchCalls();
   window.sessionStorage.setItem('openwa_key_scoped', 'true');
   try {
@@ -744,12 +741,8 @@ test('a session-scoped admin key is offered neither New Session nor a proxy Save
     assert.equal(screen.queryByRole('button', { name: 'New Session' }) === null, true);
 
     const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
-    fireEvent.click(within(qrCard).getByRole('button', { name: 'Proxy' }));
-    const dialog = await screen.findByRole('dialog');
-    await waitFor(() => assert.ok(findFetchCall('GET', '/api/sessions/sess-qr-1/proxy')));
-    const toggle = (await within(dialog).findByRole('checkbox')) as HTMLInputElement;
-    assert.equal(toggle.disabled, true);
-    assert.equal(within(dialog).queryByRole('button', { name: 'Save' }) === null, true);
+    assert.equal(within(qrCard).queryByRole('button', { name: 'Proxy' }) === null, true);
+    assert.equal(findFetchCall('GET', '/api/sessions/sess-qr-1/proxy'), undefined);
   } finally {
     window.sessionStorage.removeItem('openwa_key_scoped');
   }
@@ -766,7 +759,7 @@ test('a typed pairing phone number survives toggling to the QR tab and back', as
 
   // Wait for the eager GET .../qr fetch triggered by opening the modal to settle before driving
   // tab interactions, so its async setQrData doesn't land in the middle of the sequence below.
-  await screen.findByAltText('QR');
+  await screen.findByAltText('QR Code');
 
   fireEvent.click(screen.getByRole('tab', { name: 'Link with Phone Number' }));
   const phoneInput = screen.getByLabelText('Phone Number') as HTMLInputElement;
@@ -792,7 +785,7 @@ test('a pairing phone number typed in native-script or full-width digits is kept
   await screen.findByText('new-device');
   const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
   fireEvent.click(within(qrCard).getByRole('button', { name: 'Show QR' }));
-  await screen.findByAltText('QR');
+  await screen.findByAltText('QR Code');
   fireEvent.click(screen.getByRole('tab', { name: 'Link with Phone Number' }));
   const phoneInput = screen.getByLabelText('Phone Number') as HTMLInputElement;
 
@@ -813,7 +806,7 @@ test('the pairing phone field leaves a composition in progress alone and reads i
   await screen.findByText('new-device');
   const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
   fireEvent.click(within(qrCard).getByRole('button', { name: 'Show QR' }));
-  await screen.findByAltText('QR');
+  await screen.findByAltText('QR Code');
   fireEvent.click(screen.getByRole('tab', { name: 'Link with Phone Number' }));
   const phoneInput = screen.getByLabelText('Phone Number') as HTMLInputElement;
   const fullwidth = (ascii: string) => [...ascii].map(d => String.fromCharCode(0xff10 + Number(d))).join('');
@@ -839,7 +832,7 @@ async function openPairingPhoneField() {
   await screen.findByText('new-device');
   const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
   fireEvent.click(within(qrCard).getByRole('button', { name: 'Show QR' }));
-  await screen.findByAltText('QR');
+  await screen.findByAltText('QR Code');
   fireEvent.click(screen.getByRole('tab', { name: 'Link with Phone Number' }));
   return {
     phoneInput: screen.getByLabelText('Phone Number') as HTMLInputElement,
@@ -912,7 +905,7 @@ for (const [status, cleared] of [
 ] as const) {
   test(`a shown pairing code is ${cleared ? 'cleared' : 'kept'} when the session moves on to ${status}`, async () => {
     const { screen, fireEvent, within } = rtl;
-    window.sessionStorage.setItem('openwa_api_key', 'test-key');
+    window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
     const { phoneInput, generate } = await openPairingPhoneField();
     fireEvent.change(phoneInput, { target: { value: '6281234567890' } });
     fireEvent.click(generate);
@@ -989,7 +982,7 @@ test('the phone pairing tab warns that a code can unlink an existing session', a
   await screen.findByText('new-device');
   const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
   fireEvent.click(within(qrCard).getByRole('button', { name: 'Show QR' }));
-  await screen.findByAltText('QR');
+  await screen.findByAltText('QR Code');
 
   fireEvent.click(screen.getByRole('tab', { name: 'Link with Phone Number' }));
 
@@ -1010,7 +1003,7 @@ test('stopping a session dismisses its own open QR modal', async () => {
 
   // Wait for the eager GET .../qr fetch triggered by opening the modal to settle, same as the
   // toggle-persistence case above, so the assertion below isn't racing that fetch's state update.
-  await screen.findByAltText('QR');
+  await screen.findByAltText('QR Code');
   assert.ok(screen.getByRole('dialog'), 'expected the QR modal to be open before stopping the session');
 
   // SESSION_QR has engineLoaded: true, so isSessionStarted puts a no-confirmation Stop button on
@@ -1060,7 +1053,7 @@ test('a QR answer that lands after its modal closed changes nothing', async () =
     await screen.findByRole('dialog');
     closeModal();
     fireEvent.click(within(otherCard).getByRole('button', { name: 'Show QR' }));
-    await screen.findByAltText('QR');
+    await screen.findByAltText('QR Code');
     release();
     await new Promise(resolve => setTimeout(resolve, 50));
     const dialog = screen.getByRole('dialog');
@@ -1088,7 +1081,7 @@ test('a pairing code that lands after its modal closed changes nothing', async (
       let release: () => void = () => {};
       pairingGate = new Promise<void>(resolve => (release = resolve));
       fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-      await screen.findByAltText('QR');
+      await screen.findByAltText('QR Code');
       fireEvent.click(screen.getByRole('tab', { name: 'Link with Phone Number' }));
       fireEvent.change(screen.getByLabelText('Phone Number'), { target: { value: '919876543210' } });
       fireEvent.click(screen.getByRole('button', { name: 'Generate Pairing Code' }));
@@ -1096,7 +1089,7 @@ test('a pairing code that lands after its modal closed changes nothing', async (
       fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Close' }));
 
       fireEvent.click(within(reopen).getByRole('button', { name: 'Show QR' }));
-      await screen.findByAltText('QR');
+      await screen.findByAltText('QR Code');
       fireEvent.click(screen.getByRole('tab', { name: 'Link with Phone Number' }));
       const dialog = screen.getByRole('dialog');
       assert.ok(!within(dialog).queryByText('Generating pairing code...'), 'Generate stayed stuck on the old request');
@@ -1396,12 +1389,12 @@ function pushSessionStatus(sessionId: string, status: string): void {
 test('a failed status push closes that session QR modal', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   renderSessions();
 
   const card = (await screen.findByText('new-device')).closest('.session-card') as HTMLElement;
   fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-  await screen.findByAltText('QR');
+  await screen.findByAltText('QR Code');
 
   pushSessionStatus(SESSION_STALE_ENGINE.id, 'failed');
   assert.ok(screen.queryByRole('dialog'), "another session's failure closed this QR modal");
@@ -1415,7 +1408,7 @@ test('a failed status push closes that session QR modal', async () => {
 test('a session last active a few hours ago reads in hours, not as a date', async () => {
   const { screen, within } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const lastActive = new Date(Date.now() - 5 * 3_600_000).toISOString();
   SESSIONS.push({
     ...SESSION_QR,
@@ -1439,7 +1432,7 @@ test('a session last active a few hours ago reads in hours, not as a date', asyn
 test('a ready push re-reads the list so a newly linked card shows its phone', async () => {
   const { screen, within, waitFor } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-linking-1', name: 'linking', status: 'authenticating' };
   SESSIONS.push(row);
   try {
@@ -1460,7 +1453,7 @@ test('a ready push re-reads the list so a newly linked card shows its phone', as
 test('a disconnected push closes the QR modal once the re-read shows no engine', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-dropped-1', name: 'dropped', status: 'qr_ready', engineLoaded: true };
   SESSIONS.push(row);
   try {
@@ -1468,7 +1461,7 @@ test('a disconnected push closes the QR modal once the re-read shows no engine',
 
     const card = (await screen.findByText('dropped')).closest('.session-card') as HTMLElement;
     fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-    await screen.findByAltText('QR');
+    await screen.findByAltText('QR Code');
 
     Object.assign(row, { status: 'disconnected', engineLoaded: false });
     pushSessionStatus(row.id, 'disconnected');
@@ -1485,7 +1478,7 @@ test('a disconnected push closes the QR modal once the re-read shows no engine',
 test('a QR pushed while the disconnect re-read is in flight keeps the modal open', async () => {
   const { screen, fireEvent, within, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-raced-1', name: 'raced', status: 'qr_ready', engineLoaded: true };
   SESSIONS.push(row);
   try {
@@ -1493,7 +1486,7 @@ test('a QR pushed while the disconnect re-read is in flight keeps the modal open
 
     const card = (await screen.findByText('raced')).closest('.session-card') as HTMLElement;
     fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-    await screen.findByAltText('QR');
+    await screen.findByAltText('QR Code');
 
     // The server answer will say the engine is gone, which is what used to close the modal outright.
     Object.assign(row, { status: 'disconnected', engineLoaded: false });
@@ -1519,7 +1512,7 @@ test('a QR pushed while the disconnect re-read is in flight keeps the modal open
 
     // The fresh code is on screen, so the push really landed in the modal that is being judged.
     await waitFor(() =>
-      assert.equal((screen.getByAltText('QR') as HTMLImageElement).src, 'data:image/png;base64,FRESH'),
+      assert.equal((screen.getByAltText('QR Code') as HTMLImageElement).src, 'data:image/png;base64,FRESH'),
     );
     // And the handler's re-read has resolved, so the close decision has already been taken.
     await waitFor(() =>
@@ -1536,7 +1529,7 @@ test('a QR pushed while the disconnect re-read is in flight keeps the modal open
 test('a disconnected push keeps the QR modal while the engine is still registered', async () => {
   const { screen, fireEvent, within } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-backoff-1', name: 'backoff', status: 'qr_ready', engineLoaded: true };
   SESSIONS.push(row);
   try {
@@ -1544,7 +1537,7 @@ test('a disconnected push keeps the QR modal while the engine is still registere
 
     const card = (await screen.findByText('backoff')).closest('.session-card') as HTMLElement;
     fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-    await screen.findByAltText('QR');
+    await screen.findByAltText('QR Code');
 
     row.status = 'disconnected';
     pushSessionStatus(row.id, 'disconnected');
@@ -1564,7 +1557,7 @@ test('a disconnected push keeps the QR modal while the engine is still registere
 test('a disconnected push blanks the displayed QR code', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-blank-1', name: 'blanked', status: 'qr_ready', engineLoaded: true };
   SESSIONS.push(row);
   try {
@@ -1572,12 +1565,12 @@ test('a disconnected push blanks the displayed QR code', async () => {
 
     const card = (await screen.findByText('blanked')).closest('.session-card') as HTMLElement;
     fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-    await screen.findByAltText('QR');
+    await screen.findByAltText('QR Code');
 
     row.status = 'disconnected';
     pushSessionStatus(row.id, 'disconnected');
 
-    await waitFor(() => assert.ok(!screen.queryByAltText('QR'), 'the dead QR code stayed on screen'));
+    await waitFor(() => assert.ok(!screen.queryByAltText('QR Code'), 'the dead QR code stayed on screen'));
     assert.ok(screen.queryByRole('dialog'), 'the QR modal closed while the engine was still registered');
   } finally {
     SESSIONS.pop();
@@ -1588,7 +1581,7 @@ test('a disconnected push blanks the displayed QR code', async () => {
 test('a disconnected push keeps the QR modal when the re-read fails', async () => {
   const { screen, fireEvent, within, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-unknown-1', name: 'unknown', status: 'qr_ready', engineLoaded: true };
   SESSIONS.push(row);
   try {
@@ -1596,7 +1589,7 @@ test('a disconnected push keeps the QR modal when the re-read fails', async () =
 
     const card = (await screen.findByText('unknown')).closest('.session-card') as HTMLElement;
     fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-    await screen.findByAltText('QR');
+    await screen.findByAltText('QR Code');
 
     sessionListFailures = 1;
     pushSessionStatus(row.id, 'disconnected');
@@ -1615,7 +1608,7 @@ test('a disconnected push keeps the QR modal when the re-read fails', async () =
 test('a disconnect re-read overtaken by a newer read still closes the QR modal', async () => {
   const { screen, fireEvent, within, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = {
     ...SESSION_QR,
     id: 'sess-overtaken-1',
@@ -1629,7 +1622,7 @@ test('a disconnect re-read overtaken by a newer read still closes the QR modal',
     renderSessions();
     const card = (await screen.findByText('overtaken')).closest('.session-card') as HTMLElement;
     fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-    await screen.findByAltText('QR');
+    await screen.findByAltText('QR Code');
     const reads = () => fetchCalls.filter(c => c.method === 'GET' && c.path === '/api/sessions').length;
 
     let releaseDisconnect: () => void = () => {};
@@ -1660,7 +1653,7 @@ test('a disconnect re-read overtaken by a newer read still closes the QR modal',
 test('a list read that answers after a newer one does not overwrite it', async () => {
   const { screen, within, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-flap-1', name: 'flapping', status: 'authenticating' };
   SESSIONS.push(row);
   try {
@@ -1700,7 +1693,7 @@ test('a list read that answers after a newer one does not overwrite it', async (
 test('a list read that started before a status push does not undo the pushed status', async () => {
   const { screen, within, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-backoff-2', name: 'bouncing', status: 'ready', phone: '15550004444' };
   SESSIONS.push(row);
   try {
@@ -1737,7 +1730,7 @@ test('a list read that started before a status push does not undo the pushed sta
 test('a list read in flight does not undo a create, a stop or a delete', async () => {
   const { screen, fireEvent, within, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const qrRow = { ...SESSION_QR };
   const staleIndex = SESSIONS.indexOf(SESSION_STALE_ENGINE);
   try {
@@ -1796,7 +1789,7 @@ test('a list read in flight does not undo a create, a stop or a delete', async (
 test('a list read in flight does not undo a start', async () => {
   const { screen, fireEvent, within, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   startResult = { answer: { status: 'initializing', engineLoaded: true } };
   SESSIONS.push({ ...SESSION_QR, id: 'sess-start-race', name: 'start-race', status: 'created', engineLoaded: false });
   const releases: (() => void)[] = [];
@@ -1837,7 +1830,7 @@ test('a list read in flight does not undo a start', async () => {
 test('a status push landing right after a create or a delete keeps what it wrote', async () => {
   const { screen, fireEvent, within, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const staleIndex = SESSIONS.indexOf(SESSION_STALE_ENGINE);
   try {
     renderSessions();
@@ -1872,7 +1865,7 @@ test('a status push landing right after a create or a delete keeps what it wrote
 test('a duplicate push right after a list render is still recognised as a duplicate', async () => {
   const { screen, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-dup-1', name: 'dup-probe', status: 'authenticating' };
   SESSIONS.push(row);
   // Emitted outside act, so React commits and runs effects on its own schedule, as in the browser.
@@ -1914,7 +1907,7 @@ test('a duplicate push right after a list render is still recognised as a duplic
 test('an open detail modal follows its session status and phone', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const row: Session = { ...SESSION_QR, id: 'sess-viewed-1', name: 'viewed', status: 'authenticating' };
   SESSIONS.push(row);
   try {
@@ -2005,7 +1998,7 @@ test('the QR modal says WhatsApp asked for a passkey, on both tabs', async () =>
   const { screen, fireEvent, within } = rtl;
   await withQrSessionRestriction(PASSKEY_RESTRICTION, async card => {
     fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-    await screen.findByAltText('QR');
+    await screen.findByAltText('QR Code');
 
     const note = screen.getByRole('status');
     assert.match(note.textContent ?? '', /WhatsApp asked for a passkey to finish linking this device/);
@@ -2024,7 +2017,7 @@ test('the QR modal carries no passkey note for another restriction or none', asy
   for (const restriction of [undefined, { kind: 'reachout_timelock' as const, code: 'BIZ_QUALITY' }]) {
     await withQrSessionRestriction(restriction, async card => {
       fireEvent.click(within(card).getByRole('button', { name: 'Show QR' }));
-      await screen.findByAltText('QR');
+      await screen.findByAltText('QR Code');
       assert.equal(screen.queryByText(/asked for a passkey/) === null, true);
     });
     rtl.cleanup();
@@ -2037,7 +2030,7 @@ test('Refresh on a feed that never connected re-reads the list once the socket i
   const { screen, fireEvent, waitFor, act, within } = rtl;
   resetFetchCalls();
   sessionListFailures = 1;
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   holdConnect();
   renderSessions();
 
@@ -2079,7 +2072,7 @@ test('a failed mount read is retried when the feed first connects after its own 
   const { screen, waitFor, act } = rtl;
   resetFetchCalls();
   sessionListFailures = 1;
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   holdConnect();
   renderSessions();
 
@@ -2106,7 +2099,7 @@ test('a later failure on the same connection is retried too, once the first reco
   const { screen, waitFor, act } = rtl;
   resetFetchCalls();
   sessionListFailures = 1;
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   holdConnect();
   renderSessions();
 
@@ -2148,7 +2141,7 @@ test('a connect retries a failed list read once, even when each failure carries 
   resetFetchCalls();
   sessionListFailures = 10;
   distinctFailureMessages = true;
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   holdConnect();
   renderSessions();
 
@@ -2164,39 +2157,93 @@ test('a connect retries a failed list read once, even when each failure carries 
   assert.equal(listReads(), 2);
 });
 
-// A network drop brings every session back at about the same time, and each ready push asks for the list. The
-// gateway refuses this route past 10 reads a second per client: one read per push left the newest read refused,
-// its error over the page and the phones the pushes asked for unread.
-test('a burst of ready pushes over a second shares a few list reads and is not throttled', async () => {
-  const { screen, waitFor, act } = rtl;
-  resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
-  const burst: Session[] = Array.from({ length: 12 }, (_, i) => ({
+// Sessions.tsx holds the list reads that pushes ask for for this long (PUSHED_READ_WINDOW_MS).
+const PUSHED_READ_WINDOW_MS = 250;
+
+// Twelve sessions on their way back. comeBack() is a ready push for one, after the gateway wrote the phone that only a
+// list read brings to its card.
+const burstSessions = (): Session[] =>
+  Array.from({ length: 12 }, (_, i) => ({
     ...SESSION_RECONNECTING,
     id: `sess-burst-${i}`,
     name: `burst-${i}`,
     phone: `1555010${String(i).padStart(4, '0')}`,
   }));
+const comeBack = (row: Session, i: number): void => {
+  Object.assign(row, { status: 'ready', phone: `1555020${String(i).padStart(4, '0')}` });
+  pushSessionStatus(row.id, 'ready');
+};
+const listReadCalls = (): FetchCall[] => fetchCalls.filter(c => c.method === 'GET' && c.path === '/api/sessions');
+
+// A network drop brings every session back at about the same time, and each ready push asks for the list. The
+// gateway refuses this route past 10 reads a second per client: one read per push left the newest read refused,
+// its error over the page and the phones the pushes asked for unread.
+//
+// What a slow runner changes is how many windows the pushes span, never how far apart two reads are: a window is held
+// for its full length, and a push only ever opens one after the one before it was sent. So the spec bounds the gap
+// between reads and waits for the last phone, instead of bounding a count that grows with the time the loop took.
+test('a burst of ready pushes over a second shares a few list reads and is not throttled', async () => {
+  const { screen, waitFor, act } = rtl;
+  resetFetchCalls();
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
+  const burst = burstSessions();
   SESSIONS.push(...burst);
   try {
     renderSessions();
     await screen.findByText('burst-11');
     await waitFor(() => assert.ok(lastSocket()?.connected));
     await act(() => new Promise(resolve => setTimeout(resolve, 300)));
-    const listReads = () => fetchCalls.filter(c => c.method === 'GET' && c.path === '/api/sessions').length;
-    const before = listReads();
+    const before = listReadCalls().length;
     listThrottle = { limit: 10, delayMs: 20, windowStart: 0, hits: 0 };
     for (const [i, row] of burst.entries()) {
-      // The phone the gateway writes on ready, which only a list read brings to the card.
-      Object.assign(row, { status: 'ready', phone: `1555020${String(i).padStart(4, '0')}` });
-      pushSessionStatus(row.id, 'ready');
+      comeBack(row, i);
       await act(() => new Promise(resolve => setTimeout(resolve, 80)));
     }
-    await act(() => new Promise(resolve => setTimeout(resolve, 600)));
-    const reads = listReads() - before;
-    assert.ok(reads <= 6, `12 pushes sent ${reads} list reads`);
+    // The last phone is on its card once the read that follows the last push has landed.
+    await waitFor(
+      () => {
+        for (const row of burst) screen.getByText(row.phone as string);
+      },
+      { timeout: 10_000 },
+    );
+    const reads = listReadCalls().slice(before);
+    for (const [i, read] of reads.entries()) {
+      if (i === 0) continue;
+      const gap = read.at - reads[i - 1].at;
+      // Not less than the window (a timer may be read a few milliseconds early).
+      assert.ok(gap >= PUSHED_READ_WINDOW_MS - 10, `list reads ${i - 1} and ${i} were ${Math.round(gap)} ms apart`);
+    }
     assert.equal(screen.queryByText('ThrottlerException: Too Many Requests') === null, true, 'a list read was refused');
-    for (const row of burst) screen.getByText(row.phone as string);
+  } finally {
+    SESSIONS.splice(SESSIONS.length - burst.length, burst.length);
+  }
+});
+
+// No timer fires inside one synchronous run, so pushes that arrive together share a window however slowly the machine
+// runs them. This holds the sharing itself, which the spread burst above cannot on a runner too slow for any two
+// of its pushes to meet.
+test('ready pushes that arrive together share one list read', async () => {
+  const { screen, waitFor, act } = rtl;
+  resetFetchCalls();
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
+  const burst = burstSessions();
+  SESSIONS.push(...burst);
+  try {
+    renderSessions();
+    await screen.findByText('burst-11');
+    await waitFor(() => assert.ok(lastSocket()?.connected));
+    await act(() => new Promise(resolve => setTimeout(resolve, 300)));
+    const before = listReadCalls().length;
+    listThrottle = { limit: 10, delayMs: 20, windowStart: 0, hits: 0 };
+    for (const [i, row] of burst.entries()) comeBack(row, i);
+    await waitFor(
+      () => {
+        for (const row of burst) screen.getByText(row.phone as string);
+      },
+      { timeout: 10_000 },
+    );
+    assert.equal(listReadCalls().length - before, 1, '12 pushes that arrived together sent more than one list read');
+    assert.equal(screen.queryByText('ThrottlerException: Too Many Requests') === null, true, 'a list read was refused');
   } finally {
     SESSIONS.splice(SESSIONS.length - burst.length, burst.length);
   }
@@ -2207,7 +2254,7 @@ test('a burst of ready pushes over a second shares a few list reads and is not t
 test('a throttled list read is retried after the wait the gateway names', async () => {
   const { screen, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   renderSessions();
   await screen.findByText('new-device');
   await waitFor(() => assert.ok(lastSocket()?.connected));
@@ -2592,7 +2639,7 @@ const feedFrames = (): unknown[] =>
 test('the page joins the live session feed once connected, with the events it renders', async () => {
   const { screen, waitFor } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   renderSessions();
 
   await screen.findByText('new-device');
@@ -2604,7 +2651,7 @@ test('the page joins the live session feed once connected, with the events it re
 test('a key refused the wildcard room joins each listed session instead', async () => {
   const { screen, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   renderSessions();
 
   await screen.findByText('new-device');
@@ -2630,7 +2677,7 @@ test('a key refused the wildcard room joins each listed session instead', async 
 test('the list is read again once a retried feed subscribe joins', async () => {
   const { screen, waitFor, act } = rtl;
   resetFetchCalls();
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   renderSessions();
 
   await screen.findByText('new-device');

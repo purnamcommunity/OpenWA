@@ -81,10 +81,12 @@ export class SessionController {
     private readonly chatScope: ChatScopeService,
   ) {}
 
-  private transformSession(session: Session): SessionResponseDto {
+  private transformSession(session: Session, now?: Date): SessionResponseDto {
     // engineLoaded() reads the engine map itself, so this is read at response time: a session that just
     // finished reconnecting reports the engine in the same response that reports its status.
-    return SessionResponseDto.fromEntity(session, this.sessionService.engineLoaded(session));
+    const loaded =
+      now !== undefined ? this.sessionService.engineLoaded(session, now) : this.sessionService.engineLoaded(session);
+    return SessionResponseDto.fromEntity(session, loaded);
   }
 
   @Post()
@@ -176,7 +178,8 @@ export class SessionController {
       offset: offset ? parseInt(offset, 10) : undefined,
       name,
     });
-    return sessions.map(s => this.transformSession(s));
+    const now = await this.sessionService.leaseClockNow?.();
+    return sessions.map(s => this.transformSession(s, now));
   }
 
   @ChatScoped('agnostic')
@@ -192,7 +195,8 @@ export class SessionController {
   @ApiResponse({ status: 404, description: 'Session not found' })
   async findOne(@Param('sessionId', SessionIdPipe) id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.findOne(id);
-    return this.transformSession(session);
+    const now = await this.sessionService.leaseClockNow?.();
+    return this.transformSession(session, now);
   }
 
   @Get(':sessionId/config')
@@ -244,6 +248,8 @@ export class SessionController {
   }
 
   @Get(':sessionId/proxy')
+  @RequireRole(ApiKeyRole.ADMIN)
+  @RequireUnscopedKey()
   @ApiOperation({ summary: 'Get the per-session egress proxy configuration (credentials masked)' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({
@@ -252,6 +258,7 @@ export class SessionController {
     type: SessionProxyResponseDto,
   })
   @ApiResponse({ status: 400, description: SESSION_ID_400 })
+  @ApiResponse({ status: 403, description: 'Key lacks the ADMIN role, or is restricted to specific sessions' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   async getProxy(@Param('sessionId', SessionIdPipe) id: string): Promise<SessionProxyResponseDto> {
     return this.sessionService.getProxy(id);
@@ -311,8 +318,9 @@ export class SessionController {
   @ApiResponse({
     status: 503,
     description:
-      'The session could not be read, checked or claimed for the delete because the database did not answer ' +
-      '(nothing is deleted), or, on SQLite, another database transaction stayed open for 10 s before a delete ' +
+      'The session could not be read, checked, claimed or recorded for the delete because the database did not ' +
+      'answer (nothing is deleted; a delete whose record the database did not confirm may have been recorded, and ' +
+      'repeating it is safe), or, on SQLite, another database transaction stayed open for 10 s before a delete ' +
       'transaction (no further rows are removed). Retry the delete.',
   })
   async delete(@Param('sessionId', SessionIdPipe) id: string): Promise<void> {
@@ -414,8 +422,9 @@ export class SessionController {
   @ApiResponse({
     status: 503,
     description:
-      'The database did not answer the check of whether another node holds the session, so nothing was ' +
-      'stopped. Retry the stop.',
+      'The database did not answer the read of the session, the check of whether another node holds it or the ' +
+      'write that records the stop, so nothing was stopped. A stop whose record the database did not confirm may ' +
+      'have been recorded, and repeating it is safe. Retry the stop.',
   })
   async stop(@Param('sessionId', SessionIdPipe) id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.stop(id);
@@ -491,6 +500,10 @@ export class SessionController {
       "body carries `code: 'SESSION_LOGOUT_INCOMPLETE'`; `phone` is cleared and no success audit " +
       'is written. Start the session again and retry the logout.',
   })
+  @ApiResponse({
+    status: 503,
+    description: 'The database did not answer the read of the session, so nothing was logged out. Retry the logout.',
+  })
   async logout(@Param('sessionId', SessionIdPipe) id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.logout(id);
     await this.auditService.logInfo(AuditAction.SESSION_LOGGED_OUT, {
@@ -519,6 +532,10 @@ export class SessionController {
       'threw or timed out, so the engine process may still be running). The body carries ' +
       "`code: 'SESSION_FORCE_KILL_INCOMPLETE'`; the status is settled to `disconnected` and no " +
       'success audit is written. Restart the node to reap a leaked process.',
+  })
+  @ApiResponse({
+    status: 503,
+    description: 'The database did not answer the read of the session, so nothing was killed. Retry the force-kill.',
   })
   async forceKill(@Param('sessionId', SessionIdPipe) id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.forceKill(id);
@@ -938,8 +955,8 @@ export class SessionController {
   @ApiResponse({
     status: 400,
     description:
-      `${SESSION_NOT_STARTED_400} Also an invalid chatId / muteUntil, or a chatId the whatsapp-web.js engine ` +
-      'cannot resolve. The Baileys engine answers `success: true` for a chat it has never seen, and `400` for a ' +
+      `${SESSION_NOT_STARTED_400} Also an invalid chatId / muteUntil, a channel id on the whatsapp-web.js engine (a ` +
+      'channel is muted through its own route), or a chatId that engine cannot resolve. The Baileys engine answers `success: true` for a chat it has never seen, and `400` for a ' +
       'phone chatId held under a LID that neither the stored mapping nor a WhatsApp lookup pairs.',
   })
   @ApiResponse({ status: 404, description: 'Session not found' })
@@ -1058,7 +1075,7 @@ export class SessionController {
   })
   @ApiResponse({
     status: 200,
-    description: 'Session statistics including counts and memory usage',
+    description: 'Session statistics including counts, plus process memory usage for unscoped ADMIN keys',
     type: SessionsOverviewResponseDto,
   })
   async getStats(@CurrentApiKey() apiKey?: ApiKey): Promise<{
@@ -1067,10 +1084,11 @@ export class SessionController {
     ready: number;
     disconnected: number;
     byStatus: Record<string, number>;
-    memoryUsage: { heapUsed: number; heapTotal: number; rss: number };
+    memoryUsage?: { heapUsed: number; heapTotal: number; rss: number };
   }> {
     // Scope aggregate stats to the key's allowedSessions so a session-restricted key cannot enumerate
-    // global session counts/status (the route carries no :sessionId for the guard to scope against).
-    return this.sessionService.getStats(apiKey?.allowedSessions);
+    // global session counts/status, and expose process memory usage only to unscoped ADMIN callers.
+    const includeMemoryUsage = apiKey?.role === ApiKeyRole.ADMIN && !apiKey.allowedSessions?.length;
+    return this.sessionService.getStats(apiKey?.allowedSessions, { includeMemoryUsage });
   }
 }

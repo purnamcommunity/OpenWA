@@ -1,3 +1,4 @@
+import { BadRequestException } from '@nestjs/common';
 import { recordOsEnvKeys, recordPinnedEnvKeys } from '../../config/env-precedence';
 import {
   applyDatabaseSection,
@@ -161,7 +162,7 @@ it.each(cases)(
       else if (!(builtIn === undefined && pin === 'external')) {
         Object.assign(expected, { REDIS_HOST: 'redis', REDIS_PORT: '6379' });
         if (pin !== 'external') expected.REDIS_TLS = 'false';
-        delete expected.REDIS_PASSWORD;
+        if (changed) delete expected.REDIS_PASSWORD;
       }
     } else {
       const fields =
@@ -403,13 +404,80 @@ describe('Redis username ownership', () => {
     const saved = savedValues(existing, ctx);
     expect(saved.REDIS_USERNAME).toBe('worker');
     expect(saved.REDIS_PORT).toBe('6379');
-    expect(saved.REDIS_PASSWORD).toBeUndefined();
+    expect(saved.REDIS_PASSWORD).toBe('DummyRedisPassword123456');
   });
 
   it('keeps a named external username when the choice stays external', () => {
     const ctx = context();
     applyRedisSection({ enabled: true, builtIn: false, host: 'cache.external.invalid', password: '' }, existing, ctx);
     expect(savedValues(existing, ctx).REDIS_USERNAME).toBe('worker');
+  });
+});
+
+describe('Built-in Redis password ownership', () => {
+  it.each([
+    ['queue-only', { REDIS_ENABLED: 'false', QUEUE_ENABLED: 'true', CACHE_ENABLED: 'false' }],
+    ['cache-only', { REDIS_ENABLED: 'false', QUEUE_ENABLED: 'false', CACHE_ENABLED: 'true' }],
+  ])('preserves built-in REDIS_PASSWORD for %s built-in Redis when saving with a blank password', (_label, flags) => {
+    const existing = {
+      ...flags,
+      REDIS_BUILTIN: 'true',
+      REDIS_HOST: 'redis',
+      REDIS_PORT: '6379',
+      REDIS_PASSWORD: 'BuiltinRedisSecret123',
+    };
+    const ctx = context();
+
+    applyRedisSection({ builtIn: true, password: '' }, existing, ctx);
+
+    expect(savedValues(existing, ctx).REDIS_PASSWORD).toBe('BuiltinRedisSecret123');
+  });
+
+  it.each([
+    ['queue-only', { REDIS_ENABLED: 'false', QUEUE_ENABLED: 'true' }],
+    ['cache-only', { REDIS_ENABLED: 'false', CACHE_ENABLED: 'true' }],
+  ])(
+    'preserves running process built-in REDIS_PASSWORD for %s Redis after an unapplied switch away and back',
+    (_label, flags) => {
+      Object.assign(process.env, flags, {
+        REDIS_HOST: 'redis',
+        REDIS_PASSWORD: 'RunningBuiltinSecret456',
+      });
+      const existing = {
+        ...flags,
+        REDIS_BUILTIN: 'false',
+        REDIS_HOST: 'cache.external.example',
+        REDIS_PASSWORD: 'ExternalPassword789',
+      };
+      const ctx = context();
+
+      applyRedisSection({ builtIn: true, password: '' }, existing, ctx);
+
+      expect(savedValues(existing, ctx).REDIS_PASSWORD).toBe('RunningBuiltinSecret456');
+    },
+  );
+
+  it('clears built-in REDIS_PASSWORD when switching from password-protected built-in Redis to external with blank password', () => {
+    const existing = {
+      REDIS_ENABLED: 'true',
+      REDIS_BUILTIN: 'true',
+      REDIS_HOST: 'redis',
+      REDIS_PORT: '6379',
+      REDIS_PASSWORD: 'BuiltinRedisSecret123',
+    };
+    const ctx = context();
+
+    applyRedisSection({ enabled: true, builtIn: false, host: 'cache.external.example', password: '' }, existing, ctx);
+
+    expect(savedValues(existing, ctx).REDIS_PASSWORD).toBeUndefined();
+
+    const ctxWithNew = context();
+    applyRedisSection(
+      { enabled: true, builtIn: false, host: 'cache.external.example', password: 'FreshExternalSecret789' },
+      existing,
+      ctxWithNew,
+    );
+    expect(savedValues(existing, ctxWithNew).REDIS_PASSWORD).toBe('FreshExternalSecret789');
   });
 });
 
@@ -453,5 +521,31 @@ describe('PostgreSQL database name', () => {
     const sent = context();
     applyDatabaseSection({ type: 'postgres', builtIn: false, ...external, database: 'other' }, existing, sent);
     expect(savedValues(existing, sent).DATABASE_NAME).toBe('other');
+  });
+});
+
+describe('PostgreSQL pool size', () => {
+  const external = { host: 'db.example.invalid', username: 'app', password: 'DummyPassword123456' };
+
+  // The next boot reads the value back as digits, and a number written in exponent form (`1e+21`) is refused.
+  it.each([[-1], [1.5], [1e21], [2 ** 53]])('refuses a pool size of %s without writing it', poolSize => {
+    const ctx = context();
+
+    expect(() => applyDatabaseSection({ type: 'postgres', builtIn: false, ...external, poolSize }, {}, ctx)).toThrow(
+      BadRequestException,
+    );
+    expect(ctx.updates).not.toHaveProperty('DATABASE_POOL_SIZE');
+  });
+
+  it.each([
+    [25, '25'],
+    [1e7, '10000000'],
+    [0, '10'],
+  ])('writes a pool size of %s as %s', (poolSize, written) => {
+    const ctx = context();
+
+    applyDatabaseSection({ type: 'postgres', builtIn: false, ...external, poolSize }, {}, ctx);
+
+    expect(ctx.updates.DATABASE_POOL_SIZE).toBe(written);
   });
 });

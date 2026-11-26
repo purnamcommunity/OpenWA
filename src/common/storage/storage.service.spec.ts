@@ -153,6 +153,66 @@ describe('StorageService put/getFile containment is backend-agnostic', () => {
   });
 });
 
+describe('StorageService (local) file modes', () => {
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const modeOf = (target: string): number => fs.statSync(target).mode & 0o777;
+
+  it('creates a missing storage root owner-only', () => {
+    const { baseDir, localPath } = makeLocalService();
+    dirs.push(baseDir);
+
+    expect(modeOf(localPath)).toBe(0o700);
+  });
+
+  it('tightens a world-readable storage root it finds', () => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-storage-'));
+    dirs.push(baseDir);
+    const localPath = path.join(baseDir, 'media');
+    fs.mkdirSync(localPath);
+    fs.chmodSync(localPath, 0o755);
+    const configService = {
+      get: (key: string) => (key === 'storage.type' ? 'local' : key === 'storage.localPath' ? localPath : undefined),
+    } as unknown as ConfigService;
+
+    new StorageService(configService);
+
+    expect(modeOf(localPath)).toBe(0o700);
+  });
+
+  it('writes a new file 0600 in directories it creates 0700', async () => {
+    const { service, baseDir, localPath } = makeLocalService();
+    dirs.push(baseDir);
+
+    await service.putFile('statuses/session-a/clip.bin', Buffer.from('x'));
+
+    expect(modeOf(path.join(localPath, 'statuses'))).toBe(0o700);
+    expect(modeOf(path.join(localPath, 'statuses/session-a'))).toBe(0o700);
+    expect(modeOf(path.join(localPath, 'statuses/session-a/clip.bin'))).toBe(0o600);
+  });
+
+  it('leaves a file and a directory written earlier as they are, under the owner-only root', async () => {
+    const { service, baseDir, localPath } = makeLocalService();
+    dirs.push(baseDir);
+    const older = path.join(localPath, 'chat-media/session-a');
+    fs.mkdirSync(older, { recursive: true });
+    fs.chmodSync(older, 0o755);
+    fs.writeFileSync(path.join(older, 'old.bin'), 'old');
+    fs.chmodSync(path.join(older, 'old.bin'), 0o644);
+
+    await service.putFile('chat-media/session-a/new.bin', Buffer.from('new'));
+
+    expect(modeOf(older)).toBe(0o755);
+    expect(modeOf(path.join(older, 'old.bin'))).toBe(0o644);
+    expect(modeOf(path.join(older, 'new.bin'))).toBe(0o600);
+    expect(modeOf(localPath)).toBe(0o700);
+  });
+});
+
 describe('StorageService.openFile (the export read path)', () => {
   const readAll = async (stream: Readable): Promise<Buffer> => {
     const chunks: Buffer[] = [];
@@ -475,11 +535,14 @@ describe('StorageService local store holding a symbolic link', () => {
     await expect(service.createExportStream()).rejects.toThrow(/symbolic link.*chat-media/);
   });
 
-  it('still serves the linked file and lets a sweep of the linked prefix list it', async () => {
-    expect((await service.getFile('chat-media/archived.bin')).toString()).toBe('archived');
-    const listed: string[] = [];
-    for await (const file of service.iterateFiles('chat-media/', { skipUnreadable: true })) listed.push(file);
-    expect(listed).toEqual(['chat-media/archived.bin']);
+  it('refuses reads and prefix walks through a symbolic link that escapes the storage root', async () => {
+    await expect(service.getFile('chat-media/archived.bin')).rejects.toThrow(/outside storage root/);
+    const collect = async (): Promise<string[]> => {
+      const listed: string[] = [];
+      for await (const file of service.iterateFiles('chat-media/', { skipUnreadable: true })) listed.push(file);
+      return listed;
+    };
+    await expect(collect()).rejects.toThrow(/outside storage root/);
   });
 });
 

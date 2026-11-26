@@ -18,9 +18,13 @@
 # Environment:
 #   MAIN_DATABASE_NAME  restore target for the auth/audit DB (default: <data dir>/main.sqlite)
 #   DATABASE_NAME       restore target for the SQLite data store (default: <data dir>/openwa.sqlite)
-#                       Both resolve EXACTLY like the app: the environment first, then ./.env, then
-#                       .env.generated (the archive's copy when it carries one, else the data dir's),
-#                       otherwise the app's ./data default (see lib-env.sh).
+#                       Both resolve EXACTLY like the app: the environment first (a value of only
+#                       blanks counts as unset), then ./.env, then .env.generated (the archive's copy
+#                       when it carries one, else the data dir's), otherwise the app's ./data default
+#                       (see lib-env.sh).
+#   DATABASE_TYPE     resolved the same way, and read only for an archive that holds the SQLite data store:
+#                     with postgres, where DATABASE_NAME names a database, the restore stops before it
+#                     writes anything
 #   OPENWA_DATA_DIR   the app's ./data directory to restore into, such as a volume's mountpoint on
 #                     the host (default: ./data); the ./data defaults, and a ./data/... path read
 #                     from ./.env or .env.generated, are taken under it
@@ -215,7 +219,7 @@ replace_tree() {
       exit 1
       ;;
   esac
-  if [ "$PHASE" = snapshot ]; then
+  if [ "$PHASE" = check ]; then
     # An existing directory is emptied before it is refilled, which needs every directory in it.
     openwa_writable "$target_dir" || refuse_unwritable "$target_dir" "$label"
     if [ -d "$target_dir" ]; then
@@ -223,6 +227,9 @@ replace_tree() {
         -exec sh -c 'for d do [ -w "$d" ] || { echo "$d"; exit 1; }; done' sh {} + 2>/dev/null)" || true
       [ -z "$blocked" ] || refuse_unwritable "${blocked%%$'\n'*}" "$label"
     fi
+    return
+  fi
+  if [ "$PHASE" = snapshot ]; then
     snapshot_external "$target_dir"
     return
   fi
@@ -258,14 +265,13 @@ snapshot_external() {
   # Targets from different parents can share a name in one snapshot dir (a PLUGINS_DIR and a
   # PLUGIN_STATE_DIR both end in plugins); never copy one into the other's snapshot.
   n=1
-  while [ -e "$external_snapshot" ]; do
+  while [ -e "$external_snapshot" ] || [ -L "$external_snapshot" ]; do
     n=$((n + 1))
     external_snapshot="${snapshot_dir%/}/$(basename "$target").pre-restore-$RESTORE_TIMESTAMP-$n"
   done
   log "Snapshotting current $target -> $external_snapshot"
   mkdir -p "$snapshot_dir"
-  # -H copies what a symlinked target points at. The restore writes through such a link, so a copy of
-  # the link itself would end up showing the archive instead of the state it replaced.
+  # -H for a symlinked target, copying its referent rather than leaving a dangling link copy.
   cp -pRH "$target" "$external_snapshot"
 }
 
@@ -276,7 +282,7 @@ snapshot_external() {
 # removed before the copy, or the restored file reads back the old install's rows.
 restore_db() {
   resolved_db="$(resolve_path "$2")"
-  if [ "$PHASE" = snapshot ]; then
+  if [ "$PHASE" = check ]; then
     refuse_root_target "$2" "$3"
     refuse_directory_target "$2" "$3"
     openwa_writable "$2" || refuse_unwritable "$2" "$3"
@@ -287,6 +293,9 @@ restore_db() {
         fi
       done
     done
+    return
+  fi
+  if [ "$PHASE" = snapshot ]; then
     snapshot_external "$2"
     # Empty when the target lives in the data dir, whose own snapshot already holds the sidecars.
     if [ -n "$external_snapshot" ]; then
@@ -419,9 +428,20 @@ if [ -f "$STAGE/.env.generated" ]; then
   log "Paths not set in the environment or ./.env come from the archive's .env.generated."
 fi
 MAIN_DB="$(openwa_resolve MAIN_DATABASE_NAME "${DATA_DIR%/}/main.sqlite" path)"
-# DATABASE_NAME is only a target for an archive carrying the SQLite data store; a PostgreSQL dump is
-# loaded by hand, so a line for it the scripts cannot parse does not stop that restore.
+# DATABASE_TYPE and DATABASE_NAME matter only to an archive carrying the SQLite data store; a PostgreSQL dump is
+# loaded by hand, so a line for either the scripts cannot parse does not stop that restore. Under PostgreSQL
+# DATABASE_NAME names a database, so a SQLite data store has no target: it is refused before it is written to a file
+# named after that database. DATABASE_TYPE is a top-level assignment, so a line the scripts cannot parse stops the run.
 if [ -f "$STAGE/openwa.sqlite" ]; then
+  DATABASE_TYPE="$(openwa_resolve DATABASE_TYPE sqlite)"
+  if [ "$DATABASE_TYPE" = postgres ]; then
+    log "ERROR: the archive holds a SQLite data store (openwa.sqlite), but DATABASE_TYPE is postgres, so the app would not read it"
+    log "       nothing has been restored yet; to move a SQLite install to PostgreSQL, restore this archive into a SQLite"
+    log "       install, then export-data, switch and import-data as docs/14-migration-guide.md (14.3) shows; to run on"
+    log "       SQLite again, change DATABASE_TYPE and DATABASE_NAME first where they are set (the environment outranks"
+    log "       ./.env, which outranks the dashboard's .env.generated), then re-run"
+    exit 1
+  fi
   DATA_DB="$(openwa_resolve DATABASE_NAME "${DATA_DIR%/}/openwa.sqlite" path)"
 fi
 SESSIONS_DIR="$(openwa_resolve SESSION_DATA_PATH "$DATA_DIR/sessions" path)"
@@ -436,9 +456,11 @@ PLUGIN_PACKAGES_DIR="$(openwa_resolve PLUGINS_DIR "$DATA_DIR/plugins" path)"
 # resolved here exactly like PLUGINS_DIR above. Hardcoding $DATA_DIR/plugins meant an operator who
 # moved plugin state got an archive with neither the registry nor any plugin's storage in it, and
 # a restore that put nothing back. Resolved under its own name because the knob names the ROOT,
-# not the plugins directory inside it.
+# not the plugins directory inside it. That directory is not named PLUGIN_STATE_DIR: a variable of the
+# key's name keeps the export of a key in the environment (compose forwards one, blank), and from_archive
+# reads the environment by key name.
 PLUGIN_STATE_ROOT="$(openwa_resolve PLUGIN_STATE_DIR "$DATA_DIR" path)"
-PLUGIN_STATE_DIR="$PLUGIN_STATE_ROOT/plugins"
+PLUGIN_STATE_TARGET="$PLUGIN_STATE_ROOT/plugins"
 # The app reads the plaintext admin key from BOOTSTRAP_KEY_FILE when that is set.
 ADMIN_KEY_FILE="$(openwa_resolve BOOTSTRAP_KEY_FILE "$DATA_DIR/.api-key" path)"
 
@@ -460,7 +482,7 @@ done
 # follows wherever it points, and a target inside or around a directory refilled from the archive, whose links
 # are in place before the other target is written. Setting the key in the environment or ./.env lifts this.
 from_archive() {
-  [ "$OPENWA_GENERATED_ENV" = "$STAGE/.env.generated" ] && [ -z "$(printenv "$1" 2>/dev/null || true)" ] &&
+  [ "$OPENWA_GENERATED_ENV" = "$STAGE/.env.generated" ] && [ -z "$(openwa_env "$1")" ] &&
     ! openwa_env_file_value ./.env "$1" >/dev/null 2>&1 &&
     openwa_env_file_value "$OPENWA_GENERATED_ENV" "$1" >/dev/null 2>&1
 }
@@ -523,7 +545,7 @@ if [ -d "$STAGE/plugin-packages" ]; then
   archive_target PLUGINS_DIR "$PLUGIN_PACKAGES_DIR" dir "$DATA_DIR/plugins"
 fi
 if [ -d "$STAGE/plugin-state" ]; then
-  archive_target PLUGIN_STATE_DIR "$PLUGIN_STATE_DIR" dir "$DATA_DIR/plugins"
+  archive_target PLUGIN_STATE_DIR "$PLUGIN_STATE_TARGET" dir "$DATA_DIR/plugins"
 fi
 if [ -f "$STAGE/.api-key" ]; then
   archive_target BOOTSTRAP_KEY_FILE "$ADMIN_KEY_FILE" file "$DATA_DIR/.api-key"
@@ -559,6 +581,35 @@ while [ "$i" -lt "${#TARGET_KEYS[@]}" ]; do
   done
   i=$((i + 1))
 done
+
+# Fail fast BEFORE copying if OPENWA_RESTORE_SNAPSHOT_DIR resolves equal to or inside the data
+# directory or any directory target that replace_tree empties/refills (which would cause self-copy
+# recursion or destroy the snapshot before refill).
+if [ -n "${OPENWA_RESTORE_SNAPSHOT_DIR:-}" ]; then
+  RESOLVED_SNAPSHOT_DIR="$(resolve_path "$OPENWA_RESTORE_SNAPSHOT_DIR")"
+  if [ "$RESOLVED_SNAPSHOT_DIR" = / ] || [ "$OPENWA_RESTORE_SNAPSHOT_DIR" -ef / ]; then
+    log "ERROR: refusing unsafe OPENWA_RESTORE_SNAPSHOT_DIR target: $OPENWA_RESTORE_SNAPSHOT_DIR"
+    exit 1
+  fi
+  case "$RESOLVED_SNAPSHOT_DIR" in
+    "$RESOLVED_DATA_DIR" | "${RESOLVED_DATA_DIR%/}/"*)
+      log "ERROR: OPENWA_RESTORE_SNAPSHOT_DIR must not equal or lie inside OPENWA_DATA_DIR: $OPENWA_RESTORE_SNAPSHOT_DIR"
+      exit 1
+      ;;
+  esac
+  snap_idx=0
+  while [ "$snap_idx" -lt "${#TARGET_PATHS[@]}" ]; do
+    if [ "${TARGET_KINDS[snap_idx]}" = dir ]; then
+      case "$RESOLVED_SNAPSHOT_DIR" in
+        "${TARGET_PATHS[snap_idx]}" | "${TARGET_PATHS[snap_idx]%/}/"*)
+          log "ERROR: OPENWA_RESTORE_SNAPSHOT_DIR must not equal or lie inside ${TARGET_KEYS[snap_idx]}: $OPENWA_RESTORE_SNAPSHOT_DIR"
+          exit 1
+          ;;
+      esac
+    fi
+    snap_idx=$((snap_idx + 1))
+  done
+fi
 
 # A backup taken without sqlite3 .backup carries this marker: the database snapshots were
 # plain-copied from a possibly-live app and may be torn. Warn loudly and continue — unless
@@ -598,27 +649,13 @@ if [ "$FORCE" -ne 1 ]; then
   fi
 fi
 
-# Safety snapshot of whatever is there now, next to the data dir unless OPENWA_RESTORE_SNAPSHOT_DIR
-# names another directory. The shipped compose file and Helm chart mount the data dir as a volume
-# under a read-only root, where that sibling cannot be written.
-if [ -d "$DATA_DIR" ] && [ -n "$(ls -A "$DATA_DIR" 2>/dev/null || true)" ]; then
-  SAFETY_DIR="${OPENWA_RESTORE_SNAPSHOT_DIR:-$(dirname "$DATA_DIR")}"
-  SAFETY="${SAFETY_DIR%/}/$(basename "$DATA_DIR").pre-restore-$RESTORE_TIMESTAMP"
-  log "Snapshotting current data dir -> $SAFETY"
-  mkdir -p "$SAFETY_DIR"
-  # -H for a symlinked data dir, as in snapshot_external.
-  cp -pRH "$DATA_DIR" "$SAFETY"
-fi
-
-mkdir -p "$DATA_DIR"
-
 if [ ! -f "$STAGE/main.sqlite" ]; then
   log "WARN: main.sqlite not in archive — API keys / audit log will NOT be restored"
 fi
 
 MERGED_PLUGINS_DIR=""
 if [ -d "$STAGE/plugin-packages" ] && [ -d "$STAGE/plugin-state" ] &&
-  [ "$(resolve_path "$PLUGIN_PACKAGES_DIR")" = "$(resolve_path "$PLUGIN_STATE_DIR")" ]; then
+  [ "$(resolve_path "$PLUGIN_PACKAGES_DIR")" = "$(resolve_path "$PLUGIN_STATE_TARGET")" ]; then
   # Docker deployments deliberately colocate package and state files. Build the complete target in
   # staging and replace it once, so neither half can erase the other during restore.
   MERGED_PLUGINS_DIR="$STAGE/plugin-merged"
@@ -654,7 +691,7 @@ restore_targets() {
       replace_tree "$STAGE/plugin-packages" "$PLUGIN_PACKAGES_DIR" "installed plugin packages"
     fi
     if [ -d "$STAGE/plugin-state" ]; then
-      replace_tree "$STAGE/plugin-state" "$PLUGIN_STATE_DIR" "plugin registry and persisted state"
+      replace_tree "$STAGE/plugin-state" "$PLUGIN_STATE_TARGET" "plugin registry and persisted state"
     fi
   fi
   if [ -f "$STAGE/.api-key" ]; then
@@ -665,10 +702,13 @@ restore_targets() {
 # The plaintext admin key goes where the app reads it. Checked and, outside the data dir, snapshotted
 # with the other targets: it may be the only plaintext copy of a key the replaced main.sqlite accepts.
 restore_admin_key() {
-  if [ "$PHASE" = snapshot ]; then
+  if [ "$PHASE" = check ]; then
     refuse_root_target "$ADMIN_KEY_FILE" "admin key (BOOTSTRAP_KEY_FILE)"
     refuse_directory_target "$ADMIN_KEY_FILE" "admin key (BOOTSTRAP_KEY_FILE)"
     openwa_writable "$ADMIN_KEY_FILE" || refuse_unwritable "$ADMIN_KEY_FILE" "admin key (BOOTSTRAP_KEY_FILE)"
+    return
+  fi
+  if [ "$PHASE" = snapshot ]; then
     snapshot_external "$ADMIN_KEY_FILE"
     return
   fi
@@ -678,9 +718,9 @@ restore_admin_key() {
   chmod 0600 "$ADMIN_KEY_FILE"
 }
 
-PHASE=snapshot
+PHASE=check
 restore_targets
-# Written into the data dir after the targets, so checked with them; the data-dir snapshot holds both.
+# Written into the data dir after the targets, so checked before taking any safety snapshot.
 if [ -f "$STAGE/.env.generated" ]; then
   openwa_writable "$DATA_DIR/.env.generated" ||
     refuse_unwritable "$DATA_DIR/.env.generated" "dashboard-generated configuration"
@@ -688,6 +728,27 @@ fi
 if [ -f "$STAGE/database.sql" ]; then
   openwa_writable "$DATA_DIR/database.sql" || refuse_unwritable "$DATA_DIR/database.sql" "PostgreSQL dump"
 fi
+
+# Take the data-dir and external safety snapshots only after all preflight validation checks pass.
+if [ -d "$DATA_DIR" ] && [ -n "$(ls -A "$DATA_DIR" 2>/dev/null || true)" ]; then
+  SAFETY_DIR="${OPENWA_RESTORE_SNAPSHOT_DIR:-$(dirname "$DATA_DIR")}"
+  SAFETY="${SAFETY_DIR%/}/$(basename "$DATA_DIR").pre-restore-$RESTORE_TIMESTAMP"
+  n=1
+  while [ -e "$SAFETY" ] || [ -L "$SAFETY" ]; do
+    n=$((n + 1))
+    SAFETY="${SAFETY_DIR%/}/$(basename "$DATA_DIR").pre-restore-$RESTORE_TIMESTAMP-$n"
+  done
+  log "Snapshotting current data dir -> $SAFETY"
+  mkdir -p "$SAFETY_DIR"
+  # -H for a symlinked data dir, as in snapshot_external.
+  cp -pRH "$DATA_DIR" "$SAFETY"
+fi
+
+PHASE=snapshot
+restore_targets
+
+mkdir -p "$DATA_DIR"
+
 PHASE=apply
 restore_targets
 

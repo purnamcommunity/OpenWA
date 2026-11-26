@@ -1,8 +1,14 @@
 import { ArgumentMetadata, BadRequestException, INestApplication, PipeTransform, ValidationPipe } from '@nestjs/common';
+import { Transform } from 'class-transformer';
 import { applyGlobalValidation, NulBodyPipe } from './app-validation';
+import { CreateApiKeyDto } from '../modules/auth/dto/api-key.dto';
+import { CreateAutomationRuleDto } from '../modules/automation/dto/automation-rule.dto';
 import { ImportDataDto } from '../modules/infra/dto/import-data.dto';
 import { SendBulkMessageDto } from '../modules/message/dto/bulk-message.dto';
 import { SendTextMessageDto } from '../modules/message/dto/send-message.dto';
+import { CreateSessionDto } from '../modules/session/dto/create-session.dto';
+import { CreateTemplateDto } from '../modules/template/dto/template.dto';
+import { CreateWebhookDto } from '../modules/webhook/dto/webhook.dto';
 
 // PostgreSQL rejects U+0000 in every text and varchar value and bound parameter, so a body string
 // holding one failed the lookup or write behind the route as a 500.
@@ -12,6 +18,11 @@ describe('NulBodyPipe', () => {
   it('refuses a body holding a NUL character at any depth', () => {
     const body = { messages: [{ chatId: 'a@c.us', variables: { name: 'x\u0000' } }] };
     expect(() => pipe.transform(body, { type: 'body', metatype: SendBulkMessageDto })).toThrow(BadRequestException);
+  });
+
+  it('refuses a body holding a NUL character in an object key', () => {
+    const body = { url: 'https://example.com/hook', headers: { 'X-Bad\u0000': 'value' } };
+    expect(() => pipe.transform(body, { type: 'body', metatype: CreateWebhookDto })).toThrow(BadRequestException);
   });
 
   it('passes a body without one, and leaves the path and query to the URL refusal', () => {
@@ -62,11 +73,10 @@ describe('the global pipes ahead of the DTO transform', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('runs the width bound first, then the validation pipe, then the NUL refusal', () => {
-    expect(installedPipes().map(pipe => pipe.constructor.name)).toEqual([
-      'BodyWidthPipe',
-      'ValidationPipe',
-      'NulBodyPipe',
-    ]);
+    const pipes = installedPipes();
+
+    expect(pipes.map(pipe => pipe.constructor.name)).toEqual(['BodyWidthPipe', 'GlobalValidationPipe', 'NulBodyPipe']);
+    expect(pipes[1]).toBeInstanceOf(ValidationPipe);
   });
 
   describe.each([
@@ -132,6 +142,17 @@ describe('the global pipes ahead of the DTO transform', () => {
     expect((restored.tables as { messages: unknown[] }).messages).toHaveLength(260_000);
   }, 30_000);
 
+  it('still refuses a restore body holding an object past the key limit, before the validation pipe runs', async () => {
+    const transform = jest.spyOn(ValidationPipe.prototype, 'transform');
+    const oversizedRow = { tables: { messages: [keys(1_001)] } };
+    const oversizedRoot = { tables: keys(1_001) };
+
+    for (const payload of [oversizedRow, oversizedRoot]) {
+      await expect(runAll(payload, body('body', ImportDataDto))).rejects.toThrow(new BadRequestException(OBJECT_LIMIT));
+    }
+    expect(transform).not.toHaveBeenCalled();
+  });
+
   // 100 recipients, each tagging the most the single-send routes allow: the largest body the API documents.
   it('still validates a bulk send at its documented maximum', async () => {
     const messages = Array.from({ length: 100 }, (_, message) => ({
@@ -146,5 +167,121 @@ describe('the global pipes ahead of the DTO transform', () => {
     const validated = (await runAll({ messages }, body('body', SendBulkMessageDto))) as SendBulkMessageDto;
 
     expect(validated.messages).toHaveLength(100);
+  });
+
+  // The implicit conversion calls String() and Number() on whatever the caller sent for a string or a number property,
+  // and both throw on an object whose own toString is not a function. A JSON body or a form key such as name[toString]
+  // builds one. That is the caller's mistake, so it answers 400 like every other wrong-typed value, on every route.
+  describe('a value the implicit conversion cannot read', () => {
+    type Route = { label: string; dto: new () => object; sound: unknown; body: (value: unknown) => object };
+    const routes: Route[] = [
+      { label: 'session name', dto: CreateSessionDto, sound: 'abc', body: name => ({ name }) },
+      {
+        label: 'session proxyUrl',
+        dto: CreateSessionDto,
+        sound: 'http://proxy.local:3128',
+        body: proxyUrl => ({ name: 'abc', proxyUrl }),
+      },
+      { label: 'webhook url', dto: CreateWebhookDto, sound: 'https://example.com/h', body: url => ({ url }) },
+      {
+        label: 'webhook retryCount (a number)',
+        dto: CreateWebhookDto,
+        sound: 1,
+        body: retryCount => ({ url: 'https://example.com/h', retryCount }),
+      },
+      { label: 'API key name', dto: CreateApiKeyDto, sound: 'a key', body: name => ({ name }) },
+      { label: 'template body', dto: CreateTemplateDto, sound: 'hello', body: text => ({ name: 'n', body: text }) },
+      {
+        label: 'automation rule cooldownSeconds (a number)',
+        dto: CreateAutomationRuleDto,
+        sound: 5,
+        body: cooldownSeconds => ({ name: 'n', replyText: 'r', cooldownSeconds }),
+      },
+      { label: 'text message text', dto: SendTextMessageDto, sound: 'hi', body: value => text({ text: value }) },
+    ];
+    const run = (route: Route, value: unknown): Promise<unknown> => runAll(route.body(value), body('body', route.dto));
+    const cases = routes.map(route => [route.label, route] as const);
+
+    // Shapes the parsers hand over: an object with its own toString, whatever it holds, alone or inside an array.
+    const unreadable: Array<[string, unknown]> = [
+      ['{"toString":"x"}', { toString: 'x' }],
+      ['{"toString":1}', { toString: 1 }],
+      ['{"toString":null}', { toString: null }],
+      ['{"toString":{}}', { toString: {} }],
+      ['{"toString":[]}', { toString: [] }],
+      ['{"toString":"x","valueOf":"y"}', { toString: 'x', valueOf: 'y' }],
+      ['[{"toString":"x"}]', [{ toString: 'x' }]],
+    ];
+    // Wrong-typed values the conversion can read: the validators refused them before and still do.
+    const readable: Array<[string, unknown]> = [
+      ['{"valueOf":1}', { valueOf: 1 }],
+      ['{"valueOf":"x"}', { valueOf: 'x' }],
+      ['{"a":1}', { a: 1 }],
+      ['["abc"]', ['abc']],
+      ['{"constructor":"x"}', { constructor: 'x' }],
+      ['{"hasOwnProperty":"x"}', { hasOwnProperty: 'x' }],
+    ];
+
+    it.each(cases)('takes a sound value in the %s', async (_label, route) => {
+      await expect(run(route, route.sound)).resolves.toBeDefined();
+    });
+
+    describe.each(cases)('the %s', (_label, route) => {
+      it.each(unreadable)('answers 400 for %s', async (_shape, value) => {
+        await expect(run(route, value)).rejects.toBeInstanceOf(BadRequestException);
+      });
+
+      it.each(readable)('keeps answering 400 for %s', async (_shape, value) => {
+        await expect(run(route, value)).rejects.toBeInstanceOf(BadRequestException);
+      });
+    });
+
+    // The pipe also converts a query DTO, so the answer names the part of the request that holds the value.
+    it.each([
+      ['body', 'Request body holds a value of the wrong type'],
+      ['query', 'Request query holds a value of the wrong type'],
+    ] as const)('names the %s when it holds an object with its own toString', async (type, message) => {
+      const value = text({ text: { toString: 'x' } });
+
+      await expect(runAll(value, body(type, SendTextMessageDto))).rejects.toThrow(new BadRequestException(message));
+    });
+
+    // Only a conversion that throws is answered. A body is never refused up front for holding such an object: a
+    // free-form map may name a key toString, and the conversion never reads it.
+    it('takes a free-form map that has a key named toString', async () => {
+      const webhook = { url: 'https://example.com/h', headers: { toString: 'x', 'X-Custom': 'y' } };
+
+      await expect(runAll(webhook, body('body', CreateWebhookDto))).resolves.toBeDefined();
+    });
+
+    it('lets a restore body through whose row has a key named toString', async () => {
+      const backup = { tables: { messages: [{ id: 'm1', toString: 'x' }] } };
+
+      const restored = (await runAll(backup, body('body', ImportDataDto))) as ImportDataDto;
+
+      expect((restored.tables as { messages: unknown[] }).messages).toHaveLength(1);
+    });
+
+    // A TypeError the application's own code throws is a defect and stays a 500, whatever message it carries.
+    class TransformThrowsDto {
+      @Transform(() => {
+        throw new TypeError('value.trim is not a function');
+      })
+      value!: string;
+    }
+    class TransformReadsNullPrototypeDto {
+      @Transform(() => String(Object.create(null)))
+      value!: string;
+    }
+
+    it.each([
+      ['a custom transform that throws', TransformThrowsDto],
+      ['a custom transform that raises the conversion error itself', TransformReadsNullPrototypeDto],
+    ])('leaves the TypeError of %s to the exception handler', async (_label, dto) => {
+      const outcome = runAll({ value: 'abc' }, body('body', dto));
+
+      await expect(outcome).rejects.toBeInstanceOf(TypeError);
+      await expect(outcome).rejects.not.toBeInstanceOf(BadRequestException);
+    });
   });
 });

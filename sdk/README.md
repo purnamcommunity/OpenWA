@@ -1,6 +1,6 @@
 # OpenWA SDKs
 
-This document describes SDK 0.12.0. The `linkPreview` key of a session's config requires OpenWA 0.30.3 or later. `messages.receipts` (`Messages.Receipts` in Go) requires OpenWA 0.28.0 or later. `contacts.lid` (`Contacts.Lid` in Go) requires OpenWA 0.27.1 or later. `setMemberLabel` (`set_member_label` in Python, `SetMemberLabel` in Go), the search `match` option, and the `thumbnailUrl` and `thumbnailBase64` fields of `customLinkPreview` require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
+This document describes SDK 0.14.0. The idempotency key on `messages.clickButton` (`click_button` in Python, `Messages.ClickButton` in Go) requires OpenWA 0.32.0 or later, and `SessionStatsOverview.memoryUsage` (`MemoryUsage` in Go) is optional and omitted for non-admin or session-scoped keys starting in OpenWA 0.32.0. The `phone` field of a chat summary requires OpenWA 0.31.0 or later. The `linkPreview` key of a session's config requires OpenWA 0.30.3 or later. `messages.receipts` (`Messages.Receipts` in Go) requires OpenWA 0.28.0 or later. `contacts.lid` (`Contacts.Lid` in Go) requires OpenWA 0.27.1 or later. `setMemberLabel` (`set_member_label` in Python, `SetMemberLabel` in Go), the search `match` option, and the `thumbnailUrl` and `thumbnailBase64` fields of `customLinkPreview` require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
 
 Official client libraries for [OpenWA](https://github.com/rmyndharis/OpenWA), the
 open-source WhatsApp API Gateway. OpenWA is an independent project, not
@@ -49,7 +49,7 @@ All five SDKs expose the same fluent resource surface:
 > ⚠️ Check the per-route **Auth** lines in the [API specification](../docs/06-api-specification.md) for the required API-key role in every SDK. The JavaScript, Python and PHP method tables in the [SDK design](../docs/18-sdk-design.md) also mark role requirements.
 >
 > Deliberately **not** exposed, matching `docs/18-sdk-design.md` exactly:
-> `auth/api-keys` (key validation itself is the `auth` row above), `audit`,
+> `auth/api-keys` (key validation itself is the `auth` row above), `auth/session` (dashboard browser cookie sessions), `audit`,
 > `settings`, `stats`, `automation`, `infra`,
 > `plugins`, the `integration` management routes, `metrics`, `mcp`, `ingress`
 > `docker` and `calls`. These two lists have to agree — they did not, in both
@@ -184,7 +184,7 @@ handler is a `MockHandler` — no global state, no network.
 <dependency>
   <groupId>com.rmyndharis</groupId>
   <artifactId>openwa</artifactId>
-  <version>0.12.0</version>
+  <version>0.14.0</version>
 </dependency>
 ```
 
@@ -275,15 +275,21 @@ testing, retry, tracing, or metrics. See [`go/README.md`](go/README.md).
   `429`, or on `503` when it carries an `Idempotency-Key` or the `503` carries
   `Retry-After` (never after a network error), never retries a send-pacing `429`
   (`code: "SEND_PACING_LIMITED"`), honors `Retry-After`, and rewinds request
-  bodies; it is still off unless you ask for it.
+  bodies; it is still off unless you ask for it. A `409` whose `code` is
+  `"ENGINE_PAGE_RELOADING"` (whatsapp-web.js, while WhatsApp Web reloads its
+  page) is safe to repeat: wait the error's retry-after seconds and repeat the
+  request, for up to a few minutes. No client retries it by default.
 - **Webhook signatures.** Every SDK verifies a delivery's `X-OpenWA-Signature`
   against the raw request body: `verifyWebhookSignature` (JavaScript),
   `verify_webhook_signature` (Python), `VerifyWebhookSignature` (Go),
   `WebhookSignature.verify` (Java) and `WebhookSignature::verify` (PHP). The
   JavaScript, Python, Go and Java SDKs also type the delivery body as
-  `WebhookDelivery`. The signature carries no timestamp, so dedupe on the body's
-  `idempotencyKey` (also the `X-OpenWA-Idempotency-Key` header), which the
-  gateway's retries and redrives reuse.
+  `WebhookDelivery`. Because `X-OpenWA-*` delivery headers are unsigned and the
+  HMAC signature covers only the raw JSON body (with no timestamp), always
+  route on `delivery.event` and deduplicate on `delivery.idempotencyKey` read
+  from the verified JSON body, not from `X-OpenWA-Event` or
+  `X-OpenWA-Idempotency-Key` headers. The gateway's retries and redrives reuse
+  the same payload `idempotencyKey`.
 - **Redirects are never followed.** A `3xx` surfaces to the caller rather than
   being followed, so the API key is never re-sent to a redirect target.
 - **Default timeout** is 30s (configurable). `0` turns it off in the JavaScript,

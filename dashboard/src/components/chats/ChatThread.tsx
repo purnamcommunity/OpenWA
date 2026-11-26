@@ -1,5 +1,6 @@
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -19,24 +20,33 @@ import {
   ChevronDown,
   Clock,
   CornerUpLeft,
+  Download,
+  FileText,
   Loader2,
   MessageSquare,
   Smile,
   Trash2,
+  User,
 } from 'lucide-react';
 import { useRole } from '../../hooks/useRole';
 import { sessionApi, type Chat } from '../../services/api';
 import {
   buildMentionNameMap,
   getMediaSrc,
+  inlineMediaToBlob,
   isRenderableMessage,
   resolveMentions,
   senderKey,
+  timestampOf,
   type ChatMessageView,
+  type MessageMedia,
 } from '../../utils/chatMessages';
+import { contactCards, contactSnippet, isVCardBody } from '../../utils/vcard';
+import { formatFileSize } from '../../utils/bulkMedia';
 import { shouldFetchOlderMessages } from '../../utils/scrollDecision';
 import { keepsSameKey } from '../../utils/authLifecycle';
 import { retryThrottled } from '../../utils/fetchAllPages';
+import { scheduleObjectUrlRevoke } from '../../utils/objectUrl';
 import ArchivedMediaPreview, { type ArchivedMediaKind } from './ArchivedMediaPreview';
 import MessageBody from './MessageBody';
 
@@ -50,10 +60,6 @@ const senderColor = (name: string): string => {
   for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
   return `var(--chat-sender-${(Math.abs(hash) % SENDER_COLORS) + 1})`;
 };
-
-/** A message's time in epoch seconds: the WhatsApp timestamp, else when the gateway stored it. */
-const timestampOf = (msg: ChatMessageView): number =>
-  msg.timestamp || Math.floor(new Date(msg.createdAt).getTime() / 1000);
 
 const sameDay = (a: number, b: number): boolean =>
   new Date(a * 1000).toDateString() === new Date(b * 1000).toDateString();
@@ -78,6 +84,10 @@ interface ChatThreadProps {
   /** Whether an older page of this chat's history exists. */
   hasMoreMessages: boolean;
   loadingOlderMessages: boolean;
+  /** Whether the failure shown is that of a refresh of a thread that has pages: the strip retries it when pressed. */
+  refreshFailed?: boolean;
+  /** Whether a request for the thread is running, which a pressed retry of a refresh is. */
+  refreshing?: boolean;
   onLoadOlderMessages: () => void;
   onMediaLoad: (event?: { currentTarget: Element | null }) => void;
   /** Seeds each media element's pre-decode height; see useChatScrollPosition.measureMedia. */
@@ -115,6 +125,8 @@ function ChatThread({
   messagesContainerRef,
   hasMoreMessages,
   loadingOlderMessages,
+  refreshFailed = false,
+  refreshing = false,
   onLoadOlderMessages,
   onMediaLoad,
   measureMedia,
@@ -277,12 +289,14 @@ function ChatThread({
   const [buttonClick, setButtonClick] = useState<
     Record<string, { loadingId?: string; done?: boolean; selectedId?: string }>
   >({});
+
   const downloadMedia = useCallback(
     async (message: ChatMessageView) => {
       const messageId = message.waMessageId;
       if (!sessionId || !messageId) return;
       setMediaFetch(prev => ({ ...prev, [messageId]: 'loading' }));
       let objectUrl: string | null = null;
+      let handedOff = false;
       const sameKey = keepsSameKey();
       try {
         // A 429 and the 503 of a full S3 download pool are refusals to try again, as the archived previews do.
@@ -302,6 +316,8 @@ function ChatThread({
         // downloads from the same thread apart.
         link.download = message.metadata?.media?.filename || messageId;
         link.click();
+        handedOff = true;
+        scheduleObjectUrlRevoke(objectUrl);
         setMediaFetch(prev => {
           const next = { ...prev };
           delete next[messageId];
@@ -313,11 +329,29 @@ function ChatThread({
         // download disabled, over the inbound cap). Say so on the bubble rather than failing mutely.
         setMediaFetch(prev => ({ ...prev, [messageId]: 'failed' }));
       } finally {
-        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        if (objectUrl && !handedOff) URL.revokeObjectURL(objectUrl);
       }
     },
     [sessionId, activeChat.id],
   );
+
+  const downloadInlineDocument = useCallback((media: MessageMedia, fallbackName: string) => {
+    const blob = inlineMediaToBlob(media);
+    if (!blob) return;
+    let objectUrl: string | null = null;
+    let handedOff = false;
+    try {
+      objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = media.filename || fallbackName;
+      link.click();
+      handedOff = true;
+      scheduleObjectUrlRevoke(objectUrl);
+    } finally {
+      if (objectUrl && !handedOff) URL.revokeObjectURL(objectUrl);
+    }
+  }, []);
 
   const handleClickButton = useCallback(
     async (message: ChatMessageView, button: { id: string; text: string }) => {
@@ -365,33 +399,52 @@ function ChatThread({
     el.scrollTop = 1;
     nudgedTopRef.current = el.scrollTop > 0 ? el.scrollTop : null;
   }, [olderFailed, hasMoreMessages, messagesContainerRef]);
+  const olderScrollRef = useRef({ hasMoreMessages, loadingOlderMessages, onLoadOlderMessages });
+  useEffect(() => {
+    olderScrollRef.current = { hasMoreMessages, loadingOlderMessages, onLoadOlderMessages };
+  });
   useEffect(() => {
     const el = messagesContainerRef.current;
     if (!el) return undefined;
-    const onScroll = (event?: Event) => {
+    const onScroll = () => {
       // 120px gap = a couple of message bubbles before counting as "scrolled up".
       setShowJumpToBottom(el.scrollHeight - el.scrollTop - el.clientHeight > 120);
       const nudged = nudgedTopRef.current;
-      if (event && nudged !== null) {
+      if (nudged !== null) {
         nudgedTopRef.current = null;
         if (el.scrollTop === nudged) return;
       }
+      const {
+        hasMoreMessages: hasMore,
+        loadingOlderMessages: isFetching,
+        onLoadOlderMessages: loadOlder,
+      } = olderScrollRef.current;
       const geometry = { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
       if (
         shouldFetchOlderMessages({
-          isUserScroll: Boolean(event),
+          isUserScroll: true,
           geometry,
-          hasMore: hasMoreMessages,
-          isFetching: loadingOlderMessages,
+          hasMore,
+          isFetching,
         })
       ) {
-        onLoadOlderMessages();
+        loadOlder();
       }
     };
-    onScroll(); // sync initial position (e.g. saved restore landed above the bottom)
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
-  });
+  }, [messagesContainerRef]);
+
+  // Sync the jump button when the active chat changes, finishes loading, or changes length
+  // (e.g. saved scroll restore landed above the bottom without firing a user scroll event).
+  useEffect(() => {
+    const el = messagesContainerRef.current;
+    if (!el || loadingMessages) {
+      setShowJumpToBottom(false);
+      return;
+    }
+    setShowJumpToBottom(el.scrollHeight - el.scrollTop - el.clientHeight > 120);
+  }, [activeChat?.id, loadingMessages, visibleMessages.length, messagesContainerRef]);
 
   // The reaction popover is centred on its icon and opens above it. The icon of a short bubble is a few pixels
   // from the pane's side edge, and a message at the top of the pane has no room above it, so the emoji
@@ -423,12 +476,9 @@ function ChatThread({
     el.scrollTo({ top: el.scrollHeight });
   }, [messagesContainerRef]);
 
-  // Reset the jump button whenever the active chat changes: the new chat's content is restored by
-  // useChatScrollPosition and our listener will resync on its first scroll tick. The prompt-answer
-  // map goes with it: its ids belong to the chat being left, and holding them would disable a
-  // button in the chat being entered if the two ever shared a message id.
+  // Reset the prompt-answer map whenever the active chat changes: its ids belong to the chat being
+  // left, and holding them would disable a button in the chat being entered if the two ever shared a message id.
   useEffect(() => {
-    setShowJumpToBottom(false);
     setButtonClick({});
   }, [activeChat?.id]);
 
@@ -509,25 +559,41 @@ function ChatThread({
           messages already loaded, which must not fall through to the full-screen error below: that would
           replace the loaded thread with a placeholder, collapsing the scroll container so the failed
           page can never be retried by scrolling. */}
-      {!loadingMessages && (loadingOlderMessages || (messagesError && visibleMessages.length > 0)) && (
-        <div className={loadingOlderMessages ? 'messages-loading-older' : 'messages-loading-older failed'}>
-          {loadingOlderMessages ? (
-            <>
-              <Loader2 className="animate-spin" size={18} />
-              <span>{t('chats.loadingOlderMessages')}</span>
-            </>
-          ) : (
-            <>
-              <AlertCircle size={18} />
-              {/* The whole sentence, or only the retry instruction when the thread is too narrow to fit
-                  the whole one in two lines: Chats.css shows one of them, and hides the other from
-                  assistive technology as well. */}
-              <span className="older-failure-full">{t('chats.loadOlderMessagesError')}</span>
-              <span className="older-failure-hint">{t('chats.loadOlderMessagesRetryHint')}</span>
-            </>
-          )}
-        </div>
-      )}
+      {!loadingMessages &&
+        (loadingOlderMessages || (messagesError && visibleMessages.length > 0)) &&
+        // A refresh that failed is not retried by scrolling up (a thread with no older page has no such trigger, and
+        // one too short to scroll cannot raise it), so its strip is the retry.
+        (refreshFailed && !loadingOlderMessages ? (
+          <button
+            type="button"
+            className="messages-loading-older failed retry"
+            disabled={refreshing}
+            aria-busy={refreshing}
+            onClick={onLoadOlderMessages}
+          >
+            {refreshing ? <Loader2 className="animate-spin" size={18} /> : <AlertCircle size={18} />}
+            <span className="older-failure-full">{t('chats.refreshMessagesError')}</span>
+            <span className="older-failure-hint">{t('chats.refreshMessagesRetryHint')}</span>
+          </button>
+        ) : (
+          <div className={loadingOlderMessages ? 'messages-loading-older' : 'messages-loading-older failed'}>
+            {loadingOlderMessages ? (
+              <>
+                <Loader2 className="animate-spin" size={18} />
+                <span>{t('chats.loadingOlderMessages')}</span>
+              </>
+            ) : (
+              <>
+                <AlertCircle size={18} />
+                {/* The whole sentence, or only the retry instruction when the thread is too narrow to fit
+                    the whole one in two lines: Chats.css shows one of them, and hides the other from
+                    assistive technology as well. */}
+                <span className="older-failure-full">{t('chats.loadOlderMessagesError')}</span>
+                <span className="older-failure-hint">{t('chats.loadOlderMessagesRetryHint')}</span>
+              </>
+            )}
+          </div>
+        ))}
       {loadingMessages ? (
         <div className="messages-loading">
           <Loader2 className="animate-spin" size={32} />
@@ -601,22 +667,95 @@ function ChatThread({
                 </div>
               );
             }
+            if (msg.type === 'contact') {
+              // The body is the raw vCard, or `📇 <name>` for a contact the gateway sent; paint a card either way.
+              const cards = contactCards(msg.body);
+              const label = t('chats.media.contact');
+              return (
+                <div className="message-contact" role="group" aria-label={label}>
+                  {(cards.length > 0 ? cards : [{ name: '', phone: '', waid: '' }]).map((card, index) => (
+                    <div
+                      key={`${card.waid || card.phone || card.name || 'contact'}:${index}`}
+                      className="message-contact-card"
+                    >
+                      <span className="message-contact-avatar" aria-hidden="true">
+                        <User size={22} />
+                      </span>
+                      <span className="message-contact-fields">
+                        <span className="message-contact-name" title={card.name || label}>
+                          {card.name || label}
+                        </span>
+                        {card.phone ? (
+                          <span className="message-contact-phone">
+                            <bdi dir="ltr">{card.phone}</bdi>
+                          </span>
+                        ) : null}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              );
+            }
             if (!mediaInfo) return null;
+            const isPdf =
+              mediaInfo.mimetype === 'application/pdf' ||
+              Boolean(mediaInfo.filename && /\.pdf$/i.test(mediaInfo.filename));
+            // The bytes of a document the list left out are fetched when its card is pressed.
+            const fetchState = mediaInfo.omitted && msg.waMessageId ? mediaFetch[msg.waMessageId] : undefined;
+            // What a document is called and how large it is; a click on the card downloads it. The card stays whole
+            // while it fetches and after a fetch that found nothing: a spinner takes the place of the download mark,
+            // the failure the place of the size.
+            const documentName = mediaInfo.filename || t('chats.downloadDocument');
+            const documentMeta = [mediaInfo.sizeBytes ? formatFileSize(mediaInfo.sizeBytes) : '', isPdf ? 'PDF' : '']
+              .filter(Boolean)
+              .join(' \u2022 ');
+            const documentCard = (
+              <span className="chat-document-card-content">
+                <span className={`chat-document-icon-box ${isPdf ? 'pdf' : ''}`}>
+                  {isPdf ? (
+                    <span className="chat-document-pdf-badge">
+                      <FileText size={18} />
+                      <span className="chat-document-pdf-tag" aria-hidden="true">
+                        PDF
+                      </span>
+                    </span>
+                  ) : (
+                    <FileText size={18} />
+                  )}
+                </span>
+                <span className="chat-document-info">
+                  <span className="chat-document-title" title={documentName}>
+                    {documentName}
+                  </span>
+                  {fetchState === 'failed' ? (
+                    <span className="chat-document-meta">{t('chats.status.mediaUnavailable')}</span>
+                  ) : (
+                    documentMeta && <span className="chat-document-meta">{documentMeta}</span>
+                  )}
+                </span>
+                <span className="chat-document-action">
+                  {fetchState === 'loading' ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
+                </span>
+              </span>
+            );
             if (mediaInfo.omitted) {
               // Not a plain label: the bytes exist behind the per-message media route, so this is the
               // only handle the viewer has on them.
-              const fetchState = msg.waMessageId ? mediaFetch[msg.waMessageId] : undefined;
               const downloadButton = (
                 <button
                   type="button"
-                  className="message-media-omitted"
+                  className={`message-media-omitted ${msg.type === 'document' ? 'chat-document-card' : ''}`}
                   onClick={() => void downloadMedia(msg)}
                   disabled={!sessionId || !msg.waMessageId || fetchState === 'loading'}
                 >
-                  {fetchState === 'loading' ? (
+                  {msg.type === 'document' ? (
+                    documentCard
+                  ) : fetchState === 'loading' ? (
                     <Loader2 size={14} className="animate-spin" />
+                  ) : fetchState === 'failed' ? (
+                    <>📎 {t('chats.status.mediaUnavailable')}</>
                   ) : (
-                    <>📎 {t(fetchState === 'failed' ? 'chats.status.mediaUnavailable' : 'chats.media.omitted')}</>
+                    <>📎 {t('chats.media.omitted')}</>
                   )}
                 </button>
               );
@@ -702,18 +841,32 @@ function ChatThread({
                 );
               case 'document':
               default:
+                if (/^https?:\/\//i.test(mediaSrc)) {
+                  return (
+                    <div className="message-media-document">
+                      {/* A document sent by URL links off-site, where browsers ignore `download`, so a plain
+                          click would navigate the dashboard away; open it in a new tab instead. */}
+                      <a
+                        href={mediaSrc}
+                        download={mediaInfo.filename || 'document'}
+                        className="chat-document-media chat-document-card"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {documentCard}
+                      </a>
+                    </div>
+                  );
+                }
                 return (
                   <div className="message-media-document">
-                    {/* A document sent by URL links off-site, where browsers ignore `download`, so a plain
-                        click would navigate the dashboard away; open it in a new tab instead. */}
-                    <a
-                      href={mediaSrc}
-                      download={mediaInfo.filename || 'document'}
-                      className="chat-document-media"
-                      {...(/^https?:\/\//i.test(mediaSrc) ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
+                    <button
+                      type="button"
+                      className="chat-document-media chat-document-card"
+                      onClick={() => downloadInlineDocument(mediaInfo, 'document')}
                     >
-                      📎 {mediaInfo.filename || t('chats.downloadDocument')}
-                    </a>
+                      {documentCard}
+                    </button>
                   </div>
                 );
             }
@@ -774,7 +927,12 @@ function ChatThread({
                     {msg.metadata?.quotedMessage && (
                       <div className="message-quote-box">
                         <MessageBody
-                          text={resolveMentions(msg.metadata.quotedMessage.body, mentionNames)}
+                          text={resolveMentions(
+                            isVCardBody(msg.metadata.quotedMessage.body)
+                              ? contactSnippet(msg.metadata.quotedMessage.body, t('chats.media.contact'))
+                              : msg.metadata.quotedMessage.body,
+                            mentionNames,
+                          )}
                           className="quote-body"
                         />
                       </div>
@@ -793,7 +951,8 @@ function ChatThread({
                         displayBody &&
                         (!mediaInfo || displayBody !== mediaInfo.filename) &&
                         msg.type !== 'location' &&
-                        msg.type !== 'call' && (
+                        msg.type !== 'call' &&
+                        msg.type !== 'contact' && (
                           <MessageBody text={resolveMentions(displayBody, mentionNames)} className="message-text" />
                         )
                       )}
@@ -940,4 +1099,4 @@ function ChatThread({
   );
 }
 
-export default ChatThread;
+export default memo(ChatThread);

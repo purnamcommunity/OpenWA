@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { Trans, useTranslation } from 'react-i18next';
 import { nextReconnectState } from '../utils/reconnectState';
 import { applyIncomingToChatList, promoteChatWithSnippet } from '../utils/chatList';
@@ -23,13 +23,14 @@ import {
   CircleEllipsis,
   Copy,
   PanelRight,
+  Search,
   X,
 } from 'lucide-react';
 import { useProfilePicture } from '../hooks/useProfilePicture';
 import { useProfilePictures } from '../hooks/useProfilePictures';
 import { useResolvedPhone, resolvedPhoneQuery, isResolvedPhoneHeld } from '../hooks/useResolvedPhone';
-import { keepsSameKey } from '../utils/authLifecycle';
-import { chatTitle, formatPhoneForDisplay } from '../utils/formatPhone';
+import { getActiveApiKeyId, keepsSameKey } from '../utils/authLifecycle';
+import { chatTitle, formatPhoneForDisplay, savedChatName } from '../utils/formatPhone';
 import {
   sessionApi,
   messageApi,
@@ -44,6 +45,7 @@ import {
 } from '../services/api';
 import {
   applyMessageEdit,
+  applyOwnReaction,
   mergeDeliveryStatus,
   mergeReactionSnapshot,
   findRevokedIndex,
@@ -53,6 +55,8 @@ import {
   isRenderableMessage,
   liveMessageMetadata,
   stripMentionDelimiters,
+  timestampOf,
+  toggleOwnReaction,
   unacknowledgedIncomingIds,
   type ChatMessageView,
   type MessageMedia,
@@ -60,16 +64,20 @@ import {
 import { useWebSocket } from '../hooks/useWebSocket';
 import { createSessionFeedState, noteSessionFeedError, subscribeSessionFeed } from '../utils/sessionFeedSubscription';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
-import { useToast } from '../hooks/useToast';
+import { useToastActions } from '../hooks/useToast';
 import { useRole } from '../hooks/useRole';
 import { GlobalSearch } from '../components/GlobalSearch';
+import { RoomSearch, type DayJump } from '../components/chats/RoomSearch';
 import {
   useChatMessages,
   useChatMessagesActions,
   messagesQueryKey,
   updateCachedMessages,
   cachedSessionThreads,
+  hasCachedSessionMessage,
   flattenMessagePages,
+  loadMoreOfThread,
+  refreshFailed,
   type MessagesData,
 } from '../hooks/useChatMessages';
 import { useChannelMessages } from '../hooks/useChannelMessages';
@@ -91,9 +99,10 @@ import type { ChatRowActions } from '../components/chats/chatActionItems';
 import { ChatActions } from '../components/chats/ChatRowMenu';
 import { Modal } from '../components/Modal';
 import ChatThread from '../components/chats/ChatThread';
-import ChatComposer, { type StagedAttachment } from '../components/chats/ChatComposer';
+import ChatComposer, { type ChatComposerHandle, type StagedAttachment } from '../components/chats/ChatComposer';
 import StatusMedia from '../components/chats/StatusMedia';
 import StatusComposeModal from '../components/chats/StatusComposeModal';
+import { pauseOtherMedia } from '../utils/mediaPlayback';
 import './Chats.css';
 
 // Quiet window for coalescing mark-as-read RPCs (see markReadCoalescer below).
@@ -101,6 +110,27 @@ const MARK_READ_DEBOUNCE_MS = 750;
 // Most messages the gateway takes in one read (MarkChatReadDto).
 const MARK_READ_MESSAGE_IDS_MAX = 100;
 const readKey = (sessionId: string, chatId: string) => `${sessionId}\u0000${chatId}`;
+// Shared empty thread list so memoized ChatThread keeps a stable messages prop during loading/error states.
+const EMPTY_MESSAGES: ChatMessageView[] = [];
+
+/**
+ * Whether a chat's thread has loaded nothing so far, whether its load is still running or has failed: nobody has seen
+ * what a read of the chat would acknowledge, so the read waits for the thread (see the effect on its state). A load
+ * that is still running may fail after the read would have gone out, which is why it counts as unseen too.
+ */
+function threadUnseen(queryClient: QueryClient, sessionId: string, chatId: string): boolean {
+  const state = queryClient.getQueryState(messagesQueryKey(sessionId, chatId));
+  return state !== undefined && state.data === undefined;
+}
+
+/** `drafts` with `text` as the draft of the thread `key`, or with none for it when the text is empty. */
+function withDraft(drafts: Record<string, string>, key: string, text: string): Record<string, string> {
+  if ((drafts[key] ?? '') === text) return drafts;
+  const next = { ...drafts };
+  if (text === '') delete next[key];
+  else next[key] = text;
+  return next;
+}
 
 function lastRenderableIndex(thread: ChatMessageView[]): number {
   for (let i = thread.length - 1; i >= 0; i--) {
@@ -183,7 +213,7 @@ const CONFIRM_TEXT = {
 export function Chats() {
   const { t } = useTranslation();
   useDocumentTitle(t('nav.chats'));
-  const { error: showErrorToast, warning: showWarningToast, success: showSuccessToast } = useToast();
+  const { error: showErrorToast, warning: showWarningToast, success: showSuccessToast } = useToastActions();
   const { canWrite, engineType } = useRole();
 
   // Sessions list & active session
@@ -208,6 +238,17 @@ export function Chats() {
   const selectedSessionRef = useRef(selectedSessionId);
   const [loadingSessions, setLoadingSessions] = useState<boolean>(true);
 
+  // Stop previous media when playing any audio or video in the chats page
+  useEffect(() => {
+    const handlePlayCapture = (e: Event) => {
+      if (e.target instanceof HTMLMediaElement) {
+        pauseOtherMedia(e.target);
+      }
+    };
+    document.addEventListener('play', handlePlayCapture, true);
+    return () => document.removeEventListener('play', handlePlayCapture, true);
+  }, []);
+
   // Chats list
   const [chats, setChats] = useState<Chat[]>([]);
   // The session whose list `chats` holds, as listedSessionRef below says it, for rendering.
@@ -223,6 +264,8 @@ export function Chats() {
   // beside the room, and the room's overflow menu drops from its header.
   const [showNewChat, setShowNewChat] = useState<boolean>(false);
   const [roomMenuOpen, setRoomMenuOpen] = useState<boolean>(false);
+  const [roomSearchOpen, setRoomSearchOpen] = useState(false);
+  const roomSearchButtonRef = useRef<HTMLButtonElement | null>(null);
   const roomMenuRef = useRef<HTMLDivElement | null>(null);
   const roomMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   // The group whose info dialog is open, from its row's menu or from the open room's.
@@ -269,7 +312,8 @@ export function Chats() {
   const contactToggleRef = useRef<HTMLButtonElement | null>(null);
   const closeContactInfo = () => {
     setContactInfoFor('');
-    contactToggleRef.current?.focus();
+    // The in-chat search takes the header's place, toggle included: its field is then the room's nearest control.
+    (contactToggleRef.current ?? chatPageRef.current?.querySelector<HTMLElement>('.room-search-fields input'))?.focus();
   };
 
   // Chats/Channels/Status tab selection. Switching tabs closes whatever conversation is open so a
@@ -331,14 +375,38 @@ export function Chats() {
     setComposeOpen(false);
     setGroupDialogChat(null);
     setShowNewChat(false);
+    setRoomSearchOpen(false);
   }
 
+  // Leaving a conversation closes its in-chat search; a new room starts without the previous query.
+  const roomSearchChatRef = useRef<string | null>(null);
+  if (roomSearchChatRef.current !== (activeChat?.id ?? null)) {
+    roomSearchChatRef.current = activeChat?.id ?? null;
+    if (roomSearchOpen) setRoomSearchOpen(false);
+  }
+  // Closing the search unmounts the field that held focus, and the button that opened it is drawn again only then.
+  // Focus goes back to that button once it is there, unless something else on the page holds it: the composer the
+  // key was pressed in, the row of the chat opened instead, a dialog.
+  const roomSearchWasOpen = useRef(false);
+  useLayoutEffect(() => {
+    const closed = roomSearchWasOpen.current && !roomSearchOpen;
+    roomSearchWasOpen.current = roomSearchOpen;
+    if (!closed) return;
+    const active = document.activeElement;
+    if (active && active !== document.body && active.isConnected) return;
+    roomSearchButtonRef.current?.focus();
+  }, [roomSearchOpen]);
+
   const {
-    data: messages = [],
+    data: messages = EMPTY_MESSAGES,
     isLoading: loadingMessages,
     isError: messagesError,
     hasNextPage: hasMoreMessages,
     isFetchingNextPage: loadingOlderMessages,
+    isRefetchError: threadRefreshError,
+    isFetchNextPageError: olderPageError,
+    isFetching: fetchingMessages,
+    refetch: refetchMessages,
     fetchNextPage,
   } = useChatMessages(
     selectedSessionId,
@@ -346,7 +414,7 @@ export function Chats() {
     // Baileys has no live per-chat history read and answers 501 to it; any other or unknown engine is asked.
     engineType !== 'baileys',
   );
-  const { appendMessage, updateMessage } = useChatMessagesActions();
+  const { appendMessage } = useChatMessagesActions();
   const queryClient = useQueryClient();
 
   // The media viewer holds the message it shows by the key the thread merges by (waMessageId ?? id, kept when a refetch
@@ -358,10 +426,7 @@ export function Chats() {
   const [lightbox, setLightbox] = useState<ViewedImage | null>(null);
 
   const [replyingTo, setReplyingTo] = useState<ChatMessageView | null>(null);
-  // The open room's draft text lives here (not in ChatComposer) so it survives closing and reopening the room. Each
-  // thread keeps its own (see the drafts effect below): text carried into another chat would be sent to it.
-  const [messageInput, setMessageInput] = useState<string>('');
-  // The staged attachment lives here for the same reason the draft text does: ChatComposer unmounts when the room
+  // The staged attachment lives here so it survives closing and reopening the room: ChatComposer unmounts when the room
   // closes, which would silently discard a picked file. It is dropped when a DIFFERENT chat is opened (see the effect
   // below): a file that follows the user into another conversation can be sent to the wrong recipient.
   const [attachment, setAttachment] = useState<StagedAttachment | null>(null);
@@ -398,25 +463,55 @@ export function Chats() {
   // puts the composer's text away under the thread it was typed in and brings back the one of the thread opened;
   // closing the room and reopening it changes nothing. A layout effect, so the next room is never drawn with the text of
   // the last one.
+  //
+  // `chatDrafts` is what the chat list shows of it: the text each thread would open with, under the same session and
+  // chat key. Keyed so, a draft is never drawn on the row another session has for the same chat id, and it is still on
+  // its own row when its session is selected again; the list is handed the selected session's entries alone. An entry
+  // is written when the composer's thread stops being the one open (the room closes, or shows another thread) and when
+  // a refused send gives a thread its text back. The entry of the thread that is open is left as it was: its row shows
+  // the last message, as WhatsApp does, and every way out of the room writes the entry again, so typing costs no state
+  // update.
   const draftsRef = useRef(new Map<string, string>());
+  const composerHandleRef = useRef<ChatComposerHandle | null>(null);
   const draftKeyRef = useRef<string | null>(null);
+  const [chatDrafts, setChatDrafts] = useState<Record<string, string>>({});
   const openChatId = activeChat?.id;
   useLayoutEffect(() => {
-    if (openChatId === undefined) return;
-    const key = readKey(selectedSessionId, openChatId);
     const previous = draftKeyRef.current;
+    if (openChatId === undefined) {
+      // A closed room keeps the field's text for the thread last open, whichever session is selected by now.
+      if (previous !== null) {
+        const prevText = draftsRef.current.get(previous) ?? '';
+        setChatDrafts(drafts => withDraft(drafts, previous, prevText));
+      }
+      return;
+    }
+    const key = readKey(selectedSessionId, openChatId);
     if (previous === key) return;
     draftKeyRef.current = key;
-    if (previous !== null && messageInput !== '') draftsRef.current.set(previous, messageInput);
-    setMessageInput(draftsRef.current.get(key) ?? '');
-    draftsRef.current.delete(key);
-  }, [selectedSessionId, openChatId, messageInput]);
+    if (previous !== null) {
+      const prevText = draftsRef.current.get(previous) ?? '';
+      setChatDrafts(drafts => withDraft(drafts, previous, prevText));
+    }
+  }, [selectedSessionId, openChatId]);
+  // The selected session's drafts, by chat id, as the list reads them.
+  const sessionDrafts = useMemo(() => {
+    const prefix = readKey(selectedSessionId, '');
+    const drafts: Record<string, string> = {};
+    for (const [key, text] of Object.entries(chatDrafts)) {
+      if (key.startsWith(prefix)) drafts[key.slice(prefix.length)] = text;
+    }
+    return drafts;
+  }, [chatDrafts, selectedSessionId]);
   // A refused send gives back the text it took from the field, as the draft of its thread, unless something was typed
   // there since: its failed bubble lasts only until the thread is read again, and then the text was nowhere.
   const restoreRefusedDraft = useCallback((sessionId: string, chatId: string, text: string) => {
     const key = readKey(sessionId, chatId);
-    if (draftKeyRef.current === key) setMessageInput(current => (current === '' ? text : current));
-    else if (!draftsRef.current.get(key)) draftsRef.current.set(key, text);
+    if (composerHandleRef.current?.restoreDraftIfEmpty(key, text)) return;
+    if (!draftsRef.current.get(key)) {
+      draftsRef.current.set(key, text);
+      setChatDrafts(drafts => withDraft(drafts, key, text));
+    }
   }, []);
 
   // Per-chat scroll-position memory + auto-scroll heuristic.
@@ -432,6 +527,7 @@ export function Chats() {
     onMediaLoad,
     measureMedia,
     onOlderMessagesRequested,
+    showRow,
   } = useChatScrollPosition(
     activeChat ? `${selectedSessionId}:${activeChat.id}` : null,
     hasRenderableMessages,
@@ -439,9 +535,16 @@ export function Chats() {
   );
 
   const handleLoadOlderMessages = useCallback(() => {
-    onOlderMessagesRequested();
-    void fetchNextPage();
-  }, [fetchNextPage, onOlderMessagesRequested]);
+    const query = {
+      isRefetchError: threadRefreshError,
+      isFetchNextPageError: olderPageError,
+      refetch: refetchMessages,
+      fetchNextPage,
+    };
+    // A failed refresh is retried as a refresh, which prepends nothing: the scroll anchor of an older page is not asked.
+    if (!refreshFailed(query)) onOlderMessagesRequested();
+    void loadMoreOfThread(query);
+  }, [threadRefreshError, olderPageError, refetchMessages, fetchNextPage, onOlderMessagesRequested]);
 
   // Batch profile-picture fetch for the visible chat list — ONE request for the whole sidebar
   // (per-row queries burst the per-IP throttle into 429s). Sorted-key cached 1h; rows fall back
@@ -461,18 +564,22 @@ export function Chats() {
   // (notably @lid privacy ids, which are NOT phones and must never be formatted as one) resolve
   // the real number through the engine — cached a day, and only fired when local formatting failed.
   const activePhoneDisplay = activeChat ? formatPhoneForDisplay(activeChat.id) : null;
-  const needsPhoneResolution = Boolean(activeChat && activeChat.kind === 'individual' && !activePhoneDisplay);
+  const listedPhone = activeChat?.phone ? formatPhoneForDisplay(activeChat.phone) : null;
+  const needsPhoneResolution = Boolean(
+    activeChat && activeChat.kind === 'individual' && !activePhoneDisplay && !listedPhone,
+  );
   const resolvedPhoneQ = useResolvedPhone(
     needsPhoneResolution ? selectedSessionId || undefined : undefined,
     needsPhoneResolution ? activeChat?.id : undefined,
   );
   const activePhoneText =
-    activePhoneDisplay ?? (resolvedPhoneQ.data ? formatPhoneForDisplay(resolvedPhoneQ.data) : null);
+    activePhoneDisplay ?? listedPhone ?? (resolvedPhoneQ.data ? formatPhoneForDisplay(resolvedPhoneQ.data) : null);
   // An unnamed chat is titled by its number when one is known, never by the bare digits of its id (a @lid's are no
-  // phone). Shown, that number is isolated left to right, as it is under a name.
-  const activeChatTitle = activeChat ? activeChat.name || activePhoneText || activeChat.id.split('@')[0] : '';
+  // phone, and a name that is only those digits is not a name). Shown, that number is isolated left to right.
+  const named = activeChat ? savedChatName(activeChat) : undefined;
+  const activeChatTitle = activeChat ? named || activePhoneText || activeChat.id.split('@')[0] : '';
   const activeChatTitleText =
-    activeChat && !activeChat.name && activePhoneText ? <bdi dir="ltr">{activePhoneText}</bdi> : activeChatTitle;
+    activeChat && !named && activePhoneText ? <bdi dir="ltr">{activePhoneText}</bdi> : activeChatTitle;
 
   // The list loaders below reach the translator and the error toast through a ref, not as
   // dependencies: both change identity on a language switch, which re-ran the session load (it
@@ -565,6 +672,15 @@ export function Chats() {
       if (listedSessionRef.current !== selectedSessionId) return;
       rememberPatch(chatId, { unreadCount: 0 });
       setChats(prev => prev.map(c => (c.id === chatId ? { ...c, unreadCount: 0 } : c)));
+    },
+    [rememberPatch, selectedSessionId],
+  );
+  // The row of a chat that was cleared on opening, back with the count it had: its thread never showed, so it was not read.
+  const markRowUnread = useCallback(
+    (chatId: string, unreadCount: number) => {
+      if (listedSessionRef.current !== selectedSessionId) return;
+      rememberPatch(chatId, { unreadCount });
+      setChats(prev => prev.map(c => (c.id === chatId ? { ...c, unreadCount } : c)));
     },
     [rememberPatch, selectedSessionId],
   );
@@ -718,6 +834,14 @@ export function Chats() {
   const [readsInFlight] = useState(() => new Map<string, Promise<void>>());
   const [keptUnread] = useState(() => new Set<string>());
   const [withheldReads] = useState(() => new Set<string>());
+  // The unread count each chat had when it was opened, for the row that comes back if its thread never shows.
+  const [unreadAtOpen] = useState(() => new Map<string, number>());
+  // The chat on screen, by its session, which a read that falls due later asks whether its chat was left (see the
+  // layout effect that keeps it), and the chats it found left with their thread unseen, whose rows come back unread
+  // in an effect, for the tick that says there are some.
+  const [shown] = useState(() => new Map<string, string>());
+  const [leftUnseen] = useState(() => new Set<string>());
+  const [leftUnseenTick, setLeftUnseenTick] = useState(0);
   // Baileys acknowledges the messages a read names, and without any only the newest one it holds. A read names the
   // incoming messages of the thread that an earlier read has not acknowledged (the ones it named, per chat).
   const [acknowledged] = useState(() => new Map<string, Set<string>>());
@@ -727,8 +851,14 @@ export function Chats() {
     () =>
       createTrailingCoalescer<string>(chatId => {
         const key = readKey(selectedSessionId, chatId);
-        if (document.visibilityState === 'hidden') {
+        const unseen = threadUnseen(queryClient, selectedSessionId, chatId);
+        if (document.visibilityState === 'hidden' || unseen) {
           withheldReads.add(key);
+          // A chat left before its thread showed was not read: its row, cleared when it was opened, is unread again.
+          if (unseen && shown.get(selectedSessionId) !== chatId && unreadAtOpen.has(key)) {
+            leftUnseen.add(key);
+            setLeftUnseenTick(tick => tick + 1);
+          }
           return;
         }
         let named: string[] = [];
@@ -759,7 +889,19 @@ export function Chats() {
           if (readsInFlight.get(key) === read) readsInFlight.delete(key);
         });
       }, MARK_READ_DEBOUNCE_MS),
-    [selectedSessionId, t, showWarningToast, readsInFlight, withheldReads, acknowledged, engineType, queryClient],
+    [
+      selectedSessionId,
+      t,
+      showWarningToast,
+      readsInFlight,
+      withheldReads,
+      unreadAtOpen,
+      shown,
+      leftUnseen,
+      acknowledged,
+      engineType,
+      queryClient,
+    ],
   );
 
   // Flush pending trailing calls on unmount / session switch: the mark-as-read POST is
@@ -770,7 +912,7 @@ export function Chats() {
   // read flushed then goes out keyless and its 401 reloads the login form, so drop it instead.
   useEffect(
     () => () => {
-      if (sessionStorage.getItem('openwa_api_key')) markReadCoalescer.flush();
+      if (getActiveApiKeyId()) markReadCoalescer.flush();
       else markReadCoalescer.cancel();
     },
     [markReadCoalescer],
@@ -799,6 +941,8 @@ export function Chats() {
     chatsOwnerRef.current = listedSession;
     activeChatIdRef.current = activeChat?.id;
     selectedSessionRef.current = selectedSessionId;
+    shown.clear();
+    if (activeChat) shown.set(selectedSessionId, activeChat.id);
   });
   // A request that settles after the page is left no longer finds the chat open, so its follow-ups
   // (the reconnect mark-as-read) do nothing.
@@ -841,11 +985,11 @@ export function Chats() {
 
       const newMsg = event.message as unknown as IncomingWsMessage;
       if (
-        cachedSessionThreads(
+        hasCachedSessionMessage(
           queryClient,
           event.sessionId,
           m => m.chatId === newMsg.chatId && byMessageId(newMsg.id)(m) && m.type === 'revoked',
-        ).length
+        )
       ) {
         return;
       }
@@ -872,9 +1016,11 @@ export function Chats() {
 
       // A message the thread already holds merges into its row and adds none (the echo of a send after its response,
       // a message delivered twice), so the scroll heuristic below is not told to expect one.
-      const addsRow =
-        cachedSessionThreads(queryClient, event.sessionId, m => m.chatId === newMsg.chatId && byMessageId(newMsg.id)(m))
-          .length === 0;
+      const addsRow = !hasCachedSessionMessage(
+        queryClient,
+        event.sessionId,
+        m => m.chatId === newMsg.chatId && byMessageId(newMsg.id)(m),
+      );
 
       // Always write to the React Query cache for this message's session — keeps non-active chats
       // up to date so re-opening them shows fresh data without a refetch.
@@ -897,6 +1043,8 @@ export function Chats() {
         activeChatId: canWrite ? activeChat?.id : undefined,
         // A location message's body is the (multi-KB) base64 map thumbnail; show a label instead.
         locationLabel: `📍 ${t('chats.media.location')}`,
+        // A contact message's body is the raw vCard; show a short label instead.
+        contactLabel: `👤 ${t('chats.media.contact')}`,
       };
       liveRowsRef.current.set(newMsg.chatId, chatsRequestRef.current);
       const { needsSidebarRefetch } = applyIncomingToChatList(chatsRef.current, newMsg, listOptions);
@@ -1255,86 +1403,100 @@ export function Chats() {
   // 4. Message history is fetched by useChatMessages (React Query). The active-chat side effects
   // (mark-as-read + clear sidebar unread badge) live in a small effect below.
 
-  const handleReactMessage = async (msg: ChatMessageView, emoji: string) => {
-    if (!selectedSessionId || !activeChat) return;
+  const selectedSessionPhone = sessions.find(s => s.id === selectedSessionId)?.phone ?? null;
 
-    const msgId = msg.waMessageId || msg.id;
-    const currentReactions = msg.metadata?.reactions || {};
-    const sessionPhone = sessions.find(s => s.id === selectedSessionId)?.phone || 'me';
+  const handleReactMessage = useCallback(
+    async (msg: ChatMessageView, emoji: string) => {
+      if (!selectedSessionId || !activeChatId) return;
+      const sessionId = selectedSessionId;
+      const chatId = activeChatId;
+      const sessionPhone = selectedSessionPhone;
 
-    let alreadyReacted = false;
-    for (const [sender, emo] of Object.entries(currentReactions)) {
-      if ((sender === 'me' || sender.includes(sessionPhone)) && emo === emoji) {
-        alreadyReacted = true;
-        break;
+      const msgId = msg.waMessageId || msg.id;
+      const emojiToSend = toggleOwnReaction(msg.metadata?.reactions, emoji, sessionPhone);
+
+      try {
+        await messageApi.react(sessionId, {
+          chatId,
+          messageId: msgId,
+          emoji: emojiToSend,
+        });
+
+        // Deep-merge metadata.reactions so existing media / quotedMessage on metadata survive.
+        const key = messagesQueryKey(sessionId, chatId);
+        const patchReaction = (m: ChatMessageView): ChatMessageView =>
+          m.type === 'revoked'
+            ? m
+            : {
+                ...m,
+                metadata: {
+                  ...(m.metadata || {}),
+                  reactions: applyOwnReaction(m.metadata?.reactions, emojiToSend, sessionPhone),
+                },
+              };
+        updateCachedMessages(queryClient, key, old => {
+          const patched = patchMatchingMessage(old, msgId, patchReaction);
+          return patched === old && msg.id !== msgId ? patchMatchingMessage(old, msg.id, patchReaction) : patched;
+        });
+      } catch (err) {
+        showErrorToast(t('chats.errors.react'), err instanceof Error ? err.message : undefined);
       }
-    }
+    },
+    [selectedSessionId, activeChatId, selectedSessionPhone, queryClient, showErrorToast, t],
+  );
 
-    const emojiToSend = alreadyReacted ? '' : emoji;
+  const handleDeleteMessage = useCallback(
+    async (msg: ChatMessageView) => {
+      if (!selectedSessionId || !activeChatId) return;
+      const sessionId = selectedSessionId;
+      const chatId = activeChatId;
+      const msgId = msg.waMessageId || msg.id;
 
-    try {
-      await messageApi.react(selectedSessionId, {
-        chatId: activeChat.id,
-        messageId: msgId,
-        emoji: emojiToSend,
-      });
+      if (!window.confirm(t('chats.deleteConfirm'))) return;
 
-      // Deep-merge metadata.reactions so existing media / quotedMessage on metadata survive.
-      const key = messagesQueryKey(selectedSessionId, activeChat.id);
-      updateCachedMessages(queryClient, key, old =>
-        old.map(m => {
-          if (m.type !== 'revoked' && (m.id === msg.id || m.waMessageId === msg.id)) {
-            const metadata = m.metadata || {};
-            const reactions = { ...(metadata.reactions || {}) };
-            if (emojiToSend === '') {
-              delete reactions['me'];
-            } else {
-              reactions['me'] = emojiToSend;
-            }
-            return { ...m, metadata: { ...metadata, reactions } };
-          }
-          return m;
-        }),
-      );
-    } catch (err) {
-      showErrorToast(t('chats.errors.react'), err instanceof Error ? err.message : undefined);
-    }
-  };
+      try {
+        await messageApi.delete(sessionId, {
+          chatId,
+          messageId: msgId,
+          forEveryone: true,
+        });
 
-  const handleDeleteMessage = async (msg: ChatMessageView) => {
-    if (!selectedSessionId || !activeChat) return;
-    const msgId = msg.waMessageId || msg.id;
+        const key = messagesQueryKey(sessionId, chatId);
+        const patchRevoked = (m: ChatMessageView): ChatMessageView =>
+          m.type === 'revoked' && m.body === '' && m.metadata === undefined
+            ? m
+            : { ...m, body: '', type: 'revoked', metadata: undefined };
+        updateCachedMessages(queryClient, key, old => {
+          const patched = patchMatchingMessage(old, msgId, patchRevoked);
+          return patched === old && msg.id !== msgId ? patchMatchingMessage(old, msg.id, patchRevoked) : patched;
+        });
+      } catch (err) {
+        showErrorToast(t('chats.errors.delete'), err instanceof Error ? err.message : undefined);
+      }
+    },
+    [selectedSessionId, activeChatId, queryClient, showErrorToast, t],
+  );
 
-    if (!window.confirm(t('chats.deleteConfirm'))) return;
-
-    try {
-      await messageApi.delete(selectedSessionId, {
-        chatId: activeChat.id,
-        messageId: msgId,
-        forEveryone: true,
-      });
-
-      updateMessage(selectedSessionId, activeChat.id, msg.id, { body: '', type: 'revoked', metadata: undefined });
-    } catch (err) {
-      showErrorToast(t('chats.errors.delete'), err instanceof Error ? err.message : undefined);
-    }
-  };
-
-  const handleClickButton = async (msg: ChatMessageView, button: { id: string; text: string }) => {
-    if (!selectedSessionId || !activeChat) return;
-    const msgId = msg.waMessageId || msg.id;
-    try {
-      await messageApi.clickButton(selectedSessionId, {
-        chatId: activeChat.id,
-        messageId: msgId,
-        buttonId: button.id,
-        text: button.text,
-      });
-    } catch (err) {
-      showErrorToast(t('chats.errors.clickButton'), err instanceof Error ? err.message : undefined);
-      throw err;
-    }
-  };
+  const handleClickButton = useCallback(
+    async (msg: ChatMessageView, button: { id: string; text: string }) => {
+      if (!selectedSessionId || !activeChatId) return;
+      const sessionId = selectedSessionId;
+      const chatId = activeChatId;
+      const msgId = msg.waMessageId || msg.id;
+      try {
+        await messageApi.clickButton(sessionId, {
+          chatId,
+          messageId: msgId,
+          buttonId: button.id,
+          text: button.text,
+        });
+      } catch (err) {
+        showErrorToast(t('chats.errors.clickButton'), err instanceof Error ? err.message : undefined);
+        throw err;
+      }
+    },
+    [selectedSessionId, activeChatId, showErrorToast, t],
+  );
 
   // Side effects when the active chat changes: mark-as-read on the gateway + clear sidebar unread badge.
   // The message-history fetch is driven by useChatMessages; scroll restoration is driven by
@@ -1348,12 +1510,45 @@ export function Chats() {
     markChatRead(activeChat.id);
     // A read-only key sends no mark-as-read, so the chat stays unread on the gateway; clearing the
     // badge here would only have the next chat-list load bring it back.
-    if (canWrite) markRowRead(activeChat.id);
+    if (canWrite) {
+      const unread = chatsRef.current.find(c => c.id === activeChat.id)?.unreadCount ?? 0;
+      unreadAtOpen.set(readKey(selectedSessionId, activeChat.id), unread);
+      markRowRead(activeChat.id);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeChat?.id, markChatRead, canWrite]);
 
-  // On Baileys the read of an opened chat falls due before its thread has loaded, so it names no message. Once
-  // the thread is there the chat is read again, naming what it holds (the coalescer merges the two when close).
+  // The rows of the chats whose read fell due after they were left with their thread unseen come back unread: nobody
+  // saw what they hold. The ones of another session are left to its own list, which asks the gateway.
+  useEffect(() => {
+    for (const key of leftUnseen) {
+      const [sessionId, chatId] = key.split('\u0000');
+      const unread = unreadAtOpen.get(key) ?? 0;
+      if (sessionId === selectedSessionId && unread > 0) markRowUnread(chatId, unread);
+    }
+    leftUnseen.clear();
+  }, [leftUnseenTick, leftUnseen, unreadAtOpen, selectedSessionId, markRowUnread]);
+
+  // A thread that has loaded nothing shows nothing, so the chat cleared on open was not read: a thread that fails to load
+  // brings its badge back, and the read that was withheld while it loaded goes out, with the badge cleared again, once a
+  // later load of the thread succeeds. A refresh that fails after the thread showed leaves what was read as it is.
+  useEffect(() => {
+    if (!activeChat || !canWrite || loadingMessages) return;
+    const key = readKey(selectedSessionId, activeChat.id);
+    if (messagesError && threadUnseen(queryClient, selectedSessionId, activeChat.id)) {
+      const opened = unreadAtOpen.get(key) ?? 0;
+      if (opened > 0) markRowUnread(activeChat.id, opened);
+      return;
+    }
+    if (messagesError || !withheldReads.delete(key)) return;
+    markChatRead(activeChat.id);
+    markRowRead(activeChat.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChat?.id, loadingMessages, messagesError, canWrite]);
+
+  // On Baileys a read names the incoming messages of the thread. The read of an opened chat waits for its thread
+  // (see threadUnseen), so it names what the thread holds; once the thread is there the chat is read again, which the
+  // coalescer merges with the read that waited when the two are close.
   useEffect(() => {
     if (activeChat && engineType === 'baileys' && !loadingMessages && messages.length > 0) {
       markChatRead(activeChat.id);
@@ -1486,6 +1681,30 @@ export function Chats() {
     },
     [switchTab, showWarningToast, t],
   );
+
+  // The in-chat search scrolls the open thread itself. Its chat is the one on screen, so a hit needs none of the list
+  // lookup a sidebar hit goes through, and only a row the thread has drawn can be scrolled to: false says none matched.
+  const scrollToRow = (matches: (row: HTMLElement) => boolean): boolean => {
+    const rows = messagesContainerRef.current?.querySelectorAll<HTMLElement>('[data-scroll-anchor]');
+    const row = Array.from(rows ?? []).find(matches);
+    if (row) showRow(row);
+    return row !== undefined;
+  };
+
+  // The day jump of the in-chat search (the API needs text to search, so a day alone is answered from the thread).
+  // It reads the rows the thread draws, dated as the thread dates them, so it lands on the row under that day's
+  // separator. A day with no such row is either further back than what is loaded, which scrolling up fetches, or one
+  // the chat has no message of.
+  const handleRoomJumpToDate = (bounds: { dateFrom: number; dateTo: number }): DayJump => {
+    const drawn = messages.filter(isRenderableMessage);
+    const first = drawn.find(m => {
+      const ms = timestampOf(m) * 1000;
+      return ms >= bounds.dateFrom && ms <= bounds.dateTo;
+    });
+    if (first && scrollToRow(row => row.dataset.scrollAnchor === first.id)) return 'shown';
+    const beforeLoaded = drawn.length === 0 || bounds.dateTo < timestampOf(drawn[0]) * 1000;
+    return hasMoreMessages && beforeLoaded ? 'older' : 'none';
+  };
 
   const handleSearchHit = useCallback(
     async (hit: SearchHit) => {
@@ -1620,15 +1839,14 @@ export function Chats() {
     if (loadingMessages || messages.length === 0) return;
     const container = messagesContainerRef.current;
     if (container) {
-      try {
-        const el = container.querySelector(`[data-wa-message-id="${pending.waMessageId}"]`);
-        if (el instanceof HTMLElement) el.scrollIntoView({ block: 'center' });
-      } catch {
-        // Unexpected chars in the id made the selector invalid — ignore.
-      }
+      const el = Array.from(container.querySelectorAll<HTMLElement>('[data-wa-message-id]')).find(
+        row => row.dataset.waMessageId === pending.waMessageId,
+      );
+      // Through the hook, so that the pin the restore just made is not kept for a thread that has left its bottom.
+      if (el && typeof el.scrollIntoView === 'function') showRow(el);
     }
     pendingHitRef.current = null;
-  }, [activeChat, loadingMessages, messages, messagesContainerRef, hitSeq]);
+  }, [activeChat, loadingMessages, messages, messagesContainerRef, showRow, hitSeq]);
 
   // Helper formats. The list time follows WhatsApp's ladder, so the list scans the way operators
   // expect: the clock for today, "Yesterday", the weekday within the last week, else a short date.
@@ -1699,6 +1917,33 @@ export function Chats() {
     ? shownChats
     : [...shownChats.filter(c => c.pinned), ...shownChats.filter(c => !c.pinned)];
 
+  // A chat opened to write in it takes focus in its message field, so typing can start at once: a click on its row
+  // with a mouse or a pen, or a pick in the New chat panel, which closes and would leave focus on the page. Bumped
+  // when the chat is chosen, so that the focus is made once the room has rendered: a room opened from the placeholder
+  // has no field until then. Never after a tap, where a focused field raises a phone's keyboard over the thread that
+  // was just opened. A read-only key keeps its focus as well, its field being disabled. A reply started from a
+  // message's menu is the same: the menu goes with the pointer, and the focus its button held with it.
+  const [composerFocusSeq, setComposerFocusSeq] = useState(0);
+  // How the page was last pressed: the pointerdown's pointerType ('touch' for a tap), '' after a key.
+  const pagePressRef = useRef('');
+  useLayoutEffect(() => {
+    if (composerFocusSeq === 0 || pagePressRef.current === 'touch') return;
+    chatPageRef.current
+      ?.querySelector<HTMLTextAreaElement>('.message-text-input:not(:disabled)')
+      ?.focus({ preventScroll: true });
+  }, [composerFocusSeq]);
+  // A key on a row keeps focus on it, and so does a click on the row of the chat already open, where nothing opens.
+  const handleSelectChat = useCallback((chat: Chat, byPointer?: boolean) => {
+    if (byPointer && chat.id !== activeChatIdRef.current) setComposerFocusSeq(n => n + 1);
+    setActiveChat(chat);
+  }, []);
+  // The answer to a message is typed next, so the field takes the focus when the reply starts, again if that message is
+  // already the one being answered.
+  const startReply = useCallback((message: ChatMessageView) => {
+    setReplyingTo(message);
+    setComposerFocusSeq(n => n + 1);
+  }, []);
+
   // Open a chat picked in the new-chat panel. A chat with no history is not in the engine's list, so
   // it is added to the sidebar locally until the first message, or the next list load, settles it.
   // The filter and search are cleared so the opened chat is visible in the list. A chat the panel found
@@ -1716,6 +1961,8 @@ export function Chats() {
     setActiveChannel(null);
     setActiveStatusContactId(null);
     setActiveChat(existing ?? chat);
+    // Whatever opened it, a key included: the panel closes with the control that held focus.
+    setComposerFocusSeq(n => n + 1);
     setShowNewChat(false);
     setChatFilter('all');
     setSearchQuery('');
@@ -1915,7 +2162,8 @@ export function Chats() {
       } else if (kind === 'clear') {
         expectSuccess(await sessionApi.clearChatMessages(sessionId, chat.id));
         showSuccessToast(t('chats.rowActions.cleared', { name }));
-        patchChat(sessionId, chat.id, { lastMessage: '', unreadCount: 0 });
+        // The row draws a placeholder from the type of the message it last held (a contact), so the type goes too.
+        patchChat(sessionId, chat.id, { lastMessage: '', lastMessageType: undefined, unreadCount: 0 });
         // The thread cache holds the messages just deleted; the next open reads the empty chat.
         await queryClient.invalidateQueries({ queryKey: messagesQueryKey(sessionId, chat.id) });
       } else {
@@ -1955,7 +2203,7 @@ export function Chats() {
     if (!activeChat) return;
     // The house helper: over plain HTTP on a LAN address navigator.clipboard does not exist.
     if (await copyToClipboard(activeChat.id)) showSuccessToast(t('chats.chatIdCopied'));
-    else showErrorToast(t('chats.copyFailed'));
+    else showErrorToast(t('common.copyFailed'));
   };
 
   // The overflow menu closes on a press outside it, on Escape, and with the chat it belongs to. Escape
@@ -2038,16 +2286,19 @@ export function Chats() {
   }, [activeStatusGroup?.contact.id, activeStatusItemIds]);
 
   // Escape closes the open view and returns to the list. Anything that owns the key already keeps
-  // it: a modal (Modal renders role="dialog" only while open) and the language menu (role="menu")
-  // are skipped here, and so is the media viewer, whose library renders its own role="dialog"
-  // portal and closes itself on Escape. A handler that called preventDefault, or a composition
-  // still being committed by an IME, is left alone for the same reason.
+  // it: a modal (Modal renders role="dialog" only while open) is skipped here, and so is the media
+  // viewer, whose library renders its own role="dialog" portal and closes itself on Escape. A
+  // handler that called preventDefault (the sidebar language list does), or a composition still
+  // being committed by an IME, is left alone for the same reason.
   useEffect(() => {
     const closeOpenViewOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || event.defaultPrevented || isComposingKey(event)) return;
       if (document.querySelector('[role="dialog"], [role="menu"]')) return;
       if (activeStatusContactId !== null) setActiveStatusContactId(null);
       else if (activeChannel) setActiveChannel(null);
+      // The in-chat search is the last thing opened in the room, so it goes first. Its own handler takes the key
+      // only while focus is inside the bar.
+      else if (activeChat && roomSearchOpen) setRoomSearchOpen(false);
       else if (activeChat && showContactInfo) {
         setContactInfoFor('');
         contactToggleRef.current?.focus();
@@ -2058,7 +2309,7 @@ export function Chats() {
     };
     document.addEventListener('keydown', closeOpenViewOnEscape);
     return () => document.removeEventListener('keydown', closeOpenViewOnEscape);
-  }, [activeStatusContactId, activeChannel, activeChat, showContactInfo, showNewChat]);
+  }, [activeStatusContactId, activeChannel, activeChat, roomSearchOpen, showContactInfo, showNewChat]);
 
   // Image and sticker media items for the lightbox, in render order (an archived sticker opens in its own viewer
   // too, see ArchivedMediaPreview). `getMediaSrc` reconstructs a usable src
@@ -2095,8 +2346,28 @@ export function Chats() {
     if (shown?.key !== lightbox.key) setLightbox(shown);
   }, [lightbox, lightboxIndex, imageMessages]);
 
+  const handleOpenImage = useCallback(
+    (messageId: string) => {
+      const opened = imageMessages.find(m => m.id === messageId);
+      if (opened) setLightbox(viewedImage(opened));
+    },
+    [imageMessages],
+  );
+  const handleSendConfirmed = useCallback((tempId: string, key: string) => {
+    setLightbox(v => (v?.key === tempId ? { ...v, key } : v));
+  }, []);
+
   return (
-    <div className="chats-page" ref={chatPageRef}>
+    <div
+      className="chats-page"
+      ref={chatPageRef}
+      onPointerDownCapture={e => {
+        pagePressRef.current = e.pointerType;
+      }}
+      onKeyDownCapture={() => {
+        pagePressRef.current = '';
+      }}
+    >
       {/* The page header gave way to the full-height layout; its title stays for screen readers. */}
       <h1 className="visually-hidden">{t('nav.chats')}</h1>
       {/* Real-time connection permanently dropped — let the user re-establish it instead of
@@ -2196,7 +2467,8 @@ export function Chats() {
               archive: { count: archivedCount, showing: showArchived, onToggle: () => setShowArchived(v => !v) },
               activeChatId: activeChat?.id,
               pictures: listPics.data,
-              onSelectChat: setActiveChat,
+              drafts: sessionDrafts,
+              onSelectChat: handleSelectChat,
             }}
             channelsTab={{
               engineLoading: engineType === null,
@@ -2221,98 +2493,127 @@ export function Chats() {
               <div className="room-container">
                 <h2 className="visually-hidden">{activeChatTitle}</h2>
                 {/* Room header */}
-                <header className="room-header">
-                  <button className="room-back" onClick={() => setActiveChat(null)} aria-label={t('common.back')}>
-                    <ArrowLeft size={20} />
-                  </button>
-                  {/* The contact itself opens the info panel, as in WhatsApp. */}
-                  <button
-                    type="button"
-                    className="room-contact"
-                    onClick={() => setContactInfoFor(showContactInfo ? '' : openRoomKey)}
-                    title={contactInfoLabel}
-                    aria-expanded={showContactInfo}
-                  >
-                    <ChatAvatar
+                <header className={`room-header${roomSearchOpen ? ' room-header-searching' : ''}`}>
+                  {roomSearchOpen ? (
+                    <RoomSearch
+                      sessionId={selectedSessionId}
                       chatId={activeChat.id}
-                      pictureUrl={activePp.data}
-                      kind={activeChat.kind}
-                      size="sm"
-                      // Signed CDN URLs rotate every few hours; refetch the slice on a stale load.
-                      onImageError={() => activePp.refetch()}
+                      onClose={() => setRoomSearchOpen(false)}
+                      onHit={hit => scrollToRow(row => row.dataset.waMessageId === hit.waMessageId)}
+                      onJumpToDate={handleRoomJumpToDate}
                     />
-                    <span className="room-contact-info">
-                      <span className="room-contact-name">{activeChatTitleText}</span>
-                      {/* Personal chats show the prettified phone number — local formatting for
-                          @c.us ids, engine-resolved for @lid privacy ids (which are NOT phones and
-                          must never be formatted as one). Only under a saved name: an unnamed chat's
-                          title already is the number. The raw JID is in the contact panel. */}
-                      {activePhoneText && activeChat.name && (
-                        <span className="room-contact-phone" title={activePhoneText}>
-                          <bdi dir="ltr">{activePhoneText}</bdi>
-                        </span>
-                      )}
-                    </span>
-                  </button>
-
-                  <div className="room-header-actions">
-                    <div className="room-menu" ref={roomMenuRef}>
-                      <button
-                        ref={roomMenuTriggerRef}
-                        type="button"
-                        className={`icon-btn room-menu-trigger ${roomMenuOpen ? 'active' : ''}`}
-                        onClick={() => {
-                          if (activeChat.kind === 'individual') rowActions.onMenuOpen?.();
-                          setRoomMenuOpen(open => !open);
-                        }}
-                        title={t('chats.moreActions')}
-                        aria-label={t('chats.moreActions')}
-                        aria-expanded={roomMenuOpen}
-                      >
-                        <CircleEllipsis size={22} />
+                  ) : (
+                    <>
+                      <button className="room-back" onClick={() => setActiveChat(null)} aria-label={t('common.back')}>
+                        <ArrowLeft size={20} />
                       </button>
-                      {/* A disclosure of plain buttons, not role="menu": it keeps no roving focus or arrow
-                          keys, and the role would promise them. */}
-                      {roomMenuOpen && (
-                        <div className="room-menu-popover">
-                          {/* The row's actions, then what only an open room needs. The chat comes from the list,
-                              which opening it, a reload and the page's own actions keep current, not from the
-                              snapshot taken when its row was clicked. */}
-                          <ChatActions
-                            chat={chats.find(c => c.id === activeChat.id) ?? activeChat}
-                            actions={rowActions}
-                            onPicked={closeRoomMenu}
-                          />
-                          <hr />
+                      {/* The contact itself opens the info panel, as in WhatsApp. */}
+                      <button
+                        type="button"
+                        className="room-contact"
+                        onClick={() => setContactInfoFor(showContactInfo ? '' : openRoomKey)}
+                        title={contactInfoLabel}
+                        aria-expanded={showContactInfo}
+                      >
+                        <ChatAvatar
+                          chatId={activeChat.id}
+                          pictureUrl={activePp.data}
+                          kind={activeChat.kind}
+                          size="sm"
+                          // Signed CDN URLs rotate every few hours; refetch the slice on a stale load.
+                          onImageError={() => activePp.refetch()}
+                        />
+                        <span className="room-contact-info">
+                          <span className="room-contact-name">{activeChatTitleText}</span>
+                          {/* Personal chats show the prettified phone number — local formatting for
+                              @c.us ids, engine-resolved for @lid privacy ids (which are NOT phones and
+                              must never be formatted as one). Only under a saved name: an unnamed chat's
+                              title already is the number. The raw JID is in the contact panel. */}
+                          {activePhoneText && named && (
+                            <span className="room-contact-phone" title={activePhoneText}>
+                              <bdi dir="ltr">{activePhoneText}</bdi>
+                            </span>
+                          )}
+                        </span>
+                      </button>
+
+                      <div className="room-header-actions">
+                        {/* GET /search needs the operator role, so a read-only key is not offered it, as with the
+                            sidebar's message search. */}
+                        {canWrite && (
                           <button
+                            ref={roomSearchButtonRef}
                             type="button"
+                            className="icon-btn"
                             onClick={() => {
-                              closeRoomMenu();
-                              void handleCopyChatId();
+                              setRoomMenuOpen(false);
+                              setRoomSearchOpen(true);
                             }}
+                            title={t('chats.roomSearch.open')}
+                            aria-label={t('chats.roomSearch.open')}
                           >
-                            <Copy size={16} />
-                            {t('chats.copyChatId')}
+                            <Search size={22} />
                           </button>
-                          <button type="button" onClick={() => setActiveChat(null)}>
-                            <X size={16} />
-                            {t('chats.closeChat')}
+                        )}
+                        <div className="room-menu" ref={roomMenuRef}>
+                          <button
+                            ref={roomMenuTriggerRef}
+                            type="button"
+                            className={`icon-btn room-menu-trigger ${roomMenuOpen ? 'active' : ''}`}
+                            onClick={() => {
+                              if (activeChat.kind === 'individual') rowActions.onMenuOpen?.();
+                              setRoomMenuOpen(open => !open);
+                            }}
+                            title={t('chats.moreActions')}
+                            aria-label={t('chats.moreActions')}
+                            aria-expanded={roomMenuOpen}
+                          >
+                            <CircleEllipsis size={22} />
                           </button>
+                          {/* A disclosure of plain buttons, not role="menu": it keeps no roving focus or arrow
+                              keys, and the role would promise them. */}
+                          {roomMenuOpen && (
+                            <div className="room-menu-popover">
+                              {/* The row's actions, then what only an open room needs. The chat comes from the list,
+                                  which opening it, a reload and the page's own actions keep current, not from the
+                                  snapshot taken when its row was clicked. */}
+                              <ChatActions
+                                chat={chats.find(c => c.id === activeChat.id) ?? activeChat}
+                                actions={rowActions}
+                                onPicked={closeRoomMenu}
+                              />
+                              <hr />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  closeRoomMenu();
+                                  void handleCopyChatId();
+                                }}
+                              >
+                                <Copy size={16} />
+                                {t('chats.copyChatId')}
+                              </button>
+                              <button type="button" onClick={() => setActiveChat(null)}>
+                                <X size={16} />
+                                {t('chats.closeChat')}
+                              </button>
+                            </div>
+                          )}
                         </div>
-                      )}
-                    </div>
-                    <button
-                      ref={contactToggleRef}
-                      type="button"
-                      className={`icon-btn ${showContactInfo ? 'active' : ''}`}
-                      onClick={() => setContactInfoFor(showContactInfo ? '' : openRoomKey)}
-                      title={contactInfoLabel}
-                      aria-label={contactInfoLabel}
-                      aria-pressed={showContactInfo}
-                    >
-                      <PanelRight size={22} />
-                    </button>
-                  </div>
+                        <button
+                          ref={contactToggleRef}
+                          type="button"
+                          className={`icon-btn ${showContactInfo ? 'active' : ''}`}
+                          onClick={() => setContactInfoFor(showContactInfo ? '' : openRoomKey)}
+                          title={contactInfoLabel}
+                          aria-label={contactInfoLabel}
+                          aria-pressed={showContactInfo}
+                        >
+                          <PanelRight size={22} />
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </header>
 
                 {/* Messages body (list, media, reactions, scroll-to-bottom) — components/chats/ChatThread. */}
@@ -2325,20 +2626,22 @@ export function Chats() {
                   messagesContainerRef={messagesContainerRef}
                   hasMoreMessages={Boolean(hasMoreMessages)}
                   loadingOlderMessages={loadingOlderMessages}
+                  refreshFailed={refreshFailed({
+                    isRefetchError: threadRefreshError,
+                    isFetchNextPageError: olderPageError,
+                  })}
+                  refreshing={fetchingMessages}
                   onLoadOlderMessages={handleLoadOlderMessages}
                   onMediaLoad={onMediaLoad}
                   measureMedia={measureMedia}
-                  onOpenImage={messageId => {
-                    const opened = imageMessages.find(m => m.id === messageId);
-                    if (opened) setLightbox(viewedImage(opened));
-                  }}
-                  onReply={setReplyingTo}
+                  onOpenImage={handleOpenImage}
+                  onReply={startReply}
                   onReact={handleReactMessage}
                   onDelete={handleDeleteMessage}
                   onClickButton={handleClickButton}
                 />
 
-                {/* Composer: attachment preview, emoji panel, reply banner, input bar —
+                {/* Composer: attachment preview, emoji panel, reply banner, input bar -
                     components/chats/ChatComposer. */}
                 <ChatComposer
                   selectedSessionId={selectedSessionId}
@@ -2347,10 +2650,11 @@ export function Chats() {
                   setReplyingTo={setReplyingTo}
                   onMessageAppended={onMessageAppended}
                   onSent={promoteSentChat}
-                  onSendConfirmed={(tempId, key) => setLightbox(v => (v?.key === tempId ? { ...v, key } : v))}
+                  onSendConfirmed={handleSendConfirmed}
                   onSendFailed={restoreRefusedDraft}
-                  messageInput={messageInput}
-                  setMessageInput={setMessageInput}
+                  initialDraft={chatDrafts[openRoomKey] ?? ''}
+                  draftsRef={draftsRef}
+                  composerHandleRef={composerHandleRef}
                   attachment={attachment}
                   setAttachment={setAttachment}
                   previewUrl={previewUrl}
@@ -2487,7 +2791,7 @@ export function Chats() {
                 />
                 <h3>{activeChatTitleText}</h3>
                 {/* The number goes under a name only; an unnamed chat's title already is the number. */}
-                {(activeChat.name || !activePhoneText) && (
+                {(named || !activePhoneText) && (
                   <p className="contact-info-sub">
                     {activePhoneText ? (
                       <bdi dir="ltr">{activePhoneText}</bdi>

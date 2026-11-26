@@ -81,7 +81,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
     baileys: { status: 'supported' },
     evidence:
-      "baileys addLabel(jid, LabelActionBody{id,name?,color?,deleted?}) (Socket/chats.d.ts) emits one `label_edit` app-state patch indexed by ['label_edit', id] (Utils/chat-utils.js), so create and update are the same write; whatsapp-web.js 1.34.7 exposes getLabels/getLabelById/getChatLabels/getChatsByLabelId/addOrRemoveLabels (index.d.ts) and nothing that edits a label itself",
+      "baileys addLabel(jid, LabelActionBody{id,name?,color?,deleted?}) (Socket/chats.d.ts) emits one `label_edit` app-state patch indexed by ['label_edit', id] (Utils/chat-utils.js), so create and update are the same write; whatsapp-web.js 1.34.8 exposes getLabels/getLabelById/getChatLabels/getChatsByLabelId/addOrRemoveLabels (index.d.ts) and nothing that edits a label itself",
   },
   deleteLabel: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
@@ -99,7 +99,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      "wwjs GroupChat.addParticipants → per-participant {code,message} object, or a reason STRING on batch refusal (index.d.ts; GroupChat.js) — both mapped at the adapter; baileys groupParticipantsUpdate(jid,pids,'add') → per-jid [{status:'200'|error}] (Socket/groups.js); per-participant results surface on the HTTP `results` field, a total refusal throws",
+      "wwjs GroupChat.addParticipants → per-participant {code,message} object, or a reason STRING on batch refusal (index.d.ts; GroupChat.js) — both mapped at the adapter, and where the page's WAWebChatSendMessages has no sendGroupInviteMessage (the library's invitation sender, gone on current WhatsApp Web builds) the adapter adds with autoSendInviteV4 false, so an invite-only participant is a 403 and no invite is sent; baileys groupParticipantsUpdate(jid,pids,'add') → per-jid [{status:'200'|error}] (Socket/groups.js); per-participant results surface on the HTTP `results` field, a total refusal throws",
   },
   approveGroupMembershipRequests: {
     wwjs: { status: 'supported' },
@@ -141,7 +141,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs GroupChat.deletePicture() → boolean (index.d.ts; false → adapter throws EngineRefusedError); baileys removeProfilePicture(groupJid) (Socket/groups.d.ts) — the same call used for the own account, addressed at the group JID',
+      'wwjs WAWebContactProfilePicThumbBridge.requestDeletePicture(wid), sent in-page by the adapter (the request GroupChat.deletePicture() sends only when the page already holds the picture), answered by its status: 2xx success, 408/423/429/5xx a retryable 503, any other code EngineRefusedError, and a build without the job answers 501; baileys removeProfilePicture(groupJid) (Socket/groups.d.ts) — the same call used for the own account, addressed at the group JID',
   },
   demoteParticipants: {
     wwjs: { status: 'supported' },
@@ -285,7 +285,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs Client.acceptInvite(inviteCode) → res.gid._serialized (index.d.ts; Client.js); baileys groupAcceptInvite(code) → string|undefined (Socket/groups.d.ts) — undefined mapped to a thrown error',
+      'wwjs WAWebGroupInviteJob.joinGroupViaInvite(code), run in the page by the adapter the way Client.acceptInvite (index.d.ts; Client.js) calls it, answering res.gid._serialized or res.gid.$1; a build without the job answers 501, a group that has an admin approve new members is told apart as a request sent, and the status the job rejects with decides the rest (408/423/429/5xx a retryable 503, any other status the invalid invite); baileys groupAcceptInvite(code) → string|undefined (Socket/groups.d.ts) — undefined mapped to a thrown error',
   },
   pinChat: {
     wwjs: { status: 'supported' },
@@ -297,7 +297,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs Message.pin(duration) → boolean (index.d.ts); the injected helper returns false for a non-number duration and for an unknown message (Injected/Utils.js), so the adapter maps false → EngineRefusedError; baileys sendMessage(jid,{pin:key,type:PinInChat.Type.PIN_FOR_ALL,time}) (Types/Message.d.ts) — NOT chatModify({pin}), which pins the CHAT in the chat list',
+      'wwjs WAWebSendPinMessageAction.sendPinInChatMsg, run in the page by the adapter the way the build takes it: one options object {msg, pinType, pinExpiryDurationOption} on current builds, which Message.pin(duration) → boolean (index.d.ts) cannot call because it passes three positional arguments (Injected/Utils.js), and Message.pin itself on a build whose sender still takes them. A send that did not go through, an unknown message, a duration the page has no option for and a chat with a contact the account blocked (the page rejects ContactBlocked before it sends) map to EngineRefusedError, and a ServerStatusCodeError of the group read the sender makes first is answered by its status (408/423/429/5xx a retryable 503); a build with neither shape answers 501. baileys sendMessage(jid,{pin:key,type:PinInChat.Type.PIN_FOR_ALL,time}) (Types/Message.d.ts) — NOT chatModify({pin}), which pins the CHAT in the chat list',
   },
   probeLiveness: {
     wwjs: { status: 'supported' },
@@ -333,7 +333,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
     baileys: { status: 'supported' },
     evidence:
-      "baileys rejectCall(callId, callFrom) (Socket/messages-recv.d.ts) with the raw `from` JID cached from the 'offer' call event (Types/Call.d.ts); measured live on 2026-09-17 with 7.0.0-rc14, a real call fired call.received then call.rejected and auto-reject stopped the caller's phone at once. wwjs Call.reject() exists and is typed Promise<void> (index.d.ts) on the Call from the client 'call' event (index.d.ts), but measured live on 2026-09-17 on OpenWA 0.23.4 with WhatsApp Web 2.3000.1047471845-alpha the reject resolved and OpenWA logged the call as auto-rejected while the caller's phone kept ringing until it timed out. The cause is not established. The page function Call.reject() runs, WWebJS.rejectCall, is modified by OpenWA patch 1 (scripts/wwebjs-201832.patch), which reads getMaybeMePnUser()._serialized || $1",
+      "baileys rejectCall(callId, callFrom) (Socket/messages-recv.d.ts) with the raw `from` JID cached from the 'offer' call event (Types/Call.d.ts); measured live on 2026-09-17 with 7.0.0-rc14, a real call fired call.received then call.rejected and auto-reject stopped the caller's phone at once. wwjs Call.reject() exists and is typed Promise<void> (index.d.ts) on the Call from the client 'call' event (index.d.ts), but measured live on 2026-09-17 on OpenWA 0.23.4 with WhatsApp Web 2.3000.1047471845-alpha the reject resolved and OpenWA logged the call as auto-rejected while the caller's phone kept ringing until it timed out. The cause is not established. The page function Call.reject() runs, WWebJS.rejectCall, carries upstream #201832 (shipped in 1.34.8), which reads getMaybeMePnUser()._serialized || $1",
   },
   requestPairingCode: {
     wwjs: { status: 'supported' },
@@ -341,8 +341,9 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     evidence:
       'Curated for a hazard, not a gap: both engines return a code. wwjs Client.requestPairingCode ' +
       '(Client.js) runs in the shared WhatsApp Web page and calls ' +
-      'PairingCodeLinkUtils.setPairingType + initializeAltDeviceLinking before startAltLinkingFlow, ' +
-      'checking no precondition; measured twice (2026-09-17, 2026-09-18) a request for a number that ' +
+      'setPairingType + initializeAltDeviceLinking before startAltLinkingFlow (on PairingCodeLinkUtils ' +
+      'before 1.34.8, on WAWebAltDeviceLinkingApi since), checking no precondition; measured twice on ' +
+      'the earlier release (2026-09-17, 2026-09-18) a request for a number that ' +
       'already had a linked session was followed within about a minute by WhatsApp revoking that ' +
       'device, whatsapp-web.js deleting its credentials and the session returning to qr_ready. It ' +
       'also arms an in-page 3-minute re-request interval that mints a fresh code and notifies the ' +
@@ -401,7 +402,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
     baileys: { status: 'supported' },
     evidence:
-      "baileys presenceSubscribe(toJid) (Socket/chats.d.ts) + the 'presence.update' event carrying a per-participant PresenceData map (Types/Events.d.ts, Types/Chat.d.ts); whatsapp-web.js 1.34.7 has only sendPresenceAvailable/sendPresenceUnavailable (index.d.ts), which publish the ACCOUNT's own presence — it exposes no subscribe and emits no presence event",
+      "baileys presenceSubscribe(toJid) (Socket/chats.d.ts) + the 'presence.update' event carrying a per-participant PresenceData map (Types/Events.d.ts, Types/Chat.d.ts); whatsapp-web.js 1.34.8 has only sendPresenceAvailable/sendPresenceUnavailable (index.d.ts), which publish the ACCOUNT's own presence — it exposes no subscribe and emits no presence event",
   },
   starMessage: {
     wwjs: { status: 'supported' },
@@ -413,49 +414,49 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      "wwjs GroupChat.setDescription(description) → boolean (index.d.ts; false → adapter throws EngineRefusedError) — depends on 🔧⁹ (scripts/patch-wwebjs-group-description.js): stock 1.34.7 calls the page's WAWebGroupModifyInfoJob.setGroupDescription positionally, but that job now takes a single options object {desc, groupWid, newDescId, prevDescId}, so widToGroupJid reads an undefined Wid and throws inside the page, reaching the caller as a bare 500. setGroupSubject in the same module is still positional and is unaffected. Patched call measured live on wwjs 1.34.7: set reads back, empty string clears. baileys groupUpdateDescription(jid, description?) (Socket/groups.d.ts)",
+      'wwjs WAWebGroupModifyInfoJob.setGroupDescription({desc, groupWid, newDescId, prevDescId}), sent in-page by the adapter and answered by its status: 2xx success, 408/423/429/5xx a retryable 503, any other code EngineRefusedError, and a build without the job answers 501. Stock 1.34.8 GroupChat.setDescription() calls that job positionally, whereas the job takes a single options object, so the adapter bypasses GroupChat.setDescription() and invokes the page job directly. setGroupSubject in the same module is still positional and is unaffected. The options-object call was measured live on wwjs 1.34.7: set reads back, empty string clears. baileys groupUpdateDescription(jid, description?) (Socket/groups.d.ts)',
   },
   setGroupEphemeral: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs 1.34.7 exposes NO ephemeral setter — 0 hits for ephemeral in index.d.ts; only a create-time messageTimer option (Client.js); adapter throws EngineNotSupportedError; baileys groupToggleEphemeral(jid, ephemeralExpiration) (Socket/groups.d.ts)',
+      'wwjs 1.34.8 exposes NO ephemeral setter — 0 hits for ephemeral in index.d.ts; only a create-time messageTimer option (Client.js); adapter throws EngineNotSupportedError; baileys groupToggleEphemeral(jid, ephemeralExpiration) (Socket/groups.d.ts)',
   },
   setGroupMemberLabel: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs 1.34.7 exposes NO member-label setter: 0 hits for memberLabel or member tag in index.d.ts and src/; adapter throws EngineNotSupportedError; baileys updateMemberLabel(jid, memberLabel) (Socket/messages-send.d.ts) relays a GROUP_MEMBER_LABEL_CHANGE protocol message to the group with the label cut by slice(0, 30) (messages-send.js)',
+      'wwjs 1.34.8 exposes NO member-label setter: 0 hits for memberLabel or member tag in index.d.ts and src/; adapter throws EngineNotSupportedError; baileys updateMemberLabel(jid, memberLabel) (Socket/messages-send.d.ts) relays a GROUP_MEMBER_LABEL_CHANGE protocol message to the group with the label cut by slice(0, 30) (messages-send.js)',
   },
   setGroupInfoAdminsOnly: {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      "wwjs GroupChat.setInfoAdminsOnly(adminsOnly?) (index.d.ts; sets groupMetadata.restrict, GroupChat.js); baileys groupSettingUpdate(jid, 'locked'|'unlocked') (Socket/groups.d.ts)",
+      "wwjs WAWebSetPropertyGroupAction.setGroupProperty(chat, 'restrict', 1|0), sent in-page by the adapter (the call GroupChat.setInfoAdminsOnly() makes), answered the same way as the announce setting, and a build without the job answers 501; baileys groupSettingUpdate(jid, 'locked'|'unlocked') (Socket/groups.d.ts)",
   },
   setGroupMemberAddMode: {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      "wwjs GroupChat.setAddMembersAdminsOnly(adminsOnly?) → boolean (index.d.ts; false → adapter throws EngineRefusedError); baileys groupMemberAddMode(jid,'admin_add'|'all_member_add') (Socket/groups.d.ts). NOT a groupSettingUpdate option on either engine. Read side disagrees between engines and with wwjs's own types: baileys GroupMetadata.memberAddMode is a boolean where true = all_member_add (Socket/groups.js), while wwjs stores WhatsApp's raw strings (GroupChat.js) despite index.d.ts declaring a boolean with the OPPOSITE sense — both are normalised to 'all'|'admins' at the adapter",
+      "wwjs WAWebSetPropertyGroupAction.setGroupProperty(chat, 'member_add_mode', 0|1), sent in-page by the adapter (the call GroupChat.setAddMembersAdminsOnly() makes), answered the same way as the announce setting, and a build without the job answers 501; baileys groupMemberAddMode(jid,'admin_add'|'all_member_add') (Socket/groups.d.ts). NOT a groupSettingUpdate option on either engine. Read side disagrees between engines and with wwjs's own types: baileys GroupMetadata.memberAddMode is a boolean where true = all_member_add (Socket/groups.js), while wwjs stores WhatsApp's raw strings (GroupChat.js) despite index.d.ts declaring a boolean with the OPPOSITE sense — both are normalised to 'all'|'admins' at the adapter",
   },
   setGroupMessagesAdminsOnly: {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      "wwjs GroupChat.setMessagesAdminsOnly(adminsOnly?) (index.d.ts; sets groupMetadata.announce, GroupChat.js); baileys groupSettingUpdate(jid, 'announcement'|'not_announcement') (Socket/groups.d.ts)",
+      "wwjs WAWebSetPropertyGroupAction.setGroupProperty(chat, 'announcement', 1|0), sent in-page by the adapter (the call GroupChat.setMessagesAdminsOnly() makes), answered by the response union it resolves or the status it rejects with: 2xx success, 408/423/429/5xx a retryable 503, any other code or the page's own refusal EngineRefusedError, and a build without the job answers 501; baileys groupSettingUpdate(jid, 'announcement'|'not_announcement') (Socket/groups.d.ts)",
   },
   setGroupPicture: {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs GroupChat.setPicture(MessageMedia) → boolean (index.d.ts) — the GroupChat method, not Client.setProfilePicture which targets the own account; baileys updateProfilePicture(groupJid, WAMediaUpload) (Socket/groups.d.ts)',
+      'wwjs WAWebContactProfilePicThumbBridge.sendSetPicture(wid, thumbnail, picture) with the group id, sent in-page by the adapter (the call GroupChat.setPicture() makes, which reads every status as false), answered by its status: 2xx success, 408/423/429/5xx a retryable 503, any other code or a picture the page says the account may not set EngineRefusedError, and a build without the job answers 501; the own account is setProfilePicture; baileys updateProfilePicture(groupJid, WAMediaUpload) (Socket/groups.d.ts)',
   },
   setGroupSubject: {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs GroupChat.setSubject(newSubject) → boolean (index.d.ts; false → adapter throws EngineRefusedError); baileys groupUpdateSubject(jid, subject) (Socket/groups.d.ts)',
+      'wwjs WAWebGroupModifyInfoJob.setGroupSubject(wid, subject), sent in-page by the adapter (the call GroupChat.setSubject() makes, which reads every status as false), answered by its status: 2xx success, 408/423/429/5xx a retryable 503, any other code EngineRefusedError, and a build without the job answers 501; baileys groupUpdateSubject(jid, subject) (Socket/groups.d.ts)',
   },
   setOnlinePresence: {
     wwjs: { status: 'supported' },
@@ -473,18 +474,19 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'baileys removeProfilePicture(ownJid) (Socket/groups.d.ts), the same symbol deleteGroupPicture already uses, resolving void; wwjs Client.deleteProfilePicture() (index.d.ts) forwards WWebJS.deletePicture, which returns undefined when canDelete() is false, true on HTTP 200 and false on a ServerStatusCodeError (Injected/Utils.js)',
+      'baileys removeProfilePicture(ownJid) (Socket/groups.d.ts), the same symbol deleteGroupPicture already uses, resolving void; wwjs WAWebContactProfilePicThumbBridge.requestDeletePicture(ownWid), sent in-page by the adapter (the call Client.deleteProfilePicture() makes, which reads every status as false), answered by its status: 2xx success, 408/423/429/5xx a retryable 503, any other code EngineRefusedError, and a build without the job answers 501',
   },
   setProfilePicture: {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs Client.setProfilePicture(MessageMedia) → boolean (index.d.ts; false → adapter throws); baileys updateProfilePicture(ownJid, WAMediaUpload) (Socket/chats.d.ts)',
+      'wwjs WAWebContactProfilePicThumbBridge.sendSetPicture(ownWid, thumbnail, picture), sent in-page by the adapter (the call Client.setProfilePicture() makes, which reads every status as false), answered by its status: 2xx success, 408/423/429/5xx a retryable 503, any other code or a picture the page says the account may not set EngineRefusedError, and a build without the job answers 501; baileys updateProfilePicture(ownJid, WAMediaUpload) (Socket/chats.d.ts)',
   },
   setProfileStatus: {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
-    evidence: 'wwjs Client.setStatus(status) (index.d.ts); baileys updateProfileStatus(status) (Socket/chats.d.ts)',
+    evidence:
+      'wwjs Client.setStatus(status) (index.d.ts) calls setMyStatus of WAWebContactStatusBridge in the page, which WhatsApp Web builds from about mid November 2026 no longer export (the About text became an expiring text status, set through modules the library does not call): the adapter asks the page for it and answers 501 on such a build; baileys updateProfileStatus(status) (Socket/chats.d.ts)',
   },
   subscribeToChannel: {
     wwjs: { status: 'not-available', rootCause: 'adapter-gap' },
@@ -520,13 +522,13 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs Message.unpin() → boolean (index.d.ts); it passes duration 0 explicitly (Message.js), so the injected non-number guard does not bite — false → EngineRefusedError; baileys sendMessage(jid,{pin:key,type:PinInChat.Type.UNPIN_FOR_ALL}) — `time` is ignored when unpinning',
+      'wwjs the same sender with the unpin type (UNPIN_FOR_ALL, no duration option), or Message.unpin() → boolean (index.d.ts) on a build whose sender still takes positional arguments (Injected/Utils.js); a send that did not go through → EngineRefusedError, a build with neither shape answers 501; baileys sendMessage(jid,{pin:key,type:PinInChat.Type.UNPIN_FOR_ALL}) — `time` is ignored when unpinning',
   },
   unsubscribeFromChannel: {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs Client.unsubscribeFromChannel(channelId, options?) → boolean (index.d.ts; Client.js; false → adapter throws EngineRefusedError); baileys newsletterUnfollow(jid) (Socket/newsletter.d.ts)',
+      'wwjs WAWebNewsletterUnsubscribeAction.unsubscribeFromNewsletterAction(channel, options), sent in-page by the adapter with the lookups and arguments of Client.unsubscribeFromChannel(channelId, options?) → boolean (index.d.ts; Client.js), which reads every status as false: 2xx success, 408/423/429/5xx a 503 that says the outcome is unknown (a retryable status of this write cannot promise nothing changed), any other status, a channel the page does not hold and a channel the account owns EngineRefusedError; baileys newsletterUnfollow(jid) (Socket/newsletter.d.ts)',
   },
 };
 

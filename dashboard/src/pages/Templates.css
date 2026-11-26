@@ -101,7 +101,7 @@
   gap: 0.5rem;
   margin: 1rem;
   padding: 0.625rem 0.75rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
   background: var(--bg-white);
   color: var(--text-muted);
@@ -115,11 +115,14 @@
   background: transparent;
   color: var(--text-primary);
   font-size: 0.875rem;
+  unicode-bidi: plaintext;
 }
 
 .templates-page .templates-search:focus-within {
   border-color: var(--focus-ring);
-  box-shadow: 0 0 0 3px var(--primary-soft);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px var(--primary-soft);
 }
 
 .templates-page .template-list {
@@ -189,6 +192,12 @@
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* A name and a body are text of their own: under the page direction an Arabic page drew "aviso." as ".aviso".
+     Each box is as wide as its text, so the text stays at the start edge the page puts it (see .chat-item-name in
+     Chats.css) instead of moving to the other side of the row. */
+  width: fit-content;
+  max-width: 100%;
+  unicode-bidi: plaintext;
 }
 
 .templates-page .template-list-body {
@@ -199,6 +208,9 @@
   line-height: 1.45;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+  width: fit-content;
+  max-width: 100%;
+  unicode-bidi: plaintext;
 }
 
 .templates-page .template-list-meta {
@@ -266,11 +278,14 @@
 .templates-page .template-form textarea,
 .templates-page .placeholder-list input {
   width: 100%;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
   background: var(--bg-light);
   color: var(--text-primary);
   font-size: 0.9375rem;
+  /* Typed text reads its direction from its own characters: under the page direction an Arabic page put the full
+     stop of an English sentence on the wrong end of it. */
+  unicode-bidi: plaintext;
 }
 
 .templates-page .template-form input,
@@ -292,7 +307,9 @@
   outline: none;
   border-color: var(--focus-ring);
   background: var(--bg-white);
-  box-shadow: 0 0 0 3px var(--primary-soft);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px var(--primary-soft);
 }
 
 .templates-page .body-field {
@@ -345,6 +362,10 @@
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
+  /* index.css draws every pre left to right and flush left, for code. The message is text of its own: this rule wins
+     it on specificity and hands the direction and the alignment back to the characters. */
+  unicode-bidi: plaintext;
+  text-align: start;
 }
 
 .templates-page .template-variable-panel {
@@ -519,5 +540,16 @@
   .templates-page .template-preview-message,
   .templates-page .template-variable-panel {
     padding: 1rem;
+  }
+}
+
+/* Forced colours drop fills and shadows: the search box draws an outline on focus, the open template a heavy frame. */
+@media (forced-colors: active) {
+  .templates-page .templates-search:focus-within {
+    outline: 2px solid var(--focus-ring);
+  }
+
+  .templates-page .template-list-item.selected {
+    border: 3px solid CanvasText;
   }
 }

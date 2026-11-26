@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rmyndharis-openwa"
-version = "0.12.0"
+version = "0.14.0"
 description = "Official Python SDK for OpenWA, the open-source WhatsApp API Gateway (not affiliated with WhatsApp or Meta)"
 readme = "README.md"
 license = "MIT"
@@ -41,6 +41,7 @@ openwa = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
 
 # This package ships py.typed (see package-data above), so its annotations are a published
 # contract — a consumer's own type checker reads them. pytest cannot see a mistake in one:

@@ -13,6 +13,7 @@ import {
   MEDIA_TOO_LARGE_413,
   MEDIA_URL_PROXY_503,
   SESSION_NOT_STARTED_404,
+  STATUS_POST_409,
   STATUS_POST_503,
 } from '../../common/openapi/engine-status-responses';
 
@@ -86,7 +87,7 @@ export class StatusController {
   })
   @ApiResponse({ status: 400, description: 'Invalid request, or the post was blocked by a plugin.' })
   @ApiResponse({ status: 503, description: STATUS_POST_503 })
-  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 409, description: STATUS_POST_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })
   async sendTextStatus(@Param('sessionId') sessionId: string, @Body() dto: SendTextStatusDto) {
     return this.statusService.postTextStatus(sessionId, dto.text, {
@@ -114,7 +115,7 @@ export class StatusController {
   })
   @ApiResponse({ status: 413, description: MEDIA_TOO_LARGE_413 })
   @ApiResponse({ status: 503, description: `${MEDIA_URL_PROXY_503} ${STATUS_POST_503}` })
-  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 409, description: STATUS_POST_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })
   async sendImageStatus(@Param('sessionId') sessionId: string, @Body() dto: SendImageStatusDto) {
     return this.statusService.postImageStatus(sessionId, dto.image, {
@@ -141,7 +142,7 @@ export class StatusController {
   })
   @ApiResponse({ status: 413, description: MEDIA_TOO_LARGE_413 })
   @ApiResponse({ status: 503, description: `${MEDIA_URL_PROXY_503} ${STATUS_POST_503}` })
-  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 409, description: STATUS_POST_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })
   async sendVideoStatus(@Param('sessionId') sessionId: string, @Body() dto: SendVideoStatusDto) {
     return this.statusService.postVideoStatus(sessionId, dto.video, {
@@ -169,7 +170,7 @@ export class StatusController {
   })
   @ApiResponse({ status: 413, description: MEDIA_TOO_LARGE_413 })
   @ApiResponse({ status: 503, description: `${MEDIA_URL_PROXY_503} ${STATUS_POST_503}` })
-  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 409, description: STATUS_POST_409 })
   @ApiResponse({ status: 404, description: SESSION_NOT_STARTED_404 })
   async sendVoiceStatus(@Param('sessionId') sessionId: string, @Body() dto: SendVoiceStatusDto) {
     return this.statusService.postVoiceStatus(sessionId, dto.audio, {
@@ -197,7 +198,8 @@ export class StatusController {
   @ApiResponse({
     status: 503,
     description:
-      'The whatsapp-web.js page connection died mid-request, so the revoke did not complete. Safe ' +
+      'The whatsapp-web.js page connection died mid-request, or WhatsApp Web did not answer within the request ' +
+      'budget, so the revoke may not have completed. Safe ' +
       'to retry: revoking an already-revoked status converges. The status POST routes deliberately ' +
       'do NOT answer this for whatsapp-web.js, because a replayed post would publish the status a second ' +
       'time. On Baileys, also when WhatsApp rate-limits the revoke (code 429) or times out a query it ' +

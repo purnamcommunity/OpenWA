@@ -31,9 +31,9 @@ import {
 import { MessageDirection } from '../../../modules/message/entities/message.entity';
 import { MESSAGE_REFERENCE_MAX_LENGTH, MESSAGE_TYPE_MAX_LENGTH } from '../../../modules/message/message-window';
 import { chatIdSchema, chatJidSchema } from '../chat-id-schema';
-import { defineTool, refuseUnknownArguments, type AnyToolDescriptor } from '../tool-descriptor';
+import { defineTool, refuseUnknownArguments, sessionIdSchema, type AnyToolDescriptor } from '../tool-descriptor';
 
-const sessionId = z.string().min(1).describe('Session UUID (the session id, not the name)');
+const sessionId = sessionIdSchema;
 
 /**
  * Mirrors the REST `quotedMessageId` field so an agent can reply with media, a location, a contact
@@ -197,10 +197,12 @@ export function messageTools(message: MessageService, idempotency?: SendIdempote
         'List persisted messages for a session, newest first, optionally filtered by chatId, sender, direction, ' +
         'type, message time or an exact message reference. Reads from the local DB. Page with limit and offset, or ' +
         'walk with after (the id of the last message of the previous page) so a message arriving mid-walk cannot ' +
-        'shift the window. A message with media carries it inline as base64, up to a per-response budget ' +
-        '(8 MiB by default), which makes a result large; pass inlineMedia false to get the rows without the media.',
+        'shift the window. A message with media is listed without its payload, an { omitted, sizeBytes } marker ' +
+        'in its place; pass inlineMedia true to get the payloads inline as base64, up to a per-response budget ' +
+        '(8 MiB by default; the newest payload is let through whatever its size), which makes a result very large.',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
         chatId: z.string().max(CHAT_ID_MAX_LENGTH).optional().describe('Filter to a specific chat JID'),
@@ -236,8 +238,8 @@ export function messageTools(message: MessageService, idempotency?: SendIdempote
           .boolean()
           .optional()
           .describe(
-            'Set false to leave inline media payloads out: each media row then keeps an { omitted, sizeBytes } ' +
-              'marker. Media is only available inline over MCP, so leave it unset when you need the bytes.',
+            'Set true to carry media payloads inline as base64, the only way to the bytes over MCP. Unset or ' +
+              'false, each media row keeps an { omitted, sizeBytes } marker instead.',
           ),
       }),
       handler: ({ sessionId, after, inlineMedia, ...filters }) =>
@@ -245,7 +247,9 @@ export function messageTools(message: MessageService, idempotency?: SendIdempote
           ...filters,
           // REST reads a blank cursor as absent, and an agent often fills every optional field.
           after: after?.trim() || undefined,
-          ...(inlineMedia === undefined ? {} : { inlineMedia }),
+          // Off unless asked for, where REST inlines by default: base64 is of no use to a model that reads the
+          // result as text, and one photo makes the page larger than an MCP client takes.
+          inlineMedia: inlineMedia === true,
         }),
     }),
     defineTool({
@@ -256,6 +260,7 @@ export function messageTools(message: MessageService, idempotency?: SendIdempote
         'Requires the whatsapp-web.js engine; Baileys answers 501 and a retry cannot succeed, so use MessageList for stored messages.',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
         chatId: chatIdSchema.describe('Chat JID (e.g. 1234567890@c.us or groupId@g.us)'),
@@ -280,6 +285,7 @@ export function messageTools(message: MessageService, idempotency?: SendIdempote
         'Requires the whatsapp-web.js engine; Baileys answers 501 and a retry cannot succeed.',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
         chatId: chatIdSchema.describe('Chat JID containing the message'),

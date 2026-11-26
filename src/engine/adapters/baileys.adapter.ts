@@ -171,7 +171,8 @@ export class BaileysAdapter implements IWhatsAppEngine {
       toUnixSeconds,
       inboundLimiter: this.inboundLimiter,
       recordKeyLidMappings: key => this.sessionStore.recordKeyLidMappings(key),
-      recordMessage: (msg, type, order?: number) => this.sessionStore.recordMessage(msg, type, order),
+      recordMessage: (msg, type, order?: number, withhold?: boolean) =>
+        this.sessionStore.recordMessage(msg, type, order, withhold),
       nextMessageOrder: () => this.sessionStore.nextMessageOrder(),
       recordMessageEdit: (
         chatId,
@@ -230,6 +231,14 @@ export class BaileysAdapter implements IWhatsAppEngine {
       listChats: () => this.sessionStore.listChats(),
       lastMessage: chatId => this.sessionStore.lastMessage(chatId),
       lastInboundMessage: chatId => this.sessionStore.lastInboundMessage(chatId),
+      hasUnrecordedInbound: chatId => this.sessionStore.followsLastInbound(chatId, this.events.receivedInFlight()),
+      isMarkedUnread: chatId => this.sessionStore.isMarkedUnread(chatId),
+      clearUnread: (chatId, marks) => this.sessionStore.clearUnread(chatId, marks),
+      keepUnread: chatId => this.sessionStore.keepUnread(chatId),
+      expectReadEcho: jid => this.sessionStore.expectReadEcho(jid),
+      endReadEcho: jid => this.sessionStore.endReadEcho(jid),
+      dropReadEchoes: () => this.sessionStore.dropReadEchoes(),
+      clearNumberIdCache: () => this.messaging.clearNumberIdCache(),
       lidOf: jid => this.sessionStore.lidOf(jid),
       chatTwins: jid => this.sessionStore.chatTwins(jid),
       chatDeletedAt: chatId => this.sessionStore.chatDeletedAt(chatId),
@@ -664,7 +673,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
     return this.unsupported('getMessageReceipts');
   }
 
-  // Baileys exposes label WRITES only — chats.d.ts:69-73 has addLabel/addChatLabel/removeChatLabel
+  // Baileys exposes label WRITES only — chats.d.ts has addLabel/addChatLabel/removeChatLabel
   // and no query of any kind, and Types/Label.d.ts is types-only. Listing the chats on a label would
   // mean maintaining an app-state cache fed by the label-association sync events, which is a
   // separate piece of work from this one and is tracked as such.
@@ -755,7 +764,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
    * That is why the id is caller-supplied rather than returned.
    *
    * The `jid` Baileys asks for is unused on this patch: `chatModifyToPatch` builds the index from
-   * `['label_edit', id]` and never reads it (Utils/chat-utils.js:579-593). The account's own jid is
+   * `['label_edit', id]` and never reads it (Utils/chat-utils.js). The account's own jid is
    * passed because the call demands one, not because it addresses anything.
    */
   async upsertLabel(label: LabelInput): Promise<void> {
@@ -873,9 +882,10 @@ export class BaileysAdapter implements IWhatsAppEngine {
       // Still 403, but no longer an EngineRefusedError: the send breaker counts WhatsApp refusing a
       // send, and a catalog read it refused says nothing about the account's send standing.
       if (error instanceof EngineRefusedError) throw markNothingSent(new ForbiddenException(error.message));
-      // A lookup that timed out or was throttled failed before the message was handed to WhatsApp.
+      // A lookup that timed out or was throttled failed before the message was handed to WhatsApp, and so did
+      // any other failure of this read: the write comes after it.
       if (error instanceof EngineTransportError) throw new EngineNotSentError(error.message);
-      throw mapSendRefusal(error);
+      throw markNothingSent(mapSendRefusal(error));
     });
     this.ensureReadySocket(sock);
     if (!product) {

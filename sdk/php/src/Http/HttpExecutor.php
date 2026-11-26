@@ -151,6 +151,28 @@ class HttpExecutor
     }
 
     /**
+     * Re-index the named list fields of a body that the caller may have built with array_filter() or
+     * array_unique(): json_encode writes an array whose keys are not 0 to n-1 as an object, which the gateway
+     * refuses where it takes a list. A field that is absent, null or not an array is left alone, and the caller's
+     * array is never modified, not even a list in it that the caller holds by reference.
+     *
+     * @internal Used by the resource classes; not part of the public API.
+     *
+     * @param array<string,mixed> $body
+     * @return array<string,mixed>
+     */
+    public static function lists(array $body, string ...$keys): array
+    {
+        foreach ($keys as $key) {
+            if (isset($body[$key]) && is_array($body[$key])) {
+                // A new array: assigning into $body would write through a reference the caller holds.
+                $body = array_replace($body, [$key => array_values($body[$key])]);
+            }
+        }
+        return $body;
+    }
+
+    /**
      * Perform one request and return the decoded JSON body (or null for 204).
      *
      * @param string               $method  HTTP method.
@@ -172,10 +194,10 @@ class HttpExecutor
         string $method,
         string $path,
         array $query = [],
-        $body = null,
+        mixed $body = null,
         ?string $idempotencyKey = null,
         bool $allowText = false
-    ) {
+    ): mixed {
         $response = $this->send($method, $path, $query, $body, $idempotencyKey);
 
         $text = (string) $response->getBody();
@@ -189,6 +211,46 @@ class HttpExecutor
                 throw new OpenWAException("OpenWA: non-JSON response for {$method} {$path}");
             }
             return $text;
+        }
+        return $decoded;
+    }
+
+    /** @return array<mixed> */
+    public function requestArray(
+        string $method,
+        string $path,
+        array $query = [],
+        mixed $body = null,
+        ?string $idempotencyKey = null,
+        bool $emptyOnNull = false
+    ): array {
+        $decoded = $this->request($method, $path, $query, $body, $idempotencyKey);
+        if ($decoded === null) {
+            if ($emptyOnNull) {
+                return [];
+            }
+            throw new OpenWAException("OpenWA: expected JSON object/array response for {$method} {$path}");
+        }
+        if (!is_array($decoded)) {
+            throw new OpenWAException("OpenWA: expected JSON object/array response for {$method} {$path}");
+        }
+        return $decoded;
+    }
+
+    /** @return array<mixed>|null */
+    public function requestNullableArray(
+        string $method,
+        string $path,
+        array $query = [],
+        mixed $body = null,
+        ?string $idempotencyKey = null
+    ): ?array {
+        $decoded = $this->request($method, $path, $query, $body, $idempotencyKey);
+        if ($decoded === null) {
+            return null;
+        }
+        if (!is_array($decoded)) {
+            throw new OpenWAException("OpenWA: expected JSON object/array response for {$method} {$path}");
         }
         return $decoded;
     }
@@ -225,8 +287,13 @@ class HttpExecutor
      * @param array<string,mixed> $query
      * @param mixed|null          $body
      */
-    private function send(string $method, string $path, array $query, $body, ?string $idempotencyKey = null): ResponseInterface
-    {
+    private function send(
+        string $method,
+        string $path,
+        array $query,
+        mixed $body,
+        ?string $idempotencyKey = null
+    ): ResponseInterface {
         // Guzzle 7 upper-cased the method itself; Guzzle 8 sends it as written, and the gateway refuses "get".
         $method = strtoupper($method);
         if ($idempotencyKey !== null && preg_match('/\A[\x21-\x7E]{1,255}\z/', $idempotencyKey) !== 1) {
@@ -284,7 +351,10 @@ class HttpExecutor
         // Build query string, skipping null values (so absent optionals aren't sent). Guzzle's
         // 'query' option would replace a query already in a raw path, so extend the URL instead.
         $url = $this->baseUrl . $path;
-        $query = array_filter($query, fn ($v) => $v !== null);
+        $query = array_map(
+            static fn (mixed $v): mixed => is_bool($v) ? ($v ? 'true' : 'false') : $v,
+            array_filter($query, static fn (mixed $v): bool => $v !== null),
+        );
         if ($query !== []) {
             $parts = explode('#', $url, 2);
             $url = $parts[0] . (str_contains($parts[0], '?') ? '&' : '?') . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
@@ -293,7 +363,8 @@ class HttpExecutor
             }
         }
         if ($body !== null) {
-            $options['json'] = $body;
+            // json_encode writes an empty array as [], and every JSON body the gateway takes is an object.
+            $options['json'] = $body === [] ? new \stdClass() : $body;
         }
 
         $started = hrtime(true);

@@ -694,7 +694,18 @@ export interface ChatActivityPreview {
 
 export interface ChatSummary {
   id: string;
+  /**
+   * The chat's name. `''` for a Baileys chat held under a privacy id (`@lid`) that has no name of its own:
+   * title it by `phone`, when present.
+   */
   name: string;
+  /**
+   * Baileys only: its store fills it in, and the whatsapp-web.js adapter never does (it lists a chat the page gives
+   * no title under its own id, as `name`). Phone digits of a 1:1 chat WhatsApp holds under a privacy id (`@lid`),
+   * when this session can map it. Absent for a phone-keyed chat (the number is the id) and when the mapping is
+   * unknown. The digits are not a display name: an unnamed chat is titled from them, and a saved name still wins.
+   */
+  phone?: string;
   isGroup: boolean;
   /** User-facing chat kind. `isGroup` is retained for back-compat; `kind` is the full discriminator. */
   kind: ChatKind;
@@ -897,7 +908,7 @@ export interface PollVoteEvent {
  *    (action 'created' only — the wwebjs event has no revoke/reject counterpart, so only
  *    the shared signal is surfaced; rc14 itself emits the event only for non-admin-add
  *    requests — the direct self-request stub 144 is unhandled upstream, marked TODO at
- *    Utils/process-message.js:569 — so an invite-link self-request may not fire on Baileys).
+ *    Utils/process-message.js — so an invite-link self-request may not fire on Baileys).
  * All ids are in the neutral dialect (`@g.us` / `@c.us`; a lid stays `<id>@lid` when the
  * lid->phone mapping is unknown).
  */
@@ -1503,7 +1514,7 @@ export interface MessageOperationsCapability {
 
   /**
    * Cast a vote on a poll. `options` are the option TEXTS, not ids: whatsapp-web.js matches by name
-   * (`Message.js:1027-1031`), and no engine surfaces a stable per-option id through this interface,
+   * (`Message.js`), and no engine surfaces a stable per-option id through this interface,
    * so a caller has nothing else to name an option by. Pass every option that should end up
    * selected — the list replaces the current selection rather than adding to it, and an empty array
    * clears the vote.
@@ -1820,13 +1831,13 @@ export interface ProfileCapability {
   setProfilePicture(media: MediaInput): Promise<void>;
 
   /**
-   * Remove the account's own profile picture. Resolves when the removal is acknowledged; deleting a
-   * picture that is not there is a no-op rather than an error, so the call is idempotent.
+   * Remove the account's own profile picture. Resolves when the removal is acknowledged. Every call
+   * sends the request, so a repeat answers what WhatsApp answers: the removal of an absent picture is
+   * observed to succeed for a group, and not yet for an account's own.
    *
-   * Only whatsapp-web.js can report a refusal, and only as an explicit `false` — its page helper
-   * also returns `undefined` when it did not attempt the delete at all, which is NOT a refusal.
-   * Baileys resolves void and has no refusal signal, so it reports success for any acknowledged
-   * write.
+   * whatsapp-web.js sends it in the page and answers by WhatsApp's status: a refusal, a rate limit or
+   * a server error (retryable), or no job to send it with on that WhatsApp Web build. Baileys
+   * resolves void and has no refusal signal, so it reports success for any acknowledged write.
    */
   deleteProfilePicture(): Promise<void>;
 }
@@ -1991,6 +2002,11 @@ export interface ChatCapability {
    *
    * `authors` maps a message id to who posted it, for a group: a receipt names its sender, and an id the
    * engine never kept (history backfill) has no key to read it from. An id with neither is not acknowledged.
+   *
+   * Once a receipt that names the chat's newest received message is out, Baileys resets the unread count
+   * it lists the chat with, and undoes an unread mark set by hand. The answer reports the receipt alone: a
+   * mark WhatsApp refuses or does not confirm is logged, and a chat with no message to key the write to
+   * keeps its mark without a log line.
    */
   sendSeen(
     chatId: string,

@@ -1,6 +1,6 @@
 # OpenWA Java SDK
 
-This document describes SDK 0.12.0. The `linkPreview` key of a session's config requires OpenWA 0.30.3 or later. `messages.receipts` requires OpenWA 0.28.0 or later. `contacts.lid` requires OpenWA 0.27.1 or later. `groups.setMemberLabel`, the `match` field of `SearchQuery`, and the `thumbnailUrl` and `thumbnailBase64` components of `CustomLinkPreview` require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
+This document describes SDK 0.14.0. The idempotency key overload on `messages.clickButton` requires OpenWA 0.32.0 or later, and `SessionStatsOverview.memoryUsage()` is nullable starting in OpenWA 0.32.0. The `phone` component of `ChatSummary` requires OpenWA 0.31.0 or later. The `linkPreview` key of a session's config requires OpenWA 0.30.3 or later. `messages.receipts` requires OpenWA 0.28.0 or later. `contacts.lid` requires OpenWA 0.27.1 or later. `groups.setMemberLabel`, the `match` field of `SearchQuery`, and the `thumbnailUrl` and `thumbnailBase64` components of `CustomLinkPreview` require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
 
 Official Java client for [OpenWA](https://github.com/rmyndharis/OpenWA), the
 open-source WhatsApp API Gateway. OpenWA is an independent project, not
@@ -19,14 +19,14 @@ Java 17+, one runtime dependency ([Gson](https://github.com/google/gson)).
 <dependency>
   <groupId>com.rmyndharis</groupId>
   <artifactId>openwa</artifactId>
-  <version>0.12.0</version>
+  <version>0.14.0</version>
 </dependency>
 ```
 
 **Gradle**
 
 ```groovy
-implementation 'com.rmyndharis:openwa:0.12.0'
+implementation 'com.rmyndharis:openwa:0.14.0'
 ```
 
 ## Quickstart
@@ -87,8 +87,8 @@ and PHP SDKs:
 plus `client.auth()`.
 
 Deliberately not exposed, matching `docs/18-sdk-design.md`: `auth`/api-keys,
-`audit`, `settings`, `stats`, `automation`, `infra`, `plugins`, the
-`integration` management routes, `metrics`, `mcp`, `ingress` and `docker`.
+`auth/session`, `audit`, `settings`, `stats`, `automation`, `infra`, `plugins`,
+the `integration` management routes, `metrics`, `mcp`, `ingress` and `docker`.
 Everything else the gateway publishes is exposed; see
 [the SDK overview](../README.md#coverage).
 
@@ -159,14 +159,17 @@ if (!WebhookSignature.verify(rawBody, request.getHeader("X-OpenWA-Signature"), s
 }
 WebhookDelivery delivery =
     new Gson().fromJson(new String(rawBody, StandardCharsets.UTF_8), WebhookDelivery.class);
-// Process delivery.event() and delivery.data() here.
+// Route on delivery.event() and deduplicate on delivery.idempotencyKey() (headers are unsigned).
 ```
 
-The signature covers the body only and carries no timestamp, so a captured
-delivery still verifies when it is sent again. Dedupe on
-`delivery.idempotencyKey()` (also the `X-OpenWA-Idempotency-Key` header): the
-gateway's own retries and an operator's redrive of a failed delivery reuse it, so
-a key you have already handled is the same event arriving again.
+The signature covers the raw JSON body only (not `X-OpenWA-*` headers, which
+are unsigned) and carries no timestamp, so a captured delivery still verifies
+when it is sent again. Always deduplicate on `delivery.idempotencyKey()` and
+route on `delivery.event()` from the verified JSON payload rather than trusting
+the unsigned `X-OpenWA-Idempotency-Key` or `X-OpenWA-Event` headers: the
+gateway's own retries and an operator's redrive of a failed delivery reuse
+`delivery.idempotencyKey()`, so a key you have already handled is the same event
+arriving again.
 
 ## Reliability & security
 
@@ -230,7 +233,7 @@ before tagging rather than tagging to see what happens.
 Cutting a release:
 
 1. Bump `<version>` in `pom.xml` and land it on `main`.
-2. Tag that commit `java-sdk-v<version>` (e.g. `java-sdk-v0.12.0`) and push the
+2. Tag that commit `java-sdk-v<version>` (e.g. `java-sdk-v0.14.0`) and push the
    tag. The SDK has its own version line — the monorepo's `v*` tags are the app
    version and never trigger an SDK publish.
 3. The workflow builds, signs, and publishes; Central syncs within a few hours.
@@ -245,4 +248,4 @@ Supply a unique caller-owned key for one logical send and reuse it when retrying
 client.messages.sendText(sessionId, new SendTextRequest("628123@c.us", "Hello"), "order-123");
 ```
 
-The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply and forward sends. Completed calls replay their response; a 409 with the error `code` `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (the `code` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk, product and button operations have no such guarantee. Omit the key to preserve existing behavior.
+The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply, forward and `clickButton` sends. Completed calls replay their response; a 409 with the error `code` `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (the `code` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk and product operations have no such guarantee. Omit the key to preserve existing behavior.

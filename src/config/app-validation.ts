@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common';
 import { isValidationErrorDetailEnabled } from './bootstrap-security';
 import { containsNul } from '../common/validation/no-nul-character';
-import { BODY_WIDTH_MESSAGES, exceededBodyWidth } from '../common/validation/body-width';
+import { BODY_WIDTH_MESSAGES, MAX_BODY_OBJECT_KEYS, exceededBodyWidth } from '../common/validation/body-width';
 import { ImportDataDto } from '../modules/infra/dto/import-data.dto';
 
 /**
@@ -51,16 +51,52 @@ const NOT_A_DTO: unknown[] = [String, Boolean, Number, Array, Object, Buffer, Da
 /**
  * Refuses a request body too wide for the validation pipe to copy (see body-width.ts) with a 400 that names the limit
  * it exceeded. It runs BEFORE that pipe, which copies the whole body before any validator can refuse it, and only
- * for a body a DTO defines: the restore is exempt, as it is from NulBodyPipe, because its tables hold as many rows
- * as the database does, and a provider-defined body (integration ingress, plugin-hosted routes) is read raw and
- * never reaches a pipe.
+ * for a body a DTO defines: the restore lifts the array-length and total-entry caps because its tables hold as many
+ * rows as the database does, while still capping keys per object so no single object stalls class-transformer. A
+ * provider-defined body (integration ingress, plugin-hosted routes) is read raw and never reaches a pipe.
  */
 export class BodyWidthPipe implements PipeTransform {
   transform(value: unknown, { type, metatype }: ArgumentMetadata): unknown {
-    if (type !== 'body' || !metatype || NOT_A_DTO.includes(metatype) || metatype === ImportDataDto) return value;
-    const exceeded = exceededBodyWidth(value);
+    if (type !== 'body' || !metatype || NOT_A_DTO.includes(metatype)) return value;
+    const exceeded =
+      metatype === ImportDataDto
+        ? exceededBodyWidth(value, {
+            maxArrayLength: Infinity,
+            maxEntries: Infinity,
+            maxObjectKeys: MAX_BODY_OBJECT_KEYS,
+          })
+        : exceededBodyWidth(value);
     if (exceeded) throw new BadRequestException(BODY_WIDTH_MESSAGES[exceeded]);
     return value;
+  }
+}
+
+/** Whether an object with its own `toString` sits anywhere in a parsed request value. */
+const holdsOwnToString = (value: unknown): boolean =>
+  typeof value === 'object' &&
+  value !== null &&
+  ((!Array.isArray(value) && Object.hasOwn(value, 'toString')) || Object.values(value).some(holdsOwnToString));
+
+/**
+ * The ValidationPipe, answering as the caller's mistake the one failure its implicit conversion raises on the caller's
+ * data. A string or number property is converted with String() or Number(), and both throw a TypeError on an object
+ * whose own `toString` is not a function, before any validator runs, which would answer 500 for a value every other
+ * wrong type answers 400 for. Only that case is answered: a TypeError from the application's own code (a custom
+ * transform, a validator) is a defect and still reaches the exception handler, so the body must hold such an object.
+ */
+export class GlobalValidationPipe extends ValidationPipe {
+  override async transform(value: unknown, metadata: ArgumentMetadata): Promise<unknown> {
+    try {
+      return await super.transform(value, metadata);
+    } catch (error) {
+      if (error instanceof TypeError && holdsOwnToString(value)) {
+        // The pipe also runs over a query DTO, so the answer names the part of the request that holds the value.
+        throw new BadRequestException(
+          `Request ${metadata.type === 'custom' ? 'input' : metadata.type} holds a value of the wrong type`,
+        );
+      }
+      throw error;
+    }
   }
 }
 
@@ -69,7 +105,7 @@ export function applyGlobalValidation(app: INestApplication): void {
   app.setGlobalPrefix('api');
   app.useGlobalPipes(
     new BodyWidthPipe(),
-    new ValidationPipe({
+    new GlobalValidationPipe({
       ...GLOBAL_VALIDATION_OPTIONS,
       disableErrorMessages: !isValidationErrorDetailEnabled(process.env.VALIDATION_ERROR_DETAIL, process.env.NODE_ENV),
     }),

@@ -110,6 +110,15 @@
 #       to read it, and otherwise, with no psql on PATH too, names the psql versions the load needs
 #
 #   (ax) the archive listing helper finds a member listed first in a listing that outgrows a pipe buffer
+#   (ay) restore refuses an archive that holds the SQLite data store, before it writes anything, while DATABASE_TYPE is
+#       postgres (from the environment, ./.env or the archive's .env.generated), and still restores a PostgreSQL archive
+#   (az) a value of only blanks in the environment, a Unicode blank included, in a UTF-8 locale too, counts as unset, as in
+#       the app, in both scripts: a blank DATABASE_TYPE leaves the type data/.env.generated sets, a blank path key leaves
+#       the check that keeps a path from the archive inside the data dir on, as does a key exported empty, and a value
+#       with blanks inside is still used as written
+#   (ba) WAL-mode online backup preserves uncheckpointed -wal transactions when sqlite3 is present; without sqlite3,
+#       backup refuses any database carrying a non-empty -wal sidecar (no silent data loss) while still allowing a
+#       plain copy when -wal is absent or empty
 #
 # Usage: ./scripts/smoke-test-backup-restore.sh
 # Requires: bash, tar, node (restore.sh path resolution). sqlite3 is optional (see (c) and (k)).
@@ -1557,9 +1566,6 @@ for line in 'DATABASE_NAME="./data/active.sqlite" # data store' \
   fi
   if [ -n "$(ls "$AGB/out" 2>/dev/null)" ]; then
     fail "(ag) backup left an archive behind for an unparsed $key line"
-  fi
-  if [ "$key" = DATABASE_TYPE ]; then
-    continue # restore does not read it
   fi
   printf '%s\n' "$line" >"$AGB/dst/.env"
   set +e
@@ -3231,6 +3237,303 @@ for _ in 1 2 3 4 5; do
   fi
 done
 pass "(ax) tar_lists finds a member listed first in a listing that outgrows a pipe buffer"
+
+echo ""
+echo "==> (ay) an archive that holds the SQLite data store is refused while DATABASE_TYPE is postgres"
+# Under DATABASE_TYPE=postgres, DATABASE_NAME names a database. The restore chose what to write from the archive alone
+# and wrote the SQLite data store to a file named after that database (data/openwa.sqlite with no name set): a file the
+# app never opens, under "Restore complete".
+AY="$WORK/ay"
+mkdir -p "$AY/sqlite" "$AY/with-generated" "$AY/postgres"
+make_fixture "$AY/sqlite/main.sqlite" "ay-main"
+make_fixture "$AY/sqlite/openwa.sqlite" "ay-data"
+cp -R "$AY/sqlite/." "$AY/with-generated/"
+printf 'DATABASE_TYPE=postgres\n' >"$AY/with-generated/.env.generated"
+make_fixture "$AY/postgres/main.sqlite" "ay-main"
+printf -- '-- dump\n' >"$AY/postgres/database.sql"
+for archive in sqlite with-generated postgres; do
+  tar -czf "$AY/$archive.tar.gz" -C "$AY/$archive" .
+done
+# ay_restore <archive> <./.env content> [VAR=value...]: a restore into an empty directory, its output left in OUT_AY
+# and its exit status in rc.
+ay_restore() {
+  rm -rf "$AY/dst" && mkdir -p "$AY/dst"
+  [ -z "$2" ] || printf '%b' "$2" >"$AY/dst/.env"
+  set +e
+  OUT_AY="$(cd "$AY/dst" && env "${@:3}" "$RESTORE" "$1" 2>&1)"
+  rc=$?
+  set -e
+}
+# ay_refused <what>: the restore stopped with status 1 for the mismatch and left nothing behind but ./.env: no data
+# dir, no safety snapshot and no file named after the database.
+ay_refused() {
+  if [ "$rc" -ne 1 ] || ! grep -qF 'the archive holds a SQLite data store' <<<"$OUT_AY" ||
+    [ -n "$(find "$AY/dst" -mindepth 1 ! -name .env)" ]; then
+    fail "(ay) $1 was not refused before anything was written (rc $rc): $OUT_AY"
+  fi
+}
+# Control: the same archive restores where the install is SQLite, so the refusals below are not a broken fixture.
+ay_restore "$AY/sqlite.tar.gz" '' DATABASE_TYPE=sqlite
+if [ "$rc" -ne 0 ] || [ "$(db_fingerprint "$AY/dst/data/openwa.sqlite")" != "ay-data" ]; then
+  fail "(ay) a SQLite archive did not restore under DATABASE_TYPE=sqlite (rc $rc): $OUT_AY"
+fi
+ay_restore "$AY/sqlite.tar.gz" '' DATABASE_TYPE=postgres DATABASE_NAME=openwa
+ay_refused "a SQLite archive under DATABASE_TYPE=postgres and a database name in the environment"
+# The refusal names the supported move and both settings the way back needs, and does not offer the type alone: with
+# DATABASE_NAME still a database name that would write the file the refusal exists to prevent. It names every place
+# the settings can come from, not ./.env alone.
+if ! grep -qF 'docs/14-migration-guide.md' <<<"$OUT_AY" ||
+  ! grep -qF 'change DATABASE_TYPE and DATABASE_NAME first where they are set' <<<"$OUT_AY" ||
+  ! grep -qF 'the environment outranks' <<<"$OUT_AY" || grep -qF 'DATABASE_TYPE=sqlite' <<<"$OUT_AY"; then
+  fail "(ay) the refusal did not name the migration guide, both settings and where they are set: $OUT_AY"
+fi
+# The environment outranks ./.env, so a ./.env that says SQLite does not lift the refusal: the case the text above
+# exists for (a compose environment or a ConfigMap keeps DATABASE_TYPE).
+ay_restore "$AY/sqlite.tar.gz" 'DATABASE_TYPE=sqlite\nDATABASE_NAME=./data/openwa.sqlite\n' DATABASE_TYPE=postgres DATABASE_NAME=openwa
+ay_refused "a SQLite archive under DATABASE_TYPE=postgres in the environment although ./.env says sqlite"
+ay_restore "$AY/sqlite.tar.gz" '' DATABASE_TYPE=postgres
+ay_refused "a SQLite archive under DATABASE_TYPE=postgres with no database name"
+ay_restore "$AY/sqlite.tar.gz" 'DATABASE_TYPE=postgres\nDATABASE_NAME=openwa\n' DATABASE_HOST=db.example.invalid
+ay_refused "a SQLite archive under DATABASE_TYPE=postgres from ./.env"
+ay_restore "$AY/with-generated.tar.gz" '' DATABASE_HOST=db.example.invalid
+ay_refused "a SQLite archive whose own .env.generated selects postgres"
+# The environment decides before the archive's .env.generated does, as it does for the app.
+ay_restore "$AY/with-generated.tar.gz" '' DATABASE_TYPE=sqlite
+if [ "$rc" -ne 0 ] || [ "$(db_fingerprint "$AY/dst/data/openwa.sqlite")" != "ay-data" ]; then
+  fail "(ay) DATABASE_TYPE=sqlite in the environment did not outrank the archive's .env.generated (rc $rc): $OUT_AY"
+fi
+# A PostgreSQL archive is staged for the printed import under either type, and DATABASE_TYPE is not read for it, so a
+# line the scripts cannot parse does not stop that restore.
+for ay_env in 'DATABASE_TYPE=postgres\n' 'DATABASE_TYPE="postgres" # migrated\n'; do
+  ay_restore "$AY/postgres.tar.gz" "$ay_env" DATABASE_NAME=openwa
+  if [ "$rc" -ne 0 ] || [ ! -f "$AY/dst/data/database.sql" ] || [ -e "$AY/dst/openwa" ] ||
+    ! grep -qF 'psql --single-transaction' <<<"$OUT_AY"; then
+    fail "(ay) a PostgreSQL archive was not staged for the import with ./.env '$ay_env' (rc $rc): $OUT_AY"
+  fi
+done
+pass "(ay) a SQLite archive is refused under DATABASE_TYPE=postgres before anything is written"
+
+echo ""
+echo "==> (az) a value of only blanks in the environment is unset, as in the app, for backup and for restore"
+# The app drops a blank environment value, so ./.env and data/.env.generated supply the key. The scripts took only the
+# empty string for blank: a blank DATABASE_TYPE hid the PostgreSQL install (backup archived the SQLite file left from
+# before the move, restore wrote a data store the app never opens), and a blank path key hid itself from the check that
+# keeps a path from the archive inside the data dir. restore.sh's own variable named PLUGIN_STATE_DIR did the same to an
+# exported empty one.
+AZ="$WORK/az"
+mkdir -p "$AZ/install/data" "$AZ/bin" "$AZ/outside"
+make_fixture "$AZ/install/data/main.sqlite" "az-main"
+make_fixture "$AZ/install/data/openwa.sqlite" "az-stale"
+printf 'DATABASE_TYPE=postgres\nDATABASE_HOST=db.example.invalid\n' >"$AZ/install/data/.env.generated"
+printf '#!/bin/sh\necho dumped\n' >"$AZ/bin/pg_dump"
+chmod +x "$AZ/bin/pg_dump"
+(cd "$AZ/install" && PATH="$AZ/bin:$PATH" DATABASE_TYPE=' ' BACKUP_DIR="$AZ/out" "$BACKUP" >/dev/null) ||
+  fail "(az) backup stopped under a blank DATABASE_TYPE with PostgreSQL set in data/.env.generated"
+AZ_ARCHIVE="$(ls "$AZ"/out/openwa-backup-*.tar.gz)"
+if ! tar_lists -tzf "$AZ_ARCHIVE" -x './database.sql' || tar_lists -tzf "$AZ_ARCHIVE" -x './openwa.sqlite'; then
+  fail "(az) backup under a blank DATABASE_TYPE did not dump PostgreSQL, the type data/.env.generated sets"
+fi
+# One archive per reader: the type, a path key, and the plugin-state root that restore.sh's own variable once shadowed.
+mkdir -p "$AZ/stage-sqlite" "$AZ/stage-sessions/sessions/auth" "$AZ/stage-state/plugin-state"
+make_fixture "$AZ/stage-sqlite/main.sqlite" "az-main"
+make_fixture "$AZ/stage-sqlite/openwa.sqlite" "az-data"
+printf 'DATABASE_TYPE=postgres\n' >"$AZ/stage-sqlite/.env.generated"
+printf 'session\n' >"$AZ/stage-sessions/sessions/auth/creds"
+printf 'SESSION_DATA_PATH=%s\n' "$AZ/outside/sessions" >"$AZ/stage-sessions/.env.generated"
+printf '{}' >"$AZ/stage-state/plugin-state/registry.json"
+printf 'PLUGIN_STATE_DIR=%s\n' "$AZ/outside/state" >"$AZ/stage-state/.env.generated"
+for az_name in sqlite sessions state; do
+  tar -czf "$AZ/$az_name.tar.gz" -C "$AZ/stage-$az_name" .
+done
+# az_restore <archive> <VAR=value>...: a restore into an empty directory, its output left in OUT_AZ and its status in
+# rc.
+az_restore() {
+  rm -rf "$AZ/dst" && mkdir -p "$AZ/dst"
+  set +e
+  OUT_AZ="$(cd "$AZ/dst" && env "${@:2}" "$RESTORE" "$1" 2>&1)"
+  rc=$?
+  set -e
+}
+# az_refused <what> <message>: stopped with status 1 and the message, before it wrote anything in the target or outside
+# it.
+az_refused() {
+  if [ "$rc" -ne 1 ] || ! grep -qF "$2" <<<"$OUT_AZ" || [ -n "$(find "$AZ/dst" "$AZ/outside" -mindepth 1)" ]; then
+    fail "(az) $1 was not refused before anything was written (rc $rc): $OUT_AZ"
+  fi
+}
+az_restore "$AZ/sqlite.tar.gz" DATABASE_TYPE=' '
+az_refused "a SQLite archive under a blank DATABASE_TYPE with PostgreSQL in the archive's .env.generated" \
+  'the archive holds a SQLite data store'
+az_restore "$AZ/sessions.tar.gz" SESSION_DATA_PATH=' '
+az_refused "a sessions path outside the data dir under a blank SESSION_DATA_PATH" \
+  "SESSION_DATA_PATH from the archive's .env.generated is not inside the data directory"
+az_restore "$AZ/state.tar.gz" PLUGIN_STATE_DIR=
+az_refused "a plugin-state path outside the data dir with PLUGIN_STATE_DIR exported empty" \
+  "PLUGIN_STATE_DIR from the archive's .env.generated is not inside the data directory"
+# The blanks are the ones the app's trim() takes, matched as bytes: in a UTF-8 locale as in the C locale.
+az_loc="$(locale -a 2>/dev/null | grep -m 1 -ixE 'C\.UTF-?8|en_US\.UTF-?8')" || true
+if [ -n "$az_loc" ]; then
+  az_restore "$AZ/sessions.tar.gz" "LC_ALL=$az_loc" "SESSION_DATA_PATH=$(printf '\302\240\343\200\200')"
+  az_refused "a sessions path outside the data dir under a SESSION_DATA_PATH of Unicode blanks, with LC_ALL=$az_loc" \
+    "SESSION_DATA_PATH from the archive's .env.generated is not inside the data directory"
+fi
+# Only a value of nothing but blanks is unset: one with blanks inside is the caller's own and is used as written.
+az_restore "$AZ/sessions.tar.gz" "SESSION_DATA_PATH=$AZ/outside/a b"
+if [ "$rc" -ne 0 ] || [ "$(cat "$AZ/outside/a b/auth/creds" 2>/dev/null || true)" != session ]; then
+  fail "(az) a SESSION_DATA_PATH with a blank inside was not used as written (rc $rc): $OUT_AZ"
+fi
+pass "(az) a value of only blanks in the environment is unset in backup and restore; one with blanks inside is kept"
+
+echo ""
+echo "==> (ba) WAL-mode online backup preserves -wal frames; without sqlite3, non-empty -wal is refused"
+BA="$WORK/ba"
+mkdir -p "$BA/refuse/data" "$BA/empty-wal/data" "$BA/shim"
+populate_shim "$BA/shim"
+# Without sqlite3, plain-copying the base file alone while a non-empty -wal exists would silently
+# drop every committed WAL transaction. backup.sh must refuse and leave no archive behind.
+printf 'base-main\n' >"$BA/refuse/data/main.sqlite"
+printf 'base-data\n' >"$BA/refuse/data/openwa.sqlite"
+printf 'uncheckpointed-wal-data\n' >"$BA/refuse/data/openwa.sqlite-wal"
+set +e
+OUT_BA="$(cd "$BA/refuse" && PATH="$BA/shim" BACKUP_DIR="$BA/refuse-out" "$BACKUP" 2>&1)"
+RC_BA=$?
+set -e
+if [ "$RC_BA" -eq 0 ]; then
+  fail "(ba) backup.sh exited 0 without sqlite3 despite a non-empty -wal sidecar"
+fi
+if ! printf '%s' "$OUT_BA" | grep -q -- '-wal'; then
+  fail "(ba) refusal message does not name the -wal sidecar: $OUT_BA"
+fi
+if ! printf '%s' "$OUT_BA" | grep -q 'sqlite3'; then
+  fail "(ba) refusal message does not advise installing sqlite3: $OUT_BA"
+fi
+if [ -n "$(ls "$BA/refuse-out" 2>/dev/null || true)" ]; then
+  fail "(ba) backup.sh left an archive behind after refusing a non-empty -wal"
+fi
+# Symlinked database file whose resolved target carries a non-empty -wal sidecar must also be refused
+# without sqlite3 (SQLite writes -wal next to the symlink target, not next to the link name).
+mkdir -p "$BA/symlink/data" "$BA/symlink/real"
+printf 'base-main\n' >"$BA/symlink/data/main.sqlite"
+printf 'base-real-data\n' >"$BA/symlink/real/openwa.sqlite"
+printf 'uncheckpointed-real-wal-data\n' >"$BA/symlink/real/openwa.sqlite-wal"
+ln -s ../real/openwa.sqlite "$BA/symlink/data/openwa.sqlite"
+set +e
+OUT_BA_SYM="$(cd "$BA/symlink" && PATH="$BA/shim" BACKUP_DIR="$BA/symlink-out" "$BACKUP" 2>&1)"
+RC_BA_SYM=$?
+set -e
+if [ "$RC_BA_SYM" -eq 0 ]; then
+  fail "(ba) backup.sh exited 0 without sqlite3 despite a symlinked DB with non-empty target -wal"
+fi
+if ! printf '%s' "$OUT_BA_SYM" | grep -q -- '-wal'; then
+  fail "(ba) symlinked WAL refusal message does not name the -wal sidecar: $OUT_BA_SYM"
+fi
+if [ -n "$(ls "$BA/symlink-out" 2>/dev/null || true)" ]; then
+  fail "(ba) backup.sh left an archive behind after refusing a symlinked non-empty -wal"
+fi
+# An empty (0-byte) -wal sidecar, such as after a clean shutdown TRUNCATE checkpoint, still falls back
+# to cp with CONSISTENCY-WARNING.
+printf 'empty-main\n' >"$BA/empty-wal/data/main.sqlite"
+printf 'empty-data\n' >"$BA/empty-wal/data/openwa.sqlite"
+: >"$BA/empty-wal/data/openwa.sqlite-wal"
+(
+  cd "$BA/empty-wal"
+  PATH="$BA/shim" BACKUP_DIR="$BA/empty-out" "$BACKUP" >/dev/null
+)
+ARCHIVE_BA_EMPTY="$(ls "$BA"/empty-out/openwa-backup-*.tar.gz)"
+if ! tar_lists -tzf "$ARCHIVE_BA_EMPTY" 'CONSISTENCY-WARNING'; then
+  fail "(ba) empty -wal fallback archive missing CONSISTENCY-WARNING"
+fi
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  mkdir -p "$BA/wal-src/data" "$BA/wal-dst"
+  wal_fixture "$BA/wal-src/data/main.sqlite" "ba-wal-main"
+  wal_fixture "$BA/wal-src/data/openwa.sqlite" "ba-wal-data"
+  (
+    cd "$BA/wal-src"
+    BACKUP_DIR="$BA/wal-out" "$BACKUP" >/dev/null
+  )
+  ARCHIVE_BA="$(ls "$BA"/wal-out/openwa-backup-*.tar.gz)"
+  if tar_lists -tzf "$ARCHIVE_BA" 'CONSISTENCY-WARNING'; then
+    fail "(ba) unexpected CONSISTENCY-WARNING on WAL online backup with sqlite3"
+  fi
+  (
+    cd "$BA/wal-dst"
+    "$RESTORE" "$ARCHIVE_BA" >/dev/null
+  )
+  if [ "$(sqlite3 "$BA/wal-dst/data/main.sqlite" 'SELECT payload FROM sentinel;')" != "ba-wal-main" ]; then
+    fail "(ba) WAL online backup lost uncheckpointed main DB rows"
+  fi
+  if [ "$(sqlite3 "$BA/wal-dst/data/openwa.sqlite" 'SELECT payload FROM sentinel;')" != "ba-wal-data" ]; then
+    fail "(ba) WAL online backup lost uncheckpointed data DB rows"
+  fi
+fi
+pass "(ba) WAL online backup preserves -wal transactions and missing sqlite3 refuses non-empty -wal"
+
+echo ""
+echo "==> (bb) snapshot dir containment, preflight before data-dir snapshot, and sub-second collision naming"
+BB="$WORK/bb"
+mkdir -p "$BB/src/data" "$BB/out" "$BB/dst/data/sessions" "$BB/dst/ext-sessions"
+printf 'bb-key\n' >"$BB/src/data/.api-key"
+make_fixture "$BB/src/data/main.sqlite" "bb-main"
+make_fixture "$BB/src/data/openwa.sqlite" "bb-data"
+(
+  cd "$BB/src"
+  mkdir -p data/sessions/s1
+  printf 's1\n' >data/sessions/s1/marker
+  BACKUP_DIR="$BB/out" "$BACKUP" >/dev/null
+)
+ARCHIVE_BB="$(ls "$BB"/out/openwa-backup-*.tar.gz)"
+printf 'existing\n' >"$BB/dst/data/.api-key"
+
+# 1. OPENWA_RESTORE_SNAPSHOT_DIR inside $DATA_DIR or inside a replace_tree target must fail fast before copying.
+for bad_snap in "$BB/dst/data" "$BB/dst/data/snaps" "$BB/dst/data/sessions/snaps" "$BB/dst/ext-sessions/snaps"; do
+  set +e
+  OUT_BB="$(cd "$BB/dst" && OPENWA_DATA_DIR="$BB/dst/data" SESSION_DATA_PATH="$BB/dst/ext-sessions" OPENWA_RESTORE_SNAPSHOT_DIR="$bad_snap" "$RESTORE" "$ARCHIVE_BB" --force 2>&1)"
+  RC_BB=$?
+  set -e
+  if [ "$RC_BB" -eq 0 ]; then
+    fail "(bb) restore accepted unsafe OPENWA_RESTORE_SNAPSHOT_DIR: $bad_snap"
+  fi
+  if [ -n "$(find "$BB/dst" -name '*.pre-restore-*' -print -quit)" ]; then
+    fail "(bb) unsafe OPENWA_RESTORE_SNAPSHOT_DIR left pre-restore snapshots behind: $OUT_BB"
+  fi
+done
+
+# 2. Failed PHASE=snapshot preflight validation must NOT snapshot $DATA_DIR beforehand.
+if [ "$(id -u)" -ne 0 ]; then
+  mkdir -p "$BB/dst/ro-target"
+  chmod 0555 "$BB/dst/ro-target"
+  set +e
+  OUT_BB_RO="$(cd "$BB/dst" && OPENWA_DATA_DIR="$BB/dst/data" SESSION_DATA_PATH="$BB/dst/ro-target/sessions" "$RESTORE" "$ARCHIVE_BB" --force 2>&1)"
+  RC_BB_RO=$?
+  set -e
+  chmod 0755 "$BB/dst/ro-target"
+  if [ "$RC_BB_RO" -eq 0 ]; then
+    fail "(bb) expected unwritable target failure"
+  fi
+  if [ -n "$(find "$BB/dst" -name '*.pre-restore-*' -print -quit)" ]; then
+    fail "(bb) failed target preflight created a data-dir snapshot unnecessarily: $OUT_BB_RO"
+  fi
+fi
+
+# 3. Same-second collision creates distinct -2/-3 snapshots rather than nesting inside the first snapshot.
+mkdir -p "$BB/dst/snaps"
+BB_TS="$(date +%Y%m%d-%H%M%S)"
+# Pre-populate the current second and next second so even a 1s clock tick across second boundary triggers collision.
+for offset in 0 1 2; do
+  TS_CANDIDATE="$(node -e "const d = new Date(Date.now() + $offset * 1000); const p = n => String(n).padStart(2,'0'); console.log(d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'-'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds()));")"
+  mkdir -p "$BB/dst/snaps/data.pre-restore-$TS_CANDIDATE"
+done
+(
+  cd "$BB/dst"
+  OPENWA_DATA_DIR="$BB/dst/data" OPENWA_RESTORE_SNAPSHOT_DIR="$BB/dst/snaps" "$RESTORE" "$ARCHIVE_BB" --force >/dev/null
+)
+if [ -z "$(ls -d "$BB/dst/snaps"/data.pre-restore-*-2 2>/dev/null || true)" ]; then
+  fail "(bb) same-second restore did not create -2 snapshot directory: $(ls -A "$BB/dst/snaps")"
+fi
+if [ -d "$BB/dst/snaps/data.pre-restore-$BB_TS/data" ]; then
+  fail "(bb) same-second restore nested data inside existing snapshot directory"
+fi
+pass "(bb) snapshot dir containment, preflight order, and -2/-3 collision naming verified"
 
 echo ""
 echo "All smoke tests passed!"

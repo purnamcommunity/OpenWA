@@ -37,6 +37,8 @@ class FakeSock extends EventEmitter {
     removeAllListeners: (event: string) => {
       this.emitter.removeAllListeners(event);
     },
+    // Whether the event buffer is open, which holds the replay of an own app-state write until it flushes.
+    isBuffering: jest.fn(() => false),
   };
   public emitter = new EventEmitter();
   // Baileys builds sock.user from creds.me, which logout() reads live: a fake set up as linked has both.
@@ -182,6 +184,14 @@ jest.mock('@whiskeysockets/baileys', () => ({
     }
   },
   getContentType: jest.fn(() => 'conversation'),
+  // What Baileys counts as unread: every message of these tests is real content, so this is identity-true.
+  isRealMessage: jest.fn(() => true),
+  // The chat a message is filed under: its own, or the sender's for a broadcast list; without a device suffix.
+  getChatId: jest.fn(
+    ({ remoteJid, participant, fromMe }: { remoteJid: string; participant?: string; fromMe?: boolean }) =>
+      remoteJid.endsWith('@broadcast') && remoteJid !== 'status@broadcast' && !fromMe ? participant : remoteJid,
+  ),
+  jidNormalizedUser: jest.fn((jid: string) => jid.replace(/:\d+@/, '@').replace('@c.us', '@s.whatsapp.net')),
   // The adapter now downloads via 'stream' mode, so resolve to an async-iterable of chunks (factory is
   // hoisted above imports, so this stays inline; tests override with the `streamOf` helper below).
   downloadMediaMessage: jest.fn(() =>
@@ -207,7 +217,7 @@ jest.mock('@whiskeysockets/baileys', () => ({
         Type: { REVOKE: 0, MESSAGE_EDIT: 14 },
       },
     },
-    // namespace proto.PinInChat { enum Type } — WAProto/index.d.ts:10355-10361
+    // namespace proto.PinInChat { enum Type } — WAProto/index.d.ts
     PinInChat: { Type: { UNKNOWN_TYPE: 0, PIN_FOR_ALL: 1, UNPIN_FOR_ALL: 2 } },
   },
 }));
@@ -244,10 +254,14 @@ import { EngineTransportError } from '../../common/errors/engine-transport.error
 import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
 import { LidNotMappedError } from '../../common/errors/lid-not-mapped.error';
 import { countsTowardSendBreaker, sentNothing } from '../../modules/message/send-pacing.service';
+import { markEngineSendFailure } from '../../common/errors/engine-send-failure';
+import { provesNothingSent } from '../../common/errors/engine-not-sent.error';
+import { sendFailureProvesNothingSent } from '../../modules/message/idempotency/run-idempotent-send';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import { describeAudio, describeVideo } from './baileys-audio-probe';
 import * as safeLinkPreview from './safe-link-preview';
 import sharp from 'sharp';
+import { waitUntil } from '../../../test/helpers/wait-until';
 
 const fakeStore = {
   put: jest.fn().mockResolvedValue(undefined),
@@ -328,6 +342,9 @@ const SVG_BYTES = Buffer.from(
  */
 const safeSendOptions = (): unknown =>
   expect.objectContaining({ getUrlInfo: expect.any(Function) as unknown }) as unknown;
+
+/** The upload option every send hands the library, so a failed upload is known to have sent nothing. */
+const uploadOption = (): unknown => ({ upload: expect.any(Function) as unknown });
 
 function firstEditedMessage(callback: jest.Mock): EditedMessage {
   const calls = callback.mock.calls as Array<[EditedMessage]>;
@@ -873,6 +890,30 @@ describe('BaileysAdapter lifecycle & status', () => {
       await new Promise(r => setImmediate(r)); // let the async connect() body reach makeWASocket
       expect(makeWASocket).toHaveBeenCalledTimes(1);
       expect(onDisconnected).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('on a recoverable close: forgets the replays it awaited of the socket that closed', async () => {
+    const adapter = newAdapter();
+    await adapter.initialize(noopCallbacks({}));
+    const forget = jest.spyOn(
+      (adapter as unknown as { sessionStore: { dropReadEchoes(): void } }).sessionStore,
+      'dropReadEchoes',
+    );
+    forget.mockClear();
+
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    try {
+      fakeSock.fire('connection.update', {
+        connection: 'close',
+        lastDisconnect: { error: { output: { statusCode: 515 } } },
+      });
+      expect(forget).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(2_000);
+      await new Promise(r => setImmediate(r)); // let the async connect() body reach makeWASocket
+      expect(forget).toHaveBeenCalledTimes(1);
     } finally {
       jest.useRealTimers();
     }
@@ -2214,9 +2255,13 @@ describe('BaileysAdapter location + contact + poll sends', () => {
       description: 'Office',
       address: '1 Main St',
     });
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      location: { degreesLatitude: 24.12, degreesLongitude: 55.11, name: 'Office', address: '1 Main St' },
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        location: { degreesLatitude: 24.12, degreesLongitude: 55.11, name: 'Office', address: '1 Main St' },
+      },
+      uploadOption(),
+    );
   });
 
   it('sendContactMessage builds a vCard with the waid', async () => {
@@ -2252,9 +2297,13 @@ describe('BaileysAdapter location + contact + poll sends', () => {
   it('sendPollMessage maps name/values and defaults to single choice (selectableCount 1)', async () => {
     const adapter = await ready();
     await adapter.sendPollMessage('120363000@g.us', { name: 'Where?', options: ['Park', 'Beach'] });
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('120363000@g.us', {
-      poll: { name: 'Where?', values: ['Park', 'Beach'], selectableCount: 1 },
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '120363000@g.us',
+      {
+        poll: { name: 'Where?', values: ['Park', 'Beach'], selectableCount: 1 },
+      },
+      uploadOption(),
+    );
   });
 
   it('sendPollMessage uses selectableCount 0 (no limit) when multiple answers are allowed', async () => {
@@ -2264,9 +2313,13 @@ describe('BaileysAdapter location + contact + poll sends', () => {
       options: ['Cheese', 'Ham', 'Olives'],
       allowMultipleAnswers: true,
     });
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('120363000@g.us', {
-      poll: { name: 'Toppings?', values: ['Cheese', 'Ham', 'Olives'], selectableCount: 0 },
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '120363000@g.us',
+      {
+        poll: { name: 'Toppings?', values: ['Cheese', 'Ham', 'Olives'], selectableCount: 0 },
+      },
+      uploadOption(),
+    );
   });
 });
 
@@ -4618,6 +4671,39 @@ describe('BaileysAdapter inbound fan-out', () => {
       // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
       expect(onMessage.mock.calls[0][0]).toMatchObject({ type: 'text', body: 'hello group' });
     });
+
+    // Baileys merges the decrypted parts of one stanza in the order the stanza lists them, and its content type is the
+    // first key that contains `Message`: the fast-ratchet distribution does, so it can stand for a real message.
+    it.each<[string, Record<string, unknown>]>([
+      [
+        'before',
+        { fastRatchetKeySenderKeyDistributionMessage: { groupId: '120363@g.us' }, conversation: 'hello group' },
+      ],
+      [
+        'after',
+        { conversation: 'hello group', fastRatchetKeySenderKeyDistributionMessage: { groupId: '120363@g.us' } },
+      ],
+    ])(
+      'emits a real message that merged with a fast-ratchet distribution %s it as the text it is',
+      async (_where, message) => {
+        const { onMessage } = await fireLive('FR_TEXT', message);
+        expect(onMessage).toHaveBeenCalledTimes(1);
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        expect(onMessage.mock.calls[0][0]).toMatchObject({ type: 'text', body: 'hello group' });
+      },
+    );
+
+    it('drops a pin that merged after a fast-ratchet distribution as it drops a pin', async () => {
+      const { onMessage, debug } = await fireLive('FR_PIN', {
+        fastRatchetKeySenderKeyDistributionMessage: { groupId: '120363@g.us' },
+        pinInChatMessage: { key: { id: 'X' } },
+      });
+      expect(onMessage).not.toHaveBeenCalled();
+      expect(debug).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ action: 'baileys_drop_non_content', contentType: 'pinInChatMessage' }),
+      );
+    });
   });
 
   it('learns the lid pair carried on a dropped sender-key distribution before dropping it (#1568)', async () => {
@@ -4738,11 +4824,15 @@ describe('BaileysAdapter media sends', () => {
       data: buf,
       caption: 'hi',
     });
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      image: buf,
-      caption: 'hi',
-      mimetype: 'image/png',
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        image: buf,
+        caption: 'hi',
+        mimetype: 'image/png',
+      },
+      uploadOption(),
+    );
     expect(res).toEqual({ id: 'M1', timestamp: 1700000005 });
   });
 
@@ -4757,6 +4847,7 @@ describe('BaileysAdapter media sends', () => {
     expect(fakeSock.sendMessage).toHaveBeenCalledWith(
       '120@g.us',
       expect.objectContaining({ mentions: ['62811@s.whatsapp.net'] }),
+      uploadOption(),
     );
   });
 
@@ -4769,12 +4860,16 @@ describe('BaileysAdapter media sends', () => {
       caption: 'a document',
     });
     expect(loadRemoteMediaBuffer).not.toHaveBeenCalled();
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      document: Buffer.from('PDFDATA'),
-      mimetype: 'application/pdf',
-      fileName: 'doc.pdf',
-      caption: 'a document',
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        document: Buffer.from('PDFDATA'),
+        mimetype: 'application/pdf',
+        fileName: 'doc.pdf',
+        caption: 'a document',
+      },
+      uploadOption(),
+    );
   });
 
   it('fetches a URL data string through the SSRF-guarded loader', async () => {
@@ -4782,12 +4877,16 @@ describe('BaileysAdapter media sends', () => {
     const adapter = await ready();
     await adapter.sendVideoMessage('628111@s.whatsapp.net', { mimetype: '', data: 'https://cdn.example/v.mp4' });
     expect(loadRemoteMediaBuffer).toHaveBeenCalledWith('https://cdn.example/v.mp4', undefined);
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      video: Buffer.from([9]),
-      caption: undefined,
-      mimetype: 'video/mp4',
-      jpegThumbnail: null,
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        video: Buffer.from([9]),
+        caption: undefined,
+        mimetype: 'video/mp4',
+        jpegThumbnail: null,
+      },
+      uploadOption(),
+    );
   });
 
   // Baileys runs ffmpeg through a shell on the file itself whenever the content has no thumbnail.
@@ -4815,12 +4914,16 @@ describe('BaileysAdapter media sends', () => {
     const adapter = await ready();
     await adapter.sendAudioMessage('628111@s.whatsapp.net', { mimetype: 'audio/mp4', data: Buffer.from([1]) });
     // seconds is always present: an undefined one is what makes Baileys read the file itself.
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      audio: Buffer.from([1]),
-      mimetype: 'audio/mp4',
-      ptt: false,
-      seconds: 0,
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        audio: Buffer.from([1]),
+        mimetype: 'audio/mp4',
+        ptt: false,
+        seconds: 0,
+      },
+      uploadOption(),
+    );
   });
 
   it('sendAudioMessage hands Baileys the duration and waveform read in the child, so it reads nothing itself', async () => {
@@ -4833,13 +4936,17 @@ describe('BaileysAdapter media sends', () => {
       ptt: true,
     });
     expect(describeAudio).toHaveBeenLastCalledWith(Buffer.from([1]), true);
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      audio: Buffer.from([1]),
-      mimetype: 'audio/ogg; codecs=opus',
-      ptt: true,
-      seconds: 7,
-      waveform,
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        audio: Buffer.from([1]),
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true,
+        seconds: 7,
+        waveform,
+      },
+      uploadOption(),
+    );
   });
 
   /**
@@ -4858,6 +4965,7 @@ describe('BaileysAdapter media sends', () => {
     expect(fakeSock.sendMessage).toHaveBeenCalledWith(
       '120@g.us',
       expect.objectContaining({ mentions: ['62811@s.whatsapp.net'] }),
+      uploadOption(),
     );
   });
 
@@ -4868,12 +4976,16 @@ describe('BaileysAdapter media sends', () => {
       data: Buffer.from([1]),
       ptt: true,
     });
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      audio: Buffer.from([1]),
-      mimetype: 'audio/ogg; codecs=opus',
-      ptt: true,
-      seconds: 0,
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        audio: Buffer.from([1]),
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true,
+        seconds: 0,
+      },
+      uploadOption(),
+    );
   });
 
   it('sendStickerMessage sends the sticker buffer', async () => {
@@ -4887,7 +4999,7 @@ describe('BaileysAdapter media sends', () => {
       'base64',
     );
     await adapter.sendStickerMessage('628111@s.whatsapp.net', { mimetype: 'image/webp', data: webp });
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', { sticker: webp });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', { sticker: webp }, uploadOption());
   });
 
   it('sendStickerMessage tags the participants it was given', async () => {
@@ -4904,10 +5016,14 @@ describe('BaileysAdapter media sends', () => {
       data: webp,
       mentions: ['62811@c.us'],
     });
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      sticker: webp,
-      mentions: ['62811@s.whatsapp.net'],
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        sticker: webp,
+        mentions: ['62811@s.whatsapp.net'],
+      },
+      uploadOption(),
+    );
   });
 
   // A URL send is made by the gateway, not by the socket, so nothing else makes it follow the
@@ -4983,11 +5099,15 @@ describe('BaileysAdapter media sends', () => {
     });
     const adapter = await ready();
     await adapter.sendImageMessage('628111@s.whatsapp.net', { mimetype: 'image/png', data: 'https://cdn.example/x' });
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      image: Buffer.from([1]),
-      caption: undefined,
-      mimetype: 'image/png',
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        image: Buffer.from([1]),
+        caption: undefined,
+        mimetype: 'image/png',
+      },
+      uploadOption(),
+    );
   });
 
   it('media sends reject with EngineNotReadyError before the connection is open', async () => {
@@ -5204,9 +5324,13 @@ describe('BaileysAdapter store-backed ops', () => {
         { text: 'got it', linkPreview: null },
         expect.objectContaining({ quoted: listMsg }),
       );
-      expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-        react: { text: '👍', key: listMsg.key },
-      });
+      expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+        '628111@s.whatsapp.net',
+        {
+          react: { text: '👍', key: listMsg.key },
+        },
+        uploadOption(),
+      );
     });
 
     it('is still found through the list id, and not through another chat', async () => {
@@ -5221,7 +5345,7 @@ describe('BaileysAdapter store-backed ops', () => {
     fakeStore.getMessage.mockResolvedValue(stored);
     const adapter = await ready();
     await adapter.forwardMessage('628111@s.whatsapp.net', '628222@s.whatsapp.net', 'TARGET');
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628222@s.whatsapp.net', { forward: stored });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628222@s.whatsapp.net', { forward: stored }, uploadOption());
   });
 
   // fromChatId was accepted and ignored: any stored id forwarded from any claimed source, while
@@ -5242,9 +5366,13 @@ describe('BaileysAdapter store-backed ops', () => {
     fakeStore.getMessage.mockResolvedValue(stored);
     const adapter = await ready();
     await adapter.reactToMessage('628111@s.whatsapp.net', 'TARGET', '👍');
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      react: { text: '👍', key: stored.key },
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        react: { text: '👍', key: stored.key },
+      },
+      uploadOption(),
+    );
   });
 
   it("starMessage carries the stored key's fromMe, not just the id", async () => {
@@ -5282,11 +5410,15 @@ describe('BaileysAdapter store-backed ops', () => {
     await adapter.pinMessage('628111@s.whatsapp.net', 'TARGET', 604800);
     // PIN_FOR_ALL (1) on a sendMessage — NOT chatModify({pin}), which pins the CHAT in the chat
     // list. The two are entirely different features that happen to share the word "pin".
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      pin: stored.key,
-      type: 1,
-      time: 604800,
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        pin: stored.key,
+        type: 1,
+        time: 604800,
+      },
+      uploadOption(),
+    );
     expect(fakeSock.chatModify).not.toHaveBeenCalled();
   });
 
@@ -5294,10 +5426,14 @@ describe('BaileysAdapter store-backed ops', () => {
     fakeStore.getMessage.mockResolvedValue(stored);
     const adapter = await ready();
     await adapter.unpinMessage('628111@s.whatsapp.net', 'TARGET');
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      pin: stored.key,
-      type: 2,
-    });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        pin: stored.key,
+        type: 2,
+      },
+      uploadOption(),
+    );
   });
 
   it('pinMessage 404s when the message is not in the store', async () => {
@@ -5312,7 +5448,11 @@ describe('BaileysAdapter store-backed ops', () => {
     fakeStore.getMessage.mockResolvedValue(ownStored);
     const adapter = await ready();
     await adapter.deleteMessage('628111@s.whatsapp.net', 'TARGET', true);
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', { delete: ownStored.key });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      { delete: ownStored.key },
+      uploadOption(),
+    );
   });
 
   it('deleteMessage for everyone of a message the account received deletes it for the account only', async () => {
@@ -5350,7 +5490,7 @@ describe('BaileysAdapter store-backed ops', () => {
       withSelfRole('admin');
       const adapter = await ready();
       await adapter.deleteMessage(GROUP, 'TARGET', true);
-      expect(fakeSock.sendMessage).toHaveBeenCalledWith(GROUP, { delete: memberMessage.key });
+      expect(fakeSock.sendMessage).toHaveBeenCalledWith(GROUP, { delete: memberMessage.key }, uploadOption());
       expect(fakeSock.chatModify).not.toHaveBeenCalled();
     });
 
@@ -5387,7 +5527,7 @@ describe('BaileysAdapter store-backed ops', () => {
       withLidAddressedSelfRole('admin');
       const adapter = await ready();
       await adapter.deleteMessage(GROUP, 'TARGET', true);
-      expect(fakeSock.sendMessage).toHaveBeenCalledWith(GROUP, { delete: lidMemberMessage.key });
+      expect(fakeSock.sendMessage).toHaveBeenCalledWith(GROUP, { delete: lidMemberMessage.key }, uploadOption());
       expect(fakeSock.chatModify).not.toHaveBeenCalled();
     });
 
@@ -5411,7 +5551,7 @@ describe('BaileysAdapter store-backed ops', () => {
       withLidAddressedSelfRole(null);
       const adapter = await ready();
       await adapter.deleteMessage(GROUP, 'TARGET', true);
-      expect(fakeSock.sendMessage).toHaveBeenCalledWith(GROUP, { delete: lidMemberMessage.key });
+      expect(fakeSock.sendMessage).toHaveBeenCalledWith(GROUP, { delete: lidMemberMessage.key }, uploadOption());
       expect(fakeSock.chatModify).not.toHaveBeenCalled();
     });
   });
@@ -5423,7 +5563,7 @@ describe('BaileysAdapter store-backed ops', () => {
     expect(fakeSock.sendMessage).toHaveBeenCalledWith(
       '628111@s.whatsapp.net',
       expect.objectContaining({ image: Buffer.from([1]) }),
-      { ephemeralExpiration: 86400 },
+      { ephemeralExpiration: 86400, upload: expect.any(Function) as unknown },
     );
   });
 
@@ -5445,10 +5585,59 @@ describe('BaileysAdapter store-backed ops', () => {
     fakeSock.fire('chats.upsert', [{ id: '628111@s.whatsapp.net', ephemeralExpiration: 604800 }]);
     await adapter.reactToMessage('628111@s.whatsapp.net', 'TARGET', '👍');
     await adapter.deleteMessage('628111@s.whatsapp.net', 'TARGET', true);
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      react: { text: '👍', key: ownStored.key },
-    });
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', { delete: ownStored.key });
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        react: { text: '👍', key: ownStored.key },
+      },
+      uploadOption(),
+    );
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      { delete: ownStored.key },
+      uploadOption(),
+    );
+  });
+
+  it('omits ephemeralExpiration on react/pin/delete/edit while retaining it on content sends after regional JID canonicalization', async () => {
+    const rawChat = '5491112345678@c.us';
+    const preCanonical = '5491112345678@s.whatsapp.net';
+    const canonical = '541112345678@s.whatsapp.net';
+    const regionalStored = {
+      key: { id: 'TARGET', remoteJid: preCanonical, fromMe: true },
+      message: { conversation: 'hi' },
+      messageTimestamp: '1700000000',
+    };
+    fakeStore.getMessage.mockResolvedValue(regionalStored);
+    fakeSock.onWhatsApp.mockImplementation((jid: string) =>
+      Promise.resolve([{ jid: jid === preCanonical ? canonical : jid, exists: true }]),
+    );
+
+    const adapter = await ready();
+    fakeSock.fire('chats.upsert', [{ id: canonical, ephemeralExpiration: 86400 }]);
+
+    await adapter.reactToMessage(rawChat, 'TARGET', '👍');
+    await adapter.pinMessage(rawChat, 'TARGET', 604800);
+    await adapter.unpinMessage(rawChat, 'TARGET');
+    await adapter.editMessage(rawChat, 'TARGET', 'edited');
+    await adapter.deleteMessage(rawChat, 'TARGET', true);
+    await adapter.sendTextMessage(rawChat, 'hola');
+    await adapter.sendImageMessage(rawChat, { mimetype: 'image/png', data: Buffer.from([1]) });
+
+    const calls = fakeSock.sendMessage.mock.calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>;
+    expect(calls).toHaveLength(7);
+
+    // Non-content sends (react, pin, unpin, edit, delete) must never inherit ephemeralExpiration.
+    for (let i = 0; i < 5; i++) {
+      expect(calls[i][0]).toBe(canonical);
+      expect(calls[i][2].ephemeralExpiration).toBeUndefined();
+    }
+
+    // Content sends (sendTextMessage and sendImageMessage via sendContent) retain ephemeralExpiration.
+    expect(calls[5][0]).toBe(canonical);
+    expect(calls[5][2].ephemeralExpiration).toBe(86400);
+    expect(calls[6][0]).toBe(canonical);
+    expect(calls[6][2].ephemeralExpiration).toBe(86400);
   });
 
   it('throws when the referenced message is not in the store', async () => {
@@ -5699,7 +5888,11 @@ describe('BaileysAdapter store-backed ops', () => {
     fakeSock.signalRepository = { lidMapping: { getLIDForPN: jest.fn().mockResolvedValue('484848@lid') } };
     const adapter = await ready();
     await adapter.pinMessage('628111@c.us', 'TARGET', 86400);
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('484848@lid', expect.objectContaining({ pin: stored.key }));
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '484848@lid',
+      expect.objectContaining({ pin: stored.key }),
+      uploadOption(),
+    );
   });
 
   // newsletterMetadata hands back the raw GraphQL node (parseNewsletterMetadata returns it as-is), nested
@@ -6137,7 +6330,7 @@ describe('BaileysAdapter group management', () => {
     const adapter = await ready();
     expect((await adapter.getGroupInfo('123-456@g.us'))?.id).toBe('123-456@g.us');
     // Baileys carries a server refusal as Boom with the numeric WA code on `data`
-    // (assertNodeErrorFree, WABinary/generic-utils.js:57).
+    // (assertNodeErrorFree, WABinary/generic-utils.js).
     fakeSock.groupMetadata.mockRejectedValueOnce(Object.assign(new Error('item-not-found'), { data: 404 }));
     expect(await adapter.getGroupInfo('x@g.us')).toBeNull();
     fakeSock.groupMetadata.mockRejectedValueOnce(Object.assign(new Error('not-authorized'), { data: 401 }));
@@ -6920,7 +7113,7 @@ describe('BaileysAdapter group events (group-participants.update / groups.update
   it('skips full-metadata snapshots (groupFetchAllParticipating emits them via the same event)', async () => {
     const { onGroupEvent } = await readyWithGroupEvents();
 
-    // The extractGroupMetadata shape emitted by groupFetchAllParticipating (Socket/groups.js:56) —
+    // The extractGroupMetadata shape emitted by groupFetchAllParticipating (Socket/groups.js) —
     // fired on every connect (hydrateNames) and every REST getGroups(). Treating it as a delta
     // would flood consumers with bogus group.update webhooks on each reconnect / GET /groups.
     fakeSock.fire('groups.update', [
@@ -7230,7 +7423,7 @@ describe('BaileysAdapter call events (call offer) + rejectCall', () => {
     const { adapter, onCall } = await readyWithCallEvents();
 
     // Baileys replays offers for calls missed while offline with offline: true
-    // (messages-recv.js:1458); the call is long dead, so rejecting it later must 404.
+    // (messages-recv.js); the call is long dead, so rejecting it later must 404.
     fakeSock.fire('call', [offer({ offline: true })]);
 
     expect(onCall).not.toHaveBeenCalled();
@@ -7817,7 +8010,7 @@ describe('BaileysAdapter contact + chat reads', () => {
             waMessageId: string,
             check: (row: Message) => boolean = () => true,
           ): Promise<Message> => {
-            const deadline = performance.now() + 5000;
+            const deadline = performance.now() + 30_000;
             for (;;) {
               const row = await ds.getRepository(Message).findOneBy({ waMessageId });
               if (row && check(row)) return row;
@@ -7867,6 +8060,8 @@ describe('BaileysAdapter contact + chat reads', () => {
             ],
           });
           await settle();
+          // The message is handed on after lookups that take a PostgreSQL round trip each: wait for it, not for turns.
+          await waitUntil(() => onMessage.mock.calls.some(([message]) => message.id === 'CACHE_ONLY'));
           fakeSock.fire('chats.upsert', [{ id: '111@lid' }, { id: '628111@s.whatsapp.net' }]);
           const chats = await adapter.getChats();
           const fence = new ChatScopeService(store);
@@ -7882,7 +8077,7 @@ describe('BaileysAdapter contact + chat reads', () => {
             false,
           );
           await drainProjection();
-          const persisted = await ds.getRepository(Message).findOneByOrFail({ waMessageId: 'CACHE_ONLY' });
+          const persisted = await rowEventually('CACHE_ONLY');
           expect(persisted.chatId).toBe('111@lid');
           expect(await fence.filter({ allowedChats: ['628111@c.us'] }, [persisted], message => message.chatId)).toEqual(
             [],
@@ -7990,6 +8185,9 @@ describe('BaileysAdapter contact + chat reads', () => {
           editLegacy('EDIT_FOREIGN');
           await drainProjection();
           expect((await ds.getRepository(Message).findOneByOrFail({ waMessageId: 'LEGACY' })).body).toBe('old body');
+          await waitUntil(
+            async () => (await adapter.getChats()).find(chat => chat.id === '628111@c.us')?.lastMessage === 'old body',
+          );
           expect((await adapter.getChats()).find(chat => chat.id === '628111@c.us')?.lastMessage).toBe('old body');
           if (source === 'contact') {
             expect(await adapter.getContactById('628111@c.us')).toBeNull();
@@ -8129,6 +8327,8 @@ describe('BaileysAdapter contact + chat reads', () => {
           }
         }
       },
+      // Room for the deadline waits above on a busy runner.
+      120_000,
     );
   });
 
@@ -8263,6 +8463,829 @@ describe('BaileysAdapter sendSeen + markUnread + deleteChat', () => {
     expect(fakeSock.readMessages).toHaveBeenCalledWith([
       { remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'M1' },
     ]);
+  });
+
+  it('sendSeen sets the unread count the chat is listed with back to zero, with no second write', async () => {
+    // Baileys raises the count with each message received and lowers it for no receipt this session
+    // sends, so the chat stayed listed as unread after a read that answered success.
+    const adapter = await readyWithMessage();
+    fakeSock.fire('chats.update', [{ id: '628111@s.whatsapp.net', unreadCount: 1 }]);
+    expect(await adapter.getChats()).toEqual([expect.objectContaining({ unreadCount: 1 })]);
+    expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+    expect(await adapter.getChats()).toEqual([expect.objectContaining({ unreadCount: 0 })]);
+    expect(fakeSock.chatModify).not.toHaveBeenCalled();
+  });
+
+  describe('a chat update that counts a message that is none of its own', () => {
+    // Baileys raises the count for whatever is not a plain reaction, edit, delete or poll vote, and hands the message
+    // it counted along with the update.
+    const counting = (content: Record<string, unknown>, unreadCount = 1, beside: Record<string, unknown> = {}) => [
+      {
+        id: '628111@s.whatsapp.net',
+        unreadCount,
+        conversationTimestamp: 1700000040,
+        messages: [
+          {
+            message: {
+              key: { remoteJid: '628111@s.whatsapp.net', fromMe: beside.fromMe === true, id: 'X1' },
+              message: content,
+              ...(beside.stub ? { messageStubType: beside.stub } : {}),
+            },
+          },
+        ],
+      },
+    ];
+    const unread = async (adapter: BaileysAdapter): Promise<number | undefined> =>
+      (await adapter.getChats()).find(chat => chat.id === '628111@c.us')?.unreadCount;
+    // Baileys merges the decrypted parts of one stanza in the order the stanza lists them.
+    const pinAfterDistribution = { fastRatchetKeySenderKeyDistributionMessage: {}, pinInChatMessage: {} };
+
+    beforeEach(() => {
+      jest
+        .requireMock<Record<string, jest.Mock>>('@whiskeysockets/baileys')
+        .getContentType.mockImplementation(realGetContentType);
+    });
+
+    it.each([
+      ['an encrypted edit', { secretEncryptedMessage: {} }],
+      ['an encrypted reaction', { encReactionMessage: {} }],
+      ['a pin', { pinInChatMessage: {} }],
+      ['a keep-in-chat toggle', { keepInChatMessage: {} }],
+      ['an album header', { albumMessage: {} }],
+      ['an event RSVP', { encEventResponseMessage: {} }],
+      ['an encrypted comment', { encCommentMessage: {} }],
+      // The plain sender-key distribution is skipped by Baileys' own content type; this one is not.
+      ['a fast-ratchet sender-key distribution', { fastRatchetKeySenderKeyDistributionMessage: {} }],
+      ['a pin that merged after a fast-ratchet sender-key distribution', pinAfterDistribution],
+    ])('does not list the chat as unread for %s', async (_what, content) => {
+      const adapter = await readyWithMessage();
+
+      fakeSock.fire('chats.update', counting(content));
+
+      expect(await unread(adapter)).toBe(0);
+    });
+
+    it('lists the chat as unread for a message of its own', async () => {
+      const adapter = await readyWithMessage();
+
+      fakeSock.fire('chats.update', counting({ conversation: 'new' }));
+
+      expect(await unread(adapter)).toBe(1);
+    });
+
+    it.each([
+      ['before', { fastRatchetKeySenderKeyDistributionMessage: {}, conversation: 'new' }],
+      ['after', { conversation: 'new', fastRatchetKeySenderKeyDistributionMessage: {} }],
+    ])(
+      'lists the chat as unread for a text that merged with a fast-ratchet distribution %s it',
+      async (_where, content) => {
+        const adapter = await readyWithMessage();
+
+        fakeSock.fire('chats.update', counting(content));
+
+        expect(await unread(adapter)).toBe(1);
+      },
+    );
+
+    it.each([
+      ['a count', 1],
+      ['a mark set by hand', -1],
+    ])('leaves %s the chat already has', async (_what, held) => {
+      const adapter = await readyWithMessage();
+      fakeSock.fire('chats.update', [{ id: '628111@s.whatsapp.net', unreadCount: held }]);
+
+      fakeSock.fire('chats.update', counting({ secretEncryptedMessage: {} }));
+
+      expect(await unread(adapter)).toBe(held);
+    });
+
+    // The library adds the counts of one flush and emits its chat updates before its messages, so an update that counts
+    // several messages is settled with the messages that follow it in the same turn.
+    const PIN = { pinInChatMessage: {} };
+    const flush = (...received: Array<[Record<string, unknown>, string?]>) => ({
+      type: 'notify',
+      messages: received.map(([content, chat = '628111@s.whatsapp.net'], i) => ({
+        key: { remoteJid: chat, fromMe: false, id: `F${i}` },
+        message: content,
+        messageTimestamp: 1700000040 + i,
+      })),
+    });
+    const settled = () => new Promise(resolve => setImmediate(resolve));
+
+    it('leaves the count of an update that adds up several messages when no message of the flush says which', async () => {
+      const adapter = await readyWithMessage();
+
+      fakeSock.fire('chats.update', counting({ secretEncryptedMessage: {} }, 2));
+      await settled();
+
+      expect(await unread(adapter)).toBe(2);
+    });
+
+    it('does not list the chat as unread for several messages of no content that arrive in one flush', async () => {
+      const adapter = await readyWithMessage();
+
+      fakeSock.fire('chats.update', counting(PIN, 3));
+      fakeSock.fire('messages.upsert', flush([PIN], [{ encReactionMessage: {} }], [PIN]));
+      await settled();
+
+      expect(await unread(adapter)).toBe(0);
+    });
+
+    it('keeps the sum when a message of its own arrives in the flush beside them', async () => {
+      const adapter = await readyWithMessage();
+
+      fakeSock.fire('chats.update', counting(PIN, 3));
+      fakeSock.fire('messages.upsert', flush([PIN], [{ conversation: 'new' }], [PIN]));
+      await settled();
+
+      expect(await unread(adapter)).toBe(3);
+    });
+
+    it('counts only the messages of the chat the update names', async () => {
+      const adapter = await readyWithMessage();
+
+      fakeSock.fire('chats.update', counting(PIN, 2));
+      fakeSock.fire('messages.upsert', flush([PIN], [{ conversation: 'elsewhere' }, '628222@s.whatsapp.net'], [PIN]));
+      await settled();
+
+      expect(await unread(adapter)).toBe(0);
+    });
+
+    it('keeps a count that the messages of the flush do not add up to', async () => {
+      const adapter = await readyWithMessage();
+
+      fakeSock.fire('chats.update', counting(PIN, 2));
+      fakeSock.fire('messages.upsert', flush([PIN]));
+      await settled();
+
+      expect(await unread(adapter)).toBe(2);
+    });
+
+    // The library lowers the sum of a flush for a message the account read on another device, and takes the count away
+    // when it reaches zero: the chat still holds no message of its own, so it takes no time and no message from the pins.
+    const timeOf = async (adapter: BaileysAdapter) =>
+      (await adapter.getChats()).find(chat => chat.id === '628111@c.us')?.timestamp;
+
+    it('does not list the chat as unread when the account read one of the messages of no content', async () => {
+      const adapter = await readyWithMessage();
+      const before = await timeOf(adapter);
+
+      fakeSock.fire('chats.update', counting(PIN, 2));
+      fakeSock.fire('messages.upsert', flush([PIN], [PIN], [PIN]));
+      await settled();
+
+      expect(await unread(adapter)).toBe(0);
+      expect(await timeOf(adapter)).toBe(before);
+    });
+
+    it('does not date the chat by a message of no content whose count the library took away', async () => {
+      const adapter = await readyWithMessage();
+      const before = await timeOf(adapter);
+      const [update] = counting(PIN);
+      delete (update as { unreadCount?: number }).unreadCount;
+
+      fakeSock.fire('chats.update', [update]);
+      fakeSock.fire('messages.upsert', flush([PIN]));
+      await settled();
+
+      expect(await unread(adapter)).toBe(0);
+      expect(await timeOf(adapter)).toBe(before);
+    });
+
+    it('keeps a mark set on the phone but not the time of the messages of no content after it', async () => {
+      const adapter = await readyWithMessage();
+      const before = await timeOf(adapter);
+
+      fakeSock.fire('chats.update', counting(PIN, -1));
+      fakeSock.fire('messages.upsert', flush([PIN]));
+      await settled();
+
+      expect(await unread(adapter)).toBe(-1);
+      expect(await timeOf(adapter)).toBe(before);
+    });
+
+    it('does not count the messages of one flush for the update of the next', async () => {
+      const adapter = await readyWithMessage();
+      fakeSock.fire('chats.update', counting(PIN, 2));
+      fakeSock.fire('messages.upsert', flush([PIN], [PIN]));
+      await settled();
+      expect(await unread(adapter)).toBe(0);
+
+      fakeSock.fire('chats.update', counting(PIN, 2));
+      fakeSock.fire('messages.upsert', flush([{ conversation: 'elsewhere' }, '628222@s.whatsapp.net']));
+      await settled();
+
+      expect(await unread(adapter)).toBe(2);
+    });
+
+    // Baileys adds a received message's count and keeps the last message of the flush alone: after a contact's text,
+    // the account's own pin or edit leaves the text's count beside a message that was never counted.
+    it.each([
+      ["the account's own pin", { pinInChatMessage: {} }, { fromMe: true }],
+      ["the account's own encrypted edit", { secretEncryptedMessage: {} }, { fromMe: true }],
+      ['a message with a stub type', { secretEncryptedMessage: {} }, { stub: 2 }],
+    ])('keeps a count of one that stands beside %s, which Baileys did not count', async (_what, content, beside) => {
+      const adapter = await readyWithMessage();
+
+      fakeSock.fire('chats.update', counting(content, 1, beside));
+
+      expect(await unread(adapter)).toBe(1);
+    });
+
+    it('stays read after a read when a contact then edits a message', async () => {
+      const adapter = await readyWithMessage();
+      fakeSock.fire('chats.update', [{ id: '628111@s.whatsapp.net', unreadCount: 1 }]);
+      expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+
+      fakeSock.fire('chats.update', counting({ secretEncryptedMessage: {} }));
+
+      expect(await unread(adapter)).toBe(0);
+    });
+  });
+
+  describe('a disappearing message received while STORE_EPHEMERAL_MESSAGES is off', () => {
+    // Through the adapter's own wiring: the session store takes the decision the events handler made.
+    const saved = process.env.STORE_EPHEMERAL_MESSAGES;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.STORE_EPHEMERAL_MESSAGES;
+      else process.env.STORE_EPHEMERAL_MESSAGES = saved;
+    });
+    const vanishing = {
+      type: 'notify',
+      messages: [
+        {
+          key: { remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'V1' },
+          message: { extendedTextMessage: { text: 'this should vanish', contextInfo: { expiration: 86_400 } } },
+          messageTimestamp: 1700000050,
+        },
+      ],
+    };
+
+    it.each([
+      ['no text of it while the flag is off', 'false', ''],
+      ['its text while the flag is on', 'true', 'this should vanish'],
+    ])('lists the chat with %s', async (_what, value, preview) => {
+      process.env.STORE_EPHEMERAL_MESSAGES = value;
+      const adapter = await readyWithMessage();
+
+      fakeSock.fire('messages.upsert', vanishing);
+      const listed = async () => (await adapter.getChats()).find(chat => chat.id === '628111@c.us');
+      for (let i = 0; i < 200 && (await listed())?.timestamp !== 1700000050; i++) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+
+      expect(await listed()).toMatchObject({ timestamp: 1700000050, lastMessage: preview });
+    });
+  });
+
+  it('sendSeen undoes an unread mark set by hand, keyed to the newest message of the chat', async () => {
+    const adapter = await readyWithMessage();
+    fakeSock.fire('chats.update', [{ id: '628111@s.whatsapp.net', unreadCount: -1 }]);
+    expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+    expect(fakeSock.chatModify).toHaveBeenCalledWith(
+      {
+        markRead: true,
+        lastMessages: [
+          { key: { remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'M1' }, messageTimestamp: 1700000020 },
+        ],
+      },
+      '628111@s.whatsapp.net',
+    );
+    // WhatsApp confirmed the write, so the mark is gone from the list without waiting for a replayed patch.
+    expect(await adapter.getChats()).toEqual([expect.objectContaining({ unreadCount: 0 })]);
+  });
+
+  it('sendSeen keeps an unread mark listed when WhatsApp refuses the write that undoes it', async () => {
+    const adapter = await readyWithMessage();
+    fakeSock.fire('chats.update', [{ id: '628111@s.whatsapp.net', unreadCount: -1 }]);
+    fakeSock.chatModify.mockRejectedValueOnce(new Error('App state key not present!'));
+    expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+    expect(await adapter.getChats()).toEqual([expect.objectContaining({ unreadCount: -1 })]);
+  });
+
+  describe('an unread mark set by hand that a message received since has replaced in the count', () => {
+    const JID = '628111@s.whatsapp.net';
+    // The chat is marked unread, then M2 arrives: Baileys reports its count on the same field as the mark.
+    const markedThenMessaged = async (): Promise<BaileysAdapter> => {
+      const adapter = await readyWithMessage();
+      fakeSock.fire('chats.update', [{ id: JID, unreadCount: -1 }]);
+      fakeSock.fire('chats.update', [{ id: JID, unreadCount: 1, conversationTimestamp: 1700000030 }]);
+      fakeSock.fire('messages.upsert', {
+        type: 'notify',
+        messages: [
+          {
+            key: { remoteJid: JID, fromMe: false, id: 'M2' },
+            message: { conversation: 'new' },
+            messageTimestamp: 1700000030,
+          },
+        ],
+      });
+      await new Promise(r => setImmediate(r));
+      return adapter;
+    };
+    const unread = async (adapter: BaileysAdapter): Promise<number | undefined> =>
+      (await adapter.getChats()).find(chat => chat.id === '628111@c.us')?.unreadCount;
+
+    it('is undone by the read that covers the message, as the mark is still on the account', async () => {
+      const adapter = await markedThenMessaged();
+      expect(await unread(adapter)).toBe(1);
+
+      expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+
+      expect(fakeSock.readMessages).toHaveBeenCalledWith([{ remoteJid: JID, fromMe: false, id: 'M2' }]);
+      expect(fakeSock.chatModify).toHaveBeenCalledWith(
+        {
+          markRead: true,
+          lastMessages: [{ key: { remoteJid: JID, fromMe: false, id: 'M2' }, messageTimestamp: 1700000030 }],
+        },
+        JID,
+      );
+      expect(await unread(adapter)).toBe(0);
+    });
+
+    it('lists the chat marked unread again when WhatsApp refuses the write that undoes it', async () => {
+      const adapter = await markedThenMessaged();
+      fakeSock.chatModify.mockRejectedValueOnce(new Error('App state key not present!'));
+
+      expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+
+      expect(await unread(adapter)).toBe(-1);
+      // The next read tries the write again.
+      expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+      expect(fakeSock.chatModify).toHaveBeenCalledTimes(2);
+      expect(await unread(adapter)).toBe(0);
+    });
+
+    it('is forgotten once the phone reads the chat', async () => {
+      const adapter = await markedThenMessaged();
+      fakeSock.fire('chats.update', [{ id: JID, unreadCount: 0 }]); // the read on the phone, synced
+      fakeSock.fire('chats.update', [{ id: JID, unreadCount: 1, conversationTimestamp: 1700000040 }]);
+      fakeSock.fire('messages.upsert', {
+        type: 'notify',
+        messages: [
+          {
+            key: { remoteJid: JID, fromMe: false, id: 'M3' },
+            message: { conversation: 'later' },
+            messageTimestamp: 1700000040,
+          },
+        ],
+      });
+      await new Promise(r => setImmediate(r));
+
+      expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+      expect(await unread(adapter)).toBe(0);
+    });
+
+    it('stays for a read that does not cover the message', async () => {
+      const adapter = await markedThenMessaged();
+
+      expect(await adapter.sendSeen('628111@c.us', ['M1'])).toBe(true); // the older message only
+
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+      expect(await unread(adapter)).toBe(1);
+      // The read that covers M2 still finds the mark.
+      expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+      expect(fakeSock.chatModify).toHaveBeenCalledTimes(1);
+    });
+
+    // Baileys replays its own write as a count of zero, and a replay still held in its event buffer reaches the
+    // session after the write has resolved: until then the record holds the count of what arrived meanwhile.
+    it('keeps the count of messages that arrived during the write while its replay has not reached the session', async () => {
+      const adapter = await markedThenMessaged();
+      let confirm!: () => void;
+      fakeSock.chatModify.mockImplementationOnce(() => new Promise<void>(resolve => (confirm = resolve)));
+      try {
+        const read = adapter.sendSeen('628111@c.us');
+        for (let turn = 0; turn < 50 && !fakeSock.chatModify.mock.calls.length; turn++) {
+          await new Promise(r => setImmediate(r));
+        }
+        expect(fakeSock.chatModify).toHaveBeenCalledTimes(1);
+        // Three more arrive on the record the mark was on, and the write they did not see is confirmed.
+        fakeSock.fire('chats.update', [{ id: JID, unreadCount: 3, conversationTimestamp: 1700000050 }]);
+        fakeSock.fire('messages.upsert', {
+          type: 'notify',
+          messages: [
+            {
+              key: { remoteJid: JID, fromMe: false, id: 'M5' },
+              message: { conversation: 'more' },
+              messageTimestamp: 1700000050,
+            },
+          ],
+        });
+        await new Promise(r => setImmediate(r));
+        confirm();
+        expect(await read).toBe(true);
+
+        expect(await unread(adapter)).toBe(3);
+        // The mark is gone with the write: the read that covers them sends no second one.
+        expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+        expect(fakeSock.chatModify).toHaveBeenCalledTimes(1);
+        expect(await unread(adapter)).toBe(0);
+      } finally {
+        fakeSock.chatModify.mockReset().mockResolvedValue(undefined);
+      }
+    });
+
+    // The replay of the write is a count of zero that the library's event buffer can hold until it flushes, after the read
+    // has returned. The count of a message that arrived while the write was out is not what the write covers.
+    describe('when the replay of the write reaches the session after the read returned', () => {
+      afterEach(() => {
+        fakeSock.chatModify.mockReset().mockResolvedValue(undefined);
+        fakeSock.ev.isBuffering.mockReturnValue(false);
+      });
+
+      /** A read whose write is still out when three more messages arrive; the write is then confirmed. */
+      const readWithMessagesArriving = async (adapter: BaileysAdapter, held: boolean): Promise<void> => {
+        fakeSock.ev.isBuffering.mockReturnValue(held);
+        let confirm!: () => void;
+        fakeSock.chatModify.mockImplementationOnce(() => new Promise<void>(resolve => (confirm = resolve)));
+        const read = adapter.sendSeen('628111@c.us');
+        for (let turn = 0; turn < 50 && !fakeSock.chatModify.mock.calls.length; turn++) {
+          await new Promise(r => setImmediate(r));
+        }
+        expect(fakeSock.chatModify).toHaveBeenCalledTimes(1);
+        fakeSock.fire('chats.update', [{ id: JID, unreadCount: 3, conversationTimestamp: 1700000050 }]);
+        fakeSock.fire('messages.upsert', {
+          type: 'notify',
+          messages: [
+            {
+              key: { remoteJid: JID, fromMe: false, id: 'M5' },
+              message: { conversation: 'more' },
+              messageTimestamp: 1700000050,
+            },
+          ],
+        });
+        await new Promise(r => setImmediate(r));
+        confirm();
+        expect(await read).toBe(true);
+        expect(await unread(adapter)).toBe(3);
+      };
+
+      it('keeps the count of what arrived while the write was out, where the buffer held the replay', async () => {
+        const adapter = await markedThenMessaged();
+        await readWithMessagesArriving(adapter, true);
+
+        fakeSock.fire('chats.update', [{ id: JID, unreadCount: 0 }]); // the buffer flushes
+
+        expect(await unread(adapter)).toBe(3);
+        // The read that covers them sends no second write: the first one took the mark.
+        expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+        expect(fakeSock.chatModify).toHaveBeenCalledTimes(1);
+        expect(await unread(adapter)).toBe(0);
+      });
+
+      it('takes the zero a read on the phone brings later for what it is', async () => {
+        const adapter = await markedThenMessaged();
+        await readWithMessagesArriving(adapter, true);
+        fakeSock.fire('chats.update', [{ id: JID, unreadCount: 0 }]); // the replay
+        expect(await unread(adapter)).toBe(3);
+
+        fakeSock.fire('chats.update', [{ id: JID, unreadCount: 0 }]); // the account reads them on its phone
+
+        expect(await unread(adapter)).toBe(0);
+      });
+
+      // A write WhatsApp confirms only after the request budget is replayed by Baileys when nothing holds it any more.
+      it('clears that count when no buffer held the replay, as a zero Baileys delivers late does', async () => {
+        const adapter = await markedThenMessaged();
+        await readWithMessagesArriving(adapter, false);
+
+        fakeSock.fire('chats.update', [{ id: JID, unreadCount: 0 }]);
+
+        expect(await unread(adapter)).toBe(0);
+      });
+
+      // The library sums a contact's pin into the held replay and hands over one update, of the pin, with a count of one.
+      // The filter for a message that is none of its own takes the count out, but that update is the replay, delivered.
+      describe('when a pin was summed into the replay', () => {
+        const summed = (extra: Record<string, unknown> = {}) => [
+          {
+            id: JID,
+            unreadCount: 1,
+            conversationTimestamp: 1700000060,
+            messages: [
+              { message: { key: { remoteJid: JID, fromMe: false, id: 'P1' }, message: { pinInChatMessage: {} } } },
+            ],
+            ...extra,
+          },
+        ];
+        const getContentType = () =>
+          jest.requireMock<Record<string, jest.Mock>>('@whiskeysockets/baileys').getContentType;
+        beforeEach(() => getContentType().mockImplementation(realGetContentType));
+        afterEach(() => getContentType().mockImplementation(() => 'conversation'));
+
+        it.each([
+          ['carries nothing else', {}],
+          ['also carries the unarchive of the account', { archived: false }],
+        ])('lists a read made on the phone later as read when the update %s', async (_what, extra) => {
+          const adapter = await markedThenMessaged();
+          await readWithMessagesArriving(adapter, true);
+
+          fakeSock.fire('chats.update', summed(extra));
+          expect(await unread(adapter)).toBe(3);
+          fakeSock.fire('chats.update', [{ id: JID, unreadCount: 0 }]); // the account reads them on its phone
+
+          expect(await unread(adapter)).toBe(0);
+        });
+
+        it('leaves the wait for the replay in place when the update names no chat', async () => {
+          const adapter = await markedThenMessaged();
+          await readWithMessagesArriving(adapter, true);
+
+          fakeSock.fire('chats.update', [{ ...summed()[0], id: undefined }]);
+          fakeSock.fire('chats.update', [{ id: JID, unreadCount: 0 }]); // the replay
+
+          expect(await unread(adapter)).toBe(3);
+        });
+      });
+    });
+
+    it('is kept by a second message', async () => {
+      const adapter = await markedThenMessaged();
+      fakeSock.fire('chats.update', [{ id: JID, unreadCount: 1, conversationTimestamp: 1700000040 }]);
+      fakeSock.fire('messages.upsert', {
+        type: 'notify',
+        messages: [
+          {
+            key: { remoteJid: JID, fromMe: false, id: 'M3' },
+            message: { conversation: 'another' },
+            messageTimestamp: 1700000040,
+          },
+        ],
+      });
+      await new Promise(r => setImmediate(r));
+
+      expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+
+      expect(fakeSock.chatModify).toHaveBeenCalledTimes(1);
+      expect(await unread(adapter)).toBe(0);
+    });
+
+    // A chat decoded from a history sync is a protobuf object: where the wire held no count it has no
+    // `unreadCount` of its own and answers null from its prototype. It says nothing about the count or the mark.
+    it.each(['chats.upsert', 'messaging-history.set'])(
+      'is kept when %s delivers the chat with no count of its own',
+      async event => {
+        const adapter = await markedThenMessaged();
+        const decoded = Object.assign(Object.create({ unreadCount: null }) as Record<string, unknown>, {
+          id: JID,
+          name: 'From history',
+        });
+        fakeSock.fire(event, event === 'chats.upsert' ? [decoded] : { chats: [decoded], contacts: [], messages: [] });
+        await new Promise(r => setImmediate(r));
+        expect(await unread(adapter)).toBe(1);
+
+        expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+
+        expect(fakeSock.chatModify).toHaveBeenCalledTimes(1);
+        expect(await unread(adapter)).toBe(0);
+      },
+    );
+
+    // Baileys writes an own `unreadCount: undefined` where a sync cancelled a mark inside one batch.
+    it('is forgotten when an update carries a count of undefined', async () => {
+      const adapter = await markedThenMessaged();
+      fakeSock.fire('chats.update', [{ id: JID, unreadCount: undefined }]);
+
+      expect(await adapter.sendSeen('628111@c.us')).toBe(true);
+
+      expect(fakeSock.chatModify).not.toHaveBeenCalled();
+      expect(await unread(adapter)).toBe(0);
+    });
+  });
+
+  it('sendSeen keeps the count for a message that no receipt named', async () => {
+    const adapter = await readyWithMessage();
+    fakeSock.fire('chats.update', [{ id: '628111@s.whatsapp.net', unreadCount: 1 }]);
+    // An older message of the chat is acknowledged; M1, the newest, is not.
+    expect(await adapter.sendSeen('628111@c.us', ['M0'])).toBe(true);
+    expect(await adapter.getChats()).toEqual([expect.objectContaining({ unreadCount: 1 })]);
+  });
+
+  describe('a read while the session is still processing a message Baileys has counted', () => {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+    const baileys = jest.requireMock('@whiskeysockets/baileys') as {
+      getContentType: jest.Mock;
+      downloadMediaMessage: jest.Mock;
+    };
+    const PHONE_JID = '628111@s.whatsapp.net';
+    const LID_JID = '484848@lid';
+
+    /** Content types as the library names them: the key of the message that says what it is. */
+    beforeEach(() => {
+      baileys.getContentType.mockImplementation((content?: Record<string, unknown>) =>
+        Object.keys(content ?? {}).find(k => k === 'conversation' || k.endsWith('Message')),
+      );
+    });
+    afterEach(() => {
+      baileys.getContentType.mockReset().mockImplementation(() => 'conversation');
+      baileys.downloadMediaMessage
+        .mockReset()
+        .mockImplementation(() => Promise.resolve(streamOf(Buffer.from('IMGDATA'))));
+    });
+
+    /** Waits for `condition` between event-loop turns and fails at the deadline instead of hanging. */
+    const until = async (condition: () => boolean | Promise<boolean>, what: string, ms = 5_000): Promise<void> => {
+      const deadline = Date.now() + ms;
+      while (!(await condition())) {
+        if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    };
+    const received = (id: string, timestamp: number, message: Record<string, unknown>, jid = PHONE_JID) => ({
+      type: 'notify',
+      messages: [{ key: { remoteJid: jid, fromMe: false, id }, message, messageTimestamp: timestamp }],
+    });
+    const image = { imageMessage: { mimetype: 'image/jpeg' } };
+    /** The next media download stays pending until the function this returns releases it. */
+    const holdDownload = (): (() => void) => {
+      let release!: () => void;
+      baileys.downloadMediaMessage.mockReturnValueOnce(
+        new Promise(resolve => {
+          release = () => resolve(streamOf(Buffer.from('JPEG')));
+        }),
+      );
+      return release;
+    };
+    const downloads = (): number => baileys.downloadMediaMessage.mock.calls.length;
+    const listed = async (adapter: BaileysAdapter, id = '628111@c.us') =>
+      (await adapter.getChats()).find(chat => chat.id === id);
+    const recorded = (adapter: BaileysAdapter, type: string) => async (): Promise<boolean> =>
+      (await listed(adapter))?.lastMessageType === type;
+
+    it('keeps the count of a message that is still downloading', async () => {
+      const adapter = await readyWithMessage(); // M1, a text, is recorded as the newest message received
+      const release = holdDownload();
+      // Baileys flushes the chat update before the message it counts; the message is recorded once its media is in.
+      fakeSock.fire('chats.update', [{ id: PHONE_JID, unreadCount: 1, conversationTimestamp: 1700000030 }]);
+      fakeSock.fire('messages.upsert', received('M2', 1700000030, image));
+      await until(() => downloads() === 1, 'the download of M2');
+
+      expect(await adapter.sendSeen('628111@c.us')).toBe(true); // names M1, the newest the session has recorded
+      expect(fakeSock.readMessages).toHaveBeenCalledWith([{ remoteJid: PHONE_JID, fromMe: false, id: 'M1' }]);
+      release();
+      await until(recorded(adapter, 'image'), 'M2 recorded');
+
+      // M2 was recorded after its download and no receipt named it: it is unread, and the list says so.
+      expect(await listed(adapter)).toEqual(expect.objectContaining({ unreadCount: 1 }));
+    });
+
+    it('keeps the count of a message recorded before the read that did not name it', async () => {
+      const adapter = await readyWithMessage();
+      const release = holdDownload();
+      fakeSock.fire('chats.update', [{ id: PHONE_JID, unreadCount: 1, conversationTimestamp: 1700000030 }]);
+      fakeSock.fire('messages.upsert', received('M2', 1700000030, image));
+      await until(() => downloads() === 1, 'the download of M2');
+      release();
+      await until(recorded(adapter, 'image'), 'M2 recorded');
+
+      expect(await adapter.sendSeen('628111@c.us', ['M1'])).toBe(true);
+
+      expect(await listed(adapter)).toEqual(expect.objectContaining({ unreadCount: 1 }));
+    });
+
+    it('resets the count when the message still downloading is older than the one the read names', async () => {
+      const adapter = await readyWithMessage();
+      const release = holdDownload();
+      // Baileys counts both at once; the text finishes first, the photo, sent before it, is still downloading.
+      fakeSock.fire('chats.update', [{ id: PHONE_JID, unreadCount: 2, conversationTimestamp: 1700000030 }]);
+      fakeSock.fire('messages.upsert', received('M0', 1700000025, image));
+      fakeSock.fire('messages.upsert', received('M2', 1700000030, { conversation: 'text' }));
+      await until(() => downloads() === 1, 'the download of M0');
+      await until(async () => (await listed(adapter))?.lastMessage === 'text', 'M2 recorded');
+
+      expect(await adapter.sendSeen('628111@c.us', ['M2'])).toBe(true);
+
+      expect(await listed(adapter)).toEqual(expect.objectContaining({ unreadCount: 0 }));
+      release();
+      await until(
+        () => fakeStore.put.mock.calls.some(([, stored]) => (stored as { key: { id: string } }).key.id === 'M0'),
+        'M0 stored',
+      );
+      expect(await listed(adapter)).toEqual(expect.objectContaining({ unreadCount: 0 }));
+    });
+
+    it('keeps the count through a burst that is still downloading, and resets it for the read of its last message', async () => {
+      const adapter = await readyWithMessage();
+      const releases = [holdDownload(), holdDownload(), holdDownload()];
+      fakeSock.fire('chats.update', [{ id: PHONE_JID, unreadCount: 3, conversationTimestamp: 1700000050 }]);
+      ['B0', 'B1', 'B2'].forEach((id, i) => fakeSock.fire('messages.upsert', received(id, 1700000030 + i * 10, image)));
+      await until(() => downloads() === 3, 'the downloads of the burst');
+
+      expect(await adapter.sendSeen('628111@c.us', ['M1'])).toBe(true); // three are still downloading
+      expect(await listed(adapter)).toEqual(expect.objectContaining({ unreadCount: 3 }));
+      releases.forEach(release => release());
+      await until(async () => (await listed(adapter))?.lastMessageType === 'image', 'the burst recorded');
+      await until(
+        () =>
+          fakeStore.put.mock.calls.filter(([, stored]) => /^B\d$/.test((stored as { key: { id: string } }).key.id))
+            .length === 3,
+        'the burst stored',
+      );
+
+      expect(await adapter.sendSeen('628111@c.us', ['B0', 'B1', 'B2'])).toBe(true); // names the newest, nothing in flight
+      expect(await listed(adapter)).toEqual(expect.objectContaining({ unreadCount: 0 }));
+    });
+
+    it('keeps the count of a message recorded under the lid record while the unread mark was being undone', async () => {
+      const adapter = await readyWithMessage(); // M1 is recorded under the phone and is the newest message received
+      fakeSock.fire('lid-mapping.update', { lid: LID_JID, pn: PHONE_JID });
+      fakeSock.fire('chats.update', [{ id: PHONE_JID, unreadCount: -1, conversationTimestamp: 1700000020 }]);
+      let confirm!: () => void;
+      // Baileys replays an own app-state write as a chat update of the record it was keyed to (the phone), before the
+      // write resolves (appPatch, emitOwnEvents); a live replay is not conditional on the newer messages of the chat.
+      fakeSock.chatModify.mockImplementationOnce(
+        (_change: unknown, jid: string) =>
+          new Promise<void>(resolve => {
+            confirm = () => {
+              fakeSock.fire('chats.update', [{ id: jid, unreadCount: 0 }]);
+              resolve();
+            };
+          }),
+      );
+      try {
+        const read = adapter.sendSeen('628111@c.us');
+        await until(() => fakeSock.chatModify.mock.calls.length === 1, 'the write that undoes the mark');
+        expect(fakeSock.readMessages).toHaveBeenCalledTimes(1);
+        // M2 arrives under the contact's lid and is recorded: its count is on the lid record, which no write named.
+        fakeSock.fire('chats.update', [{ id: LID_JID, unreadCount: 1, conversationTimestamp: 1700000030 }]);
+        fakeSock.fire('messages.upsert', received('M2', 1700000030, { conversation: 'again' }, LID_JID));
+        await until(async () => (await listed(adapter, LID_JID))?.lastMessage === 'again', 'M2 recorded');
+        // The list keeps the two ids of the contact as two rows, each with the count of its own record.
+        expect((await listed(adapter))?.unreadCount).toBe(-1);
+        expect((await listed(adapter, LID_JID))?.unreadCount).toBe(1);
+        confirm();
+        expect(await read).toBe(true);
+
+        // M2 was not named by the receipt and is unread: a read that a newer message overtook leaves the count.
+        expect((await listed(adapter))?.unreadCount).toBe(0);
+        expect((await listed(adapter, LID_JID))?.unreadCount).toBe(1);
+      } finally {
+        fakeSock.chatModify.mockReset().mockResolvedValue(undefined);
+      }
+    });
+
+    it('lists the chat unread again for a message recorded while the unread mark was being undone', async () => {
+      const adapter = await readyWithMessage();
+      fakeSock.fire('chats.update', [{ id: PHONE_JID, unreadCount: -1, conversationTimestamp: 1700000020 }]);
+      let confirm!: () => void;
+      fakeSock.chatModify.mockImplementationOnce(
+        (_change: unknown, jid: string) =>
+          new Promise<void>(resolve => {
+            confirm = () => {
+              fakeSock.fire('chats.update', [{ id: jid, unreadCount: 0 }]); // the replay of the write
+              resolve();
+            };
+          }),
+      );
+      try {
+        const read = adapter.sendSeen('628111@c.us');
+        await until(() => fakeSock.chatModify.mock.calls.length === 1, 'the write that undoes the mark');
+        fakeSock.fire('chats.update', [{ id: PHONE_JID, unreadCount: 1, conversationTimestamp: 1700000030 }]);
+        fakeSock.fire('messages.upsert', received('M2', 1700000030, { conversation: 'again' }));
+        await until(async () => (await listed(adapter))?.lastMessage === 'again', 'M2 recorded');
+        confirm();
+        expect(await read).toBe(true);
+
+        expect(await listed(adapter)).toEqual(expect.objectContaining({ unreadCount: 1 }));
+      } finally {
+        fakeSock.chatModify.mockReset().mockResolvedValue(undefined);
+      }
+    });
+
+    it('keeps the chat unread for a message still downloading when the write that undoes the mark returns', async () => {
+      const adapter = await readyWithMessage();
+      fakeSock.fire('chats.update', [{ id: PHONE_JID, unreadCount: -1, conversationTimestamp: 1700000020 }]);
+      let confirm!: () => void;
+      fakeSock.chatModify.mockImplementationOnce(
+        (_change: unknown, jid: string) =>
+          new Promise<void>(resolve => {
+            confirm = () => {
+              fakeSock.fire('chats.update', [{ id: jid, unreadCount: 0 }]); // Baileys replays its own write
+              resolve();
+            };
+          }),
+      );
+      const release = holdDownload();
+      try {
+        const read = adapter.sendSeen('628111@c.us');
+        await until(() => fakeSock.chatModify.mock.calls.length === 1, 'the write that undoes the mark');
+        fakeSock.fire('chats.update', [{ id: PHONE_JID, unreadCount: 1, conversationTimestamp: 1700000030 }]);
+        fakeSock.fire('messages.upsert', received('M2', 1700000030, image));
+        await until(() => downloads() === 1, 'the download of M2');
+        confirm(); // the replay zeroes the record the count landed on, and M2 is still downloading
+        expect(await read).toBe(true);
+
+        expect(await listed(adapter)).toEqual(expect.objectContaining({ unreadCount: 1 }));
+        release();
+        await until(recorded(adapter, 'image'), 'M2 recorded');
+        expect(await listed(adapter)).toEqual(expect.objectContaining({ unreadCount: 1 }));
+      } finally {
+        fakeSock.chatModify.mockReset().mockResolvedValue(undefined);
+      }
+    });
   });
 
   it.each([
@@ -9228,6 +10251,161 @@ describe('BaileysAdapter chat writes keyed to a message (#1891)', () => {
       expect(await adapter.getChats()).toEqual([]);
     });
 
+    // Baileys counts these as received messages, so the chat update carries the message's time, which a chat WhatsApp
+    // deleted reads as a message that brings it back.
+    describe('when a message that is none of its own arrives', () => {
+      const raised = (content: Record<string, unknown>, fromMe = false) => [
+        {
+          id: PHONE,
+          ...(fromMe ? {} : { unreadCount: 1 }),
+          conversationTimestamp: now() + 60,
+          messages: [{ message: { key: { remoteJid: PHONE, fromMe, id: 'X1' }, message: content } }],
+        },
+      ];
+      const persistedDeletion = async (): Promise<number | null | undefined> => {
+        const store = newStore();
+        await store.reload();
+        return store.get('sess-1', PHONE)?.deletedAt;
+      };
+      const getContentType = () =>
+        jest.requireMock<Record<string, jest.Mock>>('@whiskeysockets/baileys').getContentType;
+      beforeEach(() => getContentType().mockImplementation(realGetContentType));
+      afterEach(() => getContentType().mockImplementation(() => 'conversation'));
+
+      const KINDS: Array<[string, Record<string, unknown>]> = [
+        ['an encrypted edit', { secretEncryptedMessage: {} }],
+        ['an encrypted reaction', { encReactionMessage: {} }],
+        ['a pin', { pinInChatMessage: {} }],
+        ['a keep-in-chat toggle', { keepInChatMessage: {} }],
+        ['an album header', { albumMessage: {} }],
+        ['an event RSVP', { encEventResponseMessage: {} }],
+        ['an encrypted comment', { encCommentMessage: {} }],
+      ];
+
+      it.each(KINDS)(
+        'keeps the chat out of the list, with its deletion mark, when %s arrives from a contact',
+        async (_what, content) => {
+          const adapter = await deletedOnPhone();
+          const deletedAt = await persistedDeletion();
+          expect(deletedAt).toEqual(expect.any(Number));
+          fakeSock.fire('chats.update', raised(content));
+          await settle();
+          expect(await adapter.getChats()).toEqual([]);
+          expect(await persistedDeletion()).toBe(deletedAt);
+        },
+      );
+
+      it.each(KINDS)(
+        'keeps the chat out of the list when %s arrives from another device of the account',
+        async (_what, content) => {
+          const adapter = await deletedOnPhone();
+          fakeSock.fire('chats.update', raised(content, true));
+          await settle();
+          expect(await adapter.getChats()).toEqual([]);
+        },
+      );
+
+      it('still applies what else the update carries, a disappearing-messages timer', async () => {
+        const adapter = await deletedOnPhone();
+        fakeSock.fire('chats.update', [{ ...raised({ pinInChatMessage: {} })[0], ephemeralExpiration: 604800 }]);
+        await settle();
+        expect(await adapter.getChats()).toEqual([]);
+        const store = (adapter as unknown as { sessionStore: { getEphemeralExpiration: (id: string) => unknown } })
+          .sessionStore;
+        expect(store.getEphemeralExpiration('628111@c.us')).toBe(604800);
+      });
+
+      it.each([
+        ['a text', { conversation: 'back again' }],
+        [
+          'a text and a fast-ratchet distribution that merged with it',
+          { conversation: 'back', fastRatchetKeySenderKeyDistributionMessage: {} },
+        ],
+      ])('lists the chat again for %s', async (_what, content) => {
+        const adapter = await deletedOnPhone();
+        fakeSock.fire('chats.update', raised(content));
+        await settle();
+        expect(await adapter.getChats()).toEqual([expect.objectContaining({ id: '628111@c.us', unreadCount: 1 })]);
+      });
+
+      it('lists no chat the session never knew for a message that is none of its own', async () => {
+        const adapter = await started(newStore());
+        fakeSock.fire('chats.update', raised({ pinInChatMessage: {} }));
+        await settle();
+        expect(await adapter.getChats()).toEqual([]);
+      });
+
+      // While the event buffer holds a history chunk or an upsert of the chat, the library merges the update into it: the
+      // chat then arrives with the message as its last, and with its time unless the chunk has a time of its own.
+      describe('when the library merged it into a history chunk or an upsert of the chat', () => {
+        const merged = (content: Record<string, unknown>, over: Record<string, unknown> = {}) => ({
+          id: PHONE,
+          unreadCount: 1,
+          conversationTimestamp: now() + 60,
+          messages: [
+            {
+              message: {
+                key: { remoteJid: PHONE, fromMe: false, id: 'X1' },
+                message: content,
+                messageTimestamp: now() + 60,
+              },
+            },
+          ],
+          ...over,
+        });
+        const EVENTS: Array<[string, (chat: Record<string, unknown>) => void]> = [
+          [
+            'a history chunk',
+            chat => fakeSock.fire('messaging-history.set', { chats: [chat], contacts: [], messages: [] }),
+          ],
+          ['an upsert', chat => fakeSock.fire('chats.upsert', [chat])],
+        ];
+
+        it.each(EVENTS)(
+          'keeps the chat out of the list, with its deletion mark, for a pin merged into %s',
+          async (_what, fire) => {
+            const adapter = await deletedOnPhone();
+            const deletedAt = await persistedDeletion();
+            expect(deletedAt).toEqual(expect.any(Number));
+            fire(merged({ pinInChatMessage: {} }));
+            await settle();
+            expect(await adapter.getChats()).toEqual([]);
+            expect(await persistedDeletion()).toBe(deletedAt);
+          },
+        );
+
+        it.each(EVENTS)('lists the chat again for a text merged into %s', async (_what, fire) => {
+          const adapter = await deletedOnPhone();
+          fire(merged({ conversation: 'back again' }));
+          await settle();
+          expect(await adapter.getChats()).toEqual([expect.objectContaining({ id: '628111@c.us', unreadCount: 1 })]);
+        });
+
+        it.each(EVENTS)(
+          'keeps the time of a chunk that has one of its own, and not the pin, in %s',
+          async (_what, fire) => {
+            const adapter = await started(newStore());
+            fire(merged({ pinInChatMessage: {} }, { conversationTimestamp: 1700000010 }));
+            await settle();
+            expect(await adapter.getChats()).toEqual([
+              expect.objectContaining({ id: '628111@c.us', timestamp: 1700000010, lastMessage: undefined }),
+            ]);
+          },
+        );
+
+        it('applies a chunk with no chats, and a chat with no message, as it did', async () => {
+          const adapter = await started(newStore());
+          fakeSock.fire('messaging-history.set', { contacts: [], messages: [] });
+          fakeSock.fire('chats.upsert', undefined);
+          fakeSock.fire('chats.upsert', [{ id: PHONE, conversationTimestamp: 1700000010, unreadCount: 2 }]);
+          await settle();
+          expect(await adapter.getChats()).toEqual([
+            expect.objectContaining({ id: '628111@c.us', timestamp: 1700000010, unreadCount: 2 }),
+          ]);
+        });
+      });
+    });
+
     it('lets a chat deleted through the API come back with its next message', async () => {
       const adapter = await started(newStore());
       await upsert({ remoteJid: PHONE, fromMe: false, id: 'M1' }, now() - 60);
@@ -9271,6 +10449,7 @@ describe('BaileysAdapter status posting', () => {
         statusJidList: ['628111@s.whatsapp.net', '628222@lid'],
         backgroundColor: '#25D366',
         font: 2,
+        upload: expect.any(Function) as unknown,
       },
     );
     expect(result.statusId).toBe('STATUS1');
@@ -9288,7 +10467,12 @@ describe('BaileysAdapter status posting', () => {
     expect(fakeSock.sendMessage).toHaveBeenCalledWith(
       'status@broadcast',
       { image: Buffer.from([1, 2, 3]), caption: 'cap', mimetype: 'image/png' },
-      { statusJidList: ['628111@s.whatsapp.net'], backgroundColor: undefined, font: undefined },
+      {
+        statusJidList: ['628111@s.whatsapp.net'],
+        backgroundColor: undefined,
+        font: undefined,
+        upload: expect.any(Function) as unknown,
+      },
     );
     expect(fakeStore.put).not.toHaveBeenCalled();
   });
@@ -9300,7 +10484,12 @@ describe('BaileysAdapter status posting', () => {
     expect(fakeSock.sendMessage).toHaveBeenCalledWith(
       'status@broadcast',
       { video: Buffer.from('AAAA', 'base64'), caption: undefined, mimetype: 'video/mp4', jpegThumbnail: null },
-      { statusJidList: ['628111@s.whatsapp.net'], backgroundColor: undefined, font: undefined },
+      {
+        statusJidList: ['628111@s.whatsapp.net'],
+        backgroundColor: undefined,
+        font: undefined,
+        upload: expect.any(Function) as unknown,
+      },
     );
   });
 
@@ -9358,7 +10547,7 @@ describe('BaileysAdapter status posting', () => {
           participant: '628999@s.whatsapp.net',
         },
       },
-      { statusJidList: ['628111@s.whatsapp.net'] },
+      { statusJidList: ['628111@s.whatsapp.net'], upload: expect.any(Function) as unknown },
     );
     expect(fakeStore.getMessage).not.toHaveBeenCalled();
   });
@@ -9686,23 +10875,30 @@ describe('BaileysAdapter catalog (#905)', () => {
     const adapter = await ready();
     fakeSock.getCatalog.mockResolvedValue({ products: [baileysProduct()], nextPageCursor: undefined });
     fakeSock.sendMessage.mockResolvedValue({ key: { id: 'M1' }, messageTimestamp: 1700000005 });
+    const imgBuf = Buffer.from([1, 2, 3]);
+    (loadRemoteMediaBuffer as jest.Mock).mockResolvedValueOnce({ data: imgBuf, mimetype: 'image/jpeg' });
 
     const res = await adapter.sendProduct('628111@s.whatsapp.net', 'p1', 'check this');
 
-    expect(fakeSock.sendMessage).toHaveBeenCalledWith('628111@s.whatsapp.net', {
-      product: {
-        productId: 'p1',
-        title: 'Coffee',
-        description: 'Beans',
-        currencyCode: 'USD',
-        priceAmount1000: 1500000,
-        retailerId: 'SKU1',
-        url: 'https://shop.example/p1',
-        productImage: { url: 'https://img.example/x.jpg' },
+    expect(loadRemoteMediaBuffer).toHaveBeenCalledWith('https://img.example/x.jpg', undefined);
+    expect(fakeSock.sendMessage).toHaveBeenCalledWith(
+      '628111@s.whatsapp.net',
+      {
+        product: {
+          productId: 'p1',
+          title: 'Coffee',
+          description: 'Beans',
+          currencyCode: 'USD',
+          priceAmount1000: 1500000,
+          retailerId: 'SKU1',
+          url: 'https://shop.example/p1',
+          productImage: imgBuf,
+        },
+        businessOwnerJid: '628999@s.whatsapp.net',
+        body: 'check this',
       },
-      businessOwnerJid: '628999@s.whatsapp.net',
-      body: 'check this',
-    });
+      uploadOption(),
+    );
     expect(res).toEqual({ id: 'M1', timestamp: 1700000005 });
   });
 
@@ -9710,6 +10906,7 @@ describe('BaileysAdapter catalog (#905)', () => {
     const adapter = await ready();
     fakeSock.getCatalog.mockResolvedValue({ products: [baileysProduct({ price: NaN })], nextPageCursor: undefined });
     fakeSock.sendMessage.mockResolvedValue({ key: { id: 'M1' }, messageTimestamp: 1700000005 });
+    (loadRemoteMediaBuffer as jest.Mock).mockResolvedValueOnce({ data: Buffer.from([1]), mimetype: 'image/jpeg' });
 
     await adapter.sendProduct('628111@s.whatsapp.net', 'p1');
 
@@ -9730,6 +10927,20 @@ describe('BaileysAdapter catalog (#905)', () => {
     fakeSock.getCatalog.mockResolvedValue({ products: [baileysProduct({ imageUrls: {} })], nextPageCursor: undefined });
 
     await expect(adapter.sendProduct('628111@s.whatsapp.net', 'p1')).rejects.toThrow(BadRequestException);
+    expect(fakeSock.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('sendProduct rejects non-http(s) imageUrl values as BadRequest without fetching or sending', async () => {
+    const adapter = await ready();
+    fakeSock.getCatalog.mockResolvedValue({
+      products: [baileysProduct({ imageUrls: { requested: 'file:///etc/passwd' } })],
+      nextPageCursor: undefined,
+    });
+
+    const error: unknown = await adapter.sendProduct('628111@s.whatsapp.net', 'p1').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(sentNothing(error)).toBe(true);
+    expect(loadRemoteMediaBuffer).not.toHaveBeenCalled();
     expect(fakeSock.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -9755,6 +10966,33 @@ describe('BaileysAdapter catalog (#905)', () => {
     expect((error as HttpException).getStatus()).toBe(503);
     expect(sentNothing(error)).toBe(true);
     expect(fakeSock.sendMessage).not.toHaveBeenCalled();
+  });
+
+  // The lookup is a read that comes before the write, so whatever it fails with, nothing was handed to WhatsApp.
+  it('sendProduct frees the send for a catalog lookup that fails with a WhatsApp server error', async () => {
+    const adapter = await ready();
+    fakeSock.getCatalog.mockRejectedValue(new Boom('internal-server-error', { data: 500 }));
+
+    const error: unknown = await adapter.sendProduct('628111@s.whatsapp.net', 'p1').catch((e: unknown) => e);
+
+    expect(provesNothingSent(error)).toBe(true);
+    expect(sendFailureProvesNothingSent(markEngineSendFailure(error))).toBe(true);
+    expect(sentNothing(error)).toBe(true);
+    expect(countsTowardSendBreaker(error)).toBe(false);
+    expect(fakeSock.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('sendProduct leaves a failed write as unknown', async () => {
+    const adapter = await ready();
+    fakeSock.getCatalog.mockResolvedValue({ products: [baileysProduct()], nextPageCursor: undefined });
+    (loadRemoteMediaBuffer as jest.Mock).mockResolvedValueOnce({ data: Buffer.from([1]), mimetype: 'image/jpeg' });
+    fakeSock.sendMessage.mockRejectedValue(new Boom('write failed', { statusCode: 500 }));
+
+    const error: unknown = await adapter.sendProduct('628111@s.whatsapp.net', 'p1').catch((e: unknown) => e);
+
+    expect(provesNothingSent(error)).toBe(false);
+    expect(sendFailureProvesNothingSent(markEngineSendFailure(error))).toBe(false);
+    expect(sentNothing(error)).toBe(false);
   });
 });
 

@@ -3,6 +3,11 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { generateSafeLinkPreview } from './safe-link-preview';
 import * as ssrfGuard from '../../common/security/ssrf-guard';
+import { leastCpuMsAsync } from '../../../test/helpers/cpu-time';
+import {
+  CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH,
+  CUSTOM_PREVIEW_TITLE_MAX_LENGTH,
+} from '../../modules/message/dto/send-message.dto';
 
 /**
  * This generator exists because the library's own delegates to a package with an unfixed SSRF
@@ -306,22 +311,65 @@ describe('generateSafeLinkPreview', () => {
         description: 'say "hi"',
       });
     });
+
+    // A preview a caller supplies is held to 256 and 1024 characters, and a fetched page is no more trusted: it can
+    // carry a title of hundreds of thousands, which went into the outgoing message and the store whole.
+    it('cuts a title and a description to the lengths a supplied preview may have', async () => {
+      respondWith(
+        `<meta property="og:title" content="${'t'.repeat(200_000)}"><meta property="og:description" content="${'d'.repeat(200_000)}">`,
+      );
+
+      const preview = await generateSafeLinkPreview('https://example.com');
+
+      expect(preview?.title).toBe('t'.repeat(CUSTOM_PREVIEW_TITLE_MAX_LENGTH));
+      expect(preview?.description).toBe('d'.repeat(CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH));
+    });
+
+    it('leaves a title and a description at the limit as they are', async () => {
+      const title = 't'.repeat(CUSTOM_PREVIEW_TITLE_MAX_LENGTH);
+      const description = 'd'.repeat(CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH);
+      respondWith(
+        `<meta property="og:title" content="${title}"><meta property="og:description" content="${description}">`,
+      );
+
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({ title, description });
+    });
+
+    it('does not leave half a character where a cut falls inside one', async () => {
+      const rocket = String.fromCodePoint(0x1f680);
+      respondWith(
+        `<meta property="og:title" content="${'a'.repeat(CUSTOM_PREVIEW_TITLE_MAX_LENGTH - 1)}${rocket}"><meta property="og:description" content="${'a'.repeat(CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH - 1)}${rocket}">`,
+      );
+
+      const preview = await generateSafeLinkPreview('https://example.com');
+
+      expect(preview?.title).toBe('a'.repeat(CUSTOM_PREVIEW_TITLE_MAX_LENGTH - 1));
+      expect(preview?.description).toBe('a'.repeat(CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH - 1));
+    });
   });
 
   // The scan runs on the event loop, where the fetch timeout cannot interrupt it. A page of unclosed
-  // tags made the old attribute patterns backtrack from every tag to the end of the body.
+  // tags made the old attribute patterns backtrack from every tag to the end of the body: one to two seconds
+  // of CPU per pattern for 128 KiB and four times that for 256 KiB, against a few dozen milliseconds now.
+  // The cheapest of three runs is bounded, so that a collection of the worker's heap that falls inside one
+  // run is not charged to the scan. The explicit timeout is for the failing case, which takes minutes.
   describe('a hostile page cannot stall the process', () => {
     it.each([
       ['unclosed <meta tags', '<meta '],
       ['unclosed <title tags', '<title'],
-    ])('scans a body of %s in linear time', async (_label, unit) => {
-      respondWith(unit.repeat((128 * 1024) / unit.length));
+    ])(
+      'scans a body of %s in linear time',
+      async (_label, unit) => {
+        respondWith(unit.repeat((256 * 1024) / unit.length));
 
-      const started = Date.now();
-      await expect(generateSafeLinkPreview('https://example.com')).resolves.toBeUndefined();
+        const cpuMs = await leastCpuMsAsync(() =>
+          expect(generateSafeLinkPreview('https://example.com')).resolves.toBeUndefined(),
+        );
 
-      expect(Date.now() - started).toBeLessThan(500);
-    });
+        expect(cpuMs).toBeLessThan(1000);
+      },
+      300_000,
+    );
   });
 
   describe('when there is nothing worth showing', () => {

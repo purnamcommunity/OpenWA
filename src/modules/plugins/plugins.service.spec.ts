@@ -23,7 +23,7 @@ import { SECRET_SENTINEL } from './redact-config';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { PluginStorageService } from '../../core/plugins/plugin-storage.service';
 import { PluginStatus, PluginType } from '../../core/plugins/plugin.interfaces';
-import { HookManager } from '../../core/hooks';
+import { HookExecutionError, HookManager } from '../../core/hooks';
 
 const manifest = { id: 'svc-plg', name: 'Svc Plugin', version: '1.0.0', type: 'extension', main: 'index.js' };
 
@@ -134,7 +134,7 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
 
   it('updatePackage swaps to the new version and preserves operator config', async () => {
     service.install({ buffer: pkg({ version: '1.0.0' }) });
-    service.updateConfig('svc-plg', { apiKey: 'secret-123' });
+    await service.updateConfig('svc-plg', { apiKey: 'secret-123' });
 
     const dto = await service.updatePackage('svc-plg', pkg({ version: '2.0.0' }));
 
@@ -734,8 +734,8 @@ describe('PluginsService — per-session config', () => {
     });
 
     // The override names no host, so it resolves to the base host; a write that names that host moves nothing.
-    it('judges a write against the base host when the stored override names none', () => {
-      service.updateConfig('sess-host', { baseUrl: 'https://base.example', apiKey: 'BASE' });
+    it('judges a write against the base host when the stored override names none', async () => {
+      await service.updateConfig('sess-host', { baseUrl: 'https://base.example', apiKey: 'BASE' });
       service.updateSessionConfig('sess-host', 'sess-A', { apiKey: 'OWN' });
 
       service.updateSessionConfig('sess-host', 'sess-A', { baseUrl: 'https://base.example/', apiKey: '***' });
@@ -752,22 +752,337 @@ describe('PluginsService — per-session config', () => {
     });
   });
 
+  describe('base config with a host key the plugin may call', () => {
+    const hostManifest = {
+      ...manifest,
+      id: 'base-host',
+      net: { allowConfigHosts: ['baseUrl'] },
+      configSchema: {
+        type: 'object',
+        properties: {
+          baseUrl: { type: 'string' },
+          apiKey: { type: 'string', secret: true },
+          lang: { type: 'string' },
+          auth: {
+            type: 'object',
+            properties: {
+              user: { type: 'string' },
+              password: { type: 'string', secret: true },
+            },
+          },
+        },
+      },
+    };
+    const runtimeConfig = () => loader.getPlugin('base-host')?.config;
+    const storedConfig = () => loader.getRegistryEntry('base-host')?.config;
+
+    beforeEach(async () => {
+      const z = new AdmZip();
+      z.addFile('manifest.json', Buffer.from(JSON.stringify(hostManifest)));
+      z.addFile('index.js', Buffer.from('module.exports = class {};'));
+      service.install({ buffer: z.toBuffer() });
+      await service.updateConfig('base-host', {
+        baseUrl: 'https://tenant.example',
+        apiKey: 'BASE-SECRET',
+        lang: 'en',
+        auth: { user: 'bot', password: 'NESTED-SECRET' },
+      });
+    });
+
+    it('drops a masked or blank base secret when the write points the host at another origin', async () => {
+      for (const echoed of ['***', '']) {
+        await service.updateConfig('base-host', {
+          baseUrl: 'https://tenant.example',
+          apiKey: 'BASE-SECRET',
+          lang: 'en',
+          auth: { user: 'bot', password: 'NESTED-SECRET' },
+        });
+        await service.updateConfig('base-host', {
+          baseUrl: 'https://attacker.example',
+          apiKey: echoed,
+          lang: 'en',
+          auth: { user: 'bot', password: echoed },
+        });
+        expect(runtimeConfig()).toEqual({
+          baseUrl: 'https://attacker.example',
+          lang: 'en',
+          auth: { user: 'bot' },
+        });
+        expect(storedConfig()).toEqual({
+          baseUrl: 'https://attacker.example',
+          lang: 'en',
+          auth: { user: 'bot' },
+        });
+      }
+    });
+
+    it('drops stored base secrets on a partial host-redirect update that omits secret keys', async () => {
+      await service.updateConfig('base-host', { baseUrl: 'https://attacker.example' });
+      expect(runtimeConfig()).toEqual({
+        baseUrl: 'https://attacker.example',
+        lang: 'en',
+        auth: { user: 'bot' },
+      });
+      expect(storedConfig()).toEqual({
+        baseUrl: 'https://attacker.example',
+        lang: 'en',
+        auth: { user: 'bot' },
+      });
+    });
+
+    it('keeps base secrets on non-redirect partial updates and same-origin host writes', async () => {
+      await service.updateConfig('base-host', { lang: 'fr' });
+      expect(runtimeConfig()).toEqual({
+        baseUrl: 'https://tenant.example',
+        apiKey: 'BASE-SECRET',
+        lang: 'fr',
+        auth: { user: 'bot', password: 'NESTED-SECRET' },
+      });
+
+      await service.updateConfig('base-host', { baseUrl: 'https://tenant.example/v2', apiKey: '***' });
+      expect(runtimeConfig()).toMatchObject({
+        baseUrl: 'https://tenant.example/v2',
+        apiKey: 'BASE-SECRET',
+        lang: 'fr',
+      });
+    });
+
+    it('stores a new base secret supplied alongside a host redirect', async () => {
+      await service.updateConfig('base-host', { baseUrl: 'https://other.example', apiKey: 'NEW-SECRET' });
+      expect(runtimeConfig()).toEqual({
+        baseUrl: 'https://other.example',
+        apiKey: 'NEW-SECRET',
+        lang: 'en',
+        auth: { user: 'bot' },
+      });
+      expect(storedConfig()).toEqual({
+        baseUrl: 'https://other.example',
+        apiKey: 'NEW-SECRET',
+        lang: 'en',
+        auth: { user: 'bot' },
+      });
+    });
+
+    it('strips env-derived built-in secrets on a host redirect and restores env fallback on null', async () => {
+      loader.registerBuiltInPlugin(
+        {
+          id: 'builtin-host',
+          name: 'Built-in Host',
+          version: '1.0.0',
+          type: PluginType.EXTENSION,
+          main: 'index.js',
+          net: { allowConfigHosts: ['baseUrl'] },
+          configSchema: {
+            type: 'object',
+            properties: {
+              baseUrl: { type: 'string' },
+              apiKey: { type: 'string', secret: true },
+              lang: { type: 'string' },
+            },
+          },
+        },
+        {},
+        { baseUrl: 'https://env.example', apiKey: 'ENV-SECRET', lang: 'en' },
+      );
+
+      await service.updateConfig('builtin-host', { baseUrl: 'https://other.example' });
+      expect(loader.getPlugin('builtin-host')?.config).toEqual({
+        baseUrl: 'https://other.example',
+        lang: 'en',
+      });
+
+      await service.updateConfig('builtin-host', { baseUrl: null });
+      expect(loader.getPlugin('builtin-host')?.config).toEqual({
+        baseUrl: 'https://env.example',
+        apiKey: 'ENV-SECRET',
+        lang: 'en',
+      });
+    });
+
+    it('drops stored base values on a host redirect when a plugin declares allowConfigHosts without a configSchema', async () => {
+      const z = new AdmZip();
+      z.addFile(
+        'manifest.json',
+        Buffer.from(
+          JSON.stringify({
+            ...manifest,
+            id: 'schemaless-host',
+            net: { allowConfigHosts: ['baseUrl'] },
+          }),
+        ),
+      );
+      z.addFile('index.js', Buffer.from('module.exports = class {};'));
+      service.install({ buffer: z.toBuffer() });
+      await service.updateConfig('schemaless-host', { baseUrl: 'https://tenant.example', secretToken: 'RAW' });
+
+      await service.updateConfig('schemaless-host', { baseUrl: 'https://attacker.example', secretToken: '***' });
+      expect(loader.getPlugin('schemaless-host')?.config).toEqual({ baseUrl: 'https://attacker.example' });
+      expect(loader.getRegistryEntry('schemaless-host')?.config).toEqual({ baseUrl: 'https://attacker.example' });
+    });
+
+    it('still allows pre-staging per-session config for an inactive session', () => {
+      service.updateSessions('base-host', ['sess-active']);
+      const res = service.updateSessionConfig('base-host', 'sess-inactive', {
+        baseUrl: 'https://staged.example',
+        apiKey: 'STAGED-KEY',
+      });
+      expect(res.success).toBe(true);
+      expect(loader.getPlugin('base-host')?.sessionConfig?.['sess-inactive']).toEqual({
+        baseUrl: 'https://staged.example',
+        apiKey: 'STAGED-KEY',
+      });
+    });
+
+    it('does not resurrect env-derived built-in secrets across a restart after a host redirect', async () => {
+      const builtInManifest = {
+        id: 'builtin-restart',
+        name: 'Built-in Restart',
+        version: '1.0.0',
+        type: PluginType.EXTENSION,
+        main: 'index.js',
+        net: { allowConfigHosts: ['baseUrl'] },
+        configSchema: {
+          type: 'object' as const,
+          properties: {
+            baseUrl: { type: 'string' as const },
+            apiKey: { type: 'string' as const, secret: true },
+            lang: { type: 'string' as const },
+          },
+        },
+      };
+      const envConfig = { baseUrl: 'https://env.example', apiKey: 'ENV-SECRET', lang: 'en' };
+      loader.registerBuiltInPlugin(builtInManifest, {}, envConfig);
+
+      await service.updateConfig('builtin-restart', { baseUrl: 'https://other.example' });
+      expect(loader.getPlugin('builtin-restart')?.config).toEqual({
+        baseUrl: 'https://other.example',
+        lang: 'en',
+      });
+
+      // Simulate restart with a fresh loader reading persisted registry.json and re-registering the built-in.
+      const restartConfig = {
+        get: (k: string) => (k === 'plugins.dir' ? pluginsDir : k === 'dataDir' ? tmpDir : undefined),
+      } as unknown as ConfigService;
+      const restartedLoader = new PluginLoaderService(
+        restartConfig,
+        new HookManager(),
+        new PluginStorageService(restartConfig),
+        {} as unknown as ModuleRef,
+      );
+      restartedLoader.registerBuiltInPlugin(builtInManifest, {}, envConfig);
+
+      expect(restartedLoader.getPlugin('builtin-restart')?.config).toEqual({
+        baseUrl: 'https://other.example',
+        lang: 'en',
+      });
+    });
+
+    it('removes a stored built-in secret on explicit null when the write echoes the env baseUrl', async () => {
+      const builtInManifest = {
+        id: 'builtin-echo-env',
+        name: 'Built-in Echo Env',
+        version: '1.0.0',
+        type: PluginType.EXTENSION,
+        main: 'index.js',
+        net: { allowConfigHosts: ['baseUrl'] },
+        configSchema: {
+          type: 'object' as const,
+          properties: {
+            baseUrl: { type: 'string' as const },
+            apiKey: { type: 'string' as const, secret: true },
+          },
+        },
+      };
+      loader.registerBuiltInPlugin(builtInManifest, {}, { baseUrl: 'https://env.example', apiKey: 'ENV-SECRET' });
+      // Operator overrides only apiKey (stored registry entry has no baseUrl; runtime inherits env baseUrl).
+      await service.updateConfig('builtin-echo-env', { apiKey: 'OP-SECRET' });
+      expect(loader.getRegistryEntry('builtin-echo-env')?.config).toEqual({ apiKey: 'OP-SECRET' });
+
+      // Dashboard echoes env baseUrl while explicitly clearing apiKey with null.
+      await service.updateConfig('builtin-echo-env', { baseUrl: 'https://env.example', apiKey: null });
+
+      expect(loader.getRegistryEntry('builtin-echo-env')?.config).toEqual({ baseUrl: 'https://env.example' });
+      expect(loader.getPlugin('builtin-echo-env')?.config).toEqual({
+        baseUrl: 'https://env.example',
+        apiKey: 'ENV-SECRET',
+      });
+    });
+
+    it('drops a stored built-in secret when baseUrl: null reverts the host to a different env origin', async () => {
+      const builtInManifest = {
+        id: 'builtin-revert',
+        name: 'Built-in Revert',
+        version: '1.0.0',
+        type: PluginType.EXTENSION,
+        main: 'index.js',
+        net: { allowConfigHosts: ['baseUrl'] },
+        configSchema: {
+          type: 'object' as const,
+          properties: {
+            baseUrl: { type: 'string' as const },
+            apiKey: { type: 'string' as const, secret: true },
+          },
+        },
+      };
+      loader.registerBuiltInPlugin(builtInManifest, {}, { baseUrl: 'https://env.example', apiKey: 'ENV-SECRET' });
+
+      for (const payload of [{ baseUrl: null }, { baseUrl: null, apiKey: '***' }]) {
+        await service.updateConfig('builtin-revert', { baseUrl: 'https://other.example', apiKey: 'OP-SECRET' });
+        expect(loader.getPlugin('builtin-revert')?.config).toEqual({
+          baseUrl: 'https://other.example',
+          apiKey: 'OP-SECRET',
+        });
+
+        await service.updateConfig('builtin-revert', payload);
+
+        expect(loader.getRegistryEntry('builtin-revert')?.config).toEqual({});
+        expect(loader.getPlugin('builtin-revert')?.config).toEqual({
+          baseUrl: 'https://env.example',
+          apiKey: 'ENV-SECRET',
+        });
+      }
+    });
+
+    it('strips secrets from child sessionConfig slices inheriting a redirected base host while keeping slices with their own host', async () => {
+      service.updateSessionConfig('base-host', 'sess-A', {
+        apiKey: 'SESS-A-SECRET',
+        lang: 'es',
+        auth: { user: 'a-bot', password: 'SESS-A-PW' },
+      });
+      service.updateSessionConfig('base-host', 'sess-B', {
+        baseUrl: 'https://tenant-b.example',
+        apiKey: 'SESS-B-SECRET',
+        lang: 'fr',
+      });
+      service.updateSessionConfig('base-host', 'sess-C', { apiKey: 'SESS-C-ONLY' });
+
+      await service.updateConfig('base-host', { baseUrl: 'https://attacker.example' });
+
+      const expectedSessions = {
+        'sess-A': { lang: 'es', auth: { user: 'a-bot' } },
+        'sess-B': { baseUrl: 'https://tenant-b.example', apiKey: 'SESS-B-SECRET', lang: 'fr' },
+      };
+      expect(loader.getPlugin('base-host')?.sessionConfig).toEqual(expectedSessions);
+      expect(loader.getRegistryEntry('base-host')?.sessionConfig).toEqual(expectedSessions);
+    });
+  });
+
   // A write is merged over the stored base config, so a removed secret has to travel as null; an empty
   // string is not a removal.
-  it('removes the base secret on an explicit null and keeps it on an empty string', () => {
-    service.updateConfig('sess-cfg', { apiKey: 'BASE', lang: 'en' });
+  it('removes the base secret on an explicit null and keeps it on an empty string', async () => {
+    await service.updateConfig('sess-cfg', { apiKey: 'BASE', lang: 'en' });
 
-    service.updateConfig('sess-cfg', { apiKey: '', lang: 'de' });
+    await service.updateConfig('sess-cfg', { apiKey: '', lang: 'de' });
     expect(loader.getPlugin('sess-cfg')?.config).toEqual({ apiKey: 'BASE', lang: 'de' });
 
-    expect(service.updateConfig('sess-cfg', { apiKey: null }).success).toBe(true);
+    expect((await service.updateConfig('sess-cfg', { apiKey: null })).success).toBe(true);
     expect(loader.getPlugin('sess-cfg')?.config).toEqual({ apiKey: null, lang: 'de' });
     expect(service.findOne('sess-cfg').config).toEqual({ apiKey: null, lang: 'de' });
   });
 
   // The override slice replaces the stored one, and a session without its own secret inherits the base.
-  it('drops a per-session secret sent as null, so the session inherits the base one', () => {
-    service.updateConfig('sess-cfg', { apiKey: 'BASE' });
+  it('drops a per-session secret sent as null, so the session inherits the base one', async () => {
+    await service.updateConfig('sess-cfg', { apiKey: 'BASE' });
     service.updateSessionConfig('sess-cfg', 'sess-A', { apiKey: 'A-secret', lang: 'he' });
 
     service.updateSessionConfig('sess-cfg', 'sess-A', { apiKey: null, lang: 'he' });
@@ -775,8 +1090,8 @@ describe('PluginsService — per-session config', () => {
     expect(loader.getPlugin('sess-cfg')?.sessionConfig?.['sess-A']).toEqual({ lang: 'he' });
   });
 
-  it('keeps the base config and per-session overrides independent', () => {
-    service.updateConfig('sess-cfg', { apiKey: 'BASE', lang: 'en' });
+  it('keeps the base config and per-session overrides independent', async () => {
+    await service.updateConfig('sess-cfg', { apiKey: 'BASE', lang: 'en' });
     service.updateSessionConfig('sess-cfg', 'sess-A', { apiKey: 'A-secret', lang: 'he' });
     const plugin = loader.getPlugin('sess-cfg');
     expect(plugin?.config).toEqual({ apiKey: 'BASE', lang: 'en' });
@@ -1179,6 +1494,40 @@ describe('PluginsService — recovering a plugin whose code went missing', () =>
     expect(fs.readFileSync(path.join(outside, 'manifest.json'), 'utf8')).toBe('victim');
   });
 
+  it('refuses reinstall when a nested subdirectory symlink inside the plugin dir escapes outside', () => {
+    const outside = path.join(tmpDir, 'outside-nested');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'target.js'), 'victim');
+    const { service } = orphan();
+    const pluginDir = path.join(pluginsDir, 'svc-plg');
+    fs.symlinkSync(outside, path.join(pluginDir, 'lib'));
+
+    const z = new AdmZip();
+    z.addFile('manifest.json', Buffer.from(JSON.stringify(manifest)));
+    z.addFile('index.js', Buffer.from('module.exports = class {};'));
+    z.addFile('lib/target.js', Buffer.from('overwritten'));
+
+    expect(() => service.install({ buffer: z.toBuffer() })).toThrow(ConflictException);
+    expect(fs.readFileSync(path.join(outside, 'target.js'), 'utf8')).toBe('victim');
+  });
+
+  it('refuses reinstall when a nested symlink inside the plugin dir would overwrite a file outside', () => {
+    const outside = path.join(tmpDir, 'outside-secret.txt');
+    fs.writeFileSync(outside, 'secret');
+    const { service } = orphan();
+    const nestedDir = path.join(pluginsDir, 'svc-plg', 'sub');
+    fs.mkdirSync(nestedDir, { recursive: true });
+    fs.symlinkSync(outside, path.join(nestedDir, 'payload.txt'));
+
+    const z = new AdmZip();
+    z.addFile('manifest.json', Buffer.from(JSON.stringify(manifest)));
+    z.addFile('index.js', Buffer.from('module.exports = class {};'));
+    z.addFile('sub/payload.txt', Buffer.from('tampered'));
+
+    expect(() => service.install({ buffer: z.toBuffer() })).toThrow(ConflictException);
+    expect(fs.readFileSync(outside, 'utf8')).toBe('secret');
+  });
+
   it('does not delete a file the failed install never got as far as writing', () => {
     // The rollback removes what this install wrote. Removing every entry path instead would reach
     // files the write never reached — the previous version's, still sitting in a directory the
@@ -1195,6 +1544,157 @@ describe('PluginsService — recovering a plugin whose code went missing', () =>
 
     expect(fs.readFileSync(path.join(pluginsDir, 'svc-plg', 'index.js'), 'utf8')).toBe('previous version');
     write.mockRestore();
+  });
+
+  describe('when a later entry of a reinstall fails to write', () => {
+    // A name over the 255-byte limit fails the write on every filesystem, after the entries before it were written.
+    const TOO_LONG = `${'z'.repeat(300)}.txt`;
+    const pkgWith = (files: Array<[string, string]>): Buffer => {
+      const z = new AdmZip();
+      z.addFile('manifest.json', Buffer.from(JSON.stringify(manifest)));
+      z.addFile('index.js', Buffer.from('module.exports = class {};'));
+      for (const [name, content] of files) z.addFile(name, Buffer.from(content));
+      return z.toBuffer();
+    };
+    const listing = (): string[] => fs.readdirSync(path.join(pluginsDir, 'svc-plg')).sort();
+
+    it('puts back a stored file that the package also ships', () => {
+      const { service, storage } = orphan();
+      fs.writeFileSync(path.join(pluginsDir, 'svc-plg', 'other.json'), '{"keep":true}');
+      const before = listing();
+
+      expect(() =>
+        service.install({
+          buffer: pkgWith([
+            ['key-abc.json', '{"shippedByPackage":true}'],
+            [TOO_LONG, 'x'],
+          ]),
+        }),
+      ).toThrow(BadRequestException);
+
+      // The replaced file has its bytes back, the files the install created are gone, the rest was never touched.
+      expect(listing()).toEqual(before);
+      expect(fs.readFileSync(path.join(pluginsDir, 'svc-plg', 'key-abc.json'), 'utf8')).toBe('{"lastId":"msg-42"}');
+      expect(fs.readFileSync(path.join(pluginsDir, 'svc-plg', 'other.json'), 'utf8')).toBe('{"keep":true}');
+      expect(storage.getPluginConfig('svc-plg')).toEqual({ token: 'keep-me' });
+    });
+
+    it('removes a subdirectory the failed install created', () => {
+      const { service } = orphan();
+
+      expect(() =>
+        service.install({
+          buffer: pkgWith([
+            ['lib/deep/x.txt', 'x'],
+            [TOO_LONG, 'x'],
+          ]),
+        }),
+      ).toThrow(BadRequestException);
+
+      expect(listing()).toEqual(['key-abc.json']);
+    });
+
+    it('removes the directories a mkdir created before it failed', () => {
+      const { service } = orphan();
+
+      // mkdir creates "docs" and then fails on the component past the 255-byte name limit.
+      expect(() => service.install({ buffer: pkgWith([[`docs/${'z'.repeat(300)}/readme.txt`, 'x']]) })).toThrow(
+        BadRequestException,
+      );
+
+      expect(listing()).toEqual(['key-abc.json']);
+    });
+
+    it('removes a new file whose write failed midway', () => {
+      const { service } = orphan();
+      const write = fs.writeFileSync;
+      // The write of a new file leaves part of it behind, as a full disk does, and then fails.
+      const spy = jest.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+        if (String(file).endsWith('fresh.js')) {
+          write(file, 'module.exp');
+          throw new Error('disk full');
+        }
+        write(file, data, options);
+      });
+
+      try {
+        expect(() => service.install({ buffer: pkgWith([['fresh.js', 'module.exports = 1;']]) })).toThrow(
+          /Failed to install plugin: disk full/,
+        );
+      } finally {
+        spy.mockRestore();
+      }
+
+      expect(listing()).toEqual(['key-abc.json']);
+    });
+
+    it('puts back a stored file whose replacement failed midway', () => {
+      const { service } = orphan();
+      const write = fs.writeFileSync;
+      // The write of the stored file's replacement empties it, as a full disk does, and then fails.
+      const spy = jest.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+        if (String(file).endsWith('key-abc.json') && Buffer.isBuffer(data) && data.toString().includes('shipped')) {
+          write(file, '');
+          throw new Error('disk full');
+        }
+        write(file, data, options);
+      });
+
+      try {
+        expect(() => service.install({ buffer: pkgWith([['key-abc.json', '{"shippedByPackage":true}']]) })).toThrow(
+          /Failed to install plugin: disk full/,
+        );
+      } finally {
+        spy.mockRestore();
+      }
+
+      expect(fs.readFileSync(path.join(pluginsDir, 'svc-plg', 'key-abc.json'), 'utf8')).toBe('{"lastId":"msg-42"}');
+      expect(listing()).toEqual(['key-abc.json']);
+    });
+
+    it('puts back the files of the version the reinstall was replacing', () => {
+      const { service } = orphan();
+      fs.writeFileSync(path.join(pluginsDir, 'svc-plg', 'index.js'), 'previous version');
+
+      expect(() => service.install({ buffer: pkgWith([[TOO_LONG, 'x']]) })).toThrow(BadRequestException);
+
+      expect(fs.readFileSync(path.join(pluginsDir, 'svc-plg', 'index.js'), 'utf8')).toBe('previous version');
+      expect(listing()).toEqual(['index.js', 'key-abc.json']);
+    });
+
+    it('keeps a stored file the package does not ship, as before', () => {
+      const { service } = orphan();
+
+      expect(() => service.install({ buffer: pkgWith([[TOO_LONG, 'x']]) })).toThrow(BadRequestException);
+
+      expect(listing()).toEqual(['key-abc.json']);
+      expect(fs.readFileSync(path.join(pluginsDir, 'svc-plg', 'key-abc.json'), 'utf8')).toContain('msg-42');
+    });
+
+    it('still answers why the install failed when a replaced file cannot be put back', () => {
+      const { service } = orphan();
+      const write = fs.writeFileSync;
+      const spy = jest.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+        // Only the undo writes the stored bytes back; every write of the install itself carries package bytes.
+        if (Buffer.isBuffer(data) && data.toString() === '{"lastId":"msg-42"}') throw new Error('disk full');
+        write(file, data, options);
+      });
+
+      try {
+        expect(() =>
+          service.install({
+            buffer: pkgWith([
+              ['key-abc.json', '{"shippedByPackage":true}'],
+              [TOO_LONG, 'x'],
+            ]),
+          }),
+        ).toThrow(/Failed to install plugin: .*ENAMETOOLONG/);
+      } finally {
+        spy.mockRestore();
+      }
+      // The files created by the install are still removed.
+      expect(listing()).toEqual(['key-abc.json']);
+    });
   });
 
   it('answers a conflict, not a crash, when a package entry path is occupied by a directory', () => {
@@ -1298,5 +1798,91 @@ describe('PluginsService remote catalog', () => {
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(BadRequestException);
     expect((err as BadRequestException).message).toMatch(/Invalid plugin catalog JSON/);
+  });
+});
+
+describe('PluginsService: disabling a plugin in ERROR state', () => {
+  let tmpDir: string;
+  let pluginsDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-err-disable-'));
+    pluginsDir = path.join(tmpDir, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+  });
+
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  it('transitions ERROR to DISABLED, clears enabledByOperator, unregisters retained fail-closed hooks, and unblocks sends', async () => {
+    const config = {
+      get: (k: string) =>
+        k === 'plugins.dir'
+          ? pluginsDir
+          : k === 'dataDir'
+            ? tmpDir
+            : k === 'hooks.preEgressFailClosed'
+              ? true
+              : undefined,
+    } as unknown as ConfigService;
+    const hookManager = new HookManager(config);
+    const storage = new PluginStorageService(config);
+    const loader = new PluginLoaderService(config, hookManager, storage, {} as unknown as ModuleRef);
+    const service = new PluginsService(loader, config);
+
+    service.install({ buffer: pkg() });
+    loader.setOperatorEnabled('svc-plg', true);
+    const plugin = loader.getPlugin('svc-plg')!;
+    plugin.status = PluginStatus.ERROR;
+    plugin.error = 'worker exited unexpectedly (code 1)';
+    hookManager.register('svc-plg', 'message:sending', () =>
+      Promise.resolve({ continue: true, error: new Error('plugin worker is no longer running') }),
+    );
+    hookManager.register('svc-plg', 'webhook:before', () =>
+      Promise.resolve({ continue: true, error: new Error('plugin worker is no longer running') }),
+    );
+
+    await expect(
+      hookManager.execute('message:sending', { input: { text: 'blocked' } }, { sessionId: 's1', source: 'test' }),
+    ).rejects.toBeInstanceOf(HookExecutionError);
+
+    const res = await service.disable('svc-plg');
+
+    expect(res).toEqual({ success: true, message: 'Plugin svc-plg disabled successfully' });
+    expect(plugin.status).toBe(PluginStatus.DISABLED);
+    expect(plugin.error).toBeUndefined();
+    expect(storage.getPluginEntry('svc-plg')?.enabledByOperator).toBe(false);
+    expect(hookManager.getHookCount('message:sending')).toBe(0);
+    expect(hookManager.getHookCount('webhook:before')).toBe(0);
+    await expect(
+      hookManager.execute('message:sending', { input: { text: 'unblocked' } }, { sessionId: 's1', source: 'test' }),
+    ).resolves.toEqual({ continue: true, data: { input: { text: 'unblocked' } } });
+  });
+
+  it('keeps the no-op response for INSTALLED and DISABLED plugins and still refuses active ENGINE in ERROR', async () => {
+    const config = {
+      get: (k: string) =>
+        k === 'plugins.dir' ? pluginsDir : k === 'dataDir' ? tmpDir : k === 'engine.type' ? 'baileys' : undefined,
+    } as unknown as ConfigService;
+    const storage = new PluginStorageService(config);
+    const loader = new PluginLoaderService(config, new HookManager(config), storage, {} as unknown as ModuleRef);
+    const service = new PluginsService(loader, config);
+    const disablePluginSpy = jest.spyOn(loader, 'disablePlugin');
+
+    service.install({ buffer: pkg() });
+    await expect(service.disable('svc-plg')).resolves.toEqual({
+      success: true,
+      message: 'Plugin svc-plg is not enabled',
+    });
+    expect(disablePluginSpy).not.toHaveBeenCalled();
+
+    loader.registerBuiltInPlugin(
+      { id: 'baileys', name: 'Baileys', version: '1.0.0', type: PluginType.ENGINE, main: 'index.js' },
+      {},
+    );
+    loader.getPlugin('baileys')!.status = PluginStatus.ERROR;
+    const engineRes = await service.disable('baileys');
+    expect(engineRes.success).toBe(false);
+    expect(engineRes.message).toMatch(/engine\.type/);
+    expect(disablePluginSpy).not.toHaveBeenCalled();
   });
 });

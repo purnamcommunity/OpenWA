@@ -1,9 +1,12 @@
+import { randomUUID } from 'crypto';
 import {
   PluginWorkerChannel,
   PluginLifecycleMethod,
   WorkerToHostMessage,
   SandboxStaticContext,
+  SandboxDispatchContext,
   PluginLogLevel,
+  SEND_CAP_VERBS,
 } from './protocol';
 import type { SearchQuery, SearchResults } from '../../../modules/search/search.types';
 import { createLogger } from '../../../common/services/logger.service';
@@ -19,9 +22,8 @@ const logger = createLogger('PluginWorkerHost');
  * SEND_CAP_TIMEOUT_FACTOR × the base budget (see withCapTimeout), so the timeout stays a "wedged
  * call" signal instead of firing inside normal execution. The in-flight bound is unchanged.
  */
-const SEND_CAP_VERBS: ReadonlySet<string> = new Set(['messages.sendText', 'messages.reply', 'conversation.send']);
-
-/** Send-verb budget as a multiple of capTimeoutMs (default 30s → 120s: the 30s media download + upload headroom). */
+// The budget of a send verb (SEND_CAP_VERBS) as a multiple of capTimeoutMs (default 30s → 120s: the 30s media download +
+// upload headroom).
 const SEND_CAP_TIMEOUT_FACTOR = 4;
 
 /** Longest worker-reported error kept for an exit message and the plugin's status. */
@@ -47,6 +49,34 @@ function workerText(value: unknown): string {
  */
 const MAX_LATE_HOOK_CLAIMS = 32;
 
+/** Bounded cache sizing for per-dispatch deterministic send deduplication across webhook retries. */
+const WEBHOOK_SEND_DEDUP_MAX = 1024;
+const WEBHOOK_SEND_DEDUP_TTL_MS = 15 * 60 * 1000;
+const MAX_NET_SCOPE_CACHE = 4096;
+
+interface ActiveCapEntry {
+  controller: AbortController;
+  cancel?: (reason: Error) => void;
+}
+
+interface InFlightDispatchEntry {
+  context: SandboxDispatchContext;
+  hookEvent?: string;
+  inFlight?: string[];
+  kind: 'hook' | 'webhook';
+  deadlineAt?: number;
+  deliveryKey?: string;
+  sendSeq: number;
+  activeCaps: Set<ActiveCapEntry>;
+}
+
+interface WebhookSendDedupEntry {
+  expiresAt: number;
+  hasResolved: boolean;
+  value?: unknown;
+  pending?: Promise<unknown>;
+}
+
 /** Worker replies that finish a host request; one arriving during a liveness probe restarts its window. */
 const PROGRESS_KINDS: ReadonlySet<WorkerToHostMessage['kind']> = new Set([
   'lifecycle-result',
@@ -55,6 +85,14 @@ const PROGRESS_KINDS: ReadonlySet<WorkerToHostMessage['kind']> = new Set([
   'health-result',
   'search-result',
 ]);
+
+/** Host-side capability dispatcher invoked for worker-initiated `cap` requests. */
+export type CapabilityDispatcher = (
+  verb: string,
+  args: unknown[],
+  dispatchContext?: SandboxDispatchContext,
+  signal?: AbortSignal,
+) => Promise<unknown>;
 
 /**
  * Host-side driver for a single untrusted plugin running in a worker. Owns the request/response
@@ -107,17 +145,26 @@ export class PluginWorkerHost {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  // Hook events (each dispatch's event plus its host-side ancestors) currently dispatched to the worker
-  // and not yet settled, as a multiset. A capability call names the chain of the dispatch it came from;
-  // this set bounds that claim, so a worker can never mark an event in flight that the host did not
-  // actually dispatch to it (HookManager's AsyncLocalStorage guard does not span the IPC boundary).
-  private readonly inFlightHookEvents = new Map<string, number>();
   // Dispatches that timed out host-side while their handler may still be running in the worker, oldest
   // first, each with the release of the in-flight claim it still holds. See holdLateClaim.
   private readonly lateHookClaims = new Map<number, () => void>();
+  // Host-authoritative session/instance context and in-flight hook event chain for active hook
+  // and webhook dispatches, keyed by a host-generated dispatchId. Looked up when a worker issues a
+  // capability call so the host never trusts worker-supplied session, instance, or hook claims.
+  private readonly inFlightDispatches = new Map<string, InFlightDispatchEntry>();
+  // Bounded deterministic send-outcome cache keyed per webhook delivery & send ordinal (or explicit caller key)
+  // so BullMQ retries never replay duplicate outbound sends when a previous attempt already sent or is still running.
+  private readonly webhookSendDedups = new Map<string, WebhookSendDedupEntry>();
+  // Active capability calls; cancelled (signal aborted + timeout timer cleared) on terminate() or exit.
+  private readonly activeCaps = new Set<ActiveCapEntry>();
+  // Host-minted opaque tokens mapping concrete hook sessionIds for floated off-dispatch net.fetch calls.
+  private readonly sessionToNetScopeId = new Map<string, string>();
+  private readonly netScopeIdToSession = new Map<string, string>();
 
   // Worker-initiated capability calls currently running host-side, bounded by maxInFlightCaps.
   private inFlightCaps = 0;
+  // Capability calls that timed out host-side whose underlying promise has not yet settled.
+  private unsettledTimedOutCaps = 0;
   // True once terminate() is called, so onExit can tell a deliberate kill (disable/enable-failure) from an
   // unexpected worker crash — only the latter is logged as a warning.
   private terminated = false;
@@ -127,12 +174,16 @@ export class PluginWorkerHost {
   // The liveness probe in flight, if any, and whether onUnresponsive has already fired (it fires once).
   private probe?: { id: number; timer: ReturnType<typeof setTimeout> };
   private unresponsiveReported = false;
+  // Timestamp of the last worker response proving its event loop turned (ready, pong, or dispatch result).
+  private lastWorkerActivityAt = Date.now();
+  // Optional periodic idle liveness check started once load() resolves ready; cleared on exit/terminate.
+  private idleLivenessTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly channel: PluginWorkerChannel,
     // Runs a worker-initiated capability call host-side (validating permission + session scope before
     // the real verb). Absent => the worker has no capabilities (e.g. before the bridge is wired).
-    private readonly capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
+    private readonly capDispatcher?: CapabilityDispatcher,
     // Called when the worker subscribes a handler to an event, so the host can register a shim with
     // the hook manager that dispatches into the worker.
     private readonly onHookSubscribe?: (event: string, priority?: number) => void,
@@ -160,30 +211,44 @@ export class PluginWorkerHost {
     private readonly onExit?: (code: number, intentional: boolean, reason?: string) => void,
     // Host-side budget for ONE capability call. A worker whose calls hang would otherwise hold its
     // in-flight slots forever (self-DoS once maxInFlightCaps are all wedged). On timeout the worker gets
-    // an error cap-result and the slot frees; the underlying host-side work is NOT cancelled (see
-    // withCapTimeout). Absent/undefined => no per-call timeout (legacy behavior).
+    // an error cap-result, the call's AbortSignal is aborted, and the slot frees (while unsettled late
+    // promises remain bounded). Absent/undefined => no per-call timeout (legacy behavior).
     private readonly capTimeoutMs?: number,
-    // After a hook/webhook/search dispatch times out, the host pings the worker and waits this long for
-    // the pong the bootstrap sends before any plugin code runs. A full window with neither the pong nor
-    // any other dispatch result means the worker's event loop is blocked (a slow async handler still
-    // answers), and onUnresponsive is called once so the caller can terminate it. Either absent => no
-    // probing (legacy behavior).
+    // After a hook/webhook/search/health timeout (or idle interval), the host pings the worker and waits
+    // this long for the pong the bootstrap sends before any plugin code runs. A full window with neither
+    // the pong nor any other dispatch result means the worker's event loop is blocked (a slow async handler
+    // still answers), and onUnresponsive is called once so the caller can terminate it. Either absent =>
+    // no probing (legacy behavior).
     private readonly livenessTimeoutMs?: number,
     private readonly onUnresponsive?: () => void,
+    // Optional interval (ms) for periodic idle liveness probing once load() reports ready. Defaults to 0
+    // (disabled) so unit tests remain deterministic; production passes 30_000 ms.
+    private readonly livenessIntervalMs = 0,
   ) {
     this.channel.onMessage(message => this.handleMessage(message));
     this.channel.onExit(code => this.handleExit(code));
   }
 
-  private incInFlightHook(event: string): void {
-    this.inFlightHookEvents.set(event, (this.inFlightHookEvents.get(event) ?? 0) + 1);
-  }
-
-  private decInFlightHook(event: string): void {
-    const count = this.inFlightHookEvents.get(event);
-    if (count === undefined) return;
-    if (count <= 1) this.inFlightHookEvents.delete(event);
-    else this.inFlightHookEvents.set(event, count - 1);
+  private getOrCreateNetScopeId(sessionId: string): string {
+    const existing = this.sessionToNetScopeId.get(sessionId);
+    if (existing !== undefined) {
+      this.sessionToNetScopeId.delete(sessionId);
+      this.sessionToNetScopeId.set(sessionId, existing);
+      this.netScopeIdToSession.delete(existing);
+      this.netScopeIdToSession.set(existing, sessionId);
+      return existing;
+    }
+    while (this.sessionToNetScopeId.size >= MAX_NET_SCOPE_CACHE) {
+      const oldestSession = this.sessionToNetScopeId.keys().next().value;
+      if (oldestSession === undefined) break;
+      const oldestToken = this.sessionToNetScopeId.get(oldestSession);
+      this.sessionToNetScopeId.delete(oldestSession);
+      if (oldestToken !== undefined) this.netScopeIdToSession.delete(oldestToken);
+    }
+    const token = randomUUID();
+    this.sessionToNetScopeId.set(sessionId, token);
+    this.netScopeIdToSession.set(token, sessionId);
+    return token;
   }
 
   /**
@@ -202,24 +267,34 @@ export class PluginWorkerHost {
     // Events already in flight on the host's hook chain when this dispatch fires (the caller's
     // ancestors); forwarded so a capability call the handler makes is guarded against all of them.
     inFlight?: string[];
+    failClosed?: boolean;
     timeoutMs: number;
     onTimeout?: () => void;
   }): Promise<{ continue: boolean; data?: unknown; error?: string }> {
     // Fail fast on a dead worker: a post-crash dispatchHook (the hook shim still holds the stale host
     // reference) would otherwise post to the dead worker and stall the chain for the full timeout before
-    // resolving. The fail-open { continue: true } matches what the per-call timeout + the in-flight
-    // crash-drain already produce.
-    if (this.dead) return Promise.resolve({ continue: true });
+    // resolving. Populating `error` lets fail-closed callers reject the send while fail-open callers continue.
+    if (this.dead) return Promise.resolve({ continue: true, error: 'plugin worker is no longer running' });
     const id = this.nextId++;
+    const dispatchId = randomUUID();
+    const netScopeId =
+      options.sessionId && options.sessionId !== '*' ? this.getOrCreateNetScopeId(options.sessionId) : undefined;
     const inFlight = [...new Set([...(options.inFlight ?? []), options.event])];
-    for (const event of inFlight) this.incInFlightHook(event);
-    return new Promise(resolve => {
+    this.inFlightDispatches.set(dispatchId, {
+      context: { sessionId: options.sessionId },
+      hookEvent: options.event,
+      inFlight,
+      kind: 'hook',
+      sendSeq: 0,
+      activeCaps: new Set(),
+    });
+    return new Promise((resolve, reject) => {
       let released = false;
       const release = (): void => {
         if (released) return;
         released = true;
         this.lateHookClaims.delete(id);
-        for (const event of inFlight) this.decInFlightHook(event);
+        this.inFlightDispatches.delete(dispatchId);
       };
       // settle gives the in-flight claim back on every exit path that ends the dispatch (the worker's
       // result, a late one included, or the crash drain) since it is what the hookPending entry's resolve
@@ -232,23 +307,33 @@ export class PluginWorkerHost {
         options.onTimeout?.();
         this.probeLiveness();
         // The chain moves on without this plugin, but its handler is still running in the worker, and
-        // a capability call it makes from here on still names this dispatch. Dropping the claim now
-        // would let that call run outside the re-entrancy guard, re-fire the event and dispatch the
-        // same slow handler again, one more send every timeout for as long as the plugin stays enabled.
-        resolve({ continue: true });
+        // a capability call it makes from here on still names this dispatch. Retain both the in-flight
+        // re-entrancy claim and the dispatch context until the late result arrives, eviction past
+        // MAX_LATE_HOOK_CLAIMS, or worker exit.
+        resolve({ continue: true, error: `hook timed out after ${options.timeoutMs}ms` });
         this.holdLateClaim(id, release);
       }, options.timeoutMs);
       this.hookPending.set(id, { resolve: settle, timer });
-      this.channel.postMessage({
-        kind: 'hook',
-        id,
-        event: options.event,
-        data: options.data,
-        sessionId: options.sessionId,
-        source: options.source,
-        config: options.config,
-        inFlight,
-      });
+      try {
+        this.channel.postMessage({
+          kind: 'hook',
+          id,
+          dispatchId,
+          ...(netScopeId ? { netScopeId } : {}),
+          event: options.event,
+          data: options.data,
+          sessionId: options.sessionId,
+          source: options.source,
+          config: options.config,
+          inFlight,
+          ...(options.failClosed ? { failClosed: true } : {}),
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        this.hookPending.delete(id);
+        release();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -282,6 +367,7 @@ export class PluginWorkerHost {
     rawBody: string;
     verified: boolean;
     deliveryId: string;
+    dedupKey?: string;
     sessionId?: string;
     config?: Record<string, unknown>;
     timeoutMs: number;
@@ -291,29 +377,68 @@ export class PluginWorkerHost {
     // dispatchWebhook returns immediately instead of waiting the full timeout for a worker that's gone.
     if (this.dead) return Promise.resolve({ ok: false, status: 502 });
     const id = this.nextId++;
-    return new Promise(resolve => {
+    const dispatchId = randomUUID();
+    const effectiveDedupId = options.dedupKey ?? options.deliveryId;
+    const deliveryKey = effectiveDedupId ? `${options.instanceId}:${options.route}:${effectiveDedupId}` : undefined;
+    const dispatchEntry: InFlightDispatchEntry = {
+      context: { sessionId: options.sessionId, instanceId: options.instanceId },
+      kind: 'webhook',
+      deadlineAt: Date.now() + options.timeoutMs,
+      deliveryKey,
+      sendSeq: 0,
+      activeCaps: new Set(),
+    };
+    this.inFlightDispatches.set(dispatchId, dispatchEntry);
+    return new Promise((resolve, reject) => {
+      const settle = (result: {
+        status: number;
+        headers?: Record<string, string>;
+        body?: string;
+        ok: boolean;
+        error?: string;
+      }): void => {
+        this.inFlightDispatches.delete(dispatchId);
+        resolve(result);
+      };
       const timer = setTimeout(() => {
         this.webhookPending.delete(id);
+        this.inFlightDispatches.delete(dispatchId);
+        const timeoutReason = new Error(`webhook dispatch timed out after ${options.timeoutMs}ms`);
+        for (const cap of dispatchEntry.activeCaps) {
+          if (!cap.controller.signal.aborted) {
+            cap.controller.abort(timeoutReason);
+          }
+          cap.cancel?.(timeoutReason);
+        }
+        dispatchEntry.activeCaps.clear();
         options.onTimeout?.();
         this.probeLiveness();
         resolve({ ok: false, status: 504 }); // the ingress job retries or dead-letters the delivery
       }, options.timeoutMs);
-      this.webhookPending.set(id, { resolve, timer });
-      this.channel.postMessage({
-        kind: 'webhook',
-        id,
-        instanceId: options.instanceId,
-        route: options.route,
-        method: options.method,
-        headers: options.headers,
-        query: options.query,
-        body: options.body,
-        rawBody: options.rawBody,
-        verified: options.verified,
-        deliveryId: options.deliveryId,
-        sessionId: options.sessionId,
-        config: options.config,
-      });
+      this.webhookPending.set(id, { resolve: settle, timer });
+      try {
+        this.channel.postMessage({
+          kind: 'webhook',
+          id,
+          dispatchId,
+          instanceId: options.instanceId,
+          route: options.route,
+          method: options.method,
+          headers: options.headers,
+          query: options.query,
+          body: options.body,
+          rawBody: options.rawBody,
+          verified: options.verified,
+          deliveryId: options.deliveryId,
+          sessionId: options.sessionId,
+          config: options.config,
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        this.webhookPending.delete(id);
+        this.inFlightDispatches.delete(dispatchId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -404,6 +529,7 @@ export class PluginWorkerHost {
     return new Promise(resolve => {
       const timer = setTimeout(() => {
         this.healthPending.delete(id);
+        this.probeLiveness();
         resolve({ healthy: false, message: 'health check timed out' });
       }, timeoutMs);
       this.healthPending.set(id, { resolve, timer });
@@ -447,9 +573,55 @@ export class PluginWorkerHost {
     this.probe = { id, timer };
   }
 
+  private startIdleLivenessMonitor(): void {
+    if (
+      this.idleLivenessTimer ||
+      this.livenessIntervalMs <= 0 ||
+      this.livenessTimeoutMs === undefined ||
+      !this.onUnresponsive ||
+      this.dead ||
+      this.terminated
+    ) {
+      return;
+    }
+    const timer = setInterval(() => {
+      if (this.dead || this.terminated || this.unresponsiveReported) {
+        this.stopIdleLivenessMonitor();
+        return;
+      }
+      if (this.probe) return;
+      if (Date.now() - this.lastWorkerActivityAt >= this.livenessIntervalMs) {
+        this.probeLiveness();
+      }
+    }, this.livenessIntervalMs);
+    timer.unref?.();
+    this.idleLivenessTimer = timer;
+  }
+
+  private stopIdleLivenessMonitor(): void {
+    if (this.idleLivenessTimer) {
+      clearInterval(this.idleLivenessTimer);
+      this.idleLivenessTimer = undefined;
+    }
+  }
+
+  private abortActiveCaps(reason: Error): void {
+    const entries = [...this.activeCaps];
+    this.activeCaps.clear();
+    for (const entry of entries) {
+      if (!entry.controller.signal.aborted) entry.controller.abort(reason);
+      entry.cancel?.(reason);
+    }
+  }
+
   /** Tear the worker down. */
   terminate(): Promise<void> {
     this.terminated = true;
+    this.stopIdleLivenessMonitor();
+    this.abortActiveCaps(new Error('plugin worker terminated'));
+    this.inFlightDispatches.clear();
+    this.sessionToNetScopeId.clear();
+    this.netScopeIdToSession.clear();
     return this.channel.terminate();
   }
 
@@ -470,10 +642,14 @@ export class PluginWorkerHost {
   private routeMessage(message: WorkerToHostMessage): void {
     // Only answers to host requests count as progress: a synchronous loop can still post log, cap or
     // subscribe messages, but it cannot finish a dispatch.
+    if (message.kind === 'ready' || message.kind === 'pong' || PROGRESS_KINDS.has(message.kind)) {
+      this.lastWorkerActivityAt = Date.now();
+    }
     if (this.probe && PROGRESS_KINDS.has(message.kind)) this.armProbe(this.probe.id);
     switch (message.kind) {
       case 'ready':
         this.ready = true;
+        this.startIdleLivenessMonitor();
         this.drain(this.readyWaiters, w => {
           if (w.timer) clearTimeout(w.timer);
           w.resolve();
@@ -515,9 +691,16 @@ export class PluginWorkerHost {
         if (!waiter) return;
         this.hookPending.delete(message.id);
         clearTimeout(waiter.timer);
+        if (typeof message.continue !== 'boolean') {
+          waiter.resolve({ continue: true, error: 'malformed hook-result: continue must be a boolean' });
+          break;
+        }
         const result: { continue: boolean; data?: unknown; error?: string } = { continue: message.continue };
         if (message.data !== undefined) result.data = message.data;
-        if (message.error !== undefined) result.error = workerText(message.error);
+        if (message.error !== undefined) {
+          const formatted = workerText(message.error);
+          result.error = formatted.trim().length > 0 ? formatted : 'sandbox hook failed';
+        }
         waiter.resolve(result);
         break;
       }
@@ -569,6 +752,7 @@ export class PluginWorkerHost {
   }
 
   private async handleCapRequest(message: Extract<WorkerToHostMessage, { kind: 'cap' }>): Promise<void> {
+    if (this.dead || this.terminated) return;
     if (typeof message.verb !== 'string') {
       this.channel.postMessage({ kind: 'cap-result', id: message.id, ok: false, error: NON_STRING_WORKER_VALUE });
       return;
@@ -582,80 +766,258 @@ export class PluginWorkerHost {
       });
       return;
     }
-    if (!this.capDispatcher) {
-      this.channel.postMessage({ kind: 'cap-result', id: message.id, ok: false, error: 'no capability dispatcher' });
-      return;
-    }
-    this.inFlightCaps++;
-    try {
-      const dispatcher = this.capDispatcher;
-      const run = (): Promise<unknown> => dispatcher(message.verb, message.args);
-      // Run inside the in-flight hook context of the dispatch whose handler issued this call, so a
-      // capability that re-fires that event is short-circuited by HookManager's re-entrancy guard
-      // (which otherwise can't see across the IPC boundary). Only that causal chain is guarded: a call
-      // from an ingress handler or a timer carries none, and must still run every plugin's hooks
-      // (a moderation veto on message:sending included) even while another dispatch is pending. The
-      // worker's claim is untrusted, so only events this host has dispatched to it and not yet settled
-      // are honoured. A worker can still echo a pending event from outside that handler, but that grants
-      // nothing a genuinely re-entrant call from inside the pending handler would not.
-      const claimed: unknown[] = Array.isArray(message.inFlight) ? message.inFlight : [];
-      const inFlight = claimed.filter((e): e is string => typeof e === 'string' && this.inFlightHookEvents.has(e));
-      const work = this.runWithHookGuard && inFlight.length > 0 ? this.runWithHookGuard(inFlight, run) : run();
-      const result = await this.withCapTimeout(message.verb, work);
-      this.channel.postMessage({ kind: 'cap-result', id: message.id, ok: true, result });
-    } catch (error) {
+    if (
+      this.maxInFlightCaps !== undefined &&
+      this.inFlightCaps + this.unsettledTimedOutCaps >= this.maxInFlightCaps * 2
+    ) {
       this.channel.postMessage({
         kind: 'cap-result',
         id: message.id,
         ok: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: `capability call rejected: too many unsettled timed-out capability calls (limit ${this.maxInFlightCaps * 2})`,
       });
+      return;
+    }
+    if (!this.capDispatcher) {
+      this.channel.postMessage({ kind: 'cap-result', id: message.id, ok: false, error: 'no capability dispatcher' });
+      return;
+    }
+    let dispatchEntry: InFlightDispatchEntry | undefined;
+    let dispatchContext: SandboxDispatchContext | undefined;
+    if (message.dispatchId !== undefined) {
+      if (typeof message.dispatchId !== 'string' || !this.inFlightDispatches.has(message.dispatchId)) {
+        this.channel.postMessage({
+          kind: 'cap-result',
+          id: message.id,
+          ok: false,
+          error: 'capability call rejected: unknown or expired dispatch context',
+        });
+        return;
+      }
+      dispatchEntry = this.inFlightDispatches.get(message.dispatchId);
+      dispatchContext = dispatchEntry?.context;
+    } else if (message.verb === 'net.fetch' && message.netScopeId !== undefined) {
+      if (typeof message.netScopeId !== 'string' || !this.netScopeIdToSession.has(message.netScopeId)) {
+        this.channel.postMessage({
+          kind: 'cap-result',
+          id: message.id,
+          ok: false,
+          error: 'capability call rejected: unknown or expired net scope context',
+        });
+        return;
+      }
+      dispatchContext = { sessionId: this.netScopeIdToSession.get(message.netScopeId)! };
+    }
+    const controller = new AbortController();
+    let cancelledByTeardown = false;
+    const capEntry: ActiveCapEntry = {
+      controller,
+      cancel: () => {
+        cancelledByTeardown = true;
+      },
+    };
+    this.activeCaps.add(capEntry);
+    dispatchEntry?.activeCaps.add(capEntry);
+    this.inFlightCaps++;
+    try {
+      const dispatcher = this.capDispatcher;
+      const run = (): Promise<unknown> => dispatcher(message.verb, message.args, dispatchContext, controller.signal);
+      // Always derive guardedEvents strictly from the host-recorded dispatch entry. Calls without
+      // a valid host-issued dispatchId (timers, lifecycle, or an untrusted worker stripping
+      // dispatchId) carry no hook guard so a worker can never spoof inFlight claims across dispatches.
+      const guardedEvents = dispatchEntry?.inFlight ? [...dispatchEntry.inFlight] : [];
+      const execute = (): Promise<unknown> =>
+        this.runWithHookGuard && guardedEvents.length > 0 ? this.runWithHookGuard(guardedEvents, run) : run();
+      const work =
+        dispatchEntry?.kind === 'webhook' && SEND_CAP_VERBS.has(message.verb)
+          ? this.runWebhookSendWithDedup(dispatchEntry, message.dispatchId!, message.verb, message.args, execute)
+          : execute();
+      const result = await this.withCapTimeout(
+        message.verb,
+        work,
+        capEntry,
+        () => {
+          cancelledByTeardown = true;
+        },
+        dispatchEntry?.kind === 'webhook' ? dispatchEntry.deadlineAt : undefined,
+      );
+      if (!cancelledByTeardown && !this.dead && !this.terminated) {
+        this.channel.postMessage({ kind: 'cap-result', id: message.id, ok: true, result });
+      }
+    } catch (error) {
+      if (!cancelledByTeardown && !this.dead && !this.terminated) {
+        this.channel.postMessage({
+          kind: 'cap-result',
+          id: message.id,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     } finally {
+      this.activeCaps.delete(capEntry);
+      dispatchEntry?.activeCaps.delete(capEntry);
       this.inFlightCaps--;
     }
   }
 
+  private runWebhookSendWithDedup(
+    dispatchEntry: InFlightDispatchEntry,
+    dispatchId: string,
+    verb: string,
+    args: unknown[],
+    execute: () => Promise<unknown>,
+  ): Promise<unknown> {
+    const firstArg = args[0] as { idempotencyKey?: unknown } | undefined;
+    const explicitKey =
+      typeof firstArg?.idempotencyKey === 'string' && firstArg.idempotencyKey.length > 0
+        ? firstArg.idempotencyKey
+        : undefined;
+    const dedupKey = explicitKey
+      ? `explicit:${dispatchEntry.deliveryKey ?? dispatchId}:${verb}:${explicitKey}`
+      : dispatchEntry.deliveryKey
+        ? `auto:${dispatchEntry.deliveryKey}:${verb}:${dispatchEntry.sendSeq++}`
+        : undefined;
+    if (!dedupKey) return execute();
+
+    const now = Date.now();
+    for (const [k, v] of this.webhookSendDedups) {
+      if (v.expiresAt <= now && !v.pending) this.webhookSendDedups.delete(k);
+    }
+
+    const startFresh = (): Promise<unknown> => {
+      while (this.webhookSendDedups.size >= WEBHOOK_SEND_DEDUP_MAX) {
+        const oldest = this.webhookSendDedups.keys().next().value;
+        if (oldest === undefined) break;
+        this.webhookSendDedups.delete(oldest);
+      }
+      const record: WebhookSendDedupEntry = {
+        expiresAt: Date.now() + WEBHOOK_SEND_DEDUP_TTL_MS,
+        hasResolved: false,
+      };
+      const tracked = execute().then(
+        value => {
+          record.hasResolved = true;
+          record.value = value;
+          record.pending = undefined;
+          return value;
+        },
+        err => {
+          if (this.webhookSendDedups.get(dedupKey) === record) {
+            this.webhookSendDedups.delete(dedupKey);
+          }
+          record.pending = undefined;
+          throw err;
+        },
+      );
+      tracked.catch(() => undefined);
+      record.pending = tracked;
+      this.webhookSendDedups.set(dedupKey, record);
+      return tracked;
+    };
+
+    const existing = this.webhookSendDedups.get(dedupKey);
+    if (existing && existing.expiresAt > now) {
+      if (existing.hasResolved) return Promise.resolve(existing.value);
+      if (existing.pending) {
+        return existing.pending.catch(() => startFresh());
+      }
+    }
+    return startFresh();
+  }
+
   /**
-   * Bound one capability call host-side. On timeout the caller (the worker) gets an error cap-result
-   * and the in-flight slot frees, so a plugin whose calls hang can't wedge all maxInFlightCaps slots
-   * into a self-DoS. The underlying host-side work is NOT cancelled — host verbs hold no cancellation
-   * token — so when it eventually settles the outcome is only logged as a WARN and its result is
-   * discarded (never a second cap-result). This is a robustness bound, not an atomicity guarantee: a
-   * timed-out call may still complete its side effect late (e.g. a message send that lands after the
-   * caller already saw the timeout error). To keep that late-settle window small where a duplicate is
-   * user-visible, send verbs (SEND_CAP_VERBS) run on a wider budget that covers normal execution.
+   * Bound one capability call host-side. On timeout the caller (the worker) gets an error cap-result,
+   * the call's AbortSignal is aborted, and the in-flight slot frees so a plugin whose calls hang can't
+   * wedge all maxInFlightCaps slots into a self-DoS. If the underlying verb does not support cancellation,
+   * its unsettled promise is counted against unsettledTimedOutCaps (capped at 2 * maxInFlightCaps combined
+   * with inFlightCaps) and WARN-logged once it eventually settles. Send verbs (SEND_CAP_VERBS) run on a
+   * wider budget that covers normal execution unless bounded by an active webhook deadline.
    */
-  private withCapTimeout(verb: string, work: Promise<unknown>): Promise<unknown> {
-    if (this.capTimeoutMs === undefined) return work;
-    const timeoutMs = SEND_CAP_VERBS.has(verb) ? this.capTimeoutMs * SEND_CAP_TIMEOUT_FACTOR : this.capTimeoutMs;
+  private withCapTimeout(
+    verb: string,
+    work: Promise<unknown>,
+    entry: ActiveCapEntry,
+    onTeardownCancel?: () => void,
+    dispatchDeadlineAt?: number,
+  ): Promise<unknown> {
+    const configuredTimeoutMs =
+      this.capTimeoutMs === undefined
+        ? undefined
+        : SEND_CAP_VERBS.has(verb)
+          ? this.capTimeoutMs * SEND_CAP_TIMEOUT_FACTOR
+          : this.capTimeoutMs;
+    const remainingMs = dispatchDeadlineAt !== undefined ? Math.max(0, dispatchDeadlineAt - Date.now()) : undefined;
+    const timeoutMs =
+      configuredTimeoutMs !== undefined && remainingMs !== undefined
+        ? Math.min(configuredTimeoutMs, remainingMs)
+        : (configuredTimeoutMs ?? remainingMs);
+    if (timeoutMs === undefined) return work;
     return new Promise((resolve, reject) => {
+      let settled = false;
       const timer = setTimeout(() => {
-        // Late settle: warn exactly once, whichever way the work ends. These handlers also keep a
-        // late rejection from surfacing as an unhandled promise rejection.
+        if (settled) return;
+        settled = true;
+        entry.cancel = undefined;
+        this.activeCaps.delete(entry);
+        this.unsettledTimedOutCaps++;
+        if (!entry.controller.signal.aborted) {
+          entry.controller.abort(new Error(`capability '${verb}' timed out after ${timeoutMs}ms`));
+        }
+        // Late settle: warn exactly once, whichever way the work ends, and release the unsettled slot.
+        // These handlers also keep a late rejection from surfacing as an unhandled promise rejection.
         work.then(
-          () =>
-            this.onLog?.(
-              'warn',
-              `capability '${verb}' settled after the ${timeoutMs}ms host timeout; its late result was discarded`,
-              { action: 'sandbox_cap_late_settle', verb },
-            ),
-          (error: unknown) =>
-            this.onLog?.(
-              'warn',
-              `capability '${verb}' failed after the ${timeoutMs}ms host timeout: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-              { action: 'sandbox_cap_late_settle', verb },
-            ),
+          () => {
+            this.unsettledTimedOutCaps = Math.max(0, this.unsettledTimedOutCaps - 1);
+            if (!this.dead && !this.terminated) {
+              this.onLog?.(
+                'warn',
+                `capability '${verb}' settled after the ${timeoutMs}ms host timeout; its late result was discarded`,
+                { action: 'sandbox_cap_late_settle', verb },
+              );
+            }
+          },
+          (error: unknown) => {
+            this.unsettledTimedOutCaps = Math.max(0, this.unsettledTimedOutCaps - 1);
+            if (!this.dead && !this.terminated) {
+              this.onLog?.(
+                'warn',
+                `capability '${verb}' failed after the ${timeoutMs}ms host timeout: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+                { action: 'sandbox_cap_late_settle', verb },
+              );
+            }
+          },
         );
         reject(new Error(`capability '${verb}' timed out after ${timeoutMs}ms`));
       }, timeoutMs);
+      timer.unref?.();
+      entry.cancel = (reason: Error) => {
+        if (settled) return;
+        settled = true;
+        entry.cancel = undefined;
+        onTeardownCancel?.();
+        clearTimeout(timer);
+        // Swallow any late settlement after worker teardown so a hung promise never triggers
+        // an unhandled rejection or post-teardown warning.
+        work.then(
+          () => undefined,
+          () => undefined,
+        );
+        reject(reason);
+      };
       work.then(
         result => {
+          if (settled) return;
+          settled = true;
+          entry.cancel = undefined;
           clearTimeout(timer);
           resolve(result);
         },
         (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          entry.cancel = undefined;
           clearTimeout(timer);
           // The worker sees the dispatcher's failure verbatim when it is an Error; wrap anything else
           // (a hostile/buggy dispatcher rejecting with a non-Error must not break the wire shape).
@@ -667,6 +1029,11 @@ export class PluginWorkerHost {
 
   private handleExit(code: number): void {
     this.dead = true;
+    this.stopIdleLivenessMonitor();
+    this.abortActiveCaps(new Error(`plugin worker exited (code ${code})`));
+    this.inFlightDispatches.clear();
+    this.sessionToNetScopeId.clear();
+    this.netScopeIdToSession.clear();
     if (this.probe) {
       clearTimeout(this.probe.timer);
       this.probe = undefined;
@@ -688,12 +1055,12 @@ export class PluginWorkerHost {
       resolve({ healthy: false, message: 'plugin worker exited' });
     });
     this.healthPending.clear();
-    // Drain in-flight hooks too (symmetry with the maps above): resolve {continue:true} — the same
-    // fail-open value the per-hook timeout already produces — so the host hook chain unblocks
-    // immediately on a worker crash instead of stalling for the full hook timeout per in-flight hook.
+    // Drain in-flight hooks too (symmetry with the maps above): carry an explicit error reason so
+    // fail-closed callers can reject while fail-open callers unblock immediately on a worker crash
+    // instead of stalling for the full hook timeout per in-flight hook.
     this.hookPending.forEach(({ resolve, timer }) => {
       clearTimeout(timer);
-      resolve({ continue: true });
+      resolve({ continue: true, error: 'plugin worker exited during hook dispatch' });
     });
     this.hookPending.clear();
     // Drain in-flight webhooks: a mid-dispatch worker crash returns 502 so the ingress job fails the

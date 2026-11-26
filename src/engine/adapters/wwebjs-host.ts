@@ -6,9 +6,10 @@ import {
 } from '../interfaces/whatsapp-engine.interface';
 import { type createLogger } from '../../common/services/logger.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { EnginePageReloadingError } from '../../common/errors/engine-page-reloading.error';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { type WhatsAppWebJsConfig } from './whatsapp-web-js.adapter';
-import { PAGE_RELOADING_MESSAGE, isNavigationError, toCapturedPageError } from './wwebjs-lifecycle';
+import { isNavigationError, isProtocolTimeout, toCapturedPageError } from './wwebjs-lifecycle';
 
 /**
  * Shared host surface for the delegates extracted from WhatsAppWebJsAdapter (./wwebjs-groups,
@@ -30,6 +31,11 @@ export interface WwebjsEngineHost {
    * without it keeps the text-free behaviour of simply carrying on.
    */
   reportOnceGone?(error: unknown, context: string): Promise<void>;
+  /**
+   * How many page navigations have been stamped so far, for a call to tell that one landed while it ran (see
+   * {@link rethrowIfNavigation}). Optional so a host built without it keeps the text-only reading of a failure.
+   */
+  navigationCount?(): number;
   ensureNotChannelRecipient(chatId: string): void;
   getNumberId(number: string): Promise<string | null>;
   capInboundMediaFor(
@@ -54,20 +60,48 @@ export function requireClient(host: WwebjsEngineHost): Client {
   return client;
 }
 
+/** The page navigations stamped so far, read where a page call starts and handed to {@link rethrowIfNavigation}. */
+export function navigationsSeen(host: WwebjsEngineHost): number {
+  return host.navigationCount?.() ?? 0;
+}
+
 /**
  * Answer the retryable 409 the adapter gives inside the navigation window when the error says the page
  * navigated under the call, and return for any other error. A call already in flight when WhatsApp Web
  * reloads dies with Puppeteer's navigation error before the window is stamped, so it would otherwise be a
  * bare 500, or, where a catch folds a failed lookup into "not found", a 404 for a group, contact or label
  * that exists. A navigation schedules a delayed health check without reporting an immediate death.
+ *
+ * `since` is {@link navigationsSeen} where the call started: a navigation stamped after that is the reload whatever
+ * the failure says (see isNavigationError), for a call made before the page told of its navigation and held for the
+ * new document. Only for a read or a write that converges when repeated: a caller whose repeat could duplicate
+ * keeps its own answer and does not come here.
  */
-export function rethrowIfNavigation(host: WwebjsEngineHost, error: unknown, context = 'page navigation'): void {
+export function rethrowIfNavigation(
+  host: WwebjsEngineHost,
+  error: unknown,
+  since: number,
+  context = 'page navigation',
+): void {
   // The lifecycle never reads a navigation-shaped error as a dead page, so with it this is the navigation test alone;
   // a host that does read one as dead keeps it a death. A page that really died reports through the death listeners.
-  if (isNavigationError(error) && !host.isPageTransportError(error)) {
-    host.reportIfPageTransportError(error, context);
-    throw new EngineNotReadyError(PAGE_RELOADING_MESSAGE);
+  if (isNavigationError(error, navigationsSeen(host) !== since) && !host.isPageTransportError(error)) {
+    // Only a navigation-shaped failure goes to the lifecycle, for its delayed check that the page recovered: one read
+    // as the reload because a navigation was stamped during the call says nothing about the renderer.
+    if (isNavigationError(error)) host.reportIfPageTransportError(error, context);
+    throw new EnginePageReloadingError();
   }
+}
+
+/**
+ * Answer the retryable 409 when a navigation was stamped since `since` ({@link navigationsSeen} where the call
+ * started), for a page function that answered "no such job" and not with a failure. A document a reload has just
+ * opened has not defined its modules yet, so a lookup on it finds none, as on a build that lacks the job, and the 501
+ * that says so is final. Nothing was asked of WhatsApp in either case. Returns when no navigation was stamped, which
+ * is a build that really lacks the job.
+ */
+export function throwIfNavigatedSince(host: WwebjsEngineHost, since: number): void {
+  if (navigationsSeen(host) !== since) throw new EnginePageReloadingError();
 }
 
 /**
@@ -80,13 +114,35 @@ export function rethrowIfNavigation(host: WwebjsEngineHost, error: unknown, cont
  * held a byte-identical private copy, and ./wwebjs-contacts needed a fourth.
  */
 export async function withPage<T>(host: WwebjsEngineHost, context: string, op: () => Promise<T>): Promise<T> {
+  const since = navigationsSeen(host);
   try {
     return await op();
   } catch (error) {
-    rethrowIfNavigation(host, error, context);
+    rethrowIfNavigation(host, error, since, context);
     if (host.isPageTransportError(error)) {
       host.reportIfPageTransportError(error, context);
       throw new EngineTransportError(`Transport died during ${context}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * {@link withPage} for a read, for a write that converges when repeated, and for the lookups it makes before it
+ * writes. A command that outran Puppeteer's protocol budget got no answer either way and is no page death, so it is
+ * the 503 the route documents (a read read nothing, a write may or may not have been applied), not the raw timeout as
+ * a 500, and nothing is reported: a slow renderer is not a dead one. Every other outcome is withPage's.
+ *
+ * Not for a read that folds a failure into a verdict (getNumberId answers the typed number when the phone read of
+ * a migrated number fails), and not for the write itself when it does not converge (see {@link reportPageDeath}):
+ * only the lookup in front of such a write has applied nothing yet.
+ */
+export async function withPageWrite<T>(host: WwebjsEngineHost, context: string, op: () => Promise<T>): Promise<T> {
+  try {
+    return await withPage(host, context, op);
+  } catch (error) {
+    if (isProtocolTimeout(error)) {
+      throw new EngineTransportError(`WhatsApp Web did not answer in time during ${context}`);
     }
     throw error;
   }

@@ -22,14 +22,16 @@ class ChatsResource
     }
 
     /**
-     * Entries include lastMessageType when the engine knows the last message kind.
+     * Entries include lastMessageType when the engine knows the last message kind. On Baileys, `name` is `''` for
+     * a chat held under a privacy id (`@lid`) that has no name of its own; `phone` (Baileys only; whatsapp-web.js
+     * sends none), when present, is the number to show.
      *
      * @param array<string,mixed> $query
      * @return array<int,array<string,mixed>>
      */
     public function list(string $sessionId, array $query = []): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats", $query) ?? [];
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats", $query) ?? [];
     }
 
     /**
@@ -43,7 +45,7 @@ class ChatsResource
      */
     public function subscribePresence(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/presence/subscribe", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/presence/subscribe", [], $body);
     }
 
     /**
@@ -54,7 +56,7 @@ class ChatsResource
      */
     public function getPresence(string $sessionId, string $chatId): ?array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/presence/{$this->http->encodeSegment($chatId)}");
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/presence/{$this->http->encodeSegment($chatId)}");
     }
 
     /**
@@ -63,13 +65,13 @@ class ChatsResource
      */
     public function markRead(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/read", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/read", [], HttpExecutor::lists($body, 'messageIds'));
     }
 
     /** @return array<string,mixed> */
     public function markUnread(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/unread", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/unread", [], $body);
     }
 
     /**
@@ -81,7 +83,7 @@ class ChatsResource
      */
     public function clearMessages(string $sessionId, string $chatId): array
     {
-        return $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/{$this->http->encodeSegment($chatId)}/messages") ?? [];
+        return $this->http->requestNullableArray('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/{$this->http->encodeSegment($chatId)}/messages") ?? [];
     }
 
     /**
@@ -94,7 +96,7 @@ class ChatsResource
      */
     public function archive(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/archive", [], $body) ?? [];
+        return $this->http->requestNullableArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/archive", [], $body) ?? [];
     }
 
     /**
@@ -108,7 +110,7 @@ class ChatsResource
      */
     public function pin(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/pin", [], $body) ?? [];
+        return $this->http->requestNullableArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/pin", [], $body) ?? [];
     }
 
     /**
@@ -124,7 +126,7 @@ class ChatsResource
      */
     public function mute(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/mute", [], $body) ?? [];
+        return $this->http->requestNullableArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/mute", [], $body) ?? [];
     }
 
     /**
@@ -136,12 +138,12 @@ class ChatsResource
      */
     public function delete(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/delete", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/delete", [], $body);
     }
 
     /** @return array<string,mixed> */
     public function sendState(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/typing", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/chats/typing", [], $body);
     }
 }

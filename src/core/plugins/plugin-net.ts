@@ -22,6 +22,12 @@ export interface PluginNetRequestInit {
   headers?: Record<string, string>;
   body?: string | Uint8Array;
   timeoutMs?: number;
+  /**
+   * Concrete session id for background tasks (such as retry timers) running outside an active
+   * hook or webhook dispatch. Ignored inside an active dispatch, where the host-recorded session
+   * and instance always take precedence.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -99,7 +105,7 @@ export function isNetHostAllowed(allow: string[] | undefined, url: string): bool
 export async function performPluginFetch(
   url: string,
   init: PluginNetRequestInit | null = {},
-  deps: { fetch?: typeof withSafeFetch } = {},
+  deps: { fetch?: typeof withSafeFetch; signal?: AbortSignal } = {},
 ): Promise<PluginNetResponse> {
   const safeFetch = deps.fetch ?? withSafeFetch;
   // A worker can send `null` (the default only covers undefined). Everything that reads the options
@@ -112,6 +118,8 @@ export async function performPluginFetch(
     typeof opts.timeoutMs === 'number' && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
   // AbortSignal.timeout only takes an integer, so a fractional value is cut to one before the clamp.
   const timeoutMs = Math.min(Math.max(Math.trunc(requested), 1), MAX_TIMEOUT_MS);
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const signal = deps.signal ? AbortSignal.any([timeoutSignal, deps.signal]) : timeoutSignal;
   // Reject-when-full BEFORE reserving a slot, so total concurrent host-side buffering stays bounded to
   // MAX_INFLIGHT_FETCHES × MAX_BODY_BYTES. Check + increment are synchronous (single event-loop turn),
   // so no interleaving can overshoot the cap; the slot is released in the finally below.
@@ -126,7 +134,7 @@ export async function performPluginFetch(
         method: opts.method ?? 'GET',
         headers: opts.headers,
         body: opts.body,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal,
       },
       async response => {
         const declared = Number(response.headers.get('content-length') ?? '');

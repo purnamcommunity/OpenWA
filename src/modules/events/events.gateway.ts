@@ -9,14 +9,36 @@ import {
   ConnectedSocket,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { ForbiddenException, OnModuleDestroy, UnauthorizedException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Inject,
+  OnModuleDestroy,
+  Optional,
+  UnauthorizedException,
+  forwardRef,
+} from '@nestjs/common';
+import { InjectDataSource } from '@nestjs/typeorm';
+import { DataSource, In } from 'typeorm';
 import { randomUUID } from 'crypto';
+import { hostname } from 'os';
 import { createLogger } from '../../common/services/logger.service';
 import { getRequestActor, runWithRequestId } from '../../common/services/request-context';
 import { ConfigService } from '@nestjs/config';
 import { AuthService } from '../auth/auth.service';
+import { BrowserSessionService } from '../auth/browser-session.service';
+import { BrowserSession } from '../auth/entities/browser-session.entity';
+import { allowUnauthenticatedAuditRow } from '../audit/auth-failure-audit-limiter';
+import {
+  extractBrowserSessionCookie,
+  firstHeaderValue,
+  isAllowedBrowserWsHandshake,
+  type CookieRequestLike,
+} from '../auth/browser-session.util';
 import { ChatScopeService } from '../auth/chat-scope.service';
 import { isWsRedisEnabled } from './redis-io.adapter';
+import { WS_RESTRICTED_PRESENCE_TRACKER, WsRestrictedPresenceTracker } from './ws-restricted-presence';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { parseWaId, userPart } from '../../engine/identity/wa-id';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { resolveCorsPolicy } from '../../config/bootstrap-security';
@@ -38,13 +60,16 @@ import {
 } from './ws-rate-limit';
 
 /**
- * WebSocket CORS origin: reuse the HTTP CORS policy instead of a hardcoded '*'.
- * Dev → allow any origin; production → the configured CORS_ORIGINS allowlist (or none).
+ * WebSocket CORS policy: reuse the HTTP CORS policy instead of a hardcoded '*'.
+ * Dev -> allow any origin (without credentials); explicit CORS_ORIGINS -> allowlist with credentials.
  * Read from process.env at module load (real env vars apply; same-origin is unaffected).
  */
-function resolveWsCorsOrigin(): boolean | string[] {
+function resolveWsCorsConfig(): { origin: boolean | string[]; credentials: boolean } {
   const policy = resolveCorsPolicy(process.env.CORS_ORIGINS, process.env.NODE_ENV);
-  return policy.allowAnyOrigin ? true : policy.origins;
+  return {
+    origin: policy.allowAnyOrigin ? true : policy.origins,
+    credentials: policy.credentials,
+  };
 }
 
 /**
@@ -170,6 +195,15 @@ const EVICTION_MESSAGES: Record<ApiKeyEvictionReason, string> = {
   expired: 'API key has expired',
 };
 
+/** Why a browser session's live WebSocket sockets are being torn down. */
+export type BrowserSessionEvictionReason = 'logged_out' | 'revoked' | 'expired';
+
+const BROWSER_SESSION_EVICTION_MESSAGES: Record<BrowserSessionEvictionReason, string> = {
+  logged_out: 'Session has been logged out',
+  revoked: 'Session has been revoked',
+  expired: 'Session has expired',
+};
+
 /**
  * Largest client frame the socket accepts, in bytes. A client only sends subscribe, unsubscribe and ping
  * frames, and the longest legal one (the longest session and request id, every event) is under 1 KB.
@@ -179,19 +213,33 @@ const EVICTION_MESSAGES: Record<ApiKeyEvictionReason, string> = {
 export const WS_MAX_FRAME_BYTES = 8 * 1024;
 
 /**
- * How long the lid table's answer for a chat is reused when it named another identity for it, so the acks of one
- * message read the table once. A chat the table has no other identity for is read again by the next event, so a
- * first mapping routes at once. A second identity arrives up to this long late, and after a mapping is removed or
- * moved, events of the chat keep reaching sockets restricted to the old identity for up to this long.
+ * How long the lid table's answer for a chat is reused, both for mapped chats and as a short negative
+ * cache for unmapped 1:1 chats, so bursts of events for one chat hit the table once. Newly persisted
+ * mappings immediately evict stale entries via LidMappingStoreService.onMappingLearned for both the
+ * LID and phone JID. A mapping learned on another node arrives up to this long late, and after a
+ * mapping is removed or moved, events of the chat keep reaching sockets restricted to the old identity
+ * for up to this long.
  */
 export const CHAT_IDS_MEMO_TTL_MS = 5_000;
 /** Most chats the answers are kept for; the oldest go first. */
 export const CHAT_IDS_MEMO_MAX = 1_000;
+/** Maximum queued chat-room fan-out deliveries retained per chat before dropping oldest excess. */
+const MAX_CHAT_DELIVERIES_PER_CHAT = 64;
+/** Total queued fan-out deliveries retained per session across all chats. */
+const MAX_CHAT_DELIVERIES_PER_SESSION = 1_024;
+const CHAT_DELIVERY_DROP_WARN_INTERVAL_MS = 60_000;
+const CHAT_DELIVERY_DROP_WARN_MAX = 1_000;
+
+interface PendingChatDelivery {
+  event: string;
+  chatId: string;
+  sessionId: string;
+  eventMessage: WSEventMessage;
+  idsPromise: Promise<string[] | undefined>;
+}
 
 @WebSocketGateway({
-  cors: {
-    origin: resolveWsCorsOrigin(),
-  },
+  cors: resolveWsCorsConfig(),
   namespace: '/events',
   maxHttpBufferSize: WS_MAX_FRAME_BYTES,
 })
@@ -207,13 +255,18 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
    * an already-subscribed socket keeps receiving events until it happens to disconnect).
    */
   private readonly socketsByKeyId = new Map<string, Set<Socket>>();
-  private readonly chatDeliveries = new Map<string, Promise<void>>();
+  private readonly socketsByBrowserSessionId = new Map<string, Set<Socket>>();
+  private readonly chatDeliveries = new Map<string, PendingChatDelivery[]>();
+  private readonly chatDeliveryActive = new Set<string>();
+  private readonly chatDeliveryDropWarn = new Map<string, { at: number; dropped: number }>();
+  private destroyed = false;
   // The identities of a chat as the lid table gives them, by session and chat. See chatIds.
   private readonly chatIdsMemo = new Map<string, { ids: Promise<string[] | undefined>; expiresAt: number }>();
   // Subscribes still re-validating their key. An unsubscribe answered meanwhile cancels the ones it covers, so
   // they cannot join rooms after the client was told they were left.
   private readonly pendingSubscriptions = new WeakMap<Socket, Set<{ sessionId: string; cancelled: boolean }>>();
   private authzSweepTimer?: ReturnType<typeof setInterval>;
+  private unsubscribeMappingLearned?: () => void;
 
   /**
    * Rate limiting for the WS surface (see ws-rate-limit.ts). Frames never pass through the
@@ -243,10 +296,30 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     private readonly auditService: AuditService,
     private readonly configService: ConfigService,
     private readonly chatScope: ChatScopeService = new ChatScopeService(),
+    @Optional()
+    @Inject(forwardRef(() => BrowserSessionService))
+    private readonly browserSessionService?: BrowserSessionService,
+    @Optional()
+    private readonly lidMappingStore?: LidMappingStoreService,
+    @Optional()
+    @Inject(WS_RESTRICTED_PRESENCE_TRACKER)
+    private restrictedPresence?: WsRestrictedPresenceTracker,
+    @Optional()
+    @InjectDataSource('main')
+    private readonly mainDataSource?: DataSource,
   ) {
     this.rateLimits = readWsRateLimitConfig();
     this.frameLimiter = new TokenBucketLimiter(this.rateLimits.framePerSecond, this.rateLimits.frameBurst);
     this.handshakeLimiter = new SlidingWindowLimiter(this.rateLimits.handshakeMax, this.rateLimits.handshakeWindowMs);
+    const onLearned = ({ lid, phone }: { lid: string; phone: string }) => {
+      const lidUser = userPart(lid.trim());
+      const phoneUser = userPart(phone.trim());
+      if (lidUser) this.invalidateChatIdsMemo(`${lidUser}@lid`);
+      if (phoneUser) this.invalidateChatIdsMemo(`${phoneUser}@c.us`);
+    };
+    this.unsubscribeMappingLearned =
+      this.lidMappingStore?.onMappingLearned?.(onLearned) ?? this.chatScope.onMappingLearned?.(onLearned);
+    this.restrictedPresence?.bindLocalCheck(() => this.hasLocalRestrictedSocket());
   }
 
   afterInit() {
@@ -260,11 +333,25 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       );
     }, 60_000);
     this.authzSweepTimer.unref?.();
+    if (!this.restrictedPresence && isWsRedisEnabled()) {
+      const nodeId = this.configService.get<string>('session.nodeId') || process.env.NODE_ID || hostname();
+      this.restrictedPresence = WsRestrictedPresenceTracker.createDefault(nodeId, () =>
+        this.hasLocalRestrictedSocket(),
+      );
+    }
+    this.restrictedPresence?.start();
   }
 
-  onModuleDestroy(): void {
+  async onModuleDestroy(): Promise<void> {
+    this.destroyed = true;
     if (this.authzSweepTimer) clearInterval(this.authzSweepTimer);
     this.authzSweepTimer = undefined;
+    this.unsubscribeMappingLearned?.();
+    this.unsubscribeMappingLearned = undefined;
+    this.chatDeliveries.clear();
+    this.chatDeliveryActive.clear();
+    this.chatDeliveryDropWarn.clear();
+    await this.restrictedPresence?.destroy();
   }
 
   /**
@@ -292,12 +379,76 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       }
     }
     const keyIds = Array.from(this.socketsByKeyId.keys());
-    if (keyIds.length === 0) return;
-    const current = await this.authService.findAuthorizationStates(keyIds);
-    const byId = new Map(current.map(key => [key.id, key]));
-    for (const keyId of keyIds) {
-      const reason = this.evictionReason(byId.get(keyId), this.socketsByKeyId.get(keyId), now);
-      if (reason) this.evictApiKey(keyId, reason);
+    if (keyIds.length > 0) {
+      try {
+        const current = await this.authService.findAuthorizationStates(keyIds);
+        const byId = new Map(current.map(key => [key.id, key]));
+        for (const keyId of keyIds) {
+          const reason = this.evictionReason(byId.get(keyId), this.socketsByKeyId.get(keyId), now);
+          if (reason) this.evictApiKey(keyId, reason);
+        }
+      } catch (error) {
+        this.logger.error(
+          'Failed to sweep WebSocket API key authorization',
+          error instanceof Error ? error.stack : String(error),
+        );
+      }
+    }
+    if (this.socketsByBrowserSessionId.size > 0) {
+      // Enforce stored browser-session expiry offline before hitting the DB, independent of API-key sweep errors.
+      for (const [browserSessionId, sockets] of Array.from(this.socketsByBrowserSessionId.entries())) {
+        if (Array.from(sockets).some(client => this.isBrowserSessionExpired(client, now))) {
+          this.evictBrowserSession(browserSessionId, 'expired');
+        }
+      }
+    }
+    const sessionIds = Array.from(this.socketsByBrowserSessionId.keys());
+    if (sessionIds.length > 0) {
+      if (this.mainDataSource) {
+        try {
+          const rows = await this.mainDataSource.getRepository(BrowserSession).findBy({ id: In(sessionIds) });
+          const bySessionId = new Map(rows.map(row => [row.id, row]));
+          for (const browserSessionId of sessionIds) {
+            const row = bySessionId.get(browserSessionId);
+            if (!row || row.revokedAt !== null) {
+              this.evictBrowserSession(browserSessionId, 'revoked');
+              continue;
+            }
+            const expiry = apiKeyExpiryTime(row.expiresAt);
+            if (expiry !== null && expiry <= now) {
+              this.evictBrowserSession(browserSessionId, 'expired');
+            }
+          }
+        } catch (error) {
+          this.logger.error(
+            'Failed to batch-sweep WebSocket browser sessions',
+            error instanceof Error ? error.stack : String(error),
+          );
+        }
+      } else if (this.browserSessionService) {
+        for (const browserSessionId of sessionIds) {
+          const sockets = this.socketsByBrowserSessionId.get(browserSessionId);
+          const sampleSocket = sockets?.values().next().value;
+          if (!sampleSocket) continue;
+          const clientIp = this.resolveClientIp(sampleSocket);
+          try {
+            await this.browserSessionService.validateSessionById(browserSessionId, clientIp, undefined, {
+              recordUsage: false,
+            });
+          } catch (error) {
+            if (isKeyRefusal(error)) {
+              const msg = error instanceof Error ? error.message.toLowerCase() : '';
+              const reason: BrowserSessionEvictionReason = msg.includes('expired') ? 'expired' : 'revoked';
+              this.evictBrowserSession(browserSessionId, reason);
+            } else {
+              this.logger.error(
+                `Failed to re-validate browser session ${browserSessionId} during WebSocket sweep`,
+                error instanceof Error ? error.stack : String(error),
+              );
+            }
+          }
+        }
+      }
     }
   }
 
@@ -342,6 +493,15 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     return expiry !== null && expiry <= now;
   }
 
+  /** Whether the browser session expiry a cookie socket carries has lapsed, decided without DB access. */
+  private isBrowserSessionExpired(client: Socket, now: number): boolean {
+    const expiresAt = (client.data as { browserSessionExpiresAt?: Date | string | null } | undefined)
+      ?.browserSessionExpiresAt;
+    if (expiresAt === undefined || expiresAt === null) return false;
+    const expiry = apiKeyExpiryTime(expiresAt);
+    return expiry !== null && expiry <= now;
+  }
+
   /** Whether a subscribe ever granted this socket something under a key other than its snapshot. */
   private hasDivergentGrant(client: Socket): boolean {
     return (client.data as { authorizationDiverged?: boolean } | undefined)?.authorizationDiverged === true;
@@ -363,16 +523,25 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     return resolveRequestClientIp(req, readTrustedProxies());
   }
 
-  private trackSocket(keyId: string, client: Socket): void {
+  private trackSocket(keyId: string, client: Socket, browserSessionId?: string): void {
     let sockets = this.socketsByKeyId.get(keyId);
     if (!sockets) {
       sockets = new Set();
       this.socketsByKeyId.set(keyId, sockets);
     }
     sockets.add(client);
+
+    if (browserSessionId) {
+      let sessionSockets = this.socketsByBrowserSessionId.get(browserSessionId);
+      if (!sessionSockets) {
+        sessionSockets = new Set();
+        this.socketsByBrowserSessionId.set(browserSessionId, sessionSockets);
+      }
+      sessionSockets.add(client);
+    }
   }
 
-  private untrackSocket(client: Socket): void {
+  private untrackKeySocket(client: Socket): void {
     const keyId = (client.data as { apiKey?: Pick<ApiKey, 'id'> } | undefined)?.apiKey?.id;
     if (!keyId) return;
     const sockets = this.socketsByKeyId.get(keyId);
@@ -381,6 +550,34 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     if (sockets.size === 0) {
       this.socketsByKeyId.delete(keyId);
     }
+  }
+
+  private untrackBrowserSessionSocket(client: Socket): void {
+    const browserSessionId = (client.data as { browserSessionId?: string } | undefined)?.browserSessionId;
+    if (!browserSessionId) return;
+    const sessionSockets = this.socketsByBrowserSessionId.get(browserSessionId);
+    if (!sessionSockets) return;
+    sessionSockets.delete(client);
+    if (sessionSockets.size === 0) {
+      this.socketsByBrowserSessionId.delete(browserSessionId);
+    }
+  }
+
+  private hasLocalRestrictedSocket(): boolean {
+    return Array.from(this.socketsByKeyId.values()).some(sockets =>
+      Array.from(sockets).some(client => this.chatScope.isRestricted((client.data as { apiKey?: ApiKey }).apiKey)),
+    );
+  }
+
+  private syncRestrictedPresence(): Promise<void> {
+    if (!this.restrictedPresence || !isWsRedisEnabled()) return Promise.resolve();
+    return this.restrictedPresence.syncLocal(this.hasLocalRestrictedSocket());
+  }
+
+  private untrackSocket(client: Socket): void {
+    this.untrackKeySocket(client);
+    this.untrackBrowserSessionSocket(client);
+    void this.syncRestrictedPresence();
   }
 
   /**
@@ -398,9 +595,31 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     this.socketsByKeyId.delete(keyId);
     const message = EVICTION_MESSAGES[reason];
     for (const client of sockets) {
+      this.untrackBrowserSessionSocket(client);
       client.emit('message', this.createError('UNAUTHORIZED', message));
       client.disconnect(true);
     }
+    void this.syncRestrictedPresence();
+  }
+
+  /**
+   * Tear down every active socket authenticated with a specific browser session id (logout, revoke,
+   * or expiry).
+   */
+  evictBrowserSession(browserSessionId: string, reason: BrowserSessionEvictionReason = 'logged_out'): void {
+    const sockets = this.socketsByBrowserSessionId.get(browserSessionId);
+    if (!sockets || sockets.size === 0) return;
+    this.logger.log(
+      `Evicting ${sockets.size} WebSocket connection(s) (${reason}) for browser session ${browserSessionId}`,
+    );
+    this.socketsByBrowserSessionId.delete(browserSessionId);
+    const message = BROWSER_SESSION_EVICTION_MESSAGES[reason];
+    for (const client of sockets) {
+      this.untrackKeySocket(client);
+      client.emit('message', this.createError('UNAUTHORIZED', message));
+      client.disconnect(true);
+    }
+    void this.syncRestrictedPresence();
   }
 
   handleConnection(client: Socket): Promise<void> {
@@ -442,17 +661,44 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     const handshakeAuth = client.handshake.auth as { apiKey?: unknown } | undefined;
     const authKey = typeof handshakeAuth?.apiKey === 'string' ? handshakeAuth.apiKey : undefined;
     const apiKey = authKey || (client.handshake.headers['x-api-key'] as string | undefined);
+    const sessionCookie = !apiKey ? extractBrowserSessionCookie(client.handshake.headers.cookie) : undefined;
 
-    if (!apiKey) {
+    if (!apiKey && !(sessionCookie && this.browserSessionService)) {
       this.logger.warn(`Client ${client.id} rejected: No API key provided`);
-      void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
-        ipAddress: clientIp,
-        metadata: { surface: 'websocket' },
-        errorMessage: 'missing API key',
-      });
+      if (allowUnauthenticatedAuditRow(clientIp)) {
+        void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
+          ipAddress: clientIp,
+          metadata: { surface: 'websocket' },
+          errorMessage: 'missing API key',
+        });
+      }
       client.emit('message', this.createError('UNAUTHORIZED', 'API key required'));
       client.disconnect(true);
       return;
+    }
+
+    if (!apiKey && sessionCookie) {
+      const origin = firstHeaderValue(client.handshake.headers.origin);
+      const trustedProxies = readTrustedProxies();
+      const cookieReq: CookieRequestLike = {
+        secure: Boolean((client.handshake as { secure?: boolean }).secure),
+        ip: client.handshake.address,
+        socket: { remoteAddress: client.handshake.address },
+        headers: client.handshake.headers ?? {},
+      };
+      if (!isAllowedBrowserWsHandshake(cookieReq, trustedProxies, process.env.CORS_ORIGINS, process.env.NODE_ENV)) {
+        this.logger.warn(`Client ${client.id} rejected: Cross-origin cookie WebSocket handshake refused`);
+        if (allowUnauthenticatedAuditRow(clientIp)) {
+          void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
+            ipAddress: clientIp,
+            metadata: { surface: 'websocket', authMethod: 'cookie', origin: origin ?? null },
+            errorMessage: 'WebSocket origin not allowed for cookie authentication',
+          });
+        }
+        client.emit('message', this.createError('UNAUTHORIZED', 'Authentication failed'));
+        client.disconnect(true);
+        return;
+      }
     }
 
     // The stored key validateApiKey resolved before refusing it, so the refusal's audit row names it as the REST
@@ -461,16 +707,31 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     let refusedKey: Pick<ApiKey, 'id' | 'name'> | undefined;
     try {
       // validateApiKey THROWS on any failure (it never resolves to a falsy value), so the rejection
-      // path is the catch below — a separate `if (!validKey)` branch here was dead code. The clientIp
-      // is passed so an IP-restricted key (allowedIps set) is ENFORCED rather than blanket-rejected
-      // for "Client IP could not be determined".
-      const validKey = await runWithRequestId(randomUUID(), () =>
-        this.authService.validateApiKey(apiKey, clientIp).catch((error: unknown) => {
-          const actor = getRequestActor();
-          if (actor?.apiKeyId) refusedKey = { id: actor.apiKeyId, name: actor.apiKeyName ?? '' };
-          throw error;
-        }),
-      );
+      // path is the catch below. The clientIp is passed so an IP-restricted key (allowedIps set) is
+      // ENFORCED rather than blanket-rejected for "Client IP could not be determined".
+      let validKey: ApiKey;
+      let browserSessionId: string | undefined;
+      let browserSessionExpiresAt: Date | string | null | undefined;
+      if (apiKey) {
+        validKey = await runWithRequestId(randomUUID(), () =>
+          this.authService.validateApiKey(apiKey, clientIp).catch((error: unknown) => {
+            const actor = getRequestActor();
+            if (actor?.apiKeyId) refusedKey = { id: actor.apiKeyId, name: actor.apiKeyName ?? '' };
+            throw error;
+          }),
+        );
+      } else {
+        const validated = await runWithRequestId(randomUUID(), () =>
+          this.browserSessionService!.validateSessionToken(sessionCookie!, clientIp).catch((error: unknown) => {
+            const actor = getRequestActor();
+            if (actor?.apiKeyId) refusedKey = { id: actor.apiKeyId, name: actor.apiKeyName ?? '' };
+            throw error;
+          }),
+        );
+        validKey = validated.apiKey;
+        browserSessionId = validated.session.id;
+        browserSessionExpiresAt = validated.session.expiresAt ?? null;
+      }
 
       // Cap simultaneous sockets per key: each socket holds rooms, engine fan-out, and memory,
       // so one key must not open connections without bound. Enough for multi-tab dashboards;
@@ -492,11 +753,19 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
         return;
       }
 
-      // Store the validated key AND the raw key — the raw key lets handleSubscribe
-      // RE-validate on each subscription so a key revoked mid-connection is caught.
-      (client.data as { apiKey: unknown; rawApiKey: string }).apiKey = validKey;
-      (client.data as { rawApiKey: string }).rawApiKey = apiKey;
-      this.trackSocket(validKey.id, client);
+      // Store the validated key plus either the raw API key (header/auth handshake) or the opaque
+      // browserSessionId (cookie handshake) so handleSubscribe re-validates live authorization on
+      // every subscription without ever caching a raw API key on cookie-authenticated sockets.
+      (client.data as { apiKey: unknown; apiKeyId: string }).apiKey = validKey;
+      (client.data as { apiKeyId: string }).apiKeyId = validKey.id;
+      if (apiKey) {
+        (client.data as { rawApiKey: string }).rawApiKey = apiKey;
+      } else if (browserSessionId) {
+        (client.data as { browserSessionId: string }).browserSessionId = browserSessionId;
+        (client.data as { browserSessionExpiresAt?: Date | string | null }).browserSessionExpiresAt =
+          browserSessionExpiresAt ?? null;
+      }
+      this.trackSocket(validKey.id, client, browserSessionId);
       // The handshake window is charged pre-auth to keep an unauthenticated flood off the DB. This
       // one turned out to be authentic, so give the slot back: the window then bounds FAILED
       // handshakes, and authenticated connections stay bounded by maxSocketsPerKey above. Without
@@ -513,6 +782,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
         // "Client disconnected" line for a client nothing ever announced as connected.
         this.logger.log(`Client ${client.id} authenticated after it had already gone (key: ${validKey.name})`);
         return;
+      }
+      if (this.chatScope.isRestricted(validKey)) {
+        void this.syncRestrictedPresence();
       }
       this.logger.log(`Client connected: ${client.id} (key: ${validKey.name})`);
     } catch (error) {
@@ -532,12 +804,14 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       });
       // Audit the rejected credential like the REST guard does, so probing over the WS surface leaves
       // a forensic trail too. Fire-and-forget: audit logging must never affect the rejection path.
-      void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
-        apiKey: refusedKey as ApiKey | undefined,
-        ipAddress: clientIp,
-        metadata: { surface: 'websocket' },
-        errorMessage: error instanceof Error ? error.message : String(error),
-      });
+      if (refusedKey || allowUnauthenticatedAuditRow(clientIp)) {
+        void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
+          apiKey: refusedKey as ApiKey | undefined,
+          ipAddress: clientIp,
+          metadata: { surface: 'websocket' },
+          errorMessage: error instanceof Error ? error.message : String(error),
+        });
+      }
       client.emit('message', this.createError('UNAUTHORIZED', 'Authentication failed'));
       client.disconnect(true);
     }
@@ -647,6 +921,7 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     // The clientIp is re-resolved (trusted-proxy-aware) so an IP-restricted key is enforced
     // here too, not just at connect.
     const rawApiKey = (client.data as { rawApiKey?: string }).rawApiKey;
+    const browserSessionId = (client.data as { browserSessionId?: string }).browserSessionId;
     const clientIp = this.resolveClientIp(client);
     const subscription = { sessionId, cancelled: false };
     let pending = this.pendingSubscriptions.get(client);
@@ -658,7 +933,14 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     let subscriberKey: ApiKey | null;
     let unreadable = false;
     try {
-      subscriberKey = rawApiKey ? await this.authService.validateApiKey(rawApiKey, clientIp) : null;
+      if (rawApiKey) {
+        subscriberKey = await this.authService.validateApiKey(rawApiKey, clientIp);
+      } else if (browserSessionId && this.browserSessionService) {
+        const validated = await this.browserSessionService.validateSessionById(browserSessionId, clientIp);
+        subscriberKey = validated.apiKey;
+      } else {
+        subscriberKey = null;
+      }
     } catch (error) {
       subscriberKey = null;
       if (isKeyRefusal(error)) {
@@ -789,6 +1071,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     for (const room of rooms) {
       void client.join(room);
     }
+    if (chatRestricted) {
+      await this.syncRestrictedPresence();
+    }
 
     this.logger.debug(`Client ${client.id} subscribed to: ${rooms.join(', ')}`);
 
@@ -905,6 +1190,7 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
    * Emit event to specific rooms based on sessionId and event type
    */
   private emitToRooms(sessionId: string, event: string, data: unknown, exceptRoom?: string): void {
+    if (this.destroyed) return;
     const eventMessage: WSEventMessage = {
       type: 'event',
       payload: { event, sessionId, data },
@@ -924,51 +1210,173 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       : named.to(buildRoomName(sessionId, '*')).to(buildRoomName('*', '*'));
     (exceptRoom ? broadcast.except(exceptRoom) : broadcast).emit('message', eventMessage);
     if (!CHAT_EVENTS.has(event) || data === null || typeof data !== 'object') return;
+    if (this.destroyed) return;
     const value = data as Record<string, unknown>;
     const chatId = event.startsWith('group.') ? value.groupId : value.chatId;
     if (typeof chatId !== 'string' || !chatId.trim()) return;
-    if (
-      !isWsRedisEnabled() &&
-      !Array.from(this.socketsByKeyId.values()).some(sockets =>
-        Array.from(sockets).some(client => this.chatScope.isRestricted((client.data as { apiKey?: ApiKey }).apiKey)),
-      )
-    ) {
+    const localRestricted = this.hasLocalRestrictedSocket();
+    if (!isWsRedisEnabled() && !localRestricted) {
       return;
     }
     // Expand the emitted identity using persisted mappings, so new LID mappings work
     // without rejoining rooms. Literal allowlist rooms also enforce the fence across Redis nodes.
-    // Resolve identities concurrently, but retain event order within each session, including
-    // after a failed lookup. Other sessions and unrestricted broadcasts remain independent.
-    const delivery = Promise.allSettled([this.chatDeliveries.get(sessionId), this.chatIds(sessionId, chatId)])
-      .then(([, resolved]) => {
-        if (resolved.status === 'rejected') throw resolved.reason;
-        const ids = resolved.value;
-        if (!ids?.length) return;
-        const rooms = ids.flatMap(id => {
-          const namedRooms = [chatRoom(sessionId, event, id), chatRoom('*', event, id)];
-          return WILDCARD_EXCLUDED_EVENTS.includes(event)
-            ? namedRooms
-            : [...namedRooms, chatRoom(sessionId, '*', id), chatRoom('*', '*', id)];
-        });
-        this.server.to(rooms).emit('message', eventMessage);
-      })
-      .catch(error =>
-        this.logger.warn('Could not resolve chat identity for WebSocket delivery', {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      )
-      .finally(() => {
-        if (this.chatDeliveries.get(sessionId) === delivery) this.chatDeliveries.delete(sessionId);
-      });
-    this.chatDeliveries.set(sessionId, delivery);
+    // Under REDIS_ENABLED=true without a local restricted socket, consult cluster presence first
+    // so replicas skip lid_mappings lookups and chat-room fan-out when Redis confirms zero
+    // restricted nodes exist cluster-wide (failing open when Redis is absent, disconnected, or errors).
+    // Resolve identities concurrently while retaining FIFO event order within each session (with
+    // per-chat queue bounds so stalled lookups/clients cannot grow heap unboundedly).
+    const idsPromise =
+      localRestricted || !this.restrictedPresence
+        ? this.chatIds(sessionId, chatId)
+        : this.restrictedPresence
+            .hasRestrictedNodes()
+            .then(hasAny => (hasAny ? this.chatIds(sessionId, chatId) : undefined));
+    void idsPromise.catch(() => undefined);
+    if (this.destroyed) return;
+    let queue = this.chatDeliveries.get(sessionId);
+    if (!queue) {
+      queue = [];
+      this.chatDeliveries.set(sessionId, queue);
+    }
+    let chatCount = 0;
+    let oldestChatIdx = -1;
+    for (let idx = 0; idx < queue.length; idx++) {
+      if (queue[idx].chatId === chatId) {
+        if (oldestChatIdx === -1) oldestChatIdx = idx;
+        chatCount++;
+      }
+    }
+    if (chatCount >= MAX_CHAT_DELIVERIES_PER_CHAT && oldestChatIdx !== -1) {
+      queue.splice(oldestChatIdx, 1);
+      this.noteDroppedChatDelivery(`${sessionId}:${chatId}`, 'chat', MAX_CHAT_DELIVERIES_PER_CHAT);
+    } else if (queue.length >= MAX_CHAT_DELIVERIES_PER_SESSION) {
+      const dropped = queue.shift();
+      if (dropped) {
+        this.noteDroppedChatDelivery(`${sessionId}:${dropped.chatId}`, 'session', MAX_CHAT_DELIVERIES_PER_SESSION);
+      }
+    }
+    queue.push({ event, chatId, sessionId, eventMessage, idsPromise });
+    if (!this.chatDeliveryActive.has(sessionId)) {
+      this.chatDeliveryActive.add(sessionId);
+      void this.drainChatDeliveries(sessionId);
+    }
+  }
+
+  private noteDroppedChatDelivery(queueKey: string, scope: 'chat' | 'session', maxQueued: number): void {
+    const now = Date.now();
+    const warnKey = `${scope}:${queueKey}`;
+    const state = this.chatDeliveryDropWarn.get(warnKey) ?? { at: -Infinity, dropped: 0 };
+    state.dropped++;
+    if (now - state.at >= CHAT_DELIVERY_DROP_WARN_INTERVAL_MS) {
+      const dropped = state.dropped;
+      state.at = now;
+      state.dropped = 0;
+      this.logger.warn(
+        scope === 'chat'
+          ? 'Dropped oldest queued WebSocket chat delivery at per-chat depth cap'
+          : 'Dropped oldest queued WebSocket chat delivery at per-session depth cap',
+        {
+          scope,
+          queueKey,
+          dropped,
+          maxQueued,
+        },
+      );
+    }
+    this.chatDeliveryDropWarn.delete(warnKey);
+    this.chatDeliveryDropWarn.set(warnKey, state);
+    while (this.chatDeliveryDropWarn.size > CHAT_DELIVERY_DROP_WARN_MAX) {
+      const oldest = this.chatDeliveryDropWarn.keys().next().value;
+      if (oldest === undefined) break;
+      this.chatDeliveryDropWarn.delete(oldest);
+    }
+  }
+
+  private async drainChatDeliveries(sessionId: string): Promise<void> {
+    if (this.destroyed) return;
+    try {
+      while (!this.destroyed) {
+        const queue = this.chatDeliveries.get(sessionId);
+        const item = queue?.shift();
+        if (!item) break;
+        try {
+          const ids = await item.idsPromise;
+          if (this.destroyed || !ids?.length) continue;
+          const rooms = ids.flatMap(id => {
+            const namedRooms = [chatRoom(item.sessionId, item.event, id), chatRoom('*', item.event, id)];
+            return WILDCARD_EXCLUDED_EVENTS.includes(item.event)
+              ? namedRooms
+              : [...namedRooms, chatRoom(item.sessionId, '*', id), chatRoom('*', '*', id)];
+          });
+          this.server.to(rooms).emit('message', item.eventMessage);
+        } catch (error) {
+          this.logger.warn('Could not resolve chat identity for WebSocket delivery', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    } finally {
+      this.chatDeliveryActive.delete(sessionId);
+      const remaining = this.chatDeliveries.get(sessionId);
+      if (this.destroyed || (remaining && remaining.length === 0)) {
+        this.chatDeliveries.delete(sessionId);
+      } else if (remaining && remaining.length > 0 && !this.chatDeliveryActive.has(sessionId)) {
+        this.chatDeliveryActive.add(sessionId);
+        void this.drainChatDeliveries(sessionId);
+      }
+    }
+  }
+
+  /**
+   * Evict cached chat-identity expansions for `chatId` (across all sessions and equivalent user/LID
+   * address forms), or clear the entire memo when omitted. Called automatically when
+   * LidMappingStoreService persists a new mapping so stale negative entries clear immediately.
+   */
+  invalidateChatIdsMemo(chatId?: string): void {
+    if (!chatId) {
+      this.chatIdsMemo.clear();
+      return;
+    }
+    const target = parseWaId(chatId);
+    const targetPhoneDigits =
+      target.kind === 'user'
+        ? target.userPart
+        : target.kind === 'unknown' && /^\d+$/.test(target.userPart)
+          ? target.userPart
+          : null;
+    for (const memoKey of this.chatIdsMemo.keys()) {
+      const sep = memoKey.indexOf('\n');
+      const entryChatId = sep === -1 ? memoKey : memoKey.slice(sep + 1);
+      if (entryChatId === chatId) {
+        this.chatIdsMemo.delete(memoKey);
+        continue;
+      }
+      const entry = parseWaId(entryChatId);
+      if (
+        (target.kind === 'user' || target.kind === 'lid') &&
+        entry.kind === target.kind &&
+        entry.userPart === target.userPart
+      ) {
+        this.chatIdsMemo.delete(memoKey);
+        continue;
+      }
+      if (
+        targetPhoneDigits !== null &&
+        ((entry.kind === 'user' && entry.userPart === targetPhoneDigits) ||
+          (entry.kind === 'unknown' && /^\d+$/.test(entry.userPart) && entry.userPart === targetPhoneDigits))
+      ) {
+        this.chatIdsMemo.delete(memoKey);
+      }
+    }
   }
 
   /**
    * Every identity of a chat that the lid table gives it: its own address forms plus the other dialect of a mapped
-   * phone or lid. Events about one chat of one session that are raised while a lookup is in flight share it, and a
-   * lookup that named another identity is reused for CHAT_IDS_MEMO_TTL_MS. One that named none, or failed, is dropped
-   * as soon as it settles, so the next event asks again and a failure still fails closed for every event that
-   * shared it. The key is the session as well as the chat so that a slow lookup never holds up another session.
+   * phone or lid. Events about one chat of one session that are raised while a lookup is in flight share it, and
+   * both mapped and unmapped answers are reused for CHAT_IDS_MEMO_TTL_MS (evicted early by invalidateChatIdsMemo
+   * whenever this node persists a new mapping). A failed lookup is dropped as soon as it settles, so the next event
+   * retries and every event that shared the failure still fails closed. The key is the session as well as the chat so
+   * that a slow lookup never holds up another session.
    */
   private chatIds(sessionId: string, chatId: string): Promise<string[] | undefined> {
     const memoKey = `${sessionId}\n${chatId}`;
@@ -986,10 +1394,7 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     const forget = () => {
       if (this.chatIdsMemo.get(memoKey) === entry) this.chatIdsMemo.delete(memoKey);
     };
-    ids.then(found => {
-      const literal = this.chatScope.scopeFor({ allowedChats: [chatId] });
-      if (!found?.some(id => !literal?.allowed.has(id))) forget();
-    }, forget);
+    void ids.catch(forget);
     return ids;
   }
 

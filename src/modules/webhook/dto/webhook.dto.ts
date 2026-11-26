@@ -196,6 +196,7 @@ export class CreateWebhookDto {
       'retry). An event that exhausts them is recorded in GET /api/webhooks/delivery-failures; the webhook ' +
       'stays active.',
     example: 3,
+    type: 'integer',
     minimum: 0,
     maximum: 5,
   })
@@ -234,13 +235,14 @@ export class UpdateWebhookDto {
   events?: string[];
 
   @ApiPropertyOptional({
-    // No `minLength` here, unlike create: this route also accepts the empty string as "clear the
-    // secret", so a 16 in the schema would reject a value the route honours. The floor still applies
+    // No `minLength` here, unlike create: this route also accepts the empty string, or null, as "clear
+    // the secret", so a 16 in the schema would reject a value the route honours. The floor still applies
     // to every other value, which only the description can say.
     description:
-      'Secret key for HMAC signature. At least 16 characters, or an empty string to clear it. ' +
+      'Secret key for HMAC signature. At least 16 characters, or an empty string or null to clear it. ' +
       'Never returned by any webhook route.',
     maxLength: 255,
+    nullable: true,
     // Deliberately no `example`, unlike create. This route patches a webhook that is already
     // signing deliveries, and a prefilled secret submitted whole would replace a working key with
     // a published one: every later delivery still verifies, so nothing looks broken while the
@@ -291,6 +293,7 @@ export class UpdateWebhookDto {
       'Total delivery attempts per event, including the first (0 and 1 both mean a single attempt). Same ' +
       'range the create route enforces.',
     example: 3,
+    type: 'integer',
     minimum: 0,
     maximum: 5,
   })
@@ -483,6 +486,7 @@ export class RedriveWebhookDeliveriesDto {
   @ApiPropertyOptional({
     description: 'Max rows replayed by this call (1-500, default 100).',
     example: 100,
+    type: 'integer',
     minimum: 1,
     maximum: 500,
   })

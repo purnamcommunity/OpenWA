@@ -167,7 +167,7 @@
   width: 100%;
   padding: 0.75rem 1rem;
   font-size: 0.9375rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius);
   background-color: var(--bg-white);
   color: var(--text-primary);
@@ -180,7 +180,9 @@
 .number-checker .nc-input:focus {
   outline: none;
   border-color: var(--focus-ring);
-  box-shadow: 0 0 0 3px var(--primary-soft);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px var(--primary-soft);
 }
 
 .number-checker .nc-textarea {
@@ -189,7 +191,7 @@
   padding: 0.75rem 1rem;
   font-size: 0.9375rem;
   font-family: inherit;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius);
   background: var(--bg-white);
   color: var(--text-primary);
@@ -200,7 +202,9 @@
 .number-checker .nc-textarea:focus {
   outline: none;
   border-color: var(--focus-ring);
-  box-shadow: 0 0 0 3px var(--primary-soft);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px var(--primary-soft);
 }
 
 .number-checker .nc-hint {
@@ -617,4 +621,16 @@
   font-size: 0.8125rem;
   font-weight: 600;
   color: var(--error-text);
+}
+
+/* Forced colours drop fills: the tab and the filter that are on draw a heavy frame, the alert action a frame. */
+@media (forced-colors: active) {
+  .number-checker .nc-tab.active,
+  .number-checker .nc-filter-btn.active {
+    border: 3px solid CanvasText;
+  }
+
+  .number-checker .nc-alert-action {
+    border: 1px solid ButtonText;
+  }
 }

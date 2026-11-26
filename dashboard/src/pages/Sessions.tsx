@@ -55,6 +55,7 @@ import './Sessions.css';
 import { formatLastActive, formatSessionStatus } from '../utils/sessionDisplay';
 import { normalizePhoneText } from '../utils/phone';
 import { isComposingKey } from '../utils/composition';
+import { onTabListKeyDown } from '../utils/tabKeys';
 
 /**
  * The hover title for a restriction: the engine's own cause token, plus when enforcement ends if
@@ -575,7 +576,12 @@ export function Sessions() {
     }
   };
 
-  const proxySessionId = proxySession?.id ?? null;
+  const openProxyModal = (session: Session) => {
+    if (!canEditProxy) return;
+    setProxySession(session);
+  };
+
+  const proxySessionId = canEditProxy ? (proxySession?.id ?? null) : null;
   // Cancel stays enabled while a save runs, so a save that answers after its modal closed must neither
   // close nor unlock whichever proxy modal is open by then.
   const proxyVisit = useRef(0);
@@ -906,10 +912,11 @@ export function Sessions() {
         >
           <div style={{ textAlign: 'center' }}>
             {!pairingCode && (
-              <div className="pairing-tabs" role="tablist">
+              <div className="pairing-tabs" role="tablist" onKeyDown={onTabListKeyDown}>
                 <button
                   role="tab"
                   aria-selected={!pairingMode}
+                  tabIndex={!pairingMode ? 0 : -1}
                   className={`pairing-tab-btn ${!pairingMode ? 'active' : ''}`}
                   onClick={() => selectPairingTab(false)}
                 >
@@ -918,6 +925,7 @@ export function Sessions() {
                 <button
                   role="tab"
                   aria-selected={pairingMode}
+                  tabIndex={pairingMode ? 0 : -1}
                   className={`pairing-tab-btn ${pairingMode ? 'active' : ''}`}
                   onClick={() => selectPairingTab(true)}
                 >
@@ -936,7 +944,11 @@ export function Sessions() {
               // QR Code Content
               qrData.qrCode ? (
                 <>
-                  <img src={qrData.qrCode} alt="QR" style={{ maxWidth: '280px', borderRadius: '12px' }} />
+                  <img
+                    src={qrData.qrCode}
+                    alt={t('sessions.pairing.tabQr')}
+                    style={{ maxWidth: '280px', borderRadius: '12px' }}
+                  />
                   <div className="qr-instructions">
                     <p className="qr-step">
                       <Trans i18nKey="sessions.qr.step1" components={{ strong: <strong /> }} />
@@ -1129,7 +1141,7 @@ export function Sessions() {
         </Modal>
       )}
 
-      {proxySession && (
+      {proxySession && canEditProxy && (
         <Modal
           open
           onClose={() => setProxySession(null)}
@@ -1236,13 +1248,14 @@ export function Sessions() {
       {deleteConfirmId && (
         <Modal
           open
-          onClose={() => setDeleteConfirmId(null)}
+          onClose={() => deletingId === null && setDeleteConfirmId(null)}
+          hideCloseButton={deletingId !== null}
           title={t('sessions.delete.title')}
           className="confirm-modal"
           closeLabel={t('common.close')}
           footer={
             <>
-              <button className="btn-secondary" onClick={() => setDeleteConfirmId(null)}>
+              <button className="btn-secondary" onClick={() => setDeleteConfirmId(null)} disabled={deletingId !== null}>
                 {t('common.cancel')}
               </button>
               <button
@@ -1269,13 +1282,14 @@ export function Sessions() {
       {killConfirmId && (
         <Modal
           open
-          onClose={() => setKillConfirmId(null)}
+          onClose={() => killingId === null && setKillConfirmId(null)}
+          hideCloseButton={killingId !== null}
           title={t('sessions.forceKill.title')}
           className="confirm-modal"
           closeLabel={t('common.close')}
           footer={
             <>
-              <button className="btn-secondary" onClick={() => setKillConfirmId(null)}>
+              <button className="btn-secondary" onClick={() => setKillConfirmId(null)} disabled={killingId !== null}>
                 {t('common.cancel')}
               </button>
               <button
@@ -1302,13 +1316,18 @@ export function Sessions() {
       {unlinkConfirmId && (
         <Modal
           open
-          onClose={() => setUnlinkConfirmId(null)}
+          onClose={() => unlinkingId === null && setUnlinkConfirmId(null)}
+          hideCloseButton={unlinkingId !== null}
           title={t('sessions.unlink.title')}
           className="confirm-modal"
           closeLabel={t('common.close')}
           footer={
             <>
-              <button className="btn-secondary" onClick={() => setUnlinkConfirmId(null)}>
+              <button
+                className="btn-secondary"
+                onClick={() => setUnlinkConfirmId(null)}
+                disabled={unlinkingId !== null}
+              >
                 {t('common.cancel')}
               </button>
               <button
@@ -1337,7 +1356,13 @@ export function Sessions() {
           <div className="empty-state">
             <QrCode size={48} />
             <h3>{t('sessions.empty.title')}</h3>
-            <p>{t('sessions.empty.description')}</p>
+            {/* A list the search or the status filter emptied is not a gateway with no sessions, and only a key
+                that can create one is told to. */}
+            {sessions.length > 0 ? (
+              <p>{t('sessions.empty.filtered')}</p>
+            ) : (
+              canCreate && <p>{t('sessions.empty.description')}</p>
+            )}
           </div>
         ) : (
           filteredSessions.map(session => (
@@ -1404,10 +1429,12 @@ export function Sessions() {
                   <Eye size={16} />
                   {t('sessions.actions.view')}
                 </button>
-                <button className="btn-action" onClick={() => setProxySession(session)}>
-                  <Globe size={16} />
-                  {t('sessions.actions.proxy')}
-                </button>
+                {canEditProxy && (
+                  <button className="btn-action" onClick={() => openProxyModal(session)}>
+                    <Globe size={16} />
+                    {t('sessions.actions.proxy')}
+                  </button>
+                )}
                 {canWrite && isSessionStarted(session) ? (
                   <button className="btn-action" onClick={() => handleStop(session.id)}>
                     <Square size={16} />

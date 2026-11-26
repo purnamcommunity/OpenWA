@@ -106,7 +106,7 @@ class CreateCallLinkRequest(TypedDict):
     """
 
     type: CallLinkType
-    startTime: float
+    startTime: int
 
 
 class CallLinkResponse(TypedDict):
@@ -381,7 +381,7 @@ class SessionStatsOverview(TypedDict):
     ready: int
     disconnected: int
     byStatus: dict[str, int]
-    memoryUsage: MemoryUsage
+    memoryUsage: NotRequired[MemoryUsage]
 
 
 # ── Message ───────────────────────────────────────────────────────
@@ -1047,9 +1047,9 @@ class UpdateWebhookRequest(TypedDict, total=False):
     # optional. Every field here is a partial update.
     url: str
     events: list[WebhookEvent]
-    # Same 16-character minimum as the create request, with one exception: the empty string is the
-    # documented "clear the secret" value and is accepted.
-    secret: str
+    # Same 16-character minimum as the create request, with one exception: the empty string, or None
+    # (sent as null), is the documented "clear the secret" value and is accepted.
+    secret: str | None
     headers: dict[str, str]
     filters: WebhookFilters | None
     # Total delivery attempts per event including the first, 0 to 5 (0 and 1 both mean one attempt);
@@ -1172,7 +1172,10 @@ class ChatActivityPreview(TypedDict):
 
 class ChatSummary(TypedDict):
     id: Jid
+    # '' for a Baileys chat held under a privacy id that has no name of its own: title it by `phone`, when present.
     name: str
+    # Baileys only; whatsapp-web.js sends none. Phone digits of a privacy-id chat, when the session can map it.
+    phone: NotRequired[str]
     isGroup: bool
     unreadCount: int
     # Server returns a plain preview string, not a message object.

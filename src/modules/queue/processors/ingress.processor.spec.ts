@@ -1,7 +1,7 @@
 import { DelayedError, Job, Worker } from 'bullmq';
 import { EventEmitter } from 'node:events';
 import { MAX_WORKER_CLOSE_WAIT_MS } from './close-worker';
-import { IngressProcessor } from './ingress.processor';
+import { BUSY_KEY_REQUEUE_DELAY_MS, IngressProcessor } from './ingress.processor';
 
 function job(overrides = {}) {
   return {
@@ -70,9 +70,9 @@ describe('IngressProcessor', () => {
     expect(hooks.execute).toHaveBeenCalledWith('ingress:error', expect.anything(), expect.anything());
   });
 
-  // Once the attempts are spent the DLQ row is the only durable copy: the ingress_events row retired its
-  // payload on 'queued' and removeOnFail prunes the failed job. A data database that is down for the
-  // whole retry window refuses the row too, so the delivery goes back on the queue instead.
+  // Once the attempts are spent the DLQ row is the only durable copy: removeOnFail prunes the failed job, and
+  // the ingress_events row lets go of its payload once the dead letter is written. A data database that is down
+  // for the whole retry window refuses the row too, so the delivery goes back on the queue instead.
   it('re-queues the delivery when the final-attempt DLQ write fails, and still rethrows the dispatch error', async () => {
     const loader = {
       isRestorePending: () => false,
@@ -192,8 +192,13 @@ describe('IngressProcessor', () => {
     );
 
     await proc.process(job({ id: 'ing-abc' }));
-    expect(events.update).not.toHaveBeenCalled();
+    // An original job retires only a row that is still pending, and closes no dead letter.
+    expect(events.update).toHaveBeenCalledWith(
+      { pluginId: 'chatwoot', instanceId: 'acct1', providerDeliveryId: 'd1', dispatchState: 'pending' },
+      { dispatchState: 'dispatched', payload: null },
+    );
     expect(failures.update).not.toHaveBeenCalled();
+    events.update.mockClear();
 
     await proc.process(job({ id: 'ing-abc-requeued-1' }));
     expect(events.update).toHaveBeenCalledWith(
@@ -208,6 +213,130 @@ describe('IngressProcessor', () => {
     // The delivery already reached the plugin: a failed bookkeeping write must not fail the job into a retry.
     events.update.mockRejectedValue(new Error('db down'));
     await expect(proc.process(job({ id: 'ing-abc-requeued-2' }))).resolves.toBeUndefined();
+  });
+
+  // The row keeps its payload while the job is queued, so a job that Redis loses can be replayed from it; once the
+  // delivery settles the row lets go.
+  describe('the event row of a queued delivery', () => {
+    const pending = {
+      pluginId: 'chatwoot',
+      instanceId: 'acct1',
+      providerDeliveryId: 'd1',
+      dispatchState: 'pending',
+    };
+    const retired = { dispatchState: 'dispatched', payload: null };
+
+    it('is retired once the dispatch succeeds, and a failed write does not fail the job that delivered', async () => {
+      const events = { update: jest.fn().mockResolvedValue(undefined) };
+      const proc = new IngressProcessor(
+        { isRestorePending: () => false, dispatchWebhookForInstance: jest.fn().mockResolvedValue(undefined) } as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        events as never,
+      );
+
+      await proc.process(job());
+      expect(events.update).toHaveBeenCalledTimes(1);
+      expect(events.update).toHaveBeenCalledWith(pending, retired);
+
+      events.update.mockRejectedValue(new Error('db down'));
+      await expect(proc.process(job())).resolves.toBeUndefined();
+    });
+
+    it('is left alone while the job is still being retried', async () => {
+      const events = { update: jest.fn() };
+      const proc = new IngressProcessor(
+        {
+          isRestorePending: () => false,
+          dispatchWebhookForInstance: jest.fn().mockRejectedValue(new Error('boom')),
+        } as never,
+        { save: jest.fn() } as never,
+        { execute: jest.fn() } as never,
+        {} as never,
+        events as never,
+      );
+
+      await expect(proc.process(job({ attemptsMade: 0, opts: { attempts: 3 } }))).rejects.toThrow('boom');
+
+      expect(events.update).not.toHaveBeenCalled();
+    });
+
+    it('is retired once the dead letter of a failed final attempt is written, and not before', async () => {
+      const order: string[] = [];
+      const failures = {
+        save: jest.fn(() => {
+          order.push('dead letter');
+          return Promise.resolve(undefined);
+        }),
+        count: jest.fn().mockResolvedValue(0),
+      };
+      const events = {
+        update: jest.fn(() => {
+          order.push('retire');
+          return Promise.resolve(undefined);
+        }),
+      };
+      const proc = new IngressProcessor(
+        {
+          isRestorePending: () => false,
+          dispatchWebhookForInstance: jest.fn().mockRejectedValue(new Error('boom')),
+        } as never,
+        failures as never,
+        { execute: jest.fn().mockResolvedValue({ continue: true }) } as never,
+        {} as never,
+        events as never,
+      );
+
+      await expect(proc.process(job({ attemptsMade: 2, opts: { attempts: 3 } }))).rejects.toThrow('boom');
+
+      expect(order).toEqual(['dead letter', 'retire']);
+      expect(events.update).toHaveBeenCalledWith(pending, retired);
+    });
+
+    it('is retired once the dead letter of a job that stalled out is written', async () => {
+      const events = { update: jest.fn().mockResolvedValue(undefined) };
+      const proc = new IngressProcessor(
+        {} as never,
+        { save: jest.fn().mockResolvedValue(undefined), count: jest.fn().mockResolvedValue(0) } as never,
+        { execute: jest.fn().mockResolvedValue({ continue: true }) } as never,
+        {} as never,
+        events as never,
+      );
+
+      await proc.onWorkerFailed(
+        job({ attemptsMade: 1, deferredFailure: 'job stalled more than allowable limit' }),
+        new Error('job stalled more than allowable limit'),
+      );
+
+      expect(events.update).toHaveBeenCalledWith(pending, retired);
+    });
+
+    it('keeps its payload when the dead-letter write fails and the delivery goes back on the queue', async () => {
+      const events = { update: jest.fn() };
+      const queue = {
+        waitUntilReady: jest.fn().mockResolvedValue(undefined),
+        add: jest.fn().mockResolvedValue(undefined),
+        remove: jest.fn().mockResolvedValue(1),
+      };
+      const proc = new IngressProcessor(
+        {
+          isRestorePending: () => false,
+          dispatchWebhookForInstance: jest.fn().mockRejectedValue(new Error('boom')),
+        } as never,
+        { save: jest.fn().mockRejectedValue(new Error('db down')), count: jest.fn().mockResolvedValue(0) } as never,
+        { execute: jest.fn().mockResolvedValue({ continue: true }) } as never,
+        queue as never,
+        events as never,
+      );
+
+      await expect(
+        proc.process(job({ id: 'ing-abc', name: 'ingress', attemptsMade: 2, opts: { attempts: 3 } })),
+      ).rejects.toThrow('boom');
+
+      expect(queue.add).toHaveBeenCalledTimes(1);
+      expect(events.update).not.toHaveBeenCalled();
+    });
   });
 
   it('does not add a second DLQ row when one is already open for the delivery', async () => {
@@ -705,5 +834,232 @@ describe('IngressProcessor while the plugin is still being restored', () => {
 
     expect(loader.dispatchWebhookForInstance).toHaveBeenCalledTimes(1);
     expect(moveToDelayed).not.toHaveBeenCalled();
+  });
+});
+
+describe('IngressProcessor busy-key deferral (head-of-line slot isolation)', () => {
+  const mkJob = (deliveryId: string, providerConversationId: string, extra: Record<string, unknown> = {}): Job<never> =>
+    job({
+      data: {
+        pluginId: 'chatwoot',
+        instanceId: 'acct1',
+        route: 'chatwoot',
+        deliveryId,
+        providerConversationId,
+        payload: { headers: {}, query: {}, body: '{}', rawBody: '{}' },
+      },
+      ...extra,
+    });
+
+  it('immediately delays a second job for a busy key instead of holding its worker slot', async () => {
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstInFlight = new Promise<void>(resolve => (markFirstStarted = resolve));
+
+    const loader = {
+      isRestorePending: () => false,
+      dispatchWebhookForInstance: jest.fn(async (d: { deliveryId: string }) => {
+        if (d.deliveryId === 'c1-1') {
+          markFirstStarted();
+          await new Promise<void>(resolve => (releaseFirst = resolve));
+        }
+      }),
+    };
+    const proc = new IngressProcessor(
+      loader as never,
+      { save: jest.fn() } as never,
+      { execute: jest.fn() } as never,
+      {} as never,
+      { update: jest.fn().mockResolvedValue(undefined) } as never,
+    );
+
+    const moveToDelayed1 = jest.fn().mockResolvedValue(undefined);
+    const moveToDelayed2 = jest.fn().mockResolvedValue(undefined);
+
+    const first = proc.process(mkJob('c1-1', 'c1', { moveToDelayed: moveToDelayed1 }) as never, 'tok-1');
+    await firstInFlight;
+
+    try {
+      const before = Date.now();
+      // Second job on the same key must settle immediately with DelayedError without waiting for job 1.
+      const secondOutcome = await Promise.race([
+        proc.process(mkJob('c1-2', 'c1', { moveToDelayed: moveToDelayed2 }) as never, 'tok-2').then(
+          () => 'resolved',
+          (err: unknown) => err,
+        ),
+        new Promise<string>(resolve => setTimeout(resolve, 100, 'blocked')),
+      ]);
+
+      expect(secondOutcome).toBeInstanceOf(DelayedError);
+      expect(moveToDelayed2).toHaveBeenCalledTimes(1);
+      const [when, token] = moveToDelayed2.mock.calls[0] as [number, string];
+      expect(token).toBe('tok-2');
+      expect(when).toBeGreaterThanOrEqual(before + BUSY_KEY_REQUEUE_DELAY_MS);
+      expect(when).toBeLessThanOrEqual(Date.now() + BUSY_KEY_REQUEUE_DELAY_MS);
+      expect(moveToDelayed1).not.toHaveBeenCalled();
+      expect(loader.dispatchWebhookForInstance).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseFirst();
+      await first;
+    }
+  });
+
+  it('executes a concurrent job for an unrelated key immediately in parallel', async () => {
+    let releaseC1!: () => void;
+    let markC1Started!: () => void;
+    const c1Started = new Promise<void>(resolve => (markC1Started = resolve));
+    const finished: string[] = [];
+
+    const loader = {
+      isRestorePending: () => false,
+      dispatchWebhookForInstance: jest.fn(async (d: { deliveryId: string }) => {
+        if (d.deliveryId === 'c1-1') {
+          markC1Started();
+          await new Promise<void>(resolve => (releaseC1 = resolve));
+        }
+        finished.push(d.deliveryId);
+      }),
+    };
+    const proc = new IngressProcessor(
+      loader as never,
+      { save: jest.fn() } as never,
+      { execute: jest.fn() } as never,
+      {} as never,
+      { update: jest.fn().mockResolvedValue(undefined) } as never,
+    );
+
+    const moveToDelayed1 = jest.fn().mockResolvedValue(undefined);
+    const moveToDelayed2 = jest.fn().mockResolvedValue(undefined);
+
+    const first = proc.process(mkJob('c1-1', 'c1', { moveToDelayed: moveToDelayed1 }) as never, 'tok-1');
+    await c1Started;
+
+    // Unrelated key c2 completes while c1 is still blocked.
+    await proc.process(mkJob('c2-1', 'c2', { moveToDelayed: moveToDelayed2 }) as never, 'tok-2');
+    expect(finished).toEqual(['c2-1']);
+    expect(moveToDelayed2).not.toHaveBeenCalled();
+
+    releaseC1();
+    await first;
+    expect(finished).toEqual(['c2-1', 'c1-1']);
+  });
+
+  it('does not burn attempts, file DLQ, retire the event row, or fire ingress:error when deferring on the final attempt', async () => {
+    let releaseC1!: () => void;
+    let markC1Started!: () => void;
+    const c1Started = new Promise<void>(resolve => (markC1Started = resolve));
+
+    const loader = {
+      isRestorePending: () => false,
+      dispatchWebhookForInstance: jest.fn(async (d: { deliveryId: string }) => {
+        if (d.deliveryId === 'c1-1') {
+          markC1Started();
+          await new Promise<void>(resolve => (releaseC1 = resolve));
+        }
+      }),
+    };
+    const failures = { save: jest.fn(), count: jest.fn() };
+    const hooks = { execute: jest.fn() };
+    const events = { update: jest.fn().mockResolvedValue(undefined) };
+    const proc = new IngressProcessor(loader as never, failures as never, hooks as never, {} as never, events as never);
+
+    const first = proc.process(mkJob('c1-1', 'c1', { moveToDelayed: jest.fn() }) as never, 'tok-1');
+    await c1Started;
+
+    try {
+      const moveToDelayed2 = jest.fn().mockResolvedValue(undefined);
+      const outcome = await Promise.race([
+        proc
+          .process(
+            mkJob('c1-2', 'c1', { attemptsMade: 2, opts: { attempts: 3 }, moveToDelayed: moveToDelayed2 }) as never,
+            'tok-2',
+          )
+          .then(
+            () => 'resolved',
+            (err: unknown) => err,
+          ),
+        new Promise<string>(resolve => setTimeout(resolve, 100, 'blocked')),
+      ]);
+
+      expect(outcome).toBeInstanceOf(DelayedError);
+      expect(moveToDelayed2).toHaveBeenCalledTimes(1);
+      expect(failures.save).not.toHaveBeenCalled();
+      expect(hooks.execute).not.toHaveBeenCalled();
+      expect(events.update).not.toHaveBeenCalled();
+    } finally {
+      releaseC1();
+      await first;
+    }
+  });
+
+  it('releases the key after job 1 finishes (on success or error) so subsequent jobs for that key execute normally', async () => {
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>(resolve => (markFirstStarted = resolve));
+    const dispatched: string[] = [];
+
+    const loader = {
+      isRestorePending: () => false,
+      dispatchWebhookForInstance: jest.fn(async (d: { deliveryId: string }) => {
+        dispatched.push(d.deliveryId);
+        if (d.deliveryId === 'c1-1') {
+          markFirstStarted();
+          await new Promise<void>(resolve => (releaseFirst = resolve));
+        } else if (d.deliveryId === 'c1-err') {
+          throw new Error('transient');
+        }
+      }),
+    };
+    const proc = new IngressProcessor(
+      loader as never,
+      { save: jest.fn() } as never,
+      { execute: jest.fn() } as never,
+      {} as never,
+      { update: jest.fn().mockResolvedValue(undefined) } as never,
+    );
+
+    const first = proc.process(mkJob('c1-1', 'c1', { moveToDelayed: jest.fn() }) as never, 'tok-1');
+    await firstStarted;
+    releaseFirst();
+    await first;
+
+    // After success, c1 is released and the next job executes without delaying.
+    const moveToDelayed2 = jest.fn().mockResolvedValue(undefined);
+    await proc.process(mkJob('c1-2', 'c1', { moveToDelayed: moveToDelayed2 }) as never, 'tok-2');
+    expect(moveToDelayed2).not.toHaveBeenCalled();
+
+    // After a failure, c1 is still released in finally so the next job executes normally.
+    await expect(proc.process(mkJob('c1-err', 'c1', { moveToDelayed: jest.fn() }) as never, 'tok-3')).rejects.toThrow(
+      'transient',
+    );
+
+    const moveToDelayed4 = jest.fn().mockResolvedValue(undefined);
+    await proc.process(mkJob('c1-3', 'c1', { moveToDelayed: moveToDelayed4 }) as never, 'tok-4');
+    expect(moveToDelayed4).not.toHaveBeenCalled();
+    expect(dispatched).toEqual(['c1-1', 'c1-2', 'c1-err', 'c1-3']);
+  });
+
+  it('falls back to in-process serialization when called without a BullMQ token', async () => {
+    const started: string[] = [];
+    const finished: string[] = [];
+    const loader = {
+      isRestorePending: () => false,
+      dispatchWebhookForInstance: jest.fn(async (d: { deliveryId: string }) => {
+        started.push(d.deliveryId);
+        await new Promise(r => setTimeout(r, d.deliveryId === 'c1-1' ? 20 : 1));
+        finished.push(d.deliveryId);
+      }),
+    };
+    const proc = new IngressProcessor(
+      loader as never,
+      { save: jest.fn() } as never,
+      { execute: jest.fn() } as never,
+      {} as never,
+      { update: jest.fn().mockResolvedValue(undefined) } as never,
+    );
+
+    await Promise.all([proc.process(mkJob('c1-1', 'c1') as never), proc.process(mkJob('c1-2', 'c1') as never)]);
+
+    expect(finished.indexOf('c1-1')).toBeLessThan(started.indexOf('c1-2'));
   });
 });

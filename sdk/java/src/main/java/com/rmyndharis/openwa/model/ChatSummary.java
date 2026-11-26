@@ -8,6 +8,10 @@ package com.rmyndharis.openwa.model;
  */
 public record ChatSummary(
     String id,
+    /**
+     * {@code ""} for a Baileys chat held under a privacy id that has no name of its own: title it by
+     * {@code phone}, when present.
+     */
     String name,
     Boolean isGroup,
     Integer unreadCount,
@@ -22,14 +26,28 @@ public record ChatSummary(
     Boolean muted,
     /** Epoch milliseconds the mute ends, null unless muted; 0 means indefinitely. */
     Long muteExpiration,
-    MessageType lastMessageType) {
+    MessageType lastMessageType,
+    /**
+     * Baileys only; null on whatsapp-web.js. Phone digits of a privacy-id chat, null when the chat is
+     * phone-keyed or the mapping is unknown.
+     */
+    String phone) {
 
-    /** Construct a chat summary without last-message type metadata. */
+    /** Construct a chat summary without last-message type metadata or a resolved phone. */
     public ChatSummary(
         String id, String name, Boolean isGroup, Integer unreadCount, String lastMessage,
         Long timestamp, ChatKind kind, Boolean archived, Boolean pinned, Boolean muted,
         Long muteExpiration) {
         this(id, name, isGroup, unreadCount, lastMessage, timestamp, kind, archived, pinned,
-            muted, muteExpiration, null);
+            muted, muteExpiration, null, null);
+    }
+
+    /** Construct a chat summary without a resolved phone. */
+    public ChatSummary(
+        String id, String name, Boolean isGroup, Integer unreadCount, String lastMessage,
+        Long timestamp, ChatKind kind, Boolean archived, Boolean pinned, Boolean muted,
+        Long muteExpiration, MessageType lastMessageType) {
+        this(id, name, isGroup, unreadCount, lastMessage, timestamp, kind, archived, pinned,
+            muted, muteExpiration, lastMessageType, null);
     }
 }

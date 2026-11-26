@@ -398,7 +398,7 @@ before(async () => {
   installFetchStub();
   window.sessionStorage.setItem('openwa_user_role', 'admin');
   window.sessionStorage.setItem('openwa_engine_type', 'baileys');
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   const { i18nReady } = await import('../i18n/index.ts');
   await i18nReady;
   rtl = await import('@testing-library/react');
@@ -777,6 +777,32 @@ test('an unnamed privacy-id chat is titled by the number it resolves to, and its
   await waitFor(() => assert.equal(title(), '+1 555 000 6666'));
 });
 
+test('a privacy id stored as the chat name is listed and titled by its phone, not by those digits', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  const lid = '262813461250072@lid';
+  Object.assign(aliceNow, { id: lid, name: '262813461250072', phone: '15550006666' });
+  const { container } = renderPage();
+  const number = isolated('+1 555 000 6666');
+  fireEvent.click(await screen.findByText(number));
+  await waitFor(() =>
+    assert.equal(container.querySelector('.room-header .room-contact-name')?.textContent, '+1 555 000 6666'),
+  );
+  assert.equal(container.querySelector('.room-header .room-contact-phone'), null, 'the number is shown twice');
+});
+
+test('a privacy id stored as the chat name is replaced in the header once its phone resolves', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  const lid = '262813461250072@lid';
+  Object.assign(aliceNow, { id: lid, name: '262813461250072' });
+  lidPhones[lid] = '15550006666';
+  const { container } = renderPage();
+  fireEvent.click(await screen.findByText('262813461250072'));
+  await waitFor(() =>
+    assert.equal(container.querySelector('.room-header .room-contact-name')?.textContent, '+1 555 000 6666'),
+  );
+  assert.equal(container.querySelector('.room-header .room-contact-phone'), null, 'the number is shown twice');
+});
+
 // ── The number check answers a phone id, while a contact that moved to privacy-id addressing keeps its conversation
 // under its @lid: starting a chat with that number has to find it. ──
 
@@ -973,7 +999,7 @@ test('a chat opened after a lookup is drawn with its own draft, not the text typ
   await screen.findByText('Lia');
   fireEvent.click(within(container.querySelector('.chats-sidebar') as HTMLElement).getByText('Alice'));
   await within(container.querySelector('.room-header') as HTMLElement).findByText('Alice');
-  const composerSelector = 'input[placeholder="Type a message..."]';
+  const composerSelector = '.message-text-input';
   fireEvent.change(container.querySelector(composerSelector) as HTMLInputElement, { target: { value: 'for alice' } });
 
   // A mutation callback runs as a microtask, so it reads the page as the commit that drew Lia's room left it.
@@ -1052,21 +1078,11 @@ test('the remove confirmation names an unnamed member inside an isolate', async 
   const { fireEvent, within } = rtl;
   listGroup = true;
   bobUnnamed = true;
-  const confirm = window.confirm;
-  try {
-    renderPage();
-    const dialog = await openGroupInfo();
-    fireEvent.click(within(dialog).getByRole('tab', { name: 'Participants' }));
-    let asked = '';
-    window.confirm = message => {
-      asked = String(message);
-      return false;
-    };
-    fireEvent.click(within(dialog).getByRole('button', { name: /^Remove: / }));
-    assert.equal(asked, `Remove ${LTR_BOB} from the group?`);
-  } finally {
-    window.confirm = confirm;
-  }
+  renderPage();
+  const dialog = await openGroupInfo();
+  fireEvent.click(within(dialog).getByRole('tab', { name: 'Participants' }));
+  fireEvent.click(within(dialog).getByRole('button', { name: /^Remove: / }));
+  assert.ok(within(dialog).getByText(`Remove ${LTR_BOB} from the group?`));
 });
 
 test('the number a check finds unregistered is named inside an isolate when adding to a group', async () => {
@@ -1882,34 +1898,25 @@ test('a changed description is saved on its own through the description route', 
 test('removing a member asks first, and sends nothing unless it is confirmed', async () => {
   const { fireEvent, waitFor, within } = rtl;
   listGroup = true;
-  const confirm = window.confirm;
-  try {
-    renderPage();
-    const dialog = await openGroupInfo();
-    fireEvent.click(within(dialog).getByRole('tab', { name: 'Participants' }));
-    const removals = () => fetchCalls.filter(c => c.method === 'DELETE' && c.path.endsWith('/participants'));
+  renderPage();
+  const dialog = await openGroupInfo();
+  fireEvent.click(within(dialog).getByRole('tab', { name: 'Participants' }));
+  const removals = () => fetchCalls.filter(c => c.method === 'DELETE' && c.path.endsWith('/participants'));
 
-    const asked: Array<string | undefined> = [];
-    window.confirm = message => {
-      asked.push(message);
-      return false;
-    };
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove: Bob' }));
-    assert.deepEqual(asked, ['Remove Bob from the group?']);
-    await settle();
-    assert.deepEqual(removals(), [], 'a member was removed without being confirmed');
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Remove: Bob' }));
+  assert.ok(within(dialog).getByText('Remove Bob from the group?'));
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+  await settle();
+  assert.deepEqual(removals(), [], 'a member was removed without being confirmed');
 
-    window.confirm = () => true;
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove: Bob' }));
-    await waitFor(() =>
-      assert.deepEqual(
-        removals().map(c => c.body),
-        [{ participants: ['15550002222@c.us'] }],
-      ),
-    );
-  } finally {
-    window.confirm = confirm;
-  }
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Remove: Bob' }));
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Remove' }));
+  await waitFor(() =>
+    assert.deepEqual(
+      removals().map(c => c.body),
+      [{ participants: ['15550002222@c.us'] }],
+    ),
+  );
 });
 
 // Both engines hand the number over without a device, so this id only reaches the dialog from a synthetic list;
@@ -3524,19 +3531,21 @@ test('a message that arrives later is the only one the next read names', async (
   assert.deepEqual(readBodies(CHAT.id), [{ chatId: CHAT.id, messageIds: ['wamid.live.1'] }]);
 });
 
-test('a thread that loads after the opening read is read again with its ids', async () => {
+test('a thread that loads after the opening read fell due is read once it has loaded, with its ids', async () => {
   const { screen, fireEvent, waitFor } = rtl;
   aliceThread = [threadRow(1), threadRow(2)];
   const release = hold('thread');
   renderPage();
   fireEvent.click(await screen.findByText('Alice'));
-  // The opening read is due before the thread has come, so it names nothing.
-  await waitFor(() => assert.deepEqual(readBodies(CHAT.id), [{ chatId: CHAT.id }]), { timeout: 3_000 });
+  // The opening read is due before the thread has come, and the thread has shown nothing yet, which a read would
+  // acknowledge: it waits.
+  await new Promise(resolve => setTimeout(resolve, 1_000));
+  assert.deepEqual(readBodies(CHAT.id), [], 'a chat that showed no message was read');
 
   release();
   await screen.findByText('message 2');
-  await waitFor(() => assert.equal(readsOf(CHAT.id).length, 2), { timeout: 3_000 });
-  assert.deepEqual(readBodies(CHAT.id).at(-1), { chatId: CHAT.id, messageIds: ['wamid.in.1', 'wamid.in.2'] });
+  await waitFor(() => assert.equal(readsOf(CHAT.id).length, 1), { timeout: 3_000 });
+  assert.deepEqual(readBodies(CHAT.id), [{ chatId: CHAT.id, messageIds: ['wamid.in.1', 'wamid.in.2'] }]);
 });
 
 test('on whatsapp-web.js the read names no message, since the engine reads the whole chat', async () => {

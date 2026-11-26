@@ -49,6 +49,12 @@ export class ProfileController {
   @ApiResponse({ status: 200, description: 'Profile status updated', type: ProfileAckResponseDto })
   @ApiResponse({ status: 400, description: 'Session is not started' })
   @ApiResponse({
+    status: 501,
+    description:
+      'On whatsapp-web.js, answered when the WhatsApp Web build the session runs no longer has the call the library ' +
+      'uses to set the About text. Nothing was asked of WhatsApp.',
+  })
+  @ApiResponse({
     status: 503,
     description:
       'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
@@ -80,10 +86,18 @@ export class ProfileController {
   })
   @ApiResponse({ status: 413, description: MEDIA_TOO_LARGE_413 })
   @ApiResponse({
+    status: 501,
+    description:
+      'On whatsapp-web.js, answered when the WhatsApp Web build the session runs has no job to send the picture with. ' +
+      'Nothing was asked of WhatsApp: the picture is unchanged.',
+  })
+  @ApiResponse({
     status: 503,
     description:
       'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
-      'the gateway stopped waiting for a confirmation that never came. ' +
+      'the gateway stopped waiting for a confirmation that never came. On whatsapp-web.js, also when WhatsApp answers ' +
+      'the change with a rate limit, a timeout or a server error (408, 423, 429 or 5xx): nothing was changed, so retry after a ' +
+      'pause. ' +
       MEDIA_URL_PROXY_503,
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
@@ -108,9 +122,17 @@ export class ProfileController {
     status: 503,
     description:
       'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
-      'the gateway stopped waiting for a confirmation that never came.',
+      'the gateway stopped waiting for a confirmation that never came. On whatsapp-web.js, also when WhatsApp answers ' +
+      'the removal with a rate limit, a timeout or a server error (408, 423, 429 or 5xx): nothing was removed, so retry ' +
+      'after a pause.',
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({
+    status: 501,
+    description:
+      'On whatsapp-web.js, answered when the WhatsApp Web build the session runs has no job to remove the picture with. ' +
+      'Nothing was asked of WhatsApp: the picture is unchanged.',
+  })
   async deletePicture(@Param('sessionId') sessionId: string) {
     await this.profileService.deleteProfilePicture(sessionId);
     return { success: true, message: 'Profile picture removed' };

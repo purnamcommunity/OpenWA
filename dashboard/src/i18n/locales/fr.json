@@ -51,15 +51,13 @@
     "refresh": "Actualiser",
     "errorGeneric": "Une erreur est survenue",
     "unknownError": "Erreur inconnue",
-    "retry": "Réessayer"
+    "retry": "Réessayer",
+    "copyFailed": "Impossible de copier dans le presse-papiers"
   },
   "theme": {
     "light": "Clair",
     "dark": "Sombre",
     "system": "Système",
-    "label": "Thème : {{value}}",
-    "appearance": "Apparence",
-    "mode": "Mode",
     "toggleTo": "Passer à {{value}}"
   },
   "nav": {
@@ -79,6 +77,7 @@
     "edited": "Modifié",
     "media": {
       "location": "Localisation",
+      "contact": "Contact",
       "call": "Appel",
       "callMissed": "Appel manqué",
       "callVideo": "Appel vidéo",
@@ -86,7 +85,6 @@
       "omitted": "Média",
       "image": "Image"
     },
-    "subtitle": "Envoyez et répondez aux messages WhatsApp en temps réel",
     "noSessionsTitle": "Aucune session connectée",
     "noSessionsDesc": "Veuillez d'abord connecter une session WhatsApp depuis le menu <1>Sessions</1> pour utiliser la fonction de discussion.",
     "sessionLabel": "Session WhatsApp",
@@ -95,6 +93,7 @@
     "loadingChats": "Chargement des discussions...",
     "empty": "Aucune discussion",
     "noMessageYet": "Aucun message pour le moment",
+    "draftLabel": "Brouillon :",
     "unreadBadge": "{{count}} message non lu",
     "unreadBadge_other": "{{count}} messages non lus",
     "unreadBadge_many": "{{count}} messages non lus",
@@ -103,6 +102,8 @@
     "loadingOlderMessages": "Chargement des messages plus anciens...",
     "loadOlderMessagesError": "Impossible de charger les messages plus anciens. Faites défiler vers le haut pour réessayer.",
     "loadOlderMessagesRetryHint": "Faites défiler vers le haut pour réessayer.",
+    "refreshMessagesError": "Impossible d'actualiser les messages. Touchez pour réessayer.",
+    "refreshMessagesRetryHint": "Touchez pour réessayer.",
     "noMessagesInChat": "Aucun message pour le moment. Envoyez le premier message pour commencer !",
     "downloadDocument": "Télécharger le document",
     "actions": {
@@ -238,7 +239,6 @@
     "moreActions": "Plus d’actions",
     "copyChatId": "Copier l’ID de la discussion",
     "chatIdCopied": "ID de la discussion copié",
-    "copyFailed": "Impossible de copier dans le presse-papiers",
     "closeChat": "Fermer la discussion",
     "phone": "Numéro de téléphone",
     "chatId": "ID de la discussion",
@@ -358,6 +358,26 @@
         "always": "Toujours"
       },
       "saveContactUnavailable": "Nécessite un numéro de téléphone connu : cette discussion n’a qu’un identifiant de confidentialité (@lid)."
+    },
+    "slash": {
+      "title": "Réponses rapides",
+      "hint": "Entrée insère le template surligné. Envoyez-le quand il est prêt.",
+      "placeholder": "Message ou /template…",
+      "empty": "Aucun template ne correspond",
+      "needsVars": "Remplissez les variables du template avant d'envoyer.",
+      "loading": "Chargement des templates… Entrée attend la fin du chargement.",
+      "loadError": "Impossible de charger les templates",
+      "close": "Fermer la liste des templates",
+      "more": "D'autres templates correspondent. Continuez à écrire pour réduire la liste."
+    },
+    "roomSearch": {
+      "title": "Rechercher des messages",
+      "placeholder": "Rechercher",
+      "date": "Aller à la date",
+      "clearDate": "Effacer la date",
+      "noDateHits": "Aucun message chargé ce jour-là",
+      "notLoaded": "Plus ancien que les messages chargés dans cette discussion. Faites défiler la discussion vers le haut pour charger des messages plus anciens.",
+      "open": "Rechercher dans la discussion"
     }
   },
   "errorBoundary": {
@@ -423,9 +443,7 @@
   },
   "sessionStatus": {
     "created": "Nouveau",
-    "idle": "Inactif",
     "initializing": "Démarrage...",
-    "connecting": "Connexion...",
     "qr_ready": "Scanner le QR",
     "ready": "Connecté",
     "disconnected": "Déconnecté",
@@ -447,7 +465,8 @@
     },
     "empty": {
       "title": "Aucune session trouvée",
-      "description": "Créez une nouvelle session pour commencer"
+      "description": "Créez une nouvelle session pour commencer",
+      "filtered": "Aucune session ne correspond à la recherche ou au filtre de statut."
     },
     "create": {
       "title": "Créer une nouvelle session",
@@ -615,7 +634,7 @@
     "filters": {
       "title": "Filtres (facultatif)",
       "hint": "Déclencher uniquement lorsque toutes les conditions sont remplies. S'applique aux événements de message.",
-      "incomplete": "Attribuez une valeur à chaque condition de filtre et utilisez au plus 20 conditions, 100 valeurs par condition et 1000 caractères de texte.",
+      "incomplete": "Attribuez une valeur à chaque condition de filtre et utilisez au plus 20 conditions, 100 valeurs par condition, 128 caractères par identifiant et 1000 caractères de texte.",
       "badge": "{{count}} filtre",
       "badge_other": "{{count}} filtres",
       "badge_many": "{{count}} filtres",
@@ -695,16 +714,16 @@
       "session.reconnect_loop": "Lorsqu'une session échoue à se reconnecter à plusieurs reprises",
       "session.restriction": "Lorsque WhatsApp restreint le compte ou lève une restriction",
       "presence.update": "Lorsqu'un chat suivi passe en ligne, écrit ou se déconnecte",
-      "event.response": "Lorsqu'un invité répond à un événement WhatsApp (participe, ne participe pas, peut-être)",
+      "event.response": "Lorsqu'un invité répond à un événement WhatsApp (participe, ne participe pas, peut-être) (Baileys uniquement)",
       "poll.vote": "Lorsqu'un participant coche ou décoche des options d'un sondage",
       "group.join": "Lorsque des participants rejoignent un groupe ou y sont ajoutés",
       "group.leave": "Lorsque des participants quittent un groupe ou en sont retirés",
       "group.update": "Lorsque le nom, la description ou les paramètres d'un groupe changent",
       "group.join_request": "Lorsque quelqu'un demande à rejoindre un groupe administré par cette session",
       "call.received": "Lorsqu'un appel entrant commence à sonner",
-      "call.accepted": "Lorsqu'un appel est décroché",
-      "call.rejected": "Lorsqu'un appel est refusé",
-      "call.missed": "Lorsqu'un appel reste sans réponse",
+      "call.accepted": "Lorsqu'un appel est décroché (Baileys uniquement)",
+      "call.rejected": "Lorsqu'un appel est refusé (Baileys uniquement)",
+      "call.missed": "Lorsqu'un appel reste sans réponse (Baileys uniquement)",
       "status.received": "Lorsqu'un contact publie un statut",
       "all": "Tous les événements sauf message.receipt, qui doit être indiqué explicitement"
     },
@@ -832,8 +851,9 @@
     "confirm": {
       "deleteTitle": "Supprimer la clé API",
       "revokeTitle": "Révoquer la clé API",
-      "deleteMessage": "Êtes-vous sûr de vouloir supprimer définitivement <strong>{{name}}</strong> ? Cette action est irréversible.",
-      "revokeMessage": "Êtes-vous sûr de vouloir révoquer <strong>{{name}}</strong> ? Elle ne fonctionnera plus.",
+      "deleteMessage": "Êtes-vous sûr de vouloir supprimer définitivement <name/> ? Cette action est irréversible.",
+      "revokeMessage": "Êtes-vous sûr de vouloir révoquer <name/> ? Elle ne fonctionnera plus.",
+      "signedIn": "Ce tableau de bord est connecté avec cette clé. La révoquer ou la supprimer vous déconnectera.",
       "delete": "Supprimer",
       "revoke": "Révoquer"
     },
@@ -1135,6 +1155,7 @@
       "reason409": "La session n'est pas connectée",
       "reason429": "La limite de requêtes de la passerelle a été atteinte",
       "reason503": "WhatsApp n'a pas répondu à une requête",
+      "reasonReloading": "WhatsApp Web recharge sa page",
       "reasonOther": "La passerelle a refusé une requête",
       "partial": "{{reason}} (HTTP {{status}}). Arrêt au numéro {{attempted}} sur {{total}} ; {{count}} numéro n'a pas été vérifié. Réessayez plus tard.",
       "partial_other": "{{reason}} (HTTP {{status}}). Arrêt au numéro {{attempted}} sur {{total}} ; {{count}} numéros n'ont pas été vérifiés. Réessayez plus tard.",
@@ -1270,7 +1291,9 @@
       "storageWarning": "Les fichiers multimédias existants ne sont pas déplacés automatiquement vers le nouveau backend de stockage ; ils resteront à leur ancien emplacement.",
       "downloadBackup": "Télécharger d'abord la sauvegarde",
       "backupTitle": "Sauvegarde et restauration des données",
-      "backupHint": "Exportez toutes les données au format JSON avant de changer de base de données, puis importez-les après le changement. Les secrets de signature des webhooks, les en-têtes personnalisés des webhooks et les identifiants de proxy ne sont pas inclus ; saisissez-les à nouveau après la restauration. Les secrets et paramètres des instances d'intégration sont inclus en clair : conservez le fichier de manière sécurisée et supprimez-le après la restauration.",
+      "backupHint": "Exportez toutes les données au format JSON avant de changer de base de données, puis importez-les après le changement. Les secrets de signature des webhooks, les en-têtes personnalisés des webhooks et les identifiants de proxy ne sont pas inclus ; saisissez-les à nouveau après la restauration. Les secrets des instances d'intégration sont omis par défaut et inclus uniquement si vous activez l'option ci-dessous.",
+      "includePluginSecrets": "Inclure les secrets des instances de plugins",
+      "includePluginSecretsHint": "Inclut en clair les secrets d'entrée des intégrations et les champs secrets de configuration des plugins. Conservez le fichier en lieu sûr et supprimez-le après la restauration.",
       "export": "Exporter les données",
       "import": "Importer les données",
       "exportFailed": "Impossible d'exporter les données",

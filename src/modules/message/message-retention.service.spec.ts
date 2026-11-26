@@ -78,7 +78,7 @@ describe('MessageRetentionService against a real database', () => {
   });
 
   afterEach(async () => {
-    service.onModuleDestroy();
+    await service.onModuleDestroy();
     jest.restoreAllMocks();
     if (prev === undefined) delete process.env.MESSAGE_RETENTION_DAYS;
     else process.env.MESSAGE_RETENTION_DAYS = prev;
@@ -130,6 +130,47 @@ describe('MessageRetentionService against a real database', () => {
 
     expect(await messages.count()).toBe(0);
     expect(del).toHaveBeenCalledTimes(3); // 500 + 500 + 203
+  });
+
+  // SQLite resolves every statement of a pass within the same turn and the awaits between them are microtasks, so a
+  // run that does not give the event loop up holds the process, requests and sockets included, from its first
+  // statement to its last (7.4 s for 100,000 expired messages with the full-text trigger).
+  it('gives up the event loop between statements, so a timer fires between any two of them', async () => {
+    process.env.MESSAGE_RETENTION_DAYS = '30';
+    await addMessages(1203, daysAgo(60));
+    const log: Array<'statement' | 'tick'> = [];
+    const remove = messages.delete.bind(messages) as (ids: string[]) => Promise<unknown>;
+    jest.spyOn(messages, 'delete').mockImplementation(((ids: string[]) => {
+      log.push('statement');
+      return remove(ids);
+    }) as never);
+    const timer = setInterval(() => log.push('tick'), 1);
+
+    try {
+      await service.prune(NOW);
+    } finally {
+      clearInterval(timer);
+    }
+
+    const statements = log.flatMap((entry, index) => (entry === 'statement' ? [index] : []));
+    expect(statements).toHaveLength(3);
+    for (let i = 1; i < statements.length; i++) {
+      expect(log.slice(statements[i - 1], statements[i])).toContain('tick');
+    }
+  });
+
+  it('ends a run between statements once the service is destroyed', async () => {
+    process.env.MESSAGE_RETENTION_DAYS = '30';
+    await addMessages(1203, daysAgo(60));
+    const remove = messages.delete.bind(messages) as (ids: string[]) => Promise<unknown>;
+    jest.spyOn(messages, 'delete').mockImplementationOnce(((ids: string[]) => {
+      void service.onModuleDestroy();
+      return remove(ids);
+    }) as never);
+
+    expect((await service.prune(NOW)).messages).toBe(500);
+
+    expect(await messages.count()).toBe(703);
   });
 
   it('prunes finished batches past the window but never a pending or processing one', async () => {
@@ -214,7 +255,7 @@ describe('MessageRetentionService against a real database', () => {
     expect(prune).toHaveBeenCalledTimes(1);
     expect(interval).toHaveBeenCalledWith(expect.any(Function), DAY_MS);
     expect(unref).toHaveBeenCalled();
-    service.onModuleDestroy();
+    void service.onModuleDestroy();
     expect(clear).toHaveBeenCalled();
   });
 
@@ -257,7 +298,7 @@ describe('MessageRetentionService against a real database', () => {
 
       service.onModuleInit();
       await jest.advanceTimersByTimeAsync(0);
-      service.onModuleDestroy();
+      await service.onModuleDestroy();
       await jest.advanceTimersByTimeAsync(60_000);
 
       expect(prune).toHaveBeenCalledTimes(1);
@@ -274,5 +315,42 @@ describe('MessageRetentionService against a real database', () => {
 
     expect(first.messages + second.messages).toBe(2);
     expect(Math.min(first.messages, second.messages)).toBe(0);
+  });
+
+  it('awaits an in-flight prune during onModuleDestroy and refuses prune calls after destroy', async () => {
+    process.env.MESSAGE_RETENTION_DAYS = '30';
+    await addMessages(1203, daysAgo(60));
+    const remove = messages.delete.bind(messages) as (ids: string[]) => Promise<unknown>;
+    let releaseBatch!: () => void;
+    const batchGate = new Promise<void>(resolve => (releaseBatch = resolve));
+    let enteredBatch!: () => void;
+    const onBatch = new Promise<void>(resolve => (enteredBatch = resolve));
+
+    jest.spyOn(messages, 'delete').mockImplementationOnce((async (ids: string[]) => {
+      enteredBatch();
+      await batchGate;
+      return remove(ids);
+    }) as never);
+
+    const pruneP = service.prune(NOW);
+    await onBatch;
+
+    let destroyed = false;
+    const destroyP = Promise.resolve(service.onModuleDestroy()).then(() => {
+      destroyed = true;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(destroyed).toBe(false);
+
+    releaseBatch();
+    await destroyP;
+    expect(destroyed).toBe(true);
+    expect((await pruneP).messages).toBe(500);
+    expect(await messages.count()).toBe(703);
+
+    // After destroy, new prune() calls must be a no-op.
+    const findSpy = jest.spyOn(messages, 'find');
+    expect(await service.prune(NOW)).toEqual({ messages: 0, batches: 0 });
+    expect(findSpy).not.toHaveBeenCalled();
   });
 });

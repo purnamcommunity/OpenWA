@@ -29,7 +29,7 @@ class CallsResource
      */
     public function rejectCall(string $sessionId, string $callId): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/calls/{$this->http->encodeSegment($callId)}/reject");
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/calls/{$this->http->encodeSegment($callId)}/reject");
     }
     /**
      * Create a shareable WhatsApp call link.
@@ -39,12 +39,12 @@ class CallsResource
      * event-linked call and has no notion of "no start time". A WhatsApp-side failure answers `403`
      * rather than a success carrying an empty link.
      *
-     * @param array{type:string,startTime:int|float} $body
+     * @param array{type:string,startTime:int} $body
      * @return array<string,mixed>
      */
     public function createLink(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/calls/link", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/calls/link", [], $body);
     }
 
 }

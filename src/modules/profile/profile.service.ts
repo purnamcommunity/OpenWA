@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { clientFacingSsrfError } from '../../common/media/client-facing-ssrf-error';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine, MediaInput } from '../../engine/interfaces/whatsapp-engine.interface';
 import { resolveMediaBody } from '../message/media-cap.util';
@@ -25,7 +26,10 @@ export class ProfileService {
     return this.getEngine(sessionId).setProfileStatus(status);
   }
 
-  /** Remove the account's own picture. Idempotent: no picture to remove is a no-op, not an error. */
+  /**
+   * Remove the account's own picture. A repeat sends the same request again and answers what WhatsApp answers: the
+   * removal of an absent picture is observed to succeed for a group, and not yet for an account's own.
+   */
   deleteProfilePicture(sessionId: string) {
     return this.getEngine(sessionId).deleteProfilePicture();
   }
@@ -38,6 +42,10 @@ export class ProfileService {
       requireMimetypeForBase64: true,
       checkUrl: true,
     });
-    return this.getEngine(sessionId).setProfilePicture(media);
+    return this.getEngine(sessionId)
+      .setProfilePicture(media)
+      .catch((error: unknown) => {
+        throw clientFacingSsrfError(error);
+      });
   }
 }

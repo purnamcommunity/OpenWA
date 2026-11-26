@@ -51,15 +51,13 @@
     "refresh": "Aggiorna",
     "errorGeneric": "Si è verificato un errore",
     "unknownError": "Errore sconosciuto",
-    "retry": "Riprova"
+    "retry": "Riprova",
+    "copyFailed": "Impossibile copiare negli appunti"
   },
   "theme": {
     "light": "Chiaro",
     "dark": "Scuro",
     "system": "Sistema",
-    "label": "Tema: {{value}}",
-    "appearance": "Aspetto",
-    "mode": "Modalità",
     "toggleTo": "Passa a {{value}}"
   },
   "nav": {
@@ -79,6 +77,7 @@
     "edited": "Modificato",
     "media": {
       "location": "Posizione",
+      "contact": "Contatto",
       "call": "Chiamata",
       "callMissed": "Chiamata persa",
       "callVideo": "Videochiamata",
@@ -86,7 +85,6 @@
       "omitted": "Media",
       "image": "Immagine"
     },
-    "subtitle": "Invia e rispondi ai messaggi WhatsApp in tempo reale",
     "noSessionsTitle": "Nessuna sessione connessa",
     "noSessionsDesc": "Per utilizzare la funzione chat, connetti prima una sessione WhatsApp dal menu <1>Sessioni</1>.",
     "sessionLabel": "Sessione WhatsApp",
@@ -95,6 +93,7 @@
     "loadingChats": "Caricamento chat...",
     "empty": "Nessuna chat",
     "noMessageYet": "Ancora nessun messaggio",
+    "draftLabel": "Bozza:",
     "unreadBadge": "{{count}} messaggio non letto",
     "unreadBadge_other": "{{count}} messaggi non letti",
     "unreadBadge_many": "{{count}} messaggi non letti",
@@ -103,6 +102,8 @@
     "loadingOlderMessages": "Caricamento messaggi precedenti...",
     "loadOlderMessagesError": "Impossibile caricare i messaggi precedenti. Scorri verso l’alto per riprovare.",
     "loadOlderMessagesRetryHint": "Scorri verso l’alto per riprovare.",
+    "refreshMessagesError": "Impossibile aggiornare i messaggi. Tocca per riprovare.",
+    "refreshMessagesRetryHint": "Tocca per riprovare.",
     "noMessagesInChat": "Ancora nessun messaggio. Invia il primo messaggio per iniziare!",
     "downloadDocument": "Scarica documento",
     "actions": {
@@ -238,7 +239,6 @@
     "moreActions": "Altre azioni",
     "copyChatId": "Copia ID chat",
     "chatIdCopied": "ID chat copiato",
-    "copyFailed": "Impossibile copiare negli appunti",
     "closeChat": "Chiudi chat",
     "phone": "Numero di telefono",
     "chatId": "ID chat",
@@ -358,6 +358,26 @@
         "always": "Sempre"
       },
       "saveContactUnavailable": "Serve un numero di telefono noto: questa chat ha solo un ID privacy (@lid)."
+    },
+    "slash": {
+      "title": "Risposte rapide",
+      "hint": "Invio inserisce il modello evidenziato. Invia quando è pronto.",
+      "placeholder": "Messaggio o /modello…",
+      "empty": "Nessun modello corrisponde",
+      "needsVars": "Compila le variabili del modello prima di inviare.",
+      "loading": "Caricamento dei modelli… Invio attende che siano caricati.",
+      "loadError": "Impossibile caricare i modelli",
+      "close": "Chiudi l'elenco dei modelli",
+      "more": "Altri modelli corrispondono. Continua a scrivere per restringere l'elenco."
+    },
+    "roomSearch": {
+      "title": "Cerca messaggi",
+      "placeholder": "Cerca",
+      "date": "Vai alla data",
+      "clearDate": "Cancella data",
+      "noDateHits": "Nessun messaggio caricato in quel giorno",
+      "notLoaded": "Precedente ai messaggi caricati in questa chat. Scorri verso l’alto nella chat per caricare i messaggi precedenti.",
+      "open": "Cerca nella chat"
     }
   },
   "errorBoundary": {
@@ -423,9 +443,7 @@
   },
   "sessionStatus": {
     "created": "Nuova",
-    "idle": "Inattiva",
     "initializing": "Avvio in corso...",
-    "connecting": "Connessione in corso...",
     "qr_ready": "Scansiona QR",
     "ready": "Connesso",
     "disconnected": "Disconnesso",
@@ -447,7 +465,8 @@
     },
     "empty": {
       "title": "Nessuna sessione trovata",
-      "description": "Crea una nuova sessione per iniziare"
+      "description": "Crea una nuova sessione per iniziare",
+      "filtered": "Nessuna sessione corrisponde alla ricerca o al filtro di stato."
     },
     "create": {
       "title": "Crea Nuova Sessione",
@@ -615,7 +634,7 @@
     "filters": {
       "title": "Filtri (opzionale)",
       "hint": "Attiva solo quando tutte le condizioni corrispondono. Si applica agli eventi dei messaggi.",
-      "incomplete": "Assegna un valore a ogni condizione di filtro e usa al massimo 20 condizioni, 100 valori per condizione e 1000 caratteri di testo.",
+      "incomplete": "Assegna un valore a ogni condizione di filtro e usa al massimo 20 condizioni, 100 valori per condizione, 128 caratteri per ID e 1000 caratteri di testo.",
       "badge": "{{count}} filtro",
       "badge_other": "{{count}} filtri",
       "badge_many": "{{count}} filtri",
@@ -695,16 +714,16 @@
       "session.reconnect_loop": "Quando una sessione continua a non riuscire a riconnettersi",
       "session.restriction": "Quando WhatsApp limita l'account o rimuove una limitazione",
       "presence.update": "Quando una chat seguita va online, scrive o va offline",
-      "event.response": "Quando un invitato risponde a un evento WhatsApp (partecipa, non partecipa, forse)",
+      "event.response": "Quando un invitato risponde a un evento WhatsApp (partecipa, non partecipa, forse) (solo Baileys)",
       "poll.vote": "Quando qualcuno seleziona o deseleziona opzioni di un sondaggio",
       "group.join": "Quando dei partecipanti entrano in un gruppo o vengono aggiunti",
       "group.leave": "Quando dei partecipanti lasciano un gruppo o vengono rimossi",
       "group.update": "Quando cambiano il nome, la descrizione o le impostazioni di un gruppo",
       "group.join_request": "Quando qualcuno chiede di entrare in un gruppo amministrato da questa sessione",
       "call.received": "Quando una chiamata in arrivo inizia a squillare",
-      "call.accepted": "Quando si risponde a una chiamata",
-      "call.rejected": "Quando una chiamata viene rifiutata",
-      "call.missed": "Quando una chiamata resta senza risposta",
+      "call.accepted": "Quando si risponde a una chiamata (solo Baileys)",
+      "call.rejected": "Quando una chiamata viene rifiutata (solo Baileys)",
+      "call.missed": "Quando una chiamata resta senza risposta (solo Baileys)",
       "status.received": "Quando un contatto pubblica uno stato",
       "all": "Tutti gli eventi tranne message.receipt, che va indicato esplicitamente"
     },
@@ -832,8 +851,9 @@
     "confirm": {
       "deleteTitle": "Elimina Chiave API",
       "revokeTitle": "Revoca Chiave API",
-      "deleteMessage": "Sei sicuro di voler eliminare permanentemente <strong>{{name}}</strong>? Questa azione non può essere annullata.",
-      "revokeMessage": "Sei sicuro di voler revocare <strong>{{name}}</strong>? Smetterà di funzionare.",
+      "deleteMessage": "Sei sicuro di voler eliminare permanentemente <name/>? Questa azione non può essere annullata.",
+      "revokeMessage": "Sei sicuro di voler revocare <name/>? Smetterà di funzionare.",
+      "signedIn": "Questa dashboard ha effettuato l'accesso con questa chiave. Revocarla o eliminarla ti disconnetterà.",
       "delete": "Elimina",
       "revoke": "Revoca"
     },
@@ -1135,6 +1155,7 @@
       "reason409": "La sessione non è connessa",
       "reason429": "È stato raggiunto il limite di richieste del gateway",
       "reason503": "WhatsApp non ha risposto a una verifica",
+      "reasonReloading": "WhatsApp Web sta ricaricando la sua pagina",
       "reasonOther": "Il gateway ha rifiutato una verifica",
       "partial": "{{reason}} (HTTP {{status}}). Verifica interrotta al numero {{attempted}} di {{total}}; {{count}} numero non è stato inviato. Riprova più tardi.",
       "partial_other": "{{reason}} (HTTP {{status}}). Verifica interrotta al numero {{attempted}} di {{total}}; {{count}} numeri non sono stati inviati. Riprova più tardi.",
@@ -1270,7 +1291,9 @@
       "storageWarning": "I file multimediali esistenti non vengono spostati automaticamente sul nuovo backend di archiviazione; rimarranno nella posizione precedente.",
       "downloadBackup": "Scarica prima il backup",
       "backupTitle": "Backup e ripristino dei dati",
-      "backupHint": "Esporta tutti i dati come JSON prima di cambiare database, poi importali dopo il cambio. I segreti di firma dei webhook, le intestazioni personalizzate dei webhook e le credenziali del proxy non sono inclusi; reinseriscili dopo il ripristino. I segreti e le impostazioni delle istanze di integrazione sono inclusi in chiaro: conserva il file in modo sicuro ed eliminalo dopo il ripristino.",
+      "backupHint": "Esporta tutti i dati come JSON prima di cambiare database, poi importali dopo il cambio. I segreti di firma dei webhook, le intestazioni personalizzate dei webhook e le credenziali del proxy non sono inclusi; reinseriscili dopo il ripristino. I segreti delle istanze di integrazione sono omessi per impostazione predefinita e inclusi solo se selezioni l'opzione qui sotto.",
+      "includePluginSecrets": "Includi i segreti delle istanze plugin",
+      "includePluginSecretsHint": "Include in chiaro i segreti di ingresso delle integrazioni e i campi segreti di configurazione dei plugin. Conserva il file in modo sicuro ed eliminalo dopo il ripristino.",
       "export": "Esporta dati",
       "import": "Importa dati",
       "exportFailed": "Impossibile esportare i dati",

@@ -14,7 +14,7 @@ import '../test-helpers/register-hooks.ts';
 import { test, before, afterEach, mock, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement } from 'react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, timeoutManager } from '@tanstack/react-query';
 import type {
   Session,
   Chat,
@@ -55,6 +55,8 @@ let thirdSessionStatus: Session['status'] | null = null;
 
 // When set, the session list answers this status with a gateway-style error body until a test clears it.
 let sessionListStatus: number | null = null;
+// Override SESSION.phone for a test (undefined uses SESSION.phone, null models a session without a phone yet).
+let sessionPhoneOverride: string | null | undefined = undefined;
 
 // Hits the global search answers with.
 let searchHits: SearchHit[] = [];
@@ -175,6 +177,15 @@ const PAGED_OLDEST = Array.from({ length: 20 }, (_, i) =>
 let olderPageGate: Promise<void> | null = null;
 // When true, an older-page request (any offset but 0) answers 500 instead of a page.
 let olderPageFails = false;
+// The status the stored read of the first chat's thread answers, 200 for its rows.
+let storedReadStatus = 200;
+// How long a refused stored read of the first chat waits before it answers, and how long the engine history read of a
+// whatsapp-web.js thread takes: a failure that comes after the read of the chat is due.
+let storedReadDelayMs = 0;
+let historyDelayMs = 0;
+// The status the first page of Carol's thread answers, and a gate that holds that answer open.
+let carolFirstStatus = 200;
+let carolFirstGate: Promise<void> | null = null;
 // Rows Carol's older page serves after the fixture rows (oldest last, as the gateway orders them).
 let olderPageExtra: ChatMessage[] = [];
 
@@ -229,6 +240,29 @@ function countPagedMessagesFetches(): number {
 }
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 6; i++) {
+    await rtl.act(async () => {
+      mock.timers.tick(0);
+      for (let j = 0; j < 6; j++) await Promise.resolve();
+    });
+  }
+}
+
+async function runWithFakeTimers(body: (tick: (ms: number) => Promise<void>) => Promise<void>): Promise<void> {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await body(async ms => {
+      await rtl.act(async () => {
+        mock.timers.tick(ms);
+      });
+      await flushMicrotasks();
+    });
+  } finally {
+    mock.timers.reset();
+  }
+}
 
 /** The per-message media route the omitted marker sends the viewer to. */
 const mediaPathFor = (waMessageId: string): string =>
@@ -309,7 +343,8 @@ function installFetchStub(): void {
 
     if (method === 'GET' && path === '/api/sessions') {
       if (sessionListStatus) return Promise.resolve(jsonResponse({ message: 'Bad Gateway' }, sessionListStatus));
-      const listed = twoSessions ? [SESSION, SESSION_2] : [SESSION];
+      const first = sessionPhoneOverride === undefined ? SESSION : { ...SESSION, phone: sessionPhoneOverride };
+      const listed = twoSessions ? [first, SESSION_2] : [first];
       if (thirdSessionStatus) listed.push({ ...SESSION_3, status: thirdSessionStatus });
       return Promise.resolve(jsonResponse(listed));
     }
@@ -349,6 +384,12 @@ function installFetchStub(): void {
       const query = new URLSearchParams(path.slice(path.indexOf('?') + 1));
       if (query.get('chatId') === CHAT_2.id) {
         const isFirstPage = Number(query.get('offset')) === 0;
+        if (isFirstPage && carolFirstStatus !== 200) {
+          // The status the request was made under, whenever its answer comes.
+          const status = carolFirstStatus;
+          const refused = () => jsonResponse({ message: 'refused' }, status);
+          return carolFirstGate ? carolFirstGate.then(refused) : Promise.resolve(refused());
+        }
         if (!isFirstPage && olderPageFails) return Promise.resolve(jsonResponse({ message: 'boom' }, 500));
         const messages = isFirstPage ? PAGED_NEWEST : [...PAGED_OLDEST, ...olderPageExtra];
         // `total` deliberately does NOT equal the 120 rows actually served (PAGED_NEWEST.length +
@@ -361,6 +402,12 @@ function installFetchStub(): void {
         const answer = () => jsonResponse({ messages, total: 500 });
         const gate = isFirstPage ? null : olderPageGate;
         return gate ? gate.then(answer) : Promise.resolve(answer());
+      }
+      if (storedReadStatus !== 200) {
+        const refused = () => jsonResponse({ message: 'refused' }, storedReadStatus);
+        return storedReadDelayMs
+          ? new Promise<Response>(resolve => setTimeout(() => resolve(refused()), storedReadDelayMs))
+          : Promise.resolve(refused());
       }
       const rows = firstPageOverride ?? [DB_MESSAGE, OMITTED_MEDIA_MESSAGE, OMITTED_MEDIA_MESSAGE_2, ...firstPageExtra];
       const firstPage = () =>
@@ -377,7 +424,9 @@ function installFetchStub(): void {
       return gate ? gate.then(bytes) : Promise.resolve(bytes());
     }
     if (method === 'GET' && /\/messages\/[^/]+\/history/.test(path)) {
-      return Promise.resolve(jsonResponse(historyExtra));
+      return historyDelayMs
+        ? new Promise<Response>(resolve => setTimeout(() => resolve(jsonResponse(historyExtra)), historyDelayMs))
+        : Promise.resolve(jsonResponse(historyExtra));
     }
     if (method === 'GET' && path === `/api/sessions/${SESSION.id}/status`) {
       return Promise.resolve(jsonResponse({ statuses }));
@@ -401,6 +450,12 @@ function installFetchStub(): void {
     }
     if (method === 'POST' && path === `/api/sessions/${SESSION.id}/messages/send-document`) {
       return Promise.resolve(jsonResponse({ messageId: 'wamid.out.document', timestamp: 1_700_000_100 }));
+    }
+    if (method === 'POST' && path === `/api/sessions/${SESSION.id}/messages/react`) {
+      return Promise.resolve(new Response(null, { status: 204 }));
+    }
+    if (method === 'POST' && path === `/api/sessions/${SESSION.id}/messages/delete`) {
+      return Promise.resolve(new Response(null, { status: 204 }));
     }
     if (method === 'GET' && path.startsWith('/api/search?')) {
       return Promise.resolve(jsonResponse({ hits: searchHits, total: searchHits.length }));
@@ -431,6 +486,18 @@ let installJsdomGlobals: typeof installJsdomGlobalsFn;
 let queryClient: QueryClient | undefined;
 
 before(async () => {
+  // Unref React Query gcTime timers so a gc timer armed across a fake/real timer transition
+  // cannot hold the Node test worker open for 5-30 minutes after all tests pass.
+  const unrefTimer = <T>(id: T): T => {
+    if (typeof id === 'object' && id !== null) (id as { unref?: () => void }).unref?.();
+    return id;
+  };
+  timeoutManager.setTimeoutProvider({
+    setTimeout: (callback, delay) => unrefTimer(setTimeout(callback, delay)),
+    clearTimeout: id => clearTimeout(id),
+    setInterval: (callback, delay) => unrefTimer(setInterval(callback, delay)),
+    clearInterval: id => clearInterval(id),
+  });
   ({ installJsdomGlobals } = await import('../test-helpers/jsdom.ts'));
   await installJsdomGlobals();
   installFetchStub();
@@ -441,7 +508,7 @@ before(async () => {
   window.sessionStorage.setItem('openwa_engine_type', 'baileys');
   // useWebSocket.connect() bails without this, so no socket would exist to receive a frame. It
   // dials nothing: the client is the double above.
-  window.sessionStorage.setItem('openwa_api_key', 'test-key');
+  window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
   // The real i18n instance, and then its readiness promise: catalogues are fetched rather than
   // bundled, so importing the module only STARTS the load. Every `getByText` below is English copy
   // out of en.json, which renders as a raw key until it lands. Awaiting is what makes that
@@ -480,11 +547,17 @@ afterEach(async () => {
   sendImageId = 'wamid.out.image';
   sendImageFails = false;
   olderPageFails = false;
+  storedReadStatus = 200;
+  storedReadDelayMs = 0;
+  historyDelayMs = 0;
+  carolFirstStatus = 200;
+  carolFirstGate = null;
   olderPageExtra = [];
   chatsResponder = null;
   for (const id of Object.keys(lidPhones)) delete lidPhones[id];
   thirdSessionStatus = null;
   sessionListStatus = null;
+  sessionPhoneOverride = undefined;
   searchHits = [];
   engineType = 'baileys';
   channels = [CHANNEL];
@@ -711,6 +784,159 @@ test('a typed draft survives closing and reopening the room', async () => {
   assert.equal(input.value, 'draft survives');
 });
 
+// What the chat list shows of a draft: the row of the chat named `name`, and whether it carries the draft label.
+function listRow(container: HTMLElement, name: string): HTMLElement {
+  const sidebar = container.querySelector('.chats-sidebar') as HTMLElement;
+  return rtl.within(sidebar).getByText(name).closest('[role="button"]') as HTMLElement;
+}
+
+const showsDraft = (container: HTMLElement, name: string): boolean =>
+  listRow(container, name).querySelector('.chat-item-draft-label') !== null;
+
+/** Open the chat named `name` from the list, once the list holds it. */
+async function openListed(container: HTMLElement, name: string): Promise<void> {
+  const { fireEvent, within } = rtl;
+  fireEvent.click(await within(container.querySelector('.chats-sidebar') as HTMLElement).findByText(name));
+  await within(container.querySelector('.room-header') as HTMLElement).findByText(name);
+}
+
+/** Select another session and wait for its chat list, which closes the room of the one left. */
+async function switchSession(container: HTMLElement, id: string): Promise<void> {
+  const { within, waitFor } = rtl;
+  selectSession(container, id);
+  await waitFor(() => assert.equal(selectedSessionId(container), id));
+  await within(container.querySelector('.chats-sidebar') as HTMLElement).findByText('Alice');
+}
+
+const typeDraft = (text: string): void => {
+  rtl.fireEvent.change(rtl.screen.getByPlaceholderText('Type a message...'), { target: { value: text } });
+};
+
+test('a parked draft shows on its list row and clears while that chat is open', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  const { container } = renderChats();
+
+  await screen.findByText(SESSION.name);
+  await openListed(container, 'Alice');
+  typeDraft('unsent for alice');
+
+  fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+  await waitFor(() => assert.ok(showsDraft(container, 'Alice'), 'draft label missing on Alice'));
+  assert.match(listRow(container, 'Alice').textContent ?? '', /unsent for alice/);
+
+  await openListed(container, 'Alice');
+  await waitFor(() => assert.equal(showsDraft(container, 'Alice'), false));
+});
+
+test('a draft shows on its row while another chat is open', async () => {
+  const { screen } = rtl;
+  const { container } = renderChats();
+
+  await screen.findByText(SESSION.name);
+  await openListed(container, 'Alice');
+  typeDraft('unsent for alice');
+
+  await openListed(container, 'Carol');
+  assert.ok(showsDraft(container, 'Alice'), 'draft label missing on Alice');
+  assert.match(listRow(container, 'Alice').textContent ?? '', /unsent for alice/);
+  assert.equal(showsDraft(container, 'Carol'), false, 'the open chat is labelled as a draft');
+});
+
+// The label is not part of the snippet: read together, the label's first letter would set the direction of the whole
+// line, and a draft written the other way round would lose its start to the ellipsis.
+test('the draft label stands beside its snippet, which holds the draft alone, in full in its title', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  const { container } = renderChats();
+
+  await screen.findByText(SESSION.name);
+  await openListed(container, 'Alice');
+  typeDraft('unsent for alice');
+  fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+  await waitFor(() => assert.ok(showsDraft(container, 'Alice'), 'draft label missing on Alice'));
+
+  const label = listRow(container, 'Alice').querySelector('.chat-item-draft-label') as HTMLElement;
+  const snippet = listRow(container, 'Alice').querySelector('.chat-item-snippet') as HTMLElement;
+  assert.equal(label.textContent, 'Draft:');
+  assert.ok(label.nextElementSibling === snippet, 'the label is not the element before the snippet');
+  assert.equal(snippet.textContent, 'unsent for alice');
+  assert.equal(snippet.getAttribute('title'), 'unsent for alice');
+});
+
+// Spaces are nothing the composer would send, and a label with no text after it says nothing.
+test('a draft of only whitespace shows no label, and the row keeps its last message', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  const { container } = renderChats();
+  const snippet = () => listRow(container, 'Alice').querySelector('.chat-item-snippet')?.textContent;
+
+  await screen.findByText(SESSION.name);
+  await openListed(container, 'Alice');
+  typeDraft('unsent for alice');
+  fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+  await waitFor(() => assert.ok(showsDraft(container, 'Alice'), 'draft label missing on Alice'));
+
+  await openListed(container, 'Alice');
+  typeDraft('   ');
+  fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+  await waitFor(() => assert.equal(snippet(), 'hello from alice'));
+  assert.equal(showsDraft(container, 'Alice'), false, 'a draft of spaces is labelled');
+});
+
+// One chat id can be a thread in two sessions (a contact or a group both accounts have), so a draft is listed for its
+// own session only, and it is listed again whenever that session is.
+test('a parked draft is on its row again after another session was visited, and never on a row there', async () => {
+  const { screen } = rtl;
+  twoSessions = true;
+  try {
+    const { container } = renderChats();
+    await screen.findByText(SESSION.name);
+    await openListed(container, 'Alice');
+    typeDraft('from session one');
+    await openListed(container, 'Carol');
+    assert.ok(showsDraft(container, 'Alice'), 'draft label missing on Alice');
+
+    // Session 2 lists a chat with Alice's id.
+    await switchSession(container, SESSION_2.id);
+    assert.equal(showsDraft(container, 'Alice'), false, "the other session's row shows this session's draft");
+
+    await switchSession(container, SESSION.id);
+    assert.ok(showsDraft(container, 'Alice'), 'the draft label did not come back with its session');
+    assert.match(listRow(container, 'Alice').textContent ?? '', /from session one/);
+  } finally {
+    twoSessions = false;
+  }
+});
+
+test('the drafts of two chats are both back on their rows after another session was used in between', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  twoSessions = true;
+  try {
+    const { container } = renderChats();
+    const drafts = () => ['Alice', 'Carol'].map(name => showsDraft(container, name));
+
+    await screen.findByText(SESSION.name);
+    await openListed(container, 'Alice');
+    typeDraft('for alice');
+    await openListed(container, 'Carol');
+    typeDraft('for carol');
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+    await waitFor(() => assert.deepEqual(drafts(), [true, true]));
+
+    // Opening a chat there puts the text still in the field away under its own thread, in the session left.
+    await switchSession(container, SESSION_2.id);
+    assert.deepEqual(drafts(), [false, false], "the other session's rows show this session's drafts");
+    await openListed(container, 'Alice');
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+    assert.deepEqual(drafts(), [false, false], "the other session's rows show this session's drafts");
+
+    await switchSession(container, SESSION.id);
+    assert.deepEqual(drafts(), [true, true], 'a draft label did not come back with its session');
+    assert.match(listRow(container, 'Alice').textContent ?? '', /for alice/);
+    assert.match(listRow(container, 'Carol').textContent ?? '', /for carol/);
+  } finally {
+    twoSessions = false;
+  }
+});
+
 // A draft is the chat's, like a staged file or reply: carried into another chat, the next Enter would deliver it to
 // the wrong recipient. It is kept for the chat it was typed in, so looking at another one loses nothing.
 test('a typed draft stays with its chat: another chat opens with its own, and the first gets it back', async () => {
@@ -866,6 +1092,70 @@ test('a refused send gives its text back to its own chat only, and not over text
   );
 });
 
+/** Run `body` with two sessions and every text send refused only once `answer()` is called. */
+async function withGatedRefusalInTwoSessions(body: (answer: () => void) => Promise<void>): Promise<void> {
+  let release = () => {};
+  const gate = () =>
+    new Promise<void>(resolve => {
+      release = resolve;
+    });
+  twoSessions = true;
+  try {
+    await withSendsRefused('send-text', () => body(() => release()), gate);
+  } finally {
+    twoSessions = false;
+  }
+}
+
+// The gateway can refuse a send after its session was left. The text is the draft of the thread it was typed in, so it
+// is listed on that session's row, not on the row the session selected by then has for the same chat id.
+test('a send refused after its session was left shows its text on the row of its own session only', async () => {
+  const { screen, fireEvent } = rtl;
+  await withGatedRefusalInTwoSessions(async answer => {
+    const { container } = renderChats();
+    await screen.findByText(SESSION.name);
+    await openListed(container, 'Alice');
+    typeDraft('price is 40');
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await switchSession(container, SESSION_2.id);
+    await openListed(container, 'Carol');
+    answer();
+    await screen.findByText('Failed to send message');
+    assert.equal(showsDraft(container, 'Alice'), false, "the other session's row shows the refused text");
+
+    await switchSession(container, SESSION.id);
+    assert.ok(showsDraft(container, 'Alice'), 'the refused text is not on the row of its own chat');
+    assert.match(listRow(container, 'Alice').textContent ?? '', /price is 40/);
+  });
+});
+
+// The same refusal, landing once its own session is selected again: the row is labelled there, and the label must not
+// follow a later switch into the session whose chat was opened in between.
+test('a draft given back by a refused send stays off the rows of a session entered later', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  await withGatedRefusalInTwoSessions(async answer => {
+    const { container } = renderChats();
+    await screen.findByText(SESSION.name);
+    await openListed(container, 'Alice');
+    typeDraft('price is 40');
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await switchSession(container, SESSION_2.id);
+    await openListed(container, 'Carol');
+    await switchSession(container, SESSION.id);
+    answer();
+    await waitFor(() =>
+      assert.ok(showsDraft(container, 'Alice'), 'the refused text is not on the row of its own chat'),
+    );
+
+    await switchSession(container, SESSION_2.id);
+    assert.equal(showsDraft(container, 'Alice'), false, "the other session's row shows the refused text");
+    await switchSession(container, SESSION.id);
+    assert.ok(showsDraft(container, 'Alice'), 'the draft label did not come back with its session');
+  });
+});
+
 test('a refused file send puts its caption back in the field', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
   await withSendsRefused('send-document', async () => {
@@ -960,9 +1250,9 @@ test('the emoji picker yields Escape to a surface layered above it', async () =>
   fireEvent.click(screen.getByTitle('Pick emoji'));
   await waitFor(() => assert.ok(container.querySelector('.chats-emoji-picker'), 'the emoji picker did not open'));
 
-  // The media viewer and the language menu render their own role while open, and the picker can
-  // still be open underneath. Taking the key there would dismiss the thing the operator is not
-  // looking at. Stand one in rather than driving the viewer, which lives in a third-party portal.
+  // The media viewer renders its own role while open, and the picker can still be open underneath.
+  // Taking the key there would dismiss the thing the operator is not looking at. Stand one in
+  // rather than driving the viewer, which lives in a third-party portal.
   const overlay = document.createElement('div');
   overlay.setAttribute('role', 'dialog');
   document.body.appendChild(overlay);
@@ -1116,6 +1406,170 @@ test('a writer key opening a chat clears its unread badge', async () => {
   fireEvent.click(await screen.findByText('Alice'));
   await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
   await waitFor(() => assert.ok(!screen.queryByLabelText('2 unread messages'), 'opening the chat kept its badge'));
+});
+
+// A thread that fails to load shows nothing, so the chat was not read: its messages were not seen.
+test('a chat whose thread fails to load is not marked read and keeps its unread badge', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  storedReadStatus = 503;
+  renderChats();
+  await screen.findByText(SESSION.name);
+  resetFetchCalls();
+  assert.ok(await screen.findByLabelText('2 unread messages'), 'the fixture chat shows no unread badge');
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(screen.getByText("Couldn't load messages. Check the server logs."));
+    // Past the quiet window of the read, with the retry of the thread done.
+    await tick(1_500);
+  });
+  assert.ok(!findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`), 'a chat that showed no message was read');
+  await waitFor(() =>
+    assert.ok(screen.queryByLabelText('2 unread messages'), 'the badge of an unseen chat was cleared'),
+  );
+});
+
+test('a chat whose thread failed to load is read once a later load of it succeeds', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  storedReadStatus = 503;
+  const { container } = renderChats();
+  await screen.findByText(SESSION.name);
+  resetFetchCalls();
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(screen.getByText("Couldn't load messages. Check the server logs."));
+    await tick(1_500);
+  });
+  assert.ok(!findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`));
+
+  // The gateway answers again and the thread is asked for again, which is all that reaches the read: no tab was hidden,
+  // so the read of a hidden tab does not go out here.
+  storedReadStatus = 200;
+  await rtl.act(() => queryClient!.invalidateQueries({ queryKey: ['messages', SESSION.id] }));
+  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+  await waitFor(
+    () =>
+      assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/chats/read`), 1, 'the chat was not read once'),
+    { timeout: 3_000 },
+  );
+  await waitFor(() => assert.ok(!screen.queryByLabelText('2 unread messages'), 'the badge stayed after the read'));
+});
+
+// A thread whose load is still running when the read of the chat is due has shown nothing yet, and may fail after it.
+test('a chat is not read while its thread is still loading, and the badge comes back when it then fails', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  storedReadStatus = 503;
+  storedReadDelayMs = 1_200;
+  renderChats();
+  await screen.findByText(SESSION.name);
+  resetFetchCalls();
+  assert.ok(await screen.findByLabelText('2 unread messages'), 'the fixture chat shows no unread badge');
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await tick(1_200);
+    assert.ok(screen.getByText("Couldn't load messages. Check the server logs."));
+    await tick(1_500);
+  });
+  assert.ok(!findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`), 'a chat that showed no message was read');
+  await waitFor(() =>
+    assert.ok(screen.queryByLabelText('2 unread messages'), 'the badge of an unseen chat stayed cleared'),
+  );
+});
+
+test('a whatsapp-web.js chat is not read while its engine history is still loading', async () => {
+  const { screen, fireEvent } = rtl;
+  engineType = 'whatsapp-web.js';
+  window.sessionStorage.setItem('openwa_engine_type', 'whatsapp-web.js');
+  storedReadStatus = 503;
+  historyDelayMs = 1_200;
+  renderChats();
+  await screen.findByText(SESSION.name);
+  resetFetchCalls();
+  assert.ok(await screen.findByLabelText('2 unread messages'), 'the fixture chat shows no unread badge');
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await tick(1_200);
+    assert.ok(screen.getByText("Couldn't load messages. Check the server logs."));
+    await tick(1_500);
+  });
+  assert.equal(
+    countFetchCalls('POST', `/api/sessions/${SESSION.id}/chats/read`),
+    0,
+    'a chat that showed no message was read',
+  );
+});
+
+test('a chat left before its thread showed is unread again, and is not read', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  // The thread of the first chat is held open until the end of the test.
+  let release!: () => void;
+  firstPageGate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  renderChats();
+  await screen.findByText(SESSION.name);
+  resetFetchCalls();
+  assert.ok(await screen.findByLabelText('2 unread messages'), 'the fixture chat shows no unread badge');
+  const aliceRow = await screen.findByText('Alice');
+  const carolRow = await screen.findByText('Carol');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(!screen.queryByLabelText('2 unread messages'), 'opening the chat kept its badge');
+
+    // Leave for another chat while the thread of the first is still loading: its read falls due after that.
+    fireEvent.click(carolRow);
+    // Carol's thread loaded, so hers is read; the one that never showed is not.
+    await tick(1_200);
+    assert.ok(screen.queryByLabelText('2 unread messages'), 'the unseen chat stayed read in the list');
+  });
+  await waitFor(
+    () => assert.ok(screen.queryByLabelText('2 unread messages'), 'the unseen chat stayed read in the list'),
+    {
+      timeout: 5_000,
+    },
+  );
+  const readOfAlice = fetchCalls.filter(
+    call =>
+      call.method === 'POST' &&
+      call.path === `/api/sessions/${SESSION.id}/chats/read` &&
+      (call.body as { chatId?: string } | undefined)?.chatId === CHAT.id,
+  );
+  assert.equal(readOfAlice.length, 0, 'a chat that showed no message was read');
+  release();
+});
+
+// A refresh that fails after the thread has shown is not a thread that never loaded: what was read stays read.
+test('an empty thread that was read does not get its unread badge back when a refresh of it fails', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  firstPageOverride = [];
+  renderChats();
+  await screen.findByText(SESSION.name);
+  resetFetchCalls();
+  assert.ok(await screen.findByLabelText('2 unread messages'), 'the fixture chat shows no unread badge');
+  fireEvent.click(await screen.findByText('Alice'));
+  await waitFor(() => assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/chats/read`), 1), {
+    timeout: 3_000,
+  });
+  await waitFor(() => assert.ok(!screen.queryByLabelText('2 unread messages')));
+
+  // A reconnect invalidates the thread, and its stored read is refused this time.
+  await runWithFakeTimers(async tick => {
+    storedReadStatus = 503;
+    await rtl.act(() => queryClient!.invalidateQueries({ queryKey: ['messages', SESSION.id] }));
+    await tick(300);
+    assert.ok(!screen.queryByLabelText('2 unread messages'), 'the badge of a chat already read came back');
+    storedReadStatus = 200;
+    await rtl.act(() => queryClient!.invalidateQueries({ queryKey: ['messages', SESSION.id] }));
+    await tick(600);
+  });
+  assert.ok(!screen.queryByLabelText('2 unread messages'), 'the badge came back after a later refresh');
+  assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/chats/read`), 1, 'the chat was read again');
 });
 
 test('a chat whose newest message has no text does not claim to have no messages', async () => {
@@ -1364,26 +1818,31 @@ test('a row a send stamped with the browser clock does not outrank a later recon
 });
 
 test('a socket reconnect keeps the open chat read instead of badging it with the gap count', async () => {
-  const { screen, fireEvent, within, act, waitFor } = rtl;
+  const { screen, fireEvent, within, act } = rtl;
   const { container } = renderChats();
   await screen.findByText(SESSION.name);
-  fireEvent.click(await screen.findByText('Alice'));
-  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
-  await waitFor(() => assert.ok(!screen.queryByLabelText('2 unread messages'), 'opening the chat kept its badge'));
-  // Past the mark-as-read quiet window, so the open's own call is out before counting.
-  await new Promise(resolve => setTimeout(resolve, 1_000));
-  resetFetchCalls();
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(within(container.querySelector('.room-messages') as HTMLElement).getByText('hello from alice'));
+    assert.ok(!screen.queryByLabelText('2 unread messages'), 'opening the chat kept its badge');
+    // Past the mark-as-read quiet window, so the open's own call is out before counting.
+    await tick(1_000);
+    resetFetchCalls();
 
-  // Alice wrote into the open chat while the socket was down; the snapshot still counts it unread.
-  chatsResponder = () =>
-    Promise.resolve(jsonResponse([{ ...CHAT, unreadCount: 4, lastMessage: 'sent during the gap' }, CHAT_2]));
-  const socket = lastSocket();
-  assert.ok(socket, 'expected the page to have opened a socket');
-  act(() => socket.receive('disconnect', 'transport close'));
-  act(() => socket.receive('connect'));
+    // Alice wrote into the open chat while the socket was down; the snapshot still counts it unread.
+    chatsResponder = () =>
+      Promise.resolve(jsonResponse([{ ...CHAT, unreadCount: 4, lastMessage: 'sent during the gap' }, CHAT_2]));
+    const socket = lastSocket();
+    assert.ok(socket, 'expected the page to have opened a socket');
+    act(() => socket.receive('disconnect', 'transport close'));
+    act(() => socket.receive('connect'));
+    await flushMicrotasks();
 
-  await screen.findByText('sent during the gap');
-  await new Promise(resolve => setTimeout(resolve, 1_000));
+    assert.ok(screen.getByText('sent during the gap'));
+    await tick(1_000);
+  });
   assert.ok(!screen.queryByLabelText('4 unread messages'), 'the open chat was badged with the gap count');
   assert.ok(findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`), 'the gap messages were not marked read');
 });
@@ -1392,20 +1851,24 @@ test('a reconnect whose refetch fails while the engine starts sends no mark-as-r
   const { screen, fireEvent, within, act } = rtl;
   const { container } = renderChats();
   await screen.findByText(SESSION.name);
-  fireEvent.click(await screen.findByText('Alice'));
-  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
-  await new Promise(resolve => setTimeout(resolve, 1_000));
-  resetFetchCalls();
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(within(container.querySelector('.room-messages') as HTMLElement).getByText('hello from alice'));
+    await tick(1_000);
+    resetFetchCalls();
 
-  // After a backend restart the socket is back before the engine: the session's routes answer 409.
-  chatsResponder = () =>
-    Promise.resolve(jsonResponse({ statusCode: 409, message: 'Engine not ready', code: 'ENGINE_NOT_READY' }, 409));
-  const socket = lastSocket();
-  assert.ok(socket, 'expected the page to have opened a socket');
-  act(() => socket.receive('disconnect', 'transport close'));
-  act(() => socket.receive('connect'));
+    // After a backend restart the socket is back before the engine: the session's routes answer 409.
+    chatsResponder = () =>
+      Promise.resolve(jsonResponse({ statusCode: 409, message: 'Engine not ready', code: 'ENGINE_NOT_READY' }, 409));
+    const socket = lastSocket();
+    assert.ok(socket, 'expected the page to have opened a socket');
+    act(() => socket.receive('disconnect', 'transport close'));
+    act(() => socket.receive('connect'));
 
-  await new Promise(resolve => setTimeout(resolve, 1_000));
+    await tick(1_000);
+  });
   assert.equal(countFetchCalls('GET', `/api/sessions/${SESSION.id}/chats?limit=1000&offset=0`), 1);
   assert.ok(
     !findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`),
@@ -1417,9 +1880,13 @@ test('a reload asked for before the reconnect zeroed the open row does not bring
   const { screen, fireEvent, within, act, waitFor } = rtl;
   const { container } = renderChats();
   await waitFor(() => assert.equal(selectedSessionId(container), SESSION.id));
-  fireEvent.click(await screen.findByText('Alice'));
-  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
-  await new Promise(resolve => setTimeout(resolve, 1_000));
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(within(container.querySelector('.room-messages') as HTMLElement).getByText('hello from alice'));
+    await tick(1_000);
+  });
   resetFetchCalls();
 
   // Every snapshot counts Alice's gap messages, as the gateway does until it has processed the read.
@@ -1448,15 +1915,16 @@ test('a reload asked for before the reconnect zeroed the open row does not bring
   await waitFor(() => assert.equal(answers.length, 2), { timeout: 3_000 }); // the reconnect's own reload is out
 
   // Another event asks for a list while it is out; that one starts the moment the reconnect's lands.
-  edit();
-  answers[1]();
-  // The row is zeroed with the reload, well before the read it sends is due.
-  await flush();
-  await flush();
-  assert.ok(!screen.queryByLabelText('4 unread messages'), 'the open chat was badged');
-  await waitFor(() => assert.equal(answers.length, 3), { timeout: 3_000 });
-  answers[2]();
-  await new Promise(resolve => setTimeout(resolve, 300));
+  await runWithFakeTimers(async tick => {
+    edit();
+    answers[1]();
+    // The row is zeroed with the reload, well before the read it sends is due.
+    await flushMicrotasks();
+    assert.ok(!screen.queryByLabelText('4 unread messages'), 'the open chat was badged');
+    assert.equal(answers.length, 3);
+    answers[2]();
+    await tick(300);
+  });
   assert.ok(!screen.queryByLabelText('4 unread messages'), 'the gap count came back on the open chat');
 });
 
@@ -1464,9 +1932,13 @@ test('a reconnect refetch that settles after the open chat was left keeps its un
   const { screen, fireEvent, within, act, waitFor } = rtl;
   const { container } = renderChats();
   await screen.findByText(SESSION.name);
-  fireEvent.click(await screen.findByText('Alice'));
-  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
-  await new Promise(resolve => setTimeout(resolve, 1_000));
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(within(container.querySelector('.room-messages') as HTMLElement).getByText('hello from alice'));
+    await tick(1_000);
+  });
   resetFetchCalls();
 
   let release!: () => void;
@@ -1482,10 +1954,14 @@ test('a reconnect refetch that settles after the open chat was left keeps its un
   await waitFor(() => assert.equal(countFetchCalls('GET', `/api/sessions/${SESSION.id}/chats?limit=1000&offset=0`), 1));
 
   // The user moves on to Carol before the refetch lands; Alice's new message was never seen.
-  fireEvent.click(await screen.findByText('Carol'));
-  release();
-  await screen.findByText('sent after leaving');
-  await new Promise(resolve => setTimeout(resolve, 1_000));
+  const carolRow = await screen.findByText('Carol');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(carolRow);
+    release();
+    await flushMicrotasks();
+    assert.ok(screen.getByText('sent after leaving'));
+    await tick(1_000);
+  });
   assert.ok(screen.queryByLabelText('4 unread messages'), 'the chat the user left lost its unread count');
   assert.ok(
     !fetchCalls.some(
@@ -1502,9 +1978,13 @@ test('a reconnect refetch that settles after the page was left sends no mark-as-
   const { screen, fireEvent, within, act, waitFor } = rtl;
   const { container, unmount } = renderChats();
   await screen.findByText(SESSION.name);
-  fireEvent.click(await screen.findByText('Alice'));
-  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
-  await new Promise(resolve => setTimeout(resolve, 1_000));
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(within(container.querySelector('.room-messages') as HTMLElement).getByText('hello from alice'));
+    await tick(1_000);
+  });
   resetFetchCalls();
 
   let release!: () => void;
@@ -1520,9 +2000,11 @@ test('a reconnect refetch that settles after the page was left sends no mark-as-
   await waitFor(() => assert.equal(countFetchCalls('GET', `/api/sessions/${SESSION.id}/chats?limit=1000&offset=0`), 1));
 
   // The operator opens another page before the refetch lands; the gap messages were never seen.
-  unmount();
-  release();
-  await new Promise(resolve => setTimeout(resolve, 1_000));
+  await runWithFakeTimers(async tick => {
+    unmount();
+    release();
+    await tick(1_000);
+  });
   assert.ok(
     !findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`),
     'the chat was marked read after the page was left',
@@ -1534,21 +2016,25 @@ async function leaveWithPendingRead(loggedOut: boolean): Promise<number> {
   resetFetchCalls();
   const { container, unmount } = renderChats();
   await screen.findByText(SESSION.name);
-  fireEvent.click(await screen.findByText('Alice'));
-  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
-  // Opening the chat queued its read behind the quiet window; the page goes away inside it.
-  assert.ok(
-    !findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`),
-    'the read went out before the page was left',
-  );
-  // Logout removes the key before the authenticated tree unmounts.
-  if (loggedOut) window.sessionStorage.removeItem('openwa_api_key');
-  try {
-    unmount();
-    await new Promise(resolve => setTimeout(resolve, 1_000));
-  } finally {
-    window.sessionStorage.setItem('openwa_api_key', 'test-key');
-  }
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(within(container.querySelector('.room-messages') as HTMLElement).getByText('hello from alice'));
+    // Opening the chat queued its read behind the quiet window; the page goes away inside it.
+    assert.ok(
+      !findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`),
+      'the read went out before the page was left',
+    );
+    // Logout removes the key before the authenticated tree unmounts.
+    if (loggedOut) window.sessionStorage.removeItem('openwa_api_key_id');
+    try {
+      unmount();
+      await tick(1_000);
+    } finally {
+      window.sessionStorage.setItem('openwa_api_key_id', 'test-key');
+    }
+  });
   return countFetchCalls('POST', `/api/sessions/${SESSION.id}/chats/read`);
 }
 
@@ -1564,9 +2050,13 @@ test('a reconnect that arrives while another reload is out is answered by the tr
   const { screen, fireEvent, within, act, waitFor } = rtl;
   const { container } = renderChats();
   await screen.findByText(SESSION.name);
-  fireEvent.click(await screen.findByText('Alice'));
-  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
-  await new Promise(resolve => setTimeout(resolve, 1_000));
+  const aliceRow = await screen.findByText('Alice');
+  await runWithFakeTimers(async tick => {
+    fireEvent.click(aliceRow);
+    await flushMicrotasks();
+    assert.ok(within(container.querySelector('.room-messages') as HTMLElement).getByText('hello from alice'));
+    await tick(1_000);
+  });
   resetFetchCalls();
 
   // An edit in a chat that was never opened reloads the list, and that reload stays out while the socket
@@ -1599,11 +2089,12 @@ test('a reconnect that arrives while another reload is out is answered by the tr
   assert.ok(screen.queryByLabelText('4 unread messages'), 'a reload that began before the reconnect answered it');
   await waitFor(() => assert.equal(answers.length, 2));
 
-  answers[1]();
-  await waitFor(() =>
-    assert.ok(!screen.queryByLabelText('4 unread messages'), 'the open chat was badged with the gap count'),
-  );
-  await new Promise(resolve => setTimeout(resolve, 1_000));
+  await runWithFakeTimers(async tick => {
+    answers[1]();
+    await flushMicrotasks();
+    assert.ok(!screen.queryByLabelText('4 unread messages'), 'the open chat was badged with the gap count');
+    await tick(1_000);
+  });
   assert.ok(
     fetchCalls.some(
       c =>
@@ -1706,10 +2197,14 @@ test('a read-only key opening a chat sends no mark-as-read', async () => {
   try {
     const { container } = renderChats();
     await screen.findByText(SESSION.name);
-    fireEvent.click(await screen.findByText('Alice'));
-    await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
-    // Past the mark-as-read quiet window, so a queued call would have gone out.
-    await new Promise(resolve => setTimeout(resolve, 1_000));
+    const aliceRow = await screen.findByText('Alice');
+    await runWithFakeTimers(async tick => {
+      fireEvent.click(aliceRow);
+      await flushMicrotasks();
+      assert.ok(within(container.querySelector('.room-messages') as HTMLElement).getByText('hello from alice'));
+      // Past the mark-as-read quiet window, so a queued call would have gone out.
+      await tick(1_000);
+    });
     assert.ok(!findFetchCall('POST', `/api/sessions/${SESSION.id}/chats/read`), 'a viewer key marked the chat read');
     // The chat is still unread on the gateway, so the sidebar badge keeps its count.
     assert.ok(
@@ -3511,7 +4006,8 @@ function makeScrollable(thread: HTMLElement, scrollTop: number): void {
     configurable: true,
     get: () => thread.querySelectorAll('.message-bubble').length * BUBBLE_PX,
   });
-  let top = scrollTop;
+  // The thread was pinned at its bottom when it opened, and that is where the browser has it until the reader moves it.
+  let top = thread.scrollHeight;
   Object.defineProperty(thread, 'scrollTop', {
     configurable: true,
     get: () => top,
@@ -3519,6 +4015,10 @@ function makeScrollable(thread: HTMLElement, scrollTop: number): void {
       top = value;
     },
   });
+  // A browser reports the box of a thread it has laid out before the reader can move it, and a thread pinned at its
+  // bottom stays there through that report. Only after it is the reader where the test puts them.
+  rtl.fireEvent.scroll(thread);
+  top = scrollTop;
 }
 
 /** Open Carol's thread and return its scroll container, with the first page rendered. */
@@ -3585,6 +4085,102 @@ test('a failed older-page fetch does not blank an already-loaded thread', async 
     assert.match(inline!.textContent ?? '', /couldn.t load older messages/i);
     assert.ok(inline!.classList.contains('failed'), 'the failure is styled to stay at the top of the thread');
   });
+});
+
+// A refresh that fails after a reconnect leaves the newest page stale. Scrolling up asks for an older page, which a thread
+// with none, or too short to scroll, cannot do, so the strip itself is the retry; a thread with an older page also
+// retries by scrolling up, and a retry that is already running is not started again.
+test('a failed refresh of a thread with no older page is retried by pressing the strip', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  // 50 rows: one short page, so there is no older page.
+  firstPageOverride = Array.from({ length: 50 }, (_, i) => ({
+    ...DB_MESSAGE,
+    id: `short-${i}`,
+    waMessageId: `wamid.short.${i}`,
+    body: `short row ${i}`,
+    timestamp: 1_700_000_000 + (50 - i),
+    createdAt: new Date((1_700_000_000 + (50 - i)) * 1000).toISOString(),
+  }));
+  const { container } = renderChats();
+  await screen.findByText(SESSION.name);
+  fireEvent.click(await screen.findByText('Alice'));
+  const thread = container.querySelector('.room-messages') as HTMLElement;
+  await within(thread).findByText('short row 0');
+
+  storedReadStatus = 503;
+  await rtl.act(() => queryClient!.invalidateQueries({ queryKey: ['messages', SESSION.id] }));
+  const strip = await waitFor(() => {
+    const found = thread.querySelector('button.messages-loading-older.failed.retry') as HTMLButtonElement | null;
+    assert.ok(found, 'a failed refresh shows a strip that can be pressed');
+    return found;
+  });
+  assert.match(strip.textContent ?? '', /couldn.t refresh the messages/i);
+  assert.doesNotMatch(strip.textContent ?? '', /scroll up/i, 'a refresh is not retried by scrolling');
+
+  storedReadStatus = 200;
+  resetFetchCalls();
+  fireEvent.click(strip);
+  await waitFor(() => assert.ok(thread.querySelector('.messages-loading-older.failed') === null, 'the failure stayed'));
+  const firstPageReads = fetchCalls.filter(
+    call =>
+      call.method === 'GET' &&
+      call.path.startsWith(`/api/sessions/${SESSION.id}/messages?chatId=${encodeURIComponent(CHAT.id)}`),
+  );
+  assert.equal(firstPageReads.length, 1, 'the strip asked for the newest page once');
+});
+
+test('a failed refresh of a thread with an older page is also retried by scrolling up, and by the strip', async () => {
+  const { fireEvent, waitFor } = rtl;
+  const { container } = renderChats();
+  const thread = await openPagedChat(container);
+  carolFirstStatus = 503;
+  await rtl.act(() => queryClient!.invalidateQueries({ queryKey: ['messages', SESSION.id] }));
+  await waitFor(() => assert.ok(thread.querySelector('button.messages-loading-older.failed.retry'), 'the strip shows'));
+
+  carolFirstStatus = 200;
+  resetFetchCalls();
+  makeScrollable(thread, 0);
+  fireEvent.scroll(thread);
+  await waitFor(() => assert.equal(countFetchCalls('GET', pagedMessagesPath(0)), 1), { timeout: 3_000 });
+  await waitFor(() => assert.ok(thread.querySelector('.messages-loading-older.failed') === null));
+});
+
+test('a refresh retry that is already running is not started again by the next scroll or press', async () => {
+  const { fireEvent, waitFor } = rtl;
+  const { container } = renderChats();
+  const thread = await openPagedChat(container);
+  carolFirstStatus = 503;
+  await rtl.act(() => queryClient!.invalidateQueries({ queryKey: ['messages', SESSION.id] }));
+  const strip = await waitFor(() => {
+    const found = thread.querySelector('button.messages-loading-older.failed.retry') as HTMLButtonElement | null;
+    assert.ok(found, 'the strip shows');
+    return found;
+  });
+  // The retry is held open, as a slow gateway would.
+  let release!: () => void;
+  carolFirstGate = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  resetFetchCalls();
+  makeScrollable(thread, 60);
+  fireEvent.scroll(thread);
+  await waitFor(() => assert.equal(countFetchCalls('GET', pagedMessagesPath(0)), 1));
+  (thread as unknown as { scrollTop: number }).scrollTop = 30;
+  fireEvent.scroll(thread);
+  (thread as unknown as { scrollTop: number }).scrollTop = 5;
+  fireEvent.scroll(thread);
+  fireEvent.click(strip);
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.equal(countFetchCalls('GET', pagedMessagesPath(0)), 1, 'a running retry was restarted');
+  assert.equal(strip.disabled, true, 'the strip stays pressed while the retry runs');
+  // The retry that was running is refused too, and the strip is pressable again; the next press loads the thread.
+  carolFirstGate = null;
+  release();
+  const pressable = () => thread.querySelector('button.messages-loading-older.failed.retry:not(:disabled)');
+  await waitFor(() => assert.ok(pressable() !== null, 'the strip stayed pressed after the retry failed'));
+  carolFirstStatus = 200;
+  fireEvent.click(pressable() as HTMLButtonElement);
+  await waitFor(() => assert.ok(thread.querySelector('.messages-loading-older.failed') === null));
 });
 
 test('a delivery ack reaches a message held by an older page', async () => {
@@ -5470,4 +6066,274 @@ test('a thread whose initial rows are all unrenderable unknown entries pins to t
   });
   await within(room).findByText('first real hello');
   await waitFor(() => assert.equal(top, 1200, 'room did not pin to bottom when first renderable message arrived'));
+});
+
+test('playing an audio or video element pauses other active media on the page', () => {
+  const { cleanup } = rtl;
+  renderChats();
+
+  const audio1 = document.createElement('audio');
+  const audio2 = document.createElement('audio');
+  let audio1Paused = false;
+  Object.defineProperty(audio1, 'paused', { get: () => audio1Paused, configurable: true });
+  Object.defineProperty(audio2, 'paused', { get: () => false, configurable: true });
+  audio1.pause = () => {
+    audio1Paused = true;
+  };
+
+  document.body.appendChild(audio1);
+  document.body.appendChild(audio2);
+
+  // Play event on audio2 is captured by document listener and pauses audio1
+  const EventCtor = audio2.ownerDocument.defaultView?.Event || Event;
+  audio2.dispatchEvent(new EventCtor('play', { bubbles: false }));
+
+  assert.equal(audio1Paused, true, 'audio1 should have been paused when audio2 played');
+
+  audio1.remove();
+  audio2.remove();
+  cleanup();
+});
+
+test('own reactions match only exact session phone JIDs, key consistently, and withdraw cleanly', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  firstPageOverride = [
+    {
+      ...DB_MESSAGE,
+      id: 'db-react-1',
+      waMessageId: 'wamid.react.1',
+      body: 'react target',
+      metadata: {
+        reactions: {
+          [`${SESSION.phone}@c.us`]: '👍',
+          [`${SESSION.phone}99@c.us`]: '❤️',
+          [`${SESSION.phone}@lid`]: '😂',
+        },
+      },
+    },
+  ];
+  const { container } = renderChats();
+  await screen.findByText(SESSION.name);
+  await openListed(container, 'Alice');
+  const room = container.querySelector('.room-messages') as HTMLElement;
+  await within(room).findByText('react target');
+
+  const bubble = room.querySelector('[data-wa-message-id="wamid.react.1"]') as HTMLElement;
+  // Clicking ❤️ belongs to a different superstring phone (not ours), so it must send ❤️ and replace our 👍
+  // under <phone>@c.us without creating a duplicate 'me' key.
+  resetFetchCalls();
+  fireEvent.click(within(bubble).getByRole('button', { name: '❤️' }));
+  await waitFor(() => assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/messages/react`), 1));
+  assert.deepEqual(findFetchCall('POST', `/api/sessions/${SESSION.id}/messages/react`)?.body, {
+    chatId: CHAT.id,
+    messageId: 'wamid.react.1',
+    emoji: '❤️',
+  });
+  await waitFor(() => {
+    const cached = queryClient?.getQueryData<{ pages: Array<{ db: ChatMessage[] }> }>([
+      'messages',
+      SESSION.id,
+      CHAT.id,
+    ]);
+    const row = cached?.pages[0].db.find(m => m.waMessageId === 'wamid.react.1');
+    assert.deepEqual(row?.metadata?.reactions, {
+      [`${SESSION.phone}@c.us`]: '❤️',
+      [`${SESSION.phone}99@c.us`]: '❤️',
+      [`${SESSION.phone}@lid`]: '😂',
+    });
+  });
+
+  // Clicking ❤️ again withdraws our own <phone>@c.us reaction while preserving the other participants.
+  resetFetchCalls();
+  fireEvent.click(within(bubble).getByRole('button', { name: '❤️' }));
+  await waitFor(() => assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/messages/react`), 1));
+  assert.deepEqual(findFetchCall('POST', `/api/sessions/${SESSION.id}/messages/react`)?.body, {
+    chatId: CHAT.id,
+    messageId: 'wamid.react.1',
+    emoji: '',
+  });
+  await waitFor(() => {
+    const cached = queryClient?.getQueryData<{ pages: Array<{ db: ChatMessage[] }> }>([
+      'messages',
+      SESSION.id,
+      CHAT.id,
+    ]);
+    const row = cached?.pages[0].db.find(m => m.waMessageId === 'wamid.react.1');
+    assert.deepEqual(row?.metadata?.reactions, {
+      [`${SESSION.phone}99@c.us`]: '❤️',
+      [`${SESSION.phone}@lid`]: '😂',
+    });
+  });
+});
+
+test('own reaction does not confuse another sender containing "me" when session phone is null', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  sessionPhoneOverride = null;
+  firstPageOverride = [
+    {
+      ...DB_MESSAGE,
+      id: 'db-react-null',
+      waMessageId: 'wamid.react.null',
+      body: 'null phone target',
+      metadata: {
+        reactions: {
+          'acme@c.us': '👍',
+        },
+      },
+    },
+  ];
+  const { container } = renderChats();
+  await screen.findByText(SESSION.name);
+  await openListed(container, 'Alice');
+  const room = container.querySelector('.room-messages') as HTMLElement;
+  await within(room).findByText('null phone target');
+  const bubble = room.querySelector('[data-wa-message-id="wamid.react.null"]') as HTMLElement;
+
+  resetFetchCalls();
+  fireEvent.click(within(bubble).getByRole('button', { name: '👍' }));
+  await waitFor(() => assert.equal(countFetchCalls('POST', `/api/sessions/${SESSION.id}/messages/react`), 1));
+  assert.deepEqual(findFetchCall('POST', `/api/sessions/${SESSION.id}/messages/react`)?.body, {
+    chatId: CHAT.id,
+    messageId: 'wamid.react.null',
+    emoji: '👍',
+  });
+});
+
+test('reacting to and deleting a message patch both db and history copies matched by waMessageId', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  window.sessionStorage.setItem('openwa_engine_type', 'whatsapp-web.js');
+  firstPageOverride = [
+    {
+      ...DB_MESSAGE,
+      id: 'db-uuid-pair',
+      waMessageId: 'wamid.paired.1',
+      direction: 'outgoing',
+      from: 'me',
+      to: CHAT.id,
+      status: 'delivered',
+      body: 'paired outgoing',
+    },
+  ];
+  historyExtra = [
+    {
+      id: 'wamid.paired.1',
+      chatId: CHAT.id,
+      from: 'me',
+      to: CHAT.id,
+      body: 'paired outgoing',
+      type: 'text',
+      timestamp: 1_700_000_000,
+      fromMe: true,
+      isGroup: false,
+      kind: 'individual',
+    },
+  ];
+  const confirmOriginal = window.confirm;
+  window.confirm = () => true;
+  try {
+    const { container } = renderChats();
+    await screen.findByText(SESSION.name);
+    await openListed(container, 'Alice');
+    const room = container.querySelector('.room-messages') as HTMLElement;
+    await within(room).findByText('paired outgoing');
+    const bubble = room.querySelector('[data-wa-message-id="wamid.paired.1"]') as HTMLElement;
+
+    fireEvent.click(within(bubble).getByRole('button', { name: '👍' }));
+    await waitFor(() => {
+      const cached = queryClient?.getQueryData<{
+        pages: Array<{ db: ChatMessage[]; history: ChatMessage[] }>;
+      }>(['messages', SESSION.id, CHAT.id]);
+      assert.deepEqual(cached?.pages[0].db[0].metadata?.reactions, { [`${SESSION.phone}@c.us`]: '👍' });
+      assert.deepEqual(cached?.pages[0].history[0].metadata?.reactions, { [`${SESSION.phone}@c.us`]: '👍' });
+    });
+
+    fireEvent.click(within(bubble).getByTitle('Delete message'));
+    await waitFor(() => {
+      const cached = queryClient?.getQueryData<{
+        pages: Array<{ db: ChatMessage[]; history: ChatMessage[] }>;
+      }>(['messages', SESSION.id, CHAT.id]);
+      assert.equal(cached?.pages[0].db[0].type, 'revoked');
+      assert.equal(cached?.pages[0].history[0].type, 'revoked');
+    });
+  } finally {
+    window.confirm = confirmOriginal;
+  }
+});
+
+test('typing in the composer does not re-render ChatThread and preserves in-flight sendingByThread across chat switches', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  const { container } = renderChats();
+  await screen.findByText(SESSION.name);
+  await openListed(container, 'Alice');
+  const room = container.querySelector('.room-messages') as HTMLElement;
+  await within(room).findByText('hello from alice');
+
+  // Typing characters in the composer must not trigger Chats or ChatThread re-renders.
+  const originalFormatTime = Date.prototype.toLocaleTimeString;
+  let timeFormatCalls = 0;
+  Date.prototype.toLocaleTimeString = function (...args: Parameters<Date['toLocaleTimeString']>) {
+    timeFormatCalls++;
+    return originalFormatTime.apply(this, args);
+  };
+  try {
+    const input = screen.getByPlaceholderText('Type a message...');
+    for (const draft of ['h', 'he', 'hel', 'hell', 'hello']) {
+      fireEvent.change(input, { target: { value: draft } });
+    }
+    assert.equal(timeFormatCalls, 0, 'typing in composer caused ChatThread/Chats to re-render');
+  } finally {
+    Date.prototype.toLocaleTimeString = originalFormatTime;
+  }
+
+  // Start an in-flight send in Alice, switch to Carol, then return to Alice: sending state must survive.
+  const releaseSend = holdSend();
+  try {
+    const sendButton = () => screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement;
+    fireEvent.click(sendButton());
+    await waitFor(() => assert.equal(sendButton().disabled, true));
+
+    await openListed(container, 'Carol');
+    typeDraft('carol text');
+    assert.equal(sendButton().disabled, false, 'in-flight send in Alice blocked Carol');
+
+    await openListed(container, 'Alice');
+    typeDraft('second draft');
+    assert.equal(sendButton().disabled, true, 'in-flight sendingByThread for Alice was lost on chat switch');
+  } finally {
+    releaseSend();
+  }
+});
+
+test('global search hit scrolls to messages whose waMessageId contains quotes or backslashes', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  const specialId = 'wamid."quoted"\\1';
+  firstPageOverride = [
+    {
+      ...DB_MESSAGE,
+      id: 'db-special',
+      waMessageId: specialId,
+      body: 'special id message',
+    },
+  ];
+  searchHits = [{ ...THIRD_SESSION_HIT, sessionId: SESSION.id, chatId: CHAT.id, waMessageId: specialId }];
+  const scrolled: Element[] = [];
+  const original = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = function (this: Element) {
+    scrolled.push(this);
+  };
+  try {
+    const { container } = renderChats();
+    fireEvent.click(await screen.findByText('Alice'));
+    await within(container.querySelector('.room-messages') as HTMLElement).findByText('special id message');
+    await clickSearchHit(container);
+    await waitFor(() =>
+      assert.equal(
+        scrolled.filter(el => el.getAttribute('data-wa-message-id') === specialId).length,
+        1,
+        'search hit with quotes/backslashes in waMessageId did not scroll',
+      ),
+    );
+  } finally {
+    Element.prototype.scrollIntoView = original;
+  }
 });

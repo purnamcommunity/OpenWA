@@ -68,17 +68,17 @@ const PATCHERS = [
   ['patch-baileys-appstate.js', '@whiskeysockets/baileys/lib/Socket/chats.js', m => m.LOOP_FIND],
   ['patch-baileys-newsletter-create.js', '@whiskeysockets/baileys/lib/Socket/newsletter.js', m => m.PARSE_FIND],
   ['patch-baileys-media-stream.js', '@whiskeysockets/baileys/lib/Utils/messages-media.js', m => m.PIPE_FIND],
+  ['patch-baileys-media-signal.js', '@whiskeysockets/baileys/lib/Utils/messages-media.js', m => m.FETCH_FIND],
   [
     'patch-baileys-status-ack.js',
     '@whiskeysockets/baileys/lib/Socket/messages-recv.js',
     m => [m.MAP_FIND, m.HANDLER_FIND].join('\n'),
   ],
   [
-    'patch-wwebjs-block.js',
-    'whatsapp-web.js/src/structures/Contact.js',
-    m => m.GROUPS.map(group => group.find).join('\n'),
+    'patch-baileys-event-buffer.js',
+    '@whiskeysockets/baileys/lib/Utils/event-buffer.js',
+    m => m.SITES.map(([, find]) => find).join('\n'),
   ],
-  ['patch-wwebjs-group-description.js', 'whatsapp-web.js/src/structures/GroupChat.js', m => m.POSITIONAL_CALL],
   ['patch-wwebjs-media-id.js', 'whatsapp-web.js/src/util/Injected/Utils.js', m => m.ANCHOR],
   ['patch-wwebjs-newsletter-preview.js', 'whatsapp-web.js/src/util/Injected/Utils.js', m => m.LEGACY_CALL],
   [

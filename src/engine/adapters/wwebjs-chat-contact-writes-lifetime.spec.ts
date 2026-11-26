@@ -53,7 +53,19 @@ function fixture() {
     await gate.promise;
     return target;
   };
-  const client = { getChatById: jest.fn(held), getContactById: jest.fn(held) };
+  const client = {
+    getChatById: jest.fn(held),
+    getContactById: jest.fn(held),
+    // Answered at once: the lookup these tests hold is the one of the object the write runs on.
+    getContactLidAndPhone: jest.fn().mockResolvedValue([{ lid: '100000000000001@lid' }]),
+    // The channel write is sent in the page, which answers the 200 of a write that went through.
+    pupPage: {
+      evaluate: jest.fn(() => {
+        write();
+        return Promise.resolve({ status: 200 });
+      }),
+    },
+  };
   let ready = true;
   const host = {
     ensureReady() {

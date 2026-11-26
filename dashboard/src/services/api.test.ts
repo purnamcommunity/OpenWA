@@ -23,7 +23,8 @@ before(async () => {
 
 beforeEach(() => {
   navigations.length = 0;
-  sessionStorage.setItem('openwa_api_key', 'stored-key');
+  sessionStorage.clear();
+  sessionStorage.setItem('openwa_api_key_id', 'key-actor-1');
 });
 
 function answer(status: number, message: string): void {
@@ -50,39 +51,79 @@ for (const [status, message] of [
   [403, 'IP address not allowed'],
   [403, 'Client IP could not be determined'],
 ] as const) {
-  test(`a ${status} "${message}" clears the key and returns to login`, async () => {
+  test(`a ${status} "${message}" clears the session actor, broadcasts logout to sibling tabs, and returns to login`, async () => {
+    localStorage.clear();
     answer(status, message);
     const call = sessionApi.list();
     assert.equal(await settled(call), false, 'the call settled, so its caller would render the failure');
-    assert.equal(sessionStorage.getItem('openwa_api_key'), null);
+    assert.equal(sessionStorage.getItem('openwa_api_key_id'), null);
     assert.deepEqual(navigations, ['/']);
+    const syncRaw = localStorage.getItem('openwa_auth_sync');
+    assert.ok(syncRaw, 'expected cross-tab logout broadcast');
+    const syncEvent = JSON.parse(syncRaw) as { type?: string };
+    assert.equal(syncEvent.type, 'logout');
   });
 }
 
-test('a role 403 keeps the key and rejects with the status', async () => {
+test('a role 403 keeps the session actor and rejects with the status', async () => {
   answer(403, 'Insufficient permissions. Required: operator');
   await assert.rejects(sessionApi.list(), (err: Error & { status?: number }) => {
     assert.equal(err.status, 403);
     assert.equal(err.message, 'Insufficient permissions. Required: operator');
     return true;
   });
-  assert.equal(sessionStorage.getItem('openwa_api_key'), 'stored-key');
+  assert.equal(sessionStorage.getItem('openwa_api_key_id'), 'key-actor-1');
   assert.deepEqual(navigations, []);
 });
 
-// Each response shape the client reads, so the key check covers every path into the failure handler.
+test('all request shapes send cookie credentials and X-Requested-With without an X-API-Key header', async () => {
+  sessionStorage.setItem('openwa_api_key', 'should-never-be-sent');
+  const seen: Array<{ credentials?: RequestCredentials; csrf: string | null; apiKeyHeader: string | null }> = [];
+  globalThis.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    seen.push({
+      credentials: init?.credentials,
+      csrf: headers.get('X-Requested-With'),
+      apiKeyHeader: headers.get('X-API-Key'),
+    });
+    return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
+  }) as typeof fetch;
+
+  await sessionApi.list();
+  await pluginsApi.getConfigUi('p1');
+  await sessionApi.getMessageMediaBlob('s1', '100@c.us', 'WA1');
+
+  assert.deepEqual(seen, [
+    { credentials: 'include', csrf: 'OpenWA-Dashboard', apiKeyHeader: null },
+    { credentials: 'include', csrf: 'OpenWA-Dashboard', apiKeyHeader: null },
+    { credentials: 'include', csrf: 'OpenWA-Dashboard', apiKeyHeader: null },
+  ]);
+});
+
+// Each response shape the client reads, so the session check covers every path into the failure handler.
 const shapes = [
   ['JSON', () => sessionApi.list()],
   ['text', () => pluginsApi.getConfigUi('p1')],
   ['blob', () => sessionApi.getMessageMediaBlob('s1', '100@c.us', 'WA1')],
 ] as const;
 
-// Hold every response until the test releases them, recording the key each request was sent with.
-function deferAnswers(status: number, message: string): { sentKeys: (string | undefined)[]; release: () => void } {
-  const sentKeys: (string | undefined)[] = [];
+// Hold every response until the test releases them, recording request headers and credentials.
+function deferAnswers(
+  status: number,
+  message: string,
+): {
+  sent: Array<{ credentials?: RequestCredentials; csrf: string | null; apiKeyHeader: string | null }>;
+  release: () => void;
+} {
+  const sent: Array<{ credentials?: RequestCredentials; csrf: string | null; apiKeyHeader: string | null }> = [];
   const releases: (() => void)[] = [];
   globalThis.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
-    sentKeys.push((init?.headers as Record<string, string> | undefined)?.['X-API-Key']);
+    const headers = new Headers(init?.headers);
+    sent.push({
+      credentials: init?.credentials,
+      csrf: headers.get('X-Requested-With'),
+      apiKeyHeader: headers.get('X-API-Key'),
+    });
     return new Promise<Response>(resolve => {
       releases.push(() =>
         resolve(
@@ -94,10 +135,10 @@ function deferAnswers(status: number, message: string): { sentKeys: (string | un
       );
     });
   }) as typeof fetch;
-  return { sentKeys, release: () => releases.forEach(release => release()) };
+  return { sent, release: () => releases.forEach(release => release()) };
 }
 
-// Both answers that prove a key unusable: a 401, and a 403 because the key's allowedIps refuse this client.
+// Both answers that prove a session unusable: a 401, and a 403 because allowedIps refuse this client.
 const keyFailures = [
   [401, 'API key is revoked'],
   [403, 'IP address not allowed'],
@@ -117,26 +158,30 @@ async function rejectsWithStatus(result: Promise<unknown>, status: number): Prom
 
 for (const [status, message] of keyFailures) {
   for (const [shape, call] of shapes) {
-    test(`a late ${status} ${shape} answer for a key signed out since keeps the key signed in now`, stale, async () => {
-      const pending = deferAnswers(status, message);
-      const result = call();
-      await new Promise(resolve => setImmediate(resolve));
-      assert.deepEqual(pending.sentKeys, ['stored-key']);
-      sessionStorage.removeItem('openwa_api_key');
-      sessionStorage.setItem('openwa_api_key', 'next-key');
-      pending.release();
-      await rejectsWithStatus(result, status);
-      assert.equal(sessionStorage.getItem('openwa_api_key'), 'next-key');
-      assert.deepEqual(navigations, []);
-    });
+    test(
+      `a late ${status} ${shape} answer for a session signed out since keeps the session signed in now`,
+      stale,
+      async () => {
+        const pending = deferAnswers(status, message);
+        const result = call();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(pending.sent, [{ credentials: 'include', csrf: 'OpenWA-Dashboard', apiKeyHeader: null }]);
+        sessionStorage.removeItem('openwa_api_key_id');
+        sessionStorage.setItem('openwa_api_key_id', 'key-actor-2');
+        pending.release();
+        await rejectsWithStatus(result, status);
+        assert.equal(sessionStorage.getItem('openwa_api_key_id'), 'key-actor-2');
+        assert.deepEqual(navigations, []);
+      },
+    );
 
-    test(`a ${status} ${shape} answer for the key still in use clears it and returns to login`, async () => {
+    test(`a ${status} ${shape} answer for the session still in use clears it and returns to login`, async () => {
       const pending = deferAnswers(status, message);
       const result = call();
       await new Promise(resolve => setImmediate(resolve));
       pending.release();
       assert.equal(await settled(result), false, 'the call settled, so its caller would render the failure');
-      assert.equal(sessionStorage.getItem('openwa_api_key'), null);
+      assert.equal(sessionStorage.getItem('openwa_api_key_id'), null);
       assert.deepEqual(navigations, ['/']);
     });
 
@@ -144,48 +189,48 @@ for (const [status, message] of keyFailures) {
       const pending = deferAnswers(status, message);
       const result = call();
       await new Promise(resolve => setImmediate(resolve));
-      assert.deepEqual(pending.sentKeys, ['stored-key']);
-      sessionStorage.removeItem('openwa_api_key');
+      assert.deepEqual(pending.sent, [{ credentials: 'include', csrf: 'OpenWA-Dashboard', apiKeyHeader: null }]);
+      sessionStorage.removeItem('openwa_api_key_id');
       pending.release();
       assert.equal(await settled(result), false, 'the call settled, so its caller would render the failure');
-      assert.equal(sessionStorage.getItem('openwa_api_key'), null);
+      assert.equal(sessionStorage.getItem('openwa_api_key_id'), null);
       assert.deepEqual(navigations, []);
     });
   }
 
-  test(`a burst of ${status}s for the key still in use keeps every call pending and navigates once`, async () => {
+  test(`a burst of ${status}s for the session still in use keeps every call pending and navigates once`, async () => {
     const pending = deferAnswers(status, message);
     const results = shapes.map(([, call]) => call());
     await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(pending.sentKeys, ['stored-key', 'stored-key', 'stored-key']);
+    assert.equal(pending.sent.length, 3);
     pending.release();
     for (const result of results) {
       assert.equal(await settled(result), false, 'the call settled, so its caller would render the failure');
     }
-    assert.equal(sessionStorage.getItem('openwa_api_key'), null);
+    assert.equal(sessionStorage.getItem('openwa_api_key_id'), null);
     assert.deepEqual(navigations, ['/']);
   });
 }
 
-test('a 401 for a request sent without a key while none is stored stays silent on the login form', async () => {
-  sessionStorage.removeItem('openwa_api_key');
+test('a 401 for a request sent without a session while none is stored stays silent on the login form', async () => {
+  sessionStorage.removeItem('openwa_api_key_id');
   answer(401, 'API key is required');
   const result = sessionApi.list();
   assert.equal(await settled(result), false, 'the call settled, so its caller would render the failure');
-  assert.equal(sessionStorage.getItem('openwa_api_key'), null);
+  assert.equal(sessionStorage.getItem('openwa_api_key_id'), null);
   assert.deepEqual(navigations, []);
 });
 
-test('a late 401 for a request sent while signed out keeps the key signed in since', stale, async () => {
-  sessionStorage.removeItem('openwa_api_key');
+test('a late 401 for a request sent while signed out keeps the session signed in since', stale, async () => {
+  sessionStorage.removeItem('openwa_api_key_id');
   const pending = deferAnswers(401, 'API key is required');
   const result = sessionApi.list();
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(pending.sentKeys, [undefined]);
-  sessionStorage.setItem('openwa_api_key', 'next-key');
+  assert.deepEqual(pending.sent, [{ credentials: 'include', csrf: 'OpenWA-Dashboard', apiKeyHeader: null }]);
+  sessionStorage.setItem('openwa_api_key_id', 'key-actor-2');
   pending.release();
   await rejectsWithStatus(result, 401);
-  assert.equal(sessionStorage.getItem('openwa_api_key'), 'next-key');
+  assert.equal(sessionStorage.getItem('openwa_api_key_id'), 'key-actor-2');
   assert.deepEqual(navigations, []);
 });
 
@@ -213,7 +258,9 @@ test('archived media forwards cancellation through fetch and the response body',
   await new Promise(resolve => setImmediate(resolve));
   assert.ok(reading);
   assert.ok(requested?.endsWith('/sessions/s1/messages/100%40c.us/WA1/media'));
-  assert.equal((options?.headers as Record<string, string>)['X-API-Key'], 'stored-key');
+  assert.equal(options?.credentials, 'include');
+  assert.equal((options?.headers as Record<string, string>)['X-Requested-With'], 'OpenWA-Dashboard');
+  assert.equal((options?.headers as Record<string, string>)['X-API-Key'], undefined);
   assert.equal(options?.signal, controller.signal);
   controller.abort();
   await assert.rejects(bytes, { name: 'AbortError' });
@@ -394,11 +441,163 @@ for (const change of ['replace key', 'sign out', 'abort'] as const) {
       return pending;
     }) as typeof fetch;
     const result = sessionApi.getChats('s1', controller.signal);
-    if (change === 'replace key') sessionStorage.setItem('openwa_api_key', 'next-key');
-    if (change === 'sign out') sessionStorage.removeItem('openwa_api_key');
+    if (change === 'replace key') sessionStorage.setItem('openwa_api_key_id', 'key-actor-2');
+    if (change === 'sign out') sessionStorage.removeItem('openwa_api_key_id');
     if (change === 'abort') controller.abort();
     release(chatResponse(Array.from({ length: 1000 }, (_, i) => ({ id: `chat-${i}` }))));
     await assert.rejects(result, change === 'abort' ? { name: 'AbortError' } : /Signed out/);
     assert.equal(requests, 1);
   });
 }
+
+test('dynamic path segments and stats period are URL-encoded across every API group', async () => {
+  const { webhookApi, templateApi, contactApi, apiKeyApi, messageApi, pluginInstancesApi, statsApi } =
+    await import('./api.ts');
+  const requested: string[] = [];
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    requested.push(
+      String(input)
+        .replace(/^https?:\/\/[^/]+/, '')
+        .replace(/^\/api/, ''),
+    );
+    return Promise.resolve(
+      new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+  }) as typeof fetch;
+
+  const tricky = '../admin/x?a=1#frag';
+  const encTricky = encodeURIComponent(tricky);
+  const tricky2 = 'sub/id?b=2#h';
+  const encTricky2 = encodeURIComponent(tricky2);
+
+  await sessionApi.get(tricky);
+  await sessionApi.start(tricky);
+  await sessionApi.getConfig(tricky);
+  await sessionApi.getGroups(tricky);
+  await sessionApi.getSubscribedChannels(tricky);
+  await sessionApi.getContactStatuses(tricky);
+  await webhookApi.listBySession(tricky);
+  await webhookApi.update(tricky, tricky2, { active: false });
+  await webhookApi.delete(tricky, tricky2);
+  await webhookApi.test(tricky, tricky2);
+  await templateApi.list(tricky);
+  await templateApi.update(tricky, tricky2, { body: 'hi' });
+  await templateApi.delete(tricky, tricky2);
+  await contactApi.listBlocked(tricky);
+  await contactApi.block(tricky, tricky2);
+  await apiKeyApi.update(tricky, { name: 'k' });
+  await apiKeyApi.delete(tricky);
+  await apiKeyApi.revoke(tricky);
+  await messageApi.sendText(tricky, '1555@c.us', 'hi');
+  await messageApi.react(tricky, { chatId: '1555@c.us', messageId: 'm1', emoji: '👍' });
+  await pluginsApi.get(tricky);
+  await pluginsApi.enable(tricky);
+  await pluginsApi.updateSessionConfig(tricky, tricky2, {});
+  await pluginsApi.getConfigUi(tricky);
+  await pluginInstancesApi.list(tricky);
+  await pluginInstancesApi.regenerateSecret(tricky, tricky2);
+  await pluginInstancesApi.update(tricky, tricky2, { enabled: false });
+  await pluginInstancesApi.remove(tricky, tricky2);
+  await statsApi.getMessages('7d&x=1' as '7d');
+
+  assert.deepEqual(requested, [
+    `/sessions/${encTricky}`,
+    `/sessions/${encTricky}/start`,
+    `/sessions/${encTricky}/config`,
+    `/sessions/${encTricky}/groups`,
+    `/sessions/${encTricky}/channels`,
+    `/sessions/${encTricky}/status`,
+    `/sessions/${encTricky}/webhooks`,
+    `/sessions/${encTricky}/webhooks/${encTricky2}`,
+    `/sessions/${encTricky}/webhooks/${encTricky2}`,
+    `/sessions/${encTricky}/webhooks/${encTricky2}/test`,
+    `/sessions/${encTricky}/templates`,
+    `/sessions/${encTricky}/templates/${encTricky2}`,
+    `/sessions/${encTricky}/templates/${encTricky2}`,
+    `/sessions/${encTricky}/contacts/blocked`,
+    `/sessions/${encTricky}/contacts/${encTricky2}/block`,
+    `/auth/api-keys/${encTricky}`,
+    `/auth/api-keys/${encTricky}`,
+    `/auth/api-keys/${encTricky}/revoke`,
+    `/sessions/${encTricky}/messages/send-text`,
+    `/sessions/${encTricky}/messages/react`,
+    `/plugins/${encTricky}`,
+    `/plugins/${encTricky}/enable`,
+    `/plugins/${encTricky}/config/${encTricky2}`,
+    `/plugins/${encTricky}/config-ui`,
+    `/integration/plugins/${encTricky}/instances`,
+    `/integration/plugins/${encTricky}/instances/${encTricky2}/regenerate-secret`,
+    `/integration/plugins/${encTricky}/instances/${encTricky2}`,
+    `/integration/plugins/${encTricky}/instances/${encTricky2}`,
+    `/stats/messages?period=${encodeURIComponent('7d&x=1')}`,
+  ]);
+});
+
+test('chat and contact list pagination stop at the 50,000 item ceiling on non-terminating servers', async () => {
+  const { contactApi } = await import('./api.ts');
+  let chatPages = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const offset = Number(new URL(String(input), 'http://localhost').searchParams.get('offset'));
+    chatPages++;
+    if (chatPages > 52) throw new Error('pagination exceeded ceiling');
+    return chatResponse(Array.from({ length: 1000 }, (_, i) => ({ id: `chat-${offset + i}` })));
+  }) as typeof fetch;
+
+  const chats = await sessionApi.getChats('s1');
+  assert.equal(chats.length, 50_000);
+  assert.equal(chatPages, 50);
+
+  let contactPages = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const offset = Number(new URL(String(input), 'http://localhost').searchParams.get('offset'));
+    contactPages++;
+    if (contactPages > 52) throw new Error('pagination exceeded ceiling');
+    return chatResponse(
+      Array.from({ length: 1000 }, (_, i) => ({ id: `${offset + i}@c.us`, number: `${offset + i}` })),
+    );
+  }) as typeof fetch;
+
+  const contacts = await contactApi.list('s1');
+  assert.equal(contacts.length, 50_000);
+  assert.equal(contactPages, 50);
+});
+
+test('authApi.deleteSession uses keepalive and authApi.createSession waits for in-flight logout to settle', async () => {
+  const { authApi } = await import('./api.ts');
+  const order: string[] = [];
+  let finishDelete!: () => void;
+  let deleteKeepalive: boolean | undefined;
+
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const method = init?.method ?? 'GET';
+    const url = String(input);
+    if (method === 'DELETE' && url.endsWith('/auth/session')) {
+      deleteKeepalive = init?.keepalive;
+      order.push('delete:start');
+      return new Promise<Response>(resolve => {
+        finishDelete = () => {
+          order.push('delete:end');
+          resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+        };
+      });
+    }
+    if (method === 'POST' && url.endsWith('/auth/session')) {
+      order.push('create:start');
+      return Promise.resolve(
+        new Response(JSON.stringify({ valid: true, role: 'admin', apiKeyId: 'k-new' }), { status: 200 }),
+      );
+    }
+    return Promise.resolve(new Response('{}', { status: 404 }));
+  }) as typeof fetch;
+
+  const delPromise = authApi.deleteSession();
+  const createPromise = authApi.createSession('owa_new_key');
+
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(deleteKeepalive, true, 'expected keepalive: true on DELETE /auth/session');
+  assert.deepEqual(order, ['delete:start'], 'createSession must wait until pending deleteSession finishes');
+
+  finishDelete();
+  await Promise.all([delPromise, createPromise]);
+  assert.deepEqual(order, ['delete:start', 'delete:end', 'create:start']);
+});

@@ -22,8 +22,14 @@ import type { PluginConfigSchema } from '../../core/plugins';
 import { PluginDto } from './dto/plugin.dto';
 import { redactSecretConfig, restoreSecretConfig } from './redact-config';
 import { restorableConfig } from '../../core/plugins/plugin-activation';
+import { assertWritePathNoSymlinks, lstatIfPresent } from '../../core/plugins/plugin-paths';
+import {
+  getBuiltInBaseConfig,
+  PluginInstanceSanitizationError,
+  updatePluginConfigDurable,
+} from '../../core/plugins/plugin-lifecycle';
 import { PluginUninstallingError } from '../../core/plugins/plugin-uninstaller';
-import { parsePluginPackage } from './plugin-installer';
+import { DEFAULT_PACKAGE_LIMITS, parsePluginPackage, type ParsedPackage } from './plugin-installer';
 import { assertDownloadSha256, assertPluginInstallUrl, fetchSafeBuffer } from './plugin-download';
 import { annotateCatalog, CatalogEntry, CatalogPlugin, isCatalogEntry } from './catalog';
 import { redactSsrfError } from '../../common/security/ssrf-guard';
@@ -40,6 +46,13 @@ const CATALOG_MAX_BYTES = 1 * 1024 * 1024;
 const logger = createLogger('PluginsService');
 
 /** A change the plugin registry could not store is answered as not applied, like any other refused change. */
+/** The topmost directory of `target`'s path that does not exist yet, which is the first one a recursive mkdir creates. */
+function firstMissingDir(target: string): string | null {
+  let missing: string | null = null;
+  for (let current = target; !fs.existsSync(current); current = path.dirname(current)) missing = current;
+  return missing;
+}
+
 function notApplied(error: unknown): { success: boolean; message: string } {
   if (error instanceof PluginRegistryWriteError) return { success: false, message: error.message };
   throw error;
@@ -211,9 +224,9 @@ export class PluginsService {
       };
     }
 
-    if (plugin.status !== PluginStatus.ENABLED) {
-      // Clear the decision here too: a plugin sitting in ERROR after a failed restore is not ENABLED,
-      // and disabling it must stop the gateway retrying it on every boot.
+    if (plugin.status !== PluginStatus.ENABLED && plugin.status !== PluginStatus.ERROR) {
+      // Clear the decision here too so disabling an installed/disabled plugin stops the gateway
+      // from retrying it on boot if an older registry entry kept enabledByOperator set.
       this.pluginLoader.setOperatorEnabled(id, false);
       return { success: true, message: `Plugin ${id} is not enabled` };
     }
@@ -250,7 +263,7 @@ export class PluginsService {
     return this.findOne(id);
   }
 
-  updateConfig(id: string, config: Record<string, unknown>): { success: boolean; message: string } {
+  async updateConfig(id: string, config: Record<string, unknown>): Promise<{ success: boolean; message: string }> {
     const plugin = this.pluginLoader.getPlugin(id);
 
     if (!plugin) {
@@ -261,13 +274,25 @@ export class PluginsService {
       // The dashboard PUTs the whole (redacted) config back, so a sentinel secret means "unchanged":
       // restore the stored value instead of overwriting the real secret with the mask. From the stored
       // config, not the runtime one: a built-in's runtime config carries its env-derived settings, and
-      // restoring a mask from those would store them over every later .env change.
+      // restoring a mask from those would store them over every later .env change. A write that points
+      // an allowConfigHosts key at another origin gets no stored secret back.
       const stored = this.pluginLoader.getRegistryEntry(id)?.config ?? {};
-      const merged = restoreSecretConfig(config, stored, plugin.manifest.configSchema, { mergedOverStored: true });
-      this.pluginLoader.updatePluginConfig(id, merged, { mustPersist: true });
+      const base = getBuiltInBaseConfig(plugin);
+      const merged = restoreSecretConfig(
+        config,
+        restorableConfig(stored, config, plugin.manifest, base, { nullRevertsToBeneath: Boolean(base) }),
+        plugin.manifest.configSchema,
+        { mergedOverStored: true },
+      );
+      if (!(await updatePluginConfigDurable(plugin, merged, { mustPersist: true }))) {
+        this.pluginLoader.updatePluginConfig(id, merged, { mustPersist: true });
+      }
       return { success: true, message: `Plugin ${id} configuration updated` };
     } catch (error) {
       if (error instanceof PluginUninstallingError) throw new ConflictException(error.message);
+      if (error instanceof PluginInstanceSanitizationError) {
+        throw new InternalServerErrorException(error.message);
+      }
       return {
         success: false,
         message: error instanceof Error ? error.message : String(error),
@@ -363,13 +388,24 @@ export class PluginsService {
     return fs.readFileSync(real, 'utf-8');
   }
 
+  /**
+   * parsePluginPackage under this host's ingress policy: install, the id peek of installPackage and an update all
+   * refuse at parse time what the loader would refuse at load, so a package it would refuse is never written and
+   * never replaces a running plugin.
+   */
+  private parsePackage(buffer: Buffer): ParsedPackage {
+    return parsePluginPackage(buffer, DEFAULT_PACKAGE_LIMITS, {
+      allowUnsignedIngress: this.configService.get<boolean>('ingress.allowUnsigned', false),
+    });
+  }
+
   /** Install a plugin from an uploaded .zip: validate the package, write it to the plugins dir, and load it. */
   install(file?: { buffer?: Buffer }): PluginDto {
     if (!file?.buffer?.length) {
       throw new BadRequestException('No plugin file uploaded');
     }
 
-    const { manifest, entries } = parsePluginPackage(file.buffer);
+    const { manifest, entries } = this.parsePackage(file.buffer);
 
     if (this.pluginLoader.getPlugin(manifest.id)) {
       throw new ConflictException(`Plugin "${manifest.id}" is already installed`);
@@ -387,39 +423,85 @@ export class PluginsService {
         throw new ConflictException(`A plugin directory "${manifest.id}" already exists`);
       }
       // `existsSync` answers for the link's TARGET, so narrowing the guard above must not also
-      // narrow containment: a link planted at this path would send every write below — and the
-      // rollback's delete — wherever it points.
-      if (fs.realpathSync(dir) !== path.join(fs.realpathSync(pluginsDir), manifest.id)) {
+      // narrow containment: a link planted at this path, or anywhere along an archive entry's path,
+      // would send every write below, and the rollback's delete, wherever it points.
+      const dirStat = lstatIfPresent(dir);
+      if (dirStat?.isSymbolicLink() || fs.realpathSync(dir) !== path.join(fs.realpathSync(pluginsDir), manifest.id)) {
         throw new ConflictException(`A plugin directory "${manifest.id}" already exists`);
       }
       // Merging into a pre-existing directory means an entry path can already be occupied by a
-      // directory. Refusing here keeps that a conflict; writing into it fails with EISDIR, which
-      // the rollback below cannot clean up either.
+      // directory or symlink. Refusing here keeps that a conflict; writing into a directory fails
+      // with EISDIR and writing into a symlink (including a dangling one) escapes containment.
       for (const entry of entries) {
+        assertWritePathNoSymlinks(
+          dir,
+          entry.relPath,
+          detail => new ConflictException(`Cannot install "${manifest.id}": "${entry.relPath}" ${detail}`),
+        );
         const dest = path.join(dir, entry.relPath);
-        if (fs.existsSync(dest) && fs.statSync(dest).isDirectory()) {
+        const destStat = lstatIfPresent(dest);
+        if (destStat && destStat.isDirectory()) {
           throw new ConflictException(`Cannot install "${manifest.id}": "${entry.relPath}" is a directory`);
         }
       }
     }
 
     // Write the validated entries then load; roll back on any failure so a bad package never leaves
-    // a half-installed plugin behind. Into a pre-existing directory the rollback removes only the
-    // files this install actually wrote: the directory holds the operator's stored data, and
-    // deleting it to undo a failed reinstall would destroy exactly what the reinstall promised to
-    // keep.
-    const written: string[] = [];
+    // a half-installed plugin behind. Into a pre-existing directory the rollback touches only the
+    // files this install reached: the directory holds the operator's stored data, and deleting it to
+    // undo a failed reinstall would destroy exactly what the reinstall promised to keep. A file the
+    // install created is removed; one it replaced (an entry named like a stored file) gets its bytes
+    // back, and a directory it created goes too, so a failed reinstall leaves the directory as it found it.
+    const written: Array<{ dest: string; previous: Buffer | null }> = [];
+    // The first directory each mkdir is to create: nothing below it existed before, so all of it is this install's.
+    // Recorded before the call, since a mkdir that fails part-way (a name past the filesystem limit) leaves what it made.
+    const createdDirs: string[] = [];
     try {
       for (const entry of entries) {
         const dest = path.join(dir, entry.relPath);
+        const firstMissing = firstMissingDir(path.dirname(dest));
+        if (firstMissing) createdDirs.push(firstMissing);
         fs.mkdirSync(path.dirname(dest), { recursive: true });
-        fs.writeFileSync(dest, entry.data);
-        written.push(dest);
+        const previous = fs.existsSync(dest) ? fs.readFileSync(dest) : null;
+        // A file this install replaces is recorded before the write, because a write that fails midway leaves it
+        // truncated. One it creates is recorded after, so a write that failed at open (a name too long for the
+        // filesystem) leaves nothing to undo, unless the write failed after the file came to exist.
+        if (previous !== null) written.push({ dest, previous });
+        try {
+          fs.writeFileSync(dest, entry.data);
+        } catch (writeError) {
+          if (previous === null && fs.existsSync(dest)) written.push({ dest, previous });
+          throw writeError;
+        }
+        if (previous === null) written.push({ dest, previous });
       }
       this.pluginLoader.loadPlugin(dir);
     } catch (error) {
       if (dirExisted) {
-        for (const dest of written) fs.rmSync(dest, { force: true });
+        for (const { dest, previous } of written) {
+          // One file that cannot be put back must not stop the others or hide why the install failed.
+          try {
+            if (previous === null) fs.rmSync(dest, { force: true });
+            else fs.writeFileSync(dest, previous);
+          } catch (undoError) {
+            logger.warn(`Could not undo the write of ${dest} after a failed install of ${manifest.id}`, {
+              pluginId: manifest.id,
+              action: 'plugin_install_undo_failed',
+              error: undoError instanceof Error ? undoError.message : String(undoError),
+            });
+          }
+        }
+        for (const created of createdDirs.reverse()) {
+          try {
+            fs.rmSync(created, { recursive: true, force: true });
+          } catch (undoError) {
+            logger.warn(`Could not remove ${created} after a failed install of ${manifest.id}`, {
+              pluginId: manifest.id,
+              action: 'plugin_install_undo_failed',
+              error: undoError instanceof Error ? undoError.message : String(undoError),
+            });
+          }
+        }
       } else {
         fs.rmSync(dir, { recursive: true, force: true });
       }
@@ -455,7 +537,7 @@ export class PluginsService {
     if (!file?.buffer?.length) {
       throw new BadRequestException('No plugin file uploaded');
     }
-    const { manifest } = parsePluginPackage(file.buffer);
+    const { manifest } = this.parsePackage(file.buffer);
     return this.serialize(manifest.id, () => Promise.resolve(this.install(file)));
   }
 
@@ -555,7 +637,7 @@ export class PluginsService {
     }
 
     // Validate the new package BEFORE touching the running plugin. An update must be the same plugin.
-    const { manifest, entries } = parsePluginPackage(buffer);
+    const { manifest, entries } = this.parsePackage(buffer);
     if (manifest.id !== id) {
       throw new BadRequestException(`Package id "${manifest.id}" does not match the plugin being updated ("${id}")`);
     }

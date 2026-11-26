@@ -21,6 +21,9 @@ const STALL_EXHAUSTION_MESSAGE = 'job stalled more than allowable limit';
 // How long a delivery whose dead-letter row could not be written waits before it runs again.
 const REQUEUE_DELAY_MS = 60_000;
 
+// How long a job deferred because another delivery for the same ordering key is active waits before retrying.
+export const BUSY_KEY_REQUEUE_DELAY_MS = 250;
+
 // The id suffix deadLetterOrRequeue gives a re-queued delivery (see requeuedJobIds).
 const REQUEUED_JOB_ID = /-requeued-[12]$/;
 
@@ -48,25 +51,25 @@ export interface IngressJobData {
   };
 }
 
-// The KeyedAsyncLock wrapping dispatch below guarantees no two dispatches for the SAME conversation
-// run concurrently (mutual exclusion + in-order START for events as they reach the worker), so the
-// worker no longer needs concurrency 1: raising it parallelizes unrelated conversations. The lock is
-// taken inside the job, though, so a job waiting on a busy key still holds a worker slot. A burst on
-// one key larger than the concurrency fills every slot with waiters, and other keys queue behind it
-// until it drains. The key is per instance when the route declares no conversationId pointer, so
-// routes should declare one, and the concurrency should exceed the largest expected per-key burst.
+// Active ordering keys guarantee no two dispatches for the SAME conversation run concurrently, so
+// the worker can run with concurrency > 1 to parallelize unrelated conversations. When a BullMQ job
+// arrives for a key that already has an active dispatch, process() moves it back to the delayed set
+// (via moveToDelayed + DelayedError) instead of waiting inside a worker slot: this releases the
+// concurrency slot immediately so a burst on one busy key cannot head-of-line-block unrelated keys,
+// and does not consume attemptsMade or trigger dead-lettering. Synthetic callers without a BullMQ
+// lock token (or moveToDelayed) still serialize in-process through KeyedAsyncLock.
 //
-// Strict end-to-end order is NOT preserved across a BullMQ retry: a retried job re-enters lock.run()
-// after its backoff and chains at the conversation's CURRENT tail, so it can overtake a
-// same-conversation successor that dispatched
-// during the backoff window. This is a deliberate tradeoff — BullMQ retries release the worker slot
-// during backoff (better throughput under transient failure), where retrying inside the lock would
-// hold it — and is acceptable because ingress order is best-effort regardless: the provider delivers
-// over unordered HTTP. Order-strict plugins must not assume retry-involved events arrive in sequence.
+// Strict end-to-end order is NOT preserved across a busy-key deferral or BullMQ retry: a deferred
+// or retried job wakes after its delay and may run after another job for the same key that arrived
+// in between. This tradeoff frees worker slots under bursty or failing keys and is acceptable
+// because ingress ordering is best-effort regardless (providers deliver over unordered HTTP).
+// Order-strict plugins must not assume retry- or burst-deferred events arrive in strict sequence.
 @Processor(QUEUE_NAMES.INGRESS, { connection: workerConnectionOptions(), concurrency: ingressWorkerConcurrency() })
 export class IngressProcessor extends WorkerHost {
   private readonly logger = createLogger('IngressProcessor');
   private readonly lock = new KeyedAsyncLock();
+  private readonly activeKeys = new Set<string>();
+  private readonly activeKeyCounts = new Map<string, number>();
 
   constructor(
     private readonly loader: PluginLoaderService,
@@ -122,8 +125,29 @@ export class IngressProcessor extends WorkerHost {
       await job.moveToDelayed((Math.floor(Date.now() / delay) + 1) * delay, token);
       throw new DelayedError();
     }
+    const key = orderingKeyFor(d);
+    if (this.activeKeys.has(key) && token !== undefined && typeof job.moveToDelayed === 'function') {
+      // Another delivery for this ordering key is currently executing: release this worker slot
+      // immediately back to BullMQ's delayed set without spending an attempt or triggering DLQ.
+      await job.moveToDelayed(Date.now() + BUSY_KEY_REQUEUE_DELAY_MS, token);
+      throw new DelayedError();
+    }
+
+    const activeCount = (this.activeKeyCounts.get(key) ?? 0) + 1;
+    this.activeKeyCounts.set(key, activeCount);
+    this.activeKeys.add(key);
     try {
-      await this.lock.run(orderingKeyFor(d), () => this.loader.dispatchWebhookForInstance(d, { queued: true }));
+      try {
+        await this.lock.run(key, () => this.loader.dispatchWebhookForInstance(d, { queued: true }));
+      } finally {
+        const remaining = (this.activeKeyCounts.get(key) ?? 1) - 1;
+        if (remaining > 0) {
+          this.activeKeyCounts.set(key, remaining);
+        } else {
+          this.activeKeyCounts.delete(key);
+          this.activeKeys.delete(key);
+        }
+      }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       const isFinalAttempt = job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
@@ -150,6 +174,33 @@ export class IngressProcessor extends WorkerHost {
       throw err;
     }
     if (REQUEUED_JOB_ID.test(String(job.id))) await this.settleRequeued(d);
+    else await this.retireSettled(d);
+  }
+
+  /**
+   * The delivery reached the plugin, or its dead letter is written: the event row, which kept its payload so a job
+   * that Redis loses could be replayed from it, no longer needs it. Only while the row is 'pending', so one that a
+   * recovery pass already failed or settled is not touched. Never rejects: the dispatch succeeded and a retry would
+   * deliver it again, and a row left 'pending' is settled by the reconciler once it finds the job completed.
+   */
+  private async retireSettled(d: IngressJobData): Promise<void> {
+    try {
+      await this.events.update(
+        { pluginId: d.pluginId, instanceId: d.instanceId, providerDeliveryId: d.deliveryId, dispatchState: 'pending' },
+        { dispatchState: 'dispatched', payload: null },
+      );
+    } catch (err) {
+      this.logger.error(
+        'Could not record a settled ingress delivery',
+        err instanceof Error ? err.message : String(err),
+        {
+          pluginId: d.pluginId,
+          instanceId: d.instanceId,
+          deliveryId: d.deliveryId,
+          action: 'ingress_settle_failed',
+        },
+      );
+    }
   }
 
   /**
@@ -191,9 +242,8 @@ export class IngressProcessor extends WorkerHost {
 
   /**
    * A job failed by stall exhaustion never enters process(): the worker fails it internally and only
-   * emits 'failed'. The ingress_events row already retired its payload when the enqueue returned
-   * 'queued', so without this the failed BullMQ job (pruned by removeOnFail) is the only copy and no
-   * DLQ row exists to redrive. Any other failure was already recorded by process() on the final
+   * emits 'failed'. Without this no DLQ row exists to redrive until the reconciler finds the failed job
+   * and writes one from the event row. Any other failure was already recorded by process() on the final
    * attempt, so only the stall sentinel is handled here. `job` is undefined once removeOnFail pruned it.
    */
   @OnWorkerEvent('failed')
@@ -227,6 +277,9 @@ export class IngressProcessor extends WorkerHost {
     const d = job.data;
     try {
       await this.deadLetter(d, attempts, errorMessage, REQUEUED_JOB_ID.test(String(job.id)));
+      // The dead letter is the payload's home now, so the event row lets go of it. Not when the write failed: the
+      // delivery then goes back on the queue and the row keeps its payload.
+      await this.retireSettled(d);
     } catch (err) {
       const meta = { jobId: job.id, pluginId: d.pluginId, instanceId: d.instanceId, deliveryId: d.deliveryId };
       const reason = err instanceof Error ? err.message : String(err);

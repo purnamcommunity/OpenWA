@@ -8,10 +8,11 @@ import {
   MARK_READ_MESSAGE_ID_PATTERN,
 } from '../../../modules/session/dto/mark-chat-read.dto';
 import { chatIdSchema, chatJidSchema } from '../chat-id-schema';
-import { defineTool, type AnyToolDescriptor } from '../tool-descriptor';
+import { listLimitSchema } from '../list-limit-schema';
+import { defineTool, sessionIdSchema, type AnyToolDescriptor } from '../tool-descriptor';
 import { paginate } from '../../../common/utils/paginate';
 
-const sessionId = z.string().min(1).describe('Session UUID (the session id, not the name)');
+const sessionId = sessionIdSchema;
 
 export function sessionTools(session: SessionService): AnyToolDescriptor[] {
   return [
@@ -21,14 +22,21 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
         'List the WhatsApp sessions this API key may access (id, name, status). Use to discover available sessions before calling session-scoped tools. Supports limit/offset paging and an exact, case-sensitive name filter.',
       tier: 'read',
       inputSchema: z.object({
-        limit: z.number().int().min(1).max(1000).optional(),
+        limit: listLimitSchema,
         offset: z.number().int().min(0).optional(),
         name: z.string().min(1).describe('Exact session name (case-sensitive)').optional(),
       }),
-      handler: (input, apiKey) =>
-        session
-          .findAll(apiKey.allowedSessions, { limit: input.limit, offset: input.offset, name: input.name })
-          .then(ss => ss.map(s => SessionResponseDto.fromEntity(s, session.engineLoaded(s)))),
+      handler: async (input, apiKey) => {
+        const ss = await session.findAll(apiKey.allowedSessions, {
+          limit: input.limit,
+          offset: input.offset,
+          name: input.name,
+        });
+        const now = await session.leaseClockNow?.();
+        return ss.map(s =>
+          SessionResponseDto.fromEntity(s, now !== undefined ? session.engineLoaded(s, now) : session.engineLoaded(s)),
+        );
+      },
     }),
     defineTool({
       name: 'SessionFindOne',
@@ -37,18 +45,28 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
       tier: 'read',
       sessionScoped: true,
       inputSchema: z.object({ sessionId }),
-      handler: input =>
-        session.findOne(input.sessionId).then(s => SessionResponseDto.fromEntity(s, session.engineLoaded(s))),
+      handler: async input => {
+        const s = await session.findOne(input.sessionId);
+        const now = await session.leaseClockNow?.();
+        return SessionResponseDto.fromEntity(
+          s,
+          now !== undefined ? session.engineLoaded(s, now) : session.engineLoaded(s),
+        );
+      },
     }),
     defineTool({
       name: 'SessionGetChats',
       chatScope: 'filtered',
-      description: 'List recent chats for a session (most recent first). Use limit/offset to page through large lists.',
+      description:
+        'List recent chats for a session (most recent first). Use limit/offset to page through large lists. ' +
+        'On Baileys, a chat held under a privacy id (@lid) with no name of its own has name ""; its phone, ' +
+        'when present, is the number to show.',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
-        limit: z.number().int().min(1).max(1000).optional(),
+        limit: listLimitSchema,
         offset: z.number().int().min(0).optional(),
       }),
       handler: async (input, apiKey, chatScope) => {
@@ -68,7 +86,10 @@ export function sessionTools(session: SessionService): AnyToolDescriptor[] {
       description: 'Aggregate session counts (total, active, ready, disconnected) the key is allowed to see.',
       tier: 'read',
       inputSchema: z.object({}),
-      handler: (_input, apiKey) => session.getStats(apiKey.allowedSessions),
+      handler: (_input, apiKey) =>
+        session.getStats(apiKey.allowedSessions, {
+          includeMemoryUsage: apiKey.role === ApiKeyRole.ADMIN && !apiKey.allowedSessions?.length,
+        }),
     }),
     defineTool({
       name: 'SessionSubscribePresence',

@@ -191,7 +191,7 @@
 .infrastructure-page .form-group select {
   padding: 0.75rem 1rem;
   font-size: 0.9375rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius);
   background-color: var(--bg-white);
   transition: border-color 0.2s;
@@ -201,6 +201,14 @@
 .infrastructure-page .form-group select:focus {
   outline: none;
   border-color: var(--focus-ring);
+  box-shadow: 0 0 0 1px var(--focus-ring);
+}
+
+/* A select keeps the glow of the global select:focus, which the box-shadow above replaces. */
+.infrastructure-page .form-group select:focus {
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px rgba(37, 211, 102, 0.1);
 }
 
 .infrastructure-page .form-group small {
@@ -238,6 +246,8 @@
   position: relative;
   width: 48px;
   height: 26px;
+  /* A row's long description takes the room; the track keeps its width so the knob stays inside it. */
+  flex-shrink: 0;
   cursor: pointer;
 }
 
@@ -578,6 +588,19 @@
   font-size: 0.75rem;
   margin-top: 0.15rem;
 }
+.infrastructure-page .data-migration-secrets-optin {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.infrastructure-page .data-migration-secrets-hint {
+  margin-top: 0.15rem;
+}
 .infrastructure-page .data-migration-actions {
   display: flex;
   flex-wrap: wrap;
@@ -783,4 +806,28 @@
   font-size: 1rem;
   color: var(--error-text);
   margin-bottom: 1rem;
+}
+
+/* Forced colours drop fills and shadows: the chosen card draws a heavy frame, a switch its track, knob and state. */
+@media (forced-colors: active) {
+  .infrastructure-page .radio-option.selected {
+    border: 4px solid CanvasText;
+  }
+
+  .infrastructure-page .toggle-slider {
+    border: 1px solid CanvasText;
+  }
+
+  .infrastructure-page .toggle-slider::before {
+    background: CanvasText;
+  }
+
+  .infrastructure-page .toggle-switch input:checked + .toggle-slider {
+    background: Highlight;
+    border-color: Highlight;
+  }
+
+  .infrastructure-page .toggle-switch input:checked + .toggle-slider::before {
+    background: HighlightText;
+  }
 }

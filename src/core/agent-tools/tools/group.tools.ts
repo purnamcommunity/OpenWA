@@ -7,10 +7,11 @@ import {
   GROUP_NAME_MAX_LENGTH,
   GROUP_PARTICIPANTS_MAX,
 } from '../../../modules/group/dto/group.dto';
-import { defineTool, type AnyToolDescriptor } from '../tool-descriptor';
+import { listLimitSchema } from '../list-limit-schema';
+import { defineTool, sessionIdSchema, type AnyToolDescriptor } from '../tool-descriptor';
 import { paginate } from '../../../common/utils/paginate';
 
-const sessionId = z.string().min(1).describe('Session UUID (the session id, not the name)');
+const sessionId = sessionIdSchema;
 
 export function groupTools(group: GroupService, session: Pick<SessionService, 'findOne'>): AnyToolDescriptor[] {
   return [
@@ -22,9 +23,10 @@ export function groupTools(group: GroupService, session: Pick<SessionService, 'f
         'linkedParentJID (the parent community, or null) when the engine reports them. Use limit/offset to page.',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
-        limit: z.number().int().min(1).max(1000).optional(),
+        limit: listLimitSchema,
         offset: z.number().int().min(0).optional(),
       }),
       handler: async (input, apiKey, chatScope) => {
@@ -44,6 +46,7 @@ export function groupTools(group: GroupService, session: Pick<SessionService, 'f
       description: 'Get detailed info for a specific group including participants list.',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
         groupId: z.string().min(1).describe('Group JID (e.g. 120363xxx@g.us)'),
@@ -53,9 +56,9 @@ export function groupTools(group: GroupService, session: Pick<SessionService, 'f
     defineTool({
       name: 'GroupGetInviteCode',
       description:
-        'Get the invite code and link for a group. Requires OPERATOR role: the code is a ' +
-        'transferable join capability, not plain read data.',
-      tier: 'read',
+        'Get the invite code and link for a group. Requires OPERATOR role and write-tier MCP access ' +
+        '(MCP_READONLY=false): the code is a transferable join capability, not plain read data.',
+      tier: 'write',
       requiredRole: ApiKeyRole.OPERATOR,
       sessionScoped: true,
       inputSchema: z.object({

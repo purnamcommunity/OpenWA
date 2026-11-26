@@ -1,6 +1,6 @@
 # rmyndharis-openwa
 
-This document describes SDK 0.12.0. The `linkPreview` key of a session's config requires OpenWA 0.30.3 or later. `messages.receipts` requires OpenWA 0.28.0 or later. `contacts.lid` requires OpenWA 0.27.1 or later. `groups.set_member_label`, the `match` key of the search query, and the `thumbnailUrl` and `thumbnailBase64` keys of `CustomLinkPreview` require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
+This document describes SDK 0.14.0. The `idempotency_key` parameter on `messages.click_button` requires OpenWA 0.32.0 or later, and `SessionStatsOverview.memoryUsage` is optional starting in OpenWA 0.32.0. The `phone` key of a chat summary requires OpenWA 0.31.0 or later. The `linkPreview` key of a session's config requires OpenWA 0.30.3 or later. `messages.receipts` requires OpenWA 0.28.0 or later. `contacts.lid` requires OpenWA 0.27.1 or later. `groups.set_member_label`, the `match` key of the search query, and the `thumbnailUrl` and `thumbnailBase64` keys of `CustomLinkPreview` require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
 
 Official Python SDK for [OpenWA](https://github.com/rmyndharis/OpenWA), the open-source WhatsApp API Gateway. OpenWA is an independent project, not affiliated with or endorsed by WhatsApp or Meta.
 
@@ -126,6 +126,8 @@ except OpenWANotFoundError as e:
   `client.request(method, path, query=…, body=…, idempotency_key=…)`. A path with a `.` or `..` segment (also after an
   encoded slash, as in `..%2F`), or one that does not begin with `/`, raises `ValueError` before anything is sent. An id
   with a `.` or `..` part between slashes, such as `../x`, is refused the same way.
+- On Python 3.9 the `TypedDict`s of `openwa.types` are meant for static type checkers: `typing.get_type_hints`
+  raises `TypeError` for those whose annotations use `X | None` or `X | Y`, which that version cannot evaluate.
 
 ## Receiving webhooks
 
@@ -151,14 +153,16 @@ def openwa_webhook():
     if not verify_webhook_signature(raw_body, request.headers.get("X-OpenWA-Signature"), secret):
         return "Invalid signature", 401
     delivery: WebhookDelivery = json.loads(raw_body)
-    # Process delivery["event"] and delivery["data"] here.
+    # Route on delivery["event"] and deduplicate on delivery["idempotencyKey"] (headers are unsigned).
     return "OK", 200
 ```
 
-The signature covers the body only and carries no timestamp, so a captured delivery still verifies
-when it is sent again. Dedupe on `delivery["idempotencyKey"]` (also the `X-OpenWA-Idempotency-Key`
-header): the gateway's own retries and an operator's redrive of a failed delivery reuse it, so a key
-you have already handled is the same event arriving again.
+The signature covers the raw JSON body only (not `X-OpenWA-*` headers, which are unsigned) and
+carries no timestamp, so a captured delivery still verifies when it is sent again. Always
+deduplicate on `delivery["idempotencyKey"]` and route on `delivery["event"]` from the verified
+JSON payload rather than trusting the unsigned `X-OpenWA-Idempotency-Key` or `X-OpenWA-Event`
+headers: the gateway's own retries and an operator's redrive of a failed delivery reuse
+`delivery["idempotencyKey"]`, so a key you have already handled is the same event arriving again.
 
 ## Releasing
 
@@ -182,7 +186,7 @@ rejects the upload, so configure it first.
 Cutting a release:
 
 1. Bump `version` in `pyproject.toml` and land it on `main`.
-2. Tag that commit `py-sdk-v<version>` (e.g. `py-sdk-v0.12.0`) and push the tag.
+2. Tag that commit `py-sdk-v<version>` (e.g. `py-sdk-v0.14.0`) and push the tag.
    The SDK has its own version line — the monorepo's `v*` tags are the app
    version and never trigger an SDK publish.
 3. The workflow re-runs the test suite, builds the sdist and wheel, and
@@ -198,7 +202,7 @@ Supply a unique caller-owned key for one logical send and reuse it when retrying
 client.messages.send_text(session_id, {"chatId": "628123@c.us", "text": "Hello"}, idempotency_key="order-123")
 ```
 
-The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply and forward sends. Completed calls replay their response; a 409 with the error `code` `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (the `code` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk, product and button operations have no such guarantee. Omit the key to preserve existing behavior.
+The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply, forward and `click_button` sends. Completed calls replay their response; a 409 with the error `code` `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (the `code` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk and product operations have no such guarantee. Omit the key to preserve existing behavior.
 
 ## License
 

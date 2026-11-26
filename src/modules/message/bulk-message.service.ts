@@ -17,7 +17,8 @@ import { captureSessionWrites, SessionWriteScope } from '../../common/utils/sess
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, Not, QueryDeepPartialEntity, Repository, EntityManager } from 'typeorm';
 import { createHash, randomUUID } from 'crypto';
-import { setTimeout } from 'node:timers/promises';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
   MessageBatch,
   BatchStatus,
@@ -41,14 +42,29 @@ import {
   type SettleAdmission,
 } from './send-pacing.service';
 import { SessionOwnershipService } from '../session/session-ownership.service';
-import { HookManager } from '../../core/hooks';
-import { assertBase64LengthWithinMediaCap, assertBase64WithinMediaCap, stripBase64DataUri } from './media-cap.util';
+import { SessionService, linkPreviewDefault } from '../session/session.service';
+import {
+  HookExecutionError,
+  HookManager,
+  applyPinnedRouting,
+  buildSendingExecuteOptions,
+  capturePinnedRouting,
+  cloneGateInput,
+} from '../../core/hooks';
+import {
+  assertBase64LengthWithinMediaCap,
+  assertBase64WithinMediaCap,
+  extractDataUriMimetype,
+  stripBase64DataUri,
+} from './media-cap.util';
 import { stripBatchMediaPayloads } from './batch-media.util';
-import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
+import { logSsrfRefusal } from '../../common/media/client-facing-ssrf-error';
+import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE, urlCarriesCredentials } from '../../common/security/ssrf-guard';
 import { renderedLength, renderTemplate, TemplateRenderError } from '../../common/utils/template-render';
 import { IWhatsAppEngine, MessageResult } from '../../engine/interfaces/whatsapp-engine.interface';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { markNothingSent } from '../../common/errors/engine-not-sent.error';
 import { isUniqueViolation } from '../../common/utils/db-errors';
 
 // Type definitions for bulk message content
@@ -114,16 +130,23 @@ export function resolveMaxConcurrentBatches(): number {
   return resolveNonNegativeIntEnv(process.env.BULK_MAX_CONCURRENT_BATCHES, DEFAULT_MAX_CONCURRENT_BATCHES); // 0 = unlimited
 }
 
+/** Maximum time onModuleDestroy waits for active batches to finish finalizing before continuing teardown. */
+export const BULK_SHUTDOWN_DRAIN_MS = 5_000;
+
 /** Per-run state threaded through the executeBatch pipeline stages (was local/closure state). */
 interface BatchExecutionState {
   results: BatchMessageResult[];
   stoppedOnError: boolean;
+  abortedByShutdown: boolean;
   cancelledByDb: boolean;
   /**
    * Another writer ended the row (a reap after the session was taken over): keep its status and
    * record only what this run sent.
    */
   endedElsewhere: boolean;
+  abortSignal: AbortSignal;
+  linkPreview?: boolean;
+  initiatedDuringMessageSent: boolean;
 }
 
 /** A terminal status only another writer can have put on a row this run still holds as PROCESSING. */
@@ -133,6 +156,10 @@ const ENDED_ELSEWHERE = new Set<BatchStatus>([BatchStatus.FAILED, BatchStatus.CO
 export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = createLogger(BulkMessageService.name);
   private readonly processingBatches = new Map<string, boolean>(); // Track active batches for cancellation
+  private readonly batchAborts = new Map<string, AbortController>();
+  private readonly runningBatches = new Map<string, Promise<void>>();
+  private readonly activeBatchContext = new AsyncLocalStorage<string>();
+  private readonly activeResults = new Map<string, BatchMessageResult[]>();
   private inFlightBatches = 0; // count of batches currently in processBatch (memory bound, see cap above)
   /** Set at the top of onModuleDestroy: no batch may start sending once the shutdown fail has run. */
   private shuttingDown = false;
@@ -157,6 +184,9 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     // new batches are refused on it: one accepted before the drain runs until the teardown fails it.
     @Optional()
     private readonly shutdownService?: ShutdownService,
+    // Optional trailing session lookup so bulk text sends honor the session's linkPreview default.
+    @Optional()
+    private readonly sessionService?: SessionService,
   ) {}
 
   /**
@@ -223,6 +253,31 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
         if (await this.failOrphanedBatch(row ?? { id })) this.processingBatches.set(id, false);
       } catch (error) {
         this.logger.error(`Could not mark batch ${id} FAILED on shutdown: ${String(error)}`);
+      } finally {
+        this.batchAborts.get(id)?.abort();
+      }
+    }
+    for (const controller of this.batchAborts.values()) {
+      controller.abort();
+    }
+
+    // Drain active batch runs (excluding the current batch if shutdown is invoked re-entrantly
+    // from inside an active batch execution) so terminal DB writes settle before teardown closes
+    // the connection pool.
+    const currentBatchId = this.activeBatchContext.getStore();
+    const pending = [...this.runningBatches.entries()].filter(([id]) => id !== currentBatchId).map(([, run]) => run);
+    if (pending.length > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled(pending),
+          new Promise<void>(resolve => {
+            timer = setTimeout(resolve, BULK_SHUTDOWN_DRAIN_MS);
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
       }
     }
   }
@@ -303,6 +358,9 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
   }
 
   async createBatch(sessionId: string, dto: SendBulkMessageDto): Promise<MessageBatch> {
+    // Capture synchronously before the first await so batches started from inside a `message:sent`
+    // hook suppress echo re-triggering for all items even after the hook's ALS scope settles.
+    const initiatedDuringMessageSent = this.hookManager?.isEventInFlight?.('message:sent') === true;
     // Validate the session is started (guard only — the batch is sent later, by drainBatch).
     this.engines.require(sessionId, () => new BadRequestException(`Session '${sessionId}' is not active`));
 
@@ -423,7 +481,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       );
 
       // Start processing asynchronously
-      const pickup = this.processBatch(batch.id, true, lifetime).catch(err => {
+      const pickup = this.processBatch(batch.id, true, lifetime, initiatedDuringMessageSent).catch(err => {
         this.logger.error(`Batch ${batchId} processing error: ${String(err)}`);
       });
       handedOff = true;
@@ -462,6 +520,11 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
 
     if (!batch) {
       throw new NotFoundException(`Batch '${batchId}' not found`);
+    }
+
+    const liveResults = this.activeResults.get(batch.id);
+    if (liveResults && liveResults.length > (batch.results?.length ?? 0)) {
+      batch.results = [...liveResults];
     }
 
     return batch;
@@ -514,12 +577,44 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       const fresh = await this.batchRepository.findOne({ where: { id: batch.id }, select: { status: true } });
       throw new BadRequestException(`Batch '${batchId}' is already ${fresh?.status ?? 'gone'}`);
     }
+    this.batchAborts.get(batch.id)?.abort();
     this.logger.log(`Cancelled batch ${batchId}`);
 
     return batch;
   }
 
-  private async processBatch(batchDbId: string, reserved: boolean, lifetime: SessionWriteScope): Promise<void> {
+  private processBatch(
+    batchDbId: string,
+    reserved: boolean,
+    lifetime: SessionWriteScope,
+    initiatedDuringMessageSent = false,
+  ): Promise<void> {
+    const controller = new AbortController();
+    if (this.processingBatches.get(batchDbId) === false || this.shuttingDown) {
+      controller.abort();
+    }
+    this.batchAborts.set(batchDbId, controller);
+    const run = this.activeBatchContext.run(batchDbId, () =>
+      this.runBatch(batchDbId, reserved, lifetime, controller, initiatedDuringMessageSent),
+    );
+    const settled = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.runningBatches.set(batchDbId, settled);
+    return run.finally(() => {
+      if (this.runningBatches.get(batchDbId) === settled) this.runningBatches.delete(batchDbId);
+      if (this.batchAborts.get(batchDbId) === controller) this.batchAborts.delete(batchDbId);
+    });
+  }
+
+  private async runBatch(
+    batchDbId: string,
+    reserved: boolean,
+    lifetime: SessionWriteScope,
+    controller: AbortController,
+    initiatedDuringMessageSent: boolean,
+  ): Promise<void> {
     let batch: MessageBatch | null = null;
     // Always release the in-flight marker on every exit path (engine-not-found early return, a thrown
     // save/send, or normal completion) — otherwise the map leaks an entry per such batch.
@@ -542,7 +637,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
         return;
       }
       this.processingBatches.set(batch.id, true);
-      await this.executeBatch(batch, lifetime);
+      await this.executeBatch(batch, lifetime, controller.signal, initiatedDuringMessageSent);
     } catch (error) {
       lifetime.assertCurrent();
       // A throw here (a DB error on the pickup read, the start transition or a progress write) would
@@ -559,11 +654,17 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     } finally {
       if (reserved) this.inFlightBatches--;
       this.processingBatches.delete(batchDbId);
+      this.activeResults.delete(batchDbId);
       lifetime.close();
     }
   }
 
-  private async executeBatch(batch: MessageBatch, lifetime: SessionWriteScope): Promise<void> {
+  private async executeBatch(
+    batch: MessageBatch,
+    lifetime: SessionWriteScope,
+    abortSignal: AbortSignal,
+    initiatedDuringMessageSent = false,
+  ): Promise<void> {
     if (!(await lifetime.write(() => this.markBatchProcessing(batch)))) return;
     lifetime.assertCurrent();
 
@@ -572,8 +673,22 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       return;
     }
 
+    const linkPreview =
+      linkPreviewDefault((await this.sessionService?.findOne(batch.sessionId).catch(() => null))?.config) ?? undefined;
     const results: BatchMessageResult[] = batch.results || [];
-    const state: BatchExecutionState = { results, stoppedOnError: false, cancelledByDb: false, endedElsewhere: false };
+    if (results.length > 0) {
+      this.activeResults.set(batch.id, [...results]);
+    }
+    const state: BatchExecutionState = {
+      results,
+      stoppedOnError: false,
+      abortedByShutdown: false,
+      cancelledByDb: false,
+      endedElsewhere: false,
+      abortSignal,
+      linkPreview,
+      initiatedDuringMessageSent,
+    };
     await this.processBatchMessages(batch, state, lifetime);
     await lifetime.write(() => this.finalizeBatch(batch, state));
   }
@@ -630,9 +745,14 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     lifetime: SessionWriteScope,
   ): Promise<boolean> {
     const { results } = state;
-    // Check for cancellation
+    // Check for cancellation or shutdown
     if (!this.processingBatches.get(batch.id)) {
       this.logger.log(`Batch ${batch.batchId} cancelled at index ${i}`);
+      return false;
+    }
+    if (this.shuttingDown) {
+      state.abortedByShutdown = true;
+      this.logger.log(`Batch ${batch.batchId} interrupted by shutdown at index ${i}`);
       return false;
     }
 
@@ -668,15 +788,38 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       // A block fails just THIS message (honouring stopOnError below); a plugin may also rewrite it.
       // `input` carries the recipient like a single send's DTO does, so a recipient-based plugin can
       // decide; a rewritten chatId is ignored, the item always goes to its own msg.chatId.
-      const gate = await this.hookManager.execute(
-        'message:sending',
-        {
-          sessionId: batch.sessionId,
-          input: { ...content, chatId: msg.chatId },
-          type: messageTypeOf(msg.type, content),
-        },
-        { sessionId: batch.sessionId, source: 'BulkMessageService' },
-      );
+      const gateInput = { ...content, chatId: msg.chatId };
+      const pinnedRouting = capturePinnedRouting(gateInput);
+      let gate: { continue: boolean; data: { sessionId: string; input: typeof gateInput; type: string } };
+      try {
+        gate = await this.hookManager.execute(
+          'message:sending',
+          {
+            sessionId: batch.sessionId,
+            input: cloneGateInput(gateInput),
+            type: messageTypeOf(msg.type, content),
+          },
+          buildSendingExecuteOptions(batch.sessionId, 'BulkMessageService', pinnedRouting),
+        );
+      } catch (error) {
+        if (error instanceof HookExecutionError) {
+          blockedByPlugin = true;
+          this.logger.warn('Bulk outbound send blocked: pre-egress message:sending hook failed in fail-closed mode', {
+            pluginId: error.pluginId,
+            event: error.event,
+            sessionId: batch.sessionId,
+            batchId: batch.batchId,
+            source: 'BulkMessageService',
+            error: error.message,
+          });
+          throw markNothingSent(
+            new ServiceUnavailableException(
+              'Message sending temporarily blocked: a required pre-send plugin hook failed',
+            ),
+          );
+        }
+        throw error;
+      }
       if (!gate.continue) {
         blockedByPlugin = true;
         throw new BadRequestException('Message sending blocked by plugin');
@@ -691,15 +834,17 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       } else if (
         typeof envelope !== 'object' ||
         envelope === null ||
+        Array.isArray(envelope) ||
         typeof envelope.input !== 'object' ||
-        envelope.input === null
+        envelope.input === null ||
+        Array.isArray(envelope.input)
       ) {
         blockedByPlugin = true;
         throw new BadRequestException(
           'A message:sending handler returned a payload without a usable `input`; the send was refused rather than sent unmoderated',
         );
       } else {
-        content = envelope.input;
+        content = applyPinnedRouting(envelope.input as Record<string, unknown>, pinnedRouting);
       }
 
       // Re-validate the ACTUAL outbound payload against the media cap: template variables and a
@@ -711,6 +856,9 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       // Resolved per item, not once per batch: a session restart or reconnect registers a fresh
       // adapter, and a batch still holding the retired one would fail every remaining item.
       lifetime.assertCurrent();
+      if (typeof this.ownership?.owns === 'function' && !this.ownership.owns(batch.sessionId)) {
+        throw new EngineNotReadyError();
+      }
       const engine = this.engines.get(batch.sessionId);
       if (!engine) throw new EngineNotReadyError();
 
@@ -721,8 +869,14 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       // this the breaker was blind to bulk, the highest-volume path it exists to protect.
       let messageResult;
       engineAsked = true;
+      const releaseEchoOrigin = state.initiatedDuringMessageSent
+        ? this.hookManager?.beginEchoOriginSend?.(batch.sessionId)
+        : undefined;
       try {
-        messageResult = await this.sendMessage(engine, msg.chatId, msg.type, content);
+        messageResult = await this.sendMessage(engine, msg.chatId, msg.type, content, state.linkPreview);
+        if (state.initiatedDuringMessageSent && messageResult.id) {
+          this.hookManager?.markEchoOrigin?.(batch.sessionId, messageResult.id);
+        }
       } catch (engineError) {
         // Same filter the single-send path applies: adapters also raise client-fault and
         // engine-state errors from inside this call, and those say nothing about the account.
@@ -733,6 +887,8 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
         // the echo row lands.
         settleAdmission?.(!sentNothing(engineError));
         throw engineError;
+      } finally {
+        releaseEchoOrigin?.();
       }
       settleAdmission?.(true);
       this.pacing.recordSendSuccess(batch.sessionId);
@@ -759,8 +915,10 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
         lifetime.assertCurrent();
       }
       result.status = BatchMessageStatus.FAILED;
-      // Sanitize: an SSRF block names an internal address — never store/return/log it verbatim.
+      // Sanitize: an SSRF block names an internal address, so the stored result and the hook get the generic
+      // text; the detail goes to the log only, as on every other route.
       const sanitized = sanitizeBatchError(error);
+      if (error instanceof SsrfBlockedError) logSsrfRefusal(error);
       result.error = sanitized;
       batch.progress.failed++;
       batch.progress.pending--;
@@ -805,26 +963,41 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     batch.currentIndex = i + 1;
     batch.results = results;
 
-    // Save progress after every item: the row is what batch status, a cancel served by another
-    // process and the reapers read. Honor a cancellation issued by ANY process (the in-memory Map
-    // only sees same-process cancels), and a reap that failed the batch after another node took the
-    // session over. The guard lives IN the UPDATE (not a read-then-write), so neither can be written
-    // over: zero affected rows stops the loop, and the row says which of the two it was.
+    // Save progress and results together after every item: the row is what batch status, a cancel
+    // served by another process, and the reapers read. Honor a cancellation issued by ANY process
+    // (the in-memory Map only sees same-process cancels), and a reap that failed the batch after
+    // another node took the session over. The guard lives IN the UPDATE (not a read-then-write), so
+    // neither can be written over: zero affected rows stops the loop, and the row says which of the
+    // two it was. Writing results alongside progress keeps the persisted row self-consistent across
+    // hard crashes and takeover reaps (BULK_MESSAGES_MAX bounds batch size).
+    const resultsSnapshot = [...results];
     const progressSaved = await lifetime.write(() =>
       this.batchRepository.update(
         { id: batch.id, status: BatchStatus.PROCESSING },
-        { progress: batch.progress, results, currentIndex: batch.currentIndex },
+        { progress: batch.progress, results: resultsSnapshot, currentIndex: batch.currentIndex },
       ),
     );
     if (!progressSaved.affected) {
       await this.noteRowLeftProcessing(batch, state, `at index ${i}`);
       return false;
     }
+    // Expose live results only after the DB progress update commits so getBatchStatus never reads
+    // results ahead of the persisted progress counters.
+    this.activeResults.set(batch.id, resultsSnapshot);
 
     // Delay before next message (except for last)
     if (i < batch.messages.length - 1 && this.processingBatches.get(batch.id)) {
       const delay = this.calculateDelay(batch.options);
-      await setTimeout(delay);
+      try {
+        await sleep(delay, undefined, { signal: state.abortSignal });
+      } catch (error) {
+        if ((error as { name?: string })?.name === 'AbortError' || state.abortSignal.aborted) {
+          if (this.shuttingDown) state.abortedByShutdown = true;
+          this.logger.log(`Batch ${batch.batchId} delay aborted at index ${i}`);
+          return false;
+        }
+        throw error;
+      }
     }
     return true;
   }
@@ -881,7 +1054,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       }
     }
     const cancelled = state.cancelledByDb || !this.processingBatches.get(batch.id);
-    batch.status = resolveFinalBatchStatus(cancelled, state.stoppedOnError, batch.progress);
+    batch.status = resolveFinalBatchStatus(cancelled, state.stoppedOnError || state.abortedByShutdown, batch.progress);
     // Counters reconciled the same way cancelBatch does, for a CANCELLED row only. A copy: a write that
     // loses to a reap records the unreconciled counters, since that cancel never took effect.
     const cancelledProgress: BatchProgress = { ...batch.progress, cancelled: batch.progress.pending, pending: 0 };
@@ -964,8 +1137,14 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     // Checked here rather than on the DTO because `variables` may supply the whole URL: before
     // rendering, a value holding a placeholder is left to the per-item check, which sees the rendered
     // (and plugin-rewritten) URL.
-    if (!(beforeRender && typeof media.url === 'string' && media.url.includes('{')) && !isMediaUrl(media.url)) {
-      throw new BadRequestException(`content.${type}.url must be an absolute http(s) URL`);
+    if (!(beforeRender && typeof media.url === 'string' && media.url.includes('{'))) {
+      if (!isMediaUrl(media.url)) {
+        throw new BadRequestException(`content.${type}.url must be an absolute http(s) URL`);
+      }
+      // The loader refuses it as well, but only item by item once the batch is accepted.
+      if (urlCarriesCredentials(media.url)) {
+        throw new BadRequestException(`content.${type}.url must not contain credentials (userinfo)`);
+      }
     }
   }
 
@@ -1091,9 +1270,17 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     lifetime: SessionWriteScope,
   ): Promise<void> {
     // Store what sendMessage sent: the media under the item's own type key, and the caption for a
-    // media item (audio carries none). Other keys on the item were never delivered.
+    // media item (audio carries none; captionless documents fall back to their filename). Other
+    // keys on the item were never delivered.
     const media = type === 'text' ? undefined : content[type as 'image' | 'video' | 'audio' | 'document'];
-    const body = type === 'text' ? content.text : type === 'audio' ? undefined : content.caption;
+    const body =
+      type === 'text'
+        ? content.text
+        : type === 'audio'
+          ? undefined
+          : type === 'document'
+            ? content.caption || media?.filename
+            : content.caption;
     try {
       await this.messageService.saveOutgoingMessage(
         sessionId,
@@ -1132,8 +1319,11 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
   private mediaMimetype(type: string, content: BulkMessageContent): string {
     const media = content[type as 'image' | 'video' | 'audio' | 'document'];
     if (media?.mimetype) return media.mimetype;
+    const hasBase64 = Boolean(stripBase64DataUri(media?.base64));
+    const dataUriMimetype = hasBase64 ? extractDataUriMimetype(media?.base64) : undefined;
+    if (dataUriMimetype) return dataUriMimetype;
     if (type === 'audio' && content.audio?.ptt) return 'audio/ogg; codecs=opus';
-    if (!stripBase64DataUri(media?.base64)) return 'application/octet-stream';
+    if (!hasBase64) return 'application/octet-stream';
     if (type === 'image') return 'image/jpeg';
     if (type === 'video') return 'video/mp4';
     if (type === 'audio') return 'audio/mpeg';
@@ -1145,9 +1335,18 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     chatId: string,
     type: string,
     content: BulkMessageContent,
+    linkPreview?: boolean,
   ): Promise<MessageResult> {
     switch (type) {
       case 'text':
+        if (linkPreview !== undefined) {
+          return engine.sendTextMessage(
+            chatId,
+            content.text || '',
+            content.mentions?.length ? content.mentions : undefined,
+            { linkPreview },
+          );
+        }
         return content.mentions?.length
           ? engine.sendTextMessage(chatId, content.text || '', content.mentions)
           : engine.sendTextMessage(chatId, content.text || '');
@@ -1155,6 +1354,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
         return engine.sendImageMessage(chatId, {
           mimetype: this.mediaMimetype(type, content),
           data: stripBase64DataUri(content.image?.base64) || content.image?.url || '',
+          filename: content.image?.filename,
           caption: content.caption,
           mentions: content.mentions,
         });
@@ -1162,6 +1362,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
         return engine.sendVideoMessage(chatId, {
           mimetype: this.mediaMimetype(type, content),
           data: stripBase64DataUri(content.video?.base64) || content.video?.url || '',
+          filename: content.video?.filename,
           caption: content.caption,
           mentions: content.mentions,
         });
@@ -1173,6 +1374,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
         return engine.sendAudioMessage(chatId, {
           mimetype: this.mediaMimetype(type, content),
           data: stripBase64DataUri(content.audio?.base64) || content.audio?.url || '',
+          filename: content.audio?.filename,
           ptt: content.audio?.ptt,
           mentions: content.mentions,
         });

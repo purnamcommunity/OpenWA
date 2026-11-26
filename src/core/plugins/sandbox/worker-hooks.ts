@@ -11,7 +11,17 @@ import type { HookEvent } from '../../hooks/hook.interfaces';
  * sends back to the host: only a call caused by a hook handler is re-entrancy-guarded, never an
  * unrelated one (an ingress handler, a timer set outside a hook) that merely overlaps a dispatch.
  */
-export const hookConfigStore = new AsyncLocalStorage<{ config?: Record<string, unknown>; inFlight?: string[] }>();
+export interface WorkerDispatchStore {
+  config?: Record<string, unknown>;
+  inFlight?: string[];
+  dispatchId?: string;
+  netScopeId?: string;
+}
+
+export const hookConfigStore = new AsyncLocalStorage<WorkerDispatchStore>();
+
+/** Worker-local AsyncLocalStorage carrying the active hook event for capability call origin tagging. */
+export const hookOriginStore = new AsyncLocalStorage<{ event?: HookEvent }>();
 
 export interface WorkerHookContext {
   event: string;
@@ -27,7 +37,70 @@ export interface WorkerHookResult {
   error?: Error;
 }
 
+function safeFormatWorkerHookError(
+  error: unknown,
+  fallback = 'hook handler error',
+  seen = new WeakSet<object>(),
+): string {
+  if (error === undefined) return fallback;
+  if (typeof error === 'string') {
+    return error.trim().length > 0 ? error : fallback;
+  }
+  if (error instanceof Error) {
+    if (seen.has(error)) return fallback;
+    seen.add(error);
+    let message = '';
+    try {
+      if (typeof error.message === 'string') message = error.message;
+    } catch {
+      message = '';
+    }
+    if (message.trim().length > 0) return message;
+    let name = '';
+    try {
+      if (typeof error.name === 'string') name = error.name.trim();
+    } catch {
+      name = '';
+    }
+    try {
+      if (error instanceof AggregateError && Array.isArray(error.errors) && error.errors.length > 0) {
+        const parts = error.errors
+          .slice(0, 5)
+          .map(sub => safeFormatWorkerHookError(sub, '', seen))
+          .filter(part => part.length > 0);
+        if (parts.length > 0) return `${name || 'AggregateError'}: ${parts.join('; ')}`;
+      }
+    } catch {
+      // Fall through to safe name or fallback below when AggregateError getters throw.
+    }
+    return name.length > 0 ? name : fallback;
+  }
+  if (
+    error === null ||
+    typeof error === 'number' ||
+    typeof error === 'boolean' ||
+    typeof error === 'bigint' ||
+    typeof error === 'symbol'
+  ) {
+    return String(error);
+  }
+  try {
+    const text = `${error as string}`;
+    return text.trim().length > 0 ? text : fallback;
+  } catch {
+    return '[unprintable error]';
+  }
+}
+
 export type WorkerHookHandler = (ctx: WorkerHookContext) => Promise<WorkerHookResult> | WorkerHookResult;
+
+export function isThenable<T = unknown>(value: unknown): value is PromiseLike<T> {
+  return (
+    value !== null &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    typeof (value as PromiseLike<T>).then === 'function'
+  );
+}
 
 /**
  * Worker-side hook handling. A sandboxed plugin registers handlers here (via ctx.registerHook). The
@@ -64,52 +137,108 @@ export class WorkerHookRegistry {
     // Run the whole dispatch inside the per-session config scope so every handler (and any async work
     // it awaits) sees ctx.config resolved for THIS event's session. Absent config => the bootstrap
     // getter falls back to the base config.
-    // The store outlives the dispatch in any timer or detached promise a handler starts; drop the
-    // chain once it settles so such a later call is not treated as re-entrant.
-    const store: { config?: Record<string, unknown>; inFlight?: string[] } = {
+    // The store outlives the dispatch in any floated promise a handler starts; clear dispatchId/inFlight
+    // synchronously BEFORE posting hook-result so no microtask sends a stale dispatchId after the host
+    // removes it, while retaining netScopeId on this tree for floated net.fetch calls.
+    const store: WorkerDispatchStore = {
       config: message.config,
       inFlight: message.inFlight ?? [message.event],
+      dispatchId: message.dispatchId,
+      netScopeId: message.netScopeId,
+    };
+    const originScope: { event?: HookEvent } = { event: message.event as HookEvent };
+    const clearActiveDispatch = (): void => {
+      store.inFlight = undefined;
+      store.dispatchId = undefined;
+      originScope.event = undefined;
     };
     try {
-      await hookConfigStore.run(store, () => this.dispatch(message));
+      await hookConfigStore.run(store, () =>
+        hookOriginStore.run(originScope, () => this.dispatch(message, clearActiveDispatch)),
+      );
     } finally {
-      store.inFlight = undefined;
+      clearActiveDispatch();
     }
   }
 
-  private async dispatch(message: Extract<HostToWorkerMessage, { kind: 'hook' }>): Promise<void> {
+  private async dispatch(
+    message: Extract<HostToWorkerMessage, { kind: 'hook' }>,
+    onBeforePost?: () => void,
+  ): Promise<void> {
     const list = this.handlers.get(message.event) ?? [];
     // Guard only a chain that starts from a usable value: there is nothing to keep otherwise.
     const check = HOOK_RESULT_ACCEPT[message.event as HookEvent];
     const accept = check?.(message.data) ? check : undefined;
+    const failClosed = message.failClosed === true;
     let data = message.data;
     let shouldContinue = true;
     let firstError: string | undefined;
     for (const { handler } of list) {
       try {
-        const result = await handler({
+        const called: unknown = handler({
           event: message.event,
           data,
           sessionId: message.sessionId,
           source: message.source,
           timestamp: new Date(),
         });
-        // Same rules as the host chain: a result that reports an error, or that the event cannot use, is
-        // skipped, so an earlier handler's rewrite (a redaction) survives a later handler of this plugin
-        // returning null or failing.
-        if (result.error === undefined && result.data !== undefined && (accept?.(result.data) ?? true)) {
-          data = result.data;
+        // Skip `await` on synchronous returns so floated microtasks run AFTER dispatchId is cleared and hook-result posts.
+        const rawResult: unknown = isThenable(called) ? await called : called;
+        if (failClosed) {
+          if (rawResult === null || typeof rawResult !== 'object') {
+            firstError ??= 'hook handler returned an invalid result: continue must be a boolean';
+            break;
+          }
+          const result = rawResult as Partial<WorkerHookResult>;
+          // Check reported errors BEFORE `continue: false` or shape checks so explicit errors are never dropped.
+          if (result.error !== undefined) {
+            firstError ??= safeFormatWorkerHookError(result.error);
+            break;
+          }
+          if (Array.isArray(rawResult) || typeof result.continue !== 'boolean') {
+            firstError ??= 'hook handler returned an invalid result: continue must be a boolean';
+            break;
+          }
+          if (result.data !== undefined) {
+            if (accept && !accept(result.data)) {
+              firstError ??= 'hook handler returned an unusable payload';
+              break;
+            }
+            data = result.data;
+          }
+          if (!result.continue) {
+            shouldContinue = false;
+            break;
+          }
+          continue;
+        }
+        const result = rawResult as WorkerHookResult;
+        // Check reported errors BEFORE `continue: false` so a handler returning `{ continue: false, error }`
+        // never drops its error. Check `!== undefined` (not truthiness) so falsy error values still record.
+        if (result.error !== undefined) {
+          firstError ??= safeFormatWorkerHookError(result.error);
+          if (!result.continue) {
+            shouldContinue = false;
+            break;
+          }
+          continue;
+        }
+        // Same rules as the host chain: in fail-open mode, an unusable payload is skipped so an earlier
+        // rewrite survives.
+        if (result.data !== undefined) {
+          if (!accept || accept(result.data)) {
+            data = result.data;
+          }
         }
         if (!result.continue) {
           shouldContinue = false;
           break;
         }
-        if (result.error) throw result.error;
       } catch (error) {
-        // A handler error must not break the chain (mirrors the host hook manager). Report the FIRST
-        // failure to the host so a throwing hook is visible to the operator instead of failing open
-        // in silence; later handlers still run.
-        firstError ??= error instanceof Error ? error.message : String(error);
+        firstError ??= safeFormatWorkerHookError(error);
+        if (failClosed) {
+          break;
+        }
       }
     }
     const result: Extract<WorkerToHostMessage, { kind: 'hook-result' }> = {
@@ -119,6 +248,7 @@ export class WorkerHookRegistry {
       data,
     };
     if (firstError !== undefined) result.error = firstError;
+    onBeforePost?.();
     try {
       this.post(result);
     } catch (error) {
@@ -129,7 +259,7 @@ export class WorkerHookRegistry {
         kind: 'hook-result',
         id: message.id,
         continue: shouldContinue,
-        error: firstError ?? `hook result could not be sent: ${error instanceof Error ? error.message : String(error)}`,
+        error: firstError ?? `hook result could not be sent: ${safeFormatWorkerHookError(error)}`,
       });
     }
   }

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import ts from 'typescript';
 import { engineCapabilityMatrix } from './engine-capability-matrix';
 
 /**
@@ -267,11 +268,28 @@ describe('docs/29 counts match the capability matrix', () => {
         wrong.push(`29.5.2 not-exposed: says ${split[2]}, the table has ${unexposed}`);
     }
 
-    // Guard every selector: a reworded table would make all four comparisons vacuous.
-    expect({ marks: marks.length > 0, wired: wired > 0, unexposed: unexposed > 0 }).toEqual({
+    // The ❌ rows are three kinds: the real capabilities that are missing (the backlog), the rows an adapter page function
+    // serves (marked `run in-page`, exposed and not backlog) and the session and transport settings. 29.8 states the
+    // three, and they must add up to the rows of the table, the served ones being the rows that carry the mark.
+    const inPage = (inventory.match(/^\| `[^|]+\| *❌ \*\*not exposed\*\* \(run in-page\)/gm) ?? []).length;
+    const kinds = doc.match(
+      /\((\d+) real capabilities, (\d+) served in-page\s+by an adapter page function, and (\d+) session\/transport settings/,
+    );
+    if (!kinds) wrong.push('29.8 not-exposed kinds: phrasing no longer found');
+    else {
+      const [real, served, settings] = kinds.slice(1).map(Number);
+      if (served !== inPage) wrong.push(`29.8 served in-page: says ${served}, the table marks ${inPage}`);
+      if (real + served + settings !== unexposed) {
+        wrong.push(`29.8 not-exposed kinds: add up to ${real + served + settings}, the table has ${unexposed}`);
+      }
+    }
+
+    // Guard every selector: a reworded table would make all the comparisons vacuous.
+    expect({ marks: marks.length > 0, wired: wired > 0, unexposed: unexposed > 0, inPage: inPage > 0 }).toEqual({
       marks: true,
       wired: true,
       unexposed: true,
+      inPage: true,
     });
     expect(wrong).toEqual([]);
   });
@@ -295,5 +313,16 @@ describe('docs/29 counts match the capability matrix', () => {
     }
 
     expect(wrong).toEqual([]);
+  });
+
+  it('excludes engine-capability-matrix.ts from the production build', () => {
+    const repoRoot = join(__dirname, '..', '..');
+    const configPath = join(repoRoot, 'tsconfig.build.json');
+    const readResult = ts.readConfigFile(configPath, p => readFileSync(p, 'utf8'));
+    expect(readResult.error).toBeUndefined();
+    const parsed = ts.parseJsonConfigFileContent(readResult.config, ts.sys, repoRoot);
+    expect(parsed.errors).toEqual([]);
+    const matrixPath = join(repoRoot, 'src', 'engine', 'engine-capability-matrix.ts');
+    expect(parsed.fileNames).not.toContain(matrixPath);
   });
 });

@@ -1,17 +1,15 @@
 import { NotFoundException } from '@nestjs/common';
 import { type Chat, type Client } from 'whatsapp-web.js';
-import { mapWwebjsMessageType } from './message-mapper';
 import { Label, ChatSummary } from '../interfaces/whatsapp-engine.interface';
 import { GroupChat, BusinessClient, readWid } from '../types/whatsapp-web-js.types';
-import { isChannelJid, chatKind } from '../identity/wa-id';
+import { isChannelJid } from '../identity/wa-id';
 import { ChatLabelsUnsupportedError } from '../../common/errors/chat-labels-unsupported.error';
 import { LabelNotFoundError } from '../../common/errors/label-not-found.error';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
-import { type WwebjsEngineHost, rethrowIfNavigation, withPage } from './wwebjs-host';
+import { type WwebjsEngineHost, navigationsSeen, rethrowIfNavigation, withPageWrite } from './wwebjs-host';
 import { isProtocolTimeout } from './wwebjs-lifecycle';
-import { isPageInvariant, readChats, recoverGroupChatById } from './wwebjs-chats';
-import { isNotice, isUnlistedContentless } from './wwebjs-message-events';
+import { isPageInvariant, readChats, recoverGroupChatById, summarizeChat } from './wwebjs-chats';
 
 /** The labels on a chat, read IN-PAGE as window.WWebJS.getChatLabels reads them without refreshing group metadata. */
 export async function readLocalChatLabels(chatId: string): Promise<Label[] | null> {
@@ -58,7 +56,7 @@ export class WwebjsLabels {
 
   async getLabels(): Promise<Label[]> {
     this.host.ensureReady();
-    const labels = await withPage(this.host, 'getLabels', () =>
+    const labels = await withPageWrite(this.host, 'getLabels', () =>
       (this.client() as unknown as BusinessClient).getLabels(),
     );
     if (!labels) {
@@ -84,6 +82,7 @@ export class WwebjsLabels {
     // page-side TypeError that would surface as an opaque 500. A label that is not there is a 404,
     // the same answer getLabelById gives.
     let chats: Awaited<ReturnType<BusinessClient['getChatsByLabelId']>>;
+    const since = navigationsSeen(this.host);
     try {
       chats = await (this.client() as unknown as BusinessClient)
         .getChatsByLabelId(labelId)
@@ -92,7 +91,7 @@ export class WwebjsLabels {
       // A session that went away during the local re-read below is the retryable 409, not a 404.
       if (error instanceof EngineNotReadyError) throw error;
       // Same split the group read makes: a dead page is a 503, not "no such label".
-      rethrowIfNavigation(this.host, error);
+      rethrowIfNavigation(this.host, error, since);
       if (this.host.isPageTransportError(error)) {
         this.host.reportIfPageTransportError(error, 'getChatsByLabel');
         throw new EngineTransportError(`Transport died while listing chats for label ${labelId}`);
@@ -113,29 +112,8 @@ export class WwebjsLabels {
       // for chats that no longer resolve (Client.js getChatsByLabelId → ChatFactory) — the whole
       // entry, not just the id, so the optional chain must start at the entry itself.
       const id = chat?.id?._serialized;
-      if (!id) continue;
-      summaries.push({
-        id,
-        name: chat.name || id,
-        isGroup: Boolean(chat.isGroup),
-        kind: chatKind(id),
-        unreadCount: chat.unreadCount || 0,
-        timestamp: chat.timestamp || 0,
-        // As getChats: an entry nobody sent is not the chat's last message.
-        lastMessageType:
-          chat.lastMessage && !isNotice(chat.lastMessage) && !isUnlistedContentless(chat.lastMessage)
-            ? mapWwebjsMessageType(chat.lastMessage.type)
-            : undefined,
-        archived: Boolean(chat.archived),
-        pinned: Boolean(chat.pinned),
-        muted: Boolean(chat.isMuted),
-        // wwjs muteExpiration is epoch SECONDS with -1 = forever; expose ms (0 = indefinite), muted only.
-        muteExpiration: chat.isMuted
-          ? (chat.muteExpiration ?? 0) > 0
-            ? (chat.muteExpiration ?? 0) * 1000
-            : 0
-          : undefined,
-      });
+      if (!chat || !id) continue;
+      summaries.push(summarizeChat(chat, id));
     }
     return summaries;
   }
@@ -159,7 +137,7 @@ export class WwebjsLabels {
     // Client.getLabelById never resolves null: its page code serializes the looked-up label without
     // checking it exists, so an unknown id (every id on a personal account) throws a TypeError that
     // surfaced as a 500. Picking from the full list makes a missing label the documented 404.
-    const labels = await withPage(this.host, 'getLabelById', () =>
+    const labels = await withPageWrite(this.host, 'getLabelById', () =>
       (this.client() as unknown as BusinessClient).getLabels(),
     );
     const label = labels?.find(candidate => String(candidate.id) === labelId);
@@ -191,7 +169,7 @@ export class WwebjsLabels {
    */
   private async readChatLabels(chatId: string): Promise<{ id: string; labels: Label[] } | null> {
     let id = chatId;
-    const labels = await withPage(this.host, 'getChatLabels', async () => {
+    const labels = await withPageWrite(this.host, 'getChatLabels', async () => {
       const chat = await this.client()
         .getChatById(chatId)
         .catch(error => recoverGroupChatById(this.host, 'getChatLabels', chatId, error));
@@ -269,7 +247,7 @@ export class WwebjsLabels {
    * in when the page resolves no chat; the write then answers 404 as it does without this lookup.
    */
   private async resolveChatId(chatId: string): Promise<string> {
-    const chat = await withPage(this.host, 'changeChatLabel', () =>
+    const chat = await withPageWrite(this.host, 'changeChatLabel', () =>
       this.client()
         .getChatById(chatId)
         .catch(error => recoverGroupChatById(this.host, 'changeChatLabel', chatId, error)),
@@ -291,7 +269,7 @@ export class WwebjsLabels {
       ids.delete(labelId);
     }
     try {
-      await withPage(this.host, 'changeChatLabel', () => this.client().addOrRemoveLabels([...ids], [current.id]));
+      await withPageWrite(this.host, 'changeChatLabel', () => this.client().addOrRemoveLabels([...ids], [current.id]));
     } catch (error) {
       // whatsapp-web.js throws `[LT01] Only Whatsapp business` from the page context on a personal account.
       if (String(error instanceof Error ? error.message : error).includes('LT01')) {
@@ -301,8 +279,9 @@ export class WwebjsLabels {
     }
     // The page drops an id it does not know and resolves, so the write left the chat unchanged. Checked
     // after the write, not before, so a personal account (no labels at all) still gets the LT01 422.
-    if (add && !(await this.getLabels()).some(label => label.id === labelId)) {
-      throw new LabelNotFoundError(labelId);
+    if (add) {
+      const labels = await withPageWrite(this.host, 'changeChatLabel', () => this.getLabels());
+      if (!labels.some(label => label.id === labelId)) throw new LabelNotFoundError(labelId);
     }
     this.host.logger.debug(add ? 'Added label to chat' : 'Removed label from chat', { labelId, chatId });
   }

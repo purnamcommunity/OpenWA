@@ -279,16 +279,187 @@ describe('BuiltInFtsProvider contains index build lock (postgres)', () => {
     await expect(search()).resolves.toMatchObject({ total: 0 });
     expect(tryLock).toHaveBeenCalledTimes(3);
     expect(tryLock).toHaveBeenCalledWith(expect.stringContaining("to_regclass('messages')"), [TRIGRAM_BUILD_LOCK_KEY]);
-    provider.onModuleDestroy();
+    await provider.onModuleDestroy();
   });
 
   it('stops trying once the module is destroyed', async () => {
     const { provider, tryLock } = lockedOut([]);
 
     await provider.buildContainsIndex();
-    provider.onModuleDestroy();
+    await provider.onModuleDestroy();
     await settle();
 
     expect(tryLock).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops a PostgreSQL trigram build on destroy without running DDL and still restores timeout, lock, and runner', async () => {
+    let releaseSetTimeout!: () => void;
+    const setTimeoutGate = new Promise<void>(resolve => (releaseSetTimeout = resolve));
+    let enteredSetTimeout!: () => void;
+    const onSetTimeout = new Promise<void>(resolve => (enteredSetTimeout = resolve));
+    const runnerQueries: Array<{ sql: string; params?: unknown[] }> = [];
+    const runner = {
+      connect: jest.fn().mockResolvedValue(undefined),
+      release: jest.fn().mockResolvedValue(undefined),
+      query: jest.fn(async (sql: string, params?: unknown[]) => {
+        runnerQueries.push({ sql, params });
+        if (/SET statement_timeout = 0/.test(sql)) {
+          enteredSetTimeout();
+          await setTimeoutGate;
+        }
+        return [];
+      }),
+      manager: {
+        query: jest.fn((sql: string) => {
+          if (/datctype/.test(sql)) return Promise.resolve([{ ctype: 'en_US.UTF-8' }]);
+          if (/pg_try_advisory_lock/.test(sql)) return Promise.resolve([{ locked: true }]);
+          if (/SHOW statement_timeout/.test(sql)) return Promise.resolve([{ statement_timeout: '30s' }]);
+          return Promise.resolve([{ trgm: 'public', unaccent: 'public', fn: false, idx: null }]);
+        }),
+      },
+    };
+    const ds = {
+      options: { type: 'postgres' },
+      createQueryRunner: () => runner,
+      query: jest.fn().mockResolvedValue([]),
+      manager: { query: jest.fn().mockResolvedValue([{ trgm: 'public', unaccent: 'public', fn: false, idx: null }]) },
+    } as unknown as DataSource;
+    const provider = new BuiltInFtsProvider(ds, new ConfigService({ search: { containsEnabled: true } }));
+
+    const buildP = provider.buildContainsIndex();
+    await onSetTimeout;
+
+    let destroyed = false;
+    const destroyP = provider.onModuleDestroy().then(() => {
+      destroyed = true;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(destroyed).toBe(false);
+
+    releaseSetTimeout();
+    await destroyP;
+    await buildP;
+
+    expect(destroyed).toBe(true);
+    expect(runnerQueries.some(({ sql }) => /CREATE EXTENSION|openwa_unaccent|DROP INDEX|CREATE INDEX/.test(sql))).toBe(
+      false,
+    );
+    expect(runnerQueries).toContainEqual({
+      sql: "SELECT set_config('statement_timeout', $1, false)",
+      params: ['30s'],
+    });
+    expect(runnerQueries.some(({ sql }) => /pg_advisory_unlock/.test(sql))).toBe(true);
+    expect(runner.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops before acquiring the advisory lock when destroyed while reading database ctype', async () => {
+    let releaseCtype!: () => void;
+    const ctypeGate = new Promise<void>(resolve => (releaseCtype = resolve));
+    let enteredCtype!: () => void;
+    const onCtype = new Promise<void>(resolve => (enteredCtype = resolve));
+    const managerSql: string[] = [];
+    const runner = {
+      connect: jest.fn().mockResolvedValue(undefined),
+      release: jest.fn().mockResolvedValue(undefined),
+      query: jest.fn().mockResolvedValue([]),
+      manager: {
+        query: jest.fn(async (sql: string) => {
+          managerSql.push(sql);
+          if (/datctype/.test(sql)) {
+            enteredCtype();
+            await ctypeGate;
+            return [{ ctype: 'en_US.UTF-8' }];
+          }
+          return [{ locked: true }];
+        }),
+      },
+    };
+    const ds = {
+      options: { type: 'postgres' },
+      createQueryRunner: () => runner,
+      query: jest.fn().mockResolvedValue([]),
+      manager: { query: jest.fn().mockResolvedValue([]) },
+    } as unknown as DataSource;
+    const provider = new BuiltInFtsProvider(ds, new ConfigService({ search: { containsEnabled: true } }));
+
+    const buildP = provider.buildContainsIndex();
+    await onCtype;
+
+    const destroyP = provider.onModuleDestroy();
+    releaseCtype();
+    await destroyP;
+    await buildP;
+
+    expect(managerSql.some(sql => /pg_try_advisory_lock/.test(sql))).toBe(false);
+    expect(runner.query).not.toHaveBeenCalled();
+    expect(runner.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('still runs pg_advisory_unlock when set_config fails and evicts the pooled PG connection', async () => {
+    const setConfigErr = new Error('connection reset during set_config');
+    const runner = {
+      connect: jest.fn().mockResolvedValue(undefined),
+      manager: {
+        query: jest.fn((sql: string) => {
+          if (/datctype/.test(sql)) return Promise.resolve([{ ctype: 'en_US.UTF-8' }]);
+          if (/pg_try_advisory_lock/.test(sql)) return Promise.resolve([{ locked: true }]);
+          if (/SHOW statement_timeout/.test(sql)) return Promise.resolve([{ statement_timeout: '30s' }]);
+          return Promise.resolve([{ trgm: 'public', unaccent: 'public', fn: false, idx: null }]);
+        }),
+      },
+      query: jest.fn((sql: string) => {
+        if (/set_config\('statement_timeout'/.test(sql)) return Promise.reject(setConfigErr);
+        return Promise.resolve([]);
+      }),
+      release: jest.fn().mockResolvedValue(undefined),
+      releasePostgresConnection: jest.fn().mockResolvedValue(undefined),
+    };
+    const ds = {
+      options: { type: 'postgres' },
+      createQueryRunner: jest.fn().mockReturnValue(runner),
+      query: jest.fn().mockResolvedValue([]),
+      manager: {
+        query: jest.fn((sql: string) => {
+          if (/pg_extension/.test(sql)) return Promise.resolve([{ extname: 'pg_trgm' }, { extname: 'unaccent' }]);
+          if (/pg_class/.test(sql) && /pg_attribute/.test(sql)) return Promise.resolve([{ attname: 'body' }]);
+          if (/current_schemas/.test(sql)) return Promise.resolve([{ schema: 'public' }]);
+          if (/SHOW lc_ctype/.test(sql)) return Promise.resolve([{ lc_ctype: 'C.UTF-8' }]);
+          return Promise.resolve([]);
+        }),
+      },
+    } as unknown as DataSource;
+    const provider = new BuiltInFtsProvider(ds, new ConfigService({ search: { containsEnabled: true } }));
+
+    await provider.buildContainsIndex();
+
+    const runnerSqls = (runner.query as jest.Mock).mock.calls.map(([sql]) => String(sql));
+    expect(runnerSqls.some(sql => /pg_advisory_unlock/.test(sql))).toBe(true);
+    expect(runner.releasePostgresConnection).toHaveBeenCalledWith(setConfigErr);
+    expect(runner.release).not.toHaveBeenCalled();
+  });
+
+  it('evaluates ts_headline only in outer SELECT after CTE ORDER BY LIMIT/OFFSET on Postgres word search', async () => {
+    const query = jest.fn((sql: string) => {
+      if (/COUNT\(\*\)/.test(sql)) return Promise.resolve([{ count: '0' }]);
+      return Promise.resolve([]);
+    });
+    const ds = {
+      options: { type: 'postgres' },
+      query,
+      manager: { query: jest.fn().mockResolvedValue([]) },
+    } as unknown as DataSource;
+    const provider = new BuiltInFtsProvider(ds);
+    Object.assign(provider as unknown as Record<string, unknown>, { ftsAvailable: true, containsAvailable: true });
+
+    await provider.search({ q: 'hello', match: 'word', limit: 10, offset: 5 });
+
+    const dataCall = query.mock.calls.find(([sql]) => /ts_headline/i.test(String(sql)));
+    expect(dataCall).toBeDefined();
+    const sql = String(dataCall![0]);
+    const limitIdx = sql.search(/\bLIMIT\b/i);
+    const headlineIdx = sql.search(/\bts_headline\s*\(/i);
+    expect(sql).toMatch(/\bWITH\b/i);
+    expect(limitIdx).toBeGreaterThan(-1);
+    expect(headlineIdx).toBeGreaterThan(limitIdx);
   });
 });

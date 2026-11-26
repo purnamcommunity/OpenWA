@@ -1,5 +1,5 @@
 import { HostToWorkerMessage, WorkerToHostMessage } from './protocol';
-import { hookConfigStore } from './worker-hooks';
+import { hookConfigStore, isThenable } from './worker-hooks';
 
 /**
  * The verified inbound webhook a sandboxed plugin's handler sees. Mirrors the `webhook` wire message
@@ -32,8 +32,9 @@ export class WebhookRegistry {
   constructor(private readonly post: (message: WorkerToHostMessage) => void) {}
 
   register(route: string, handler: WebhookHandler): void {
+    // The host is told about a route once; registering it again only replaces the handler.
+    if (!this.handlers.has(route)) this.post({ kind: 'webhook-subscribe', route });
     this.handlers.set(route, handler);
-    this.post({ kind: 'webhook-subscribe', route });
   }
 
   async handleWebhook(message: Extract<HostToWorkerMessage, { kind: 'webhook' }>): Promise<void> {
@@ -44,9 +45,19 @@ export class WebhookRegistry {
     }
     // Run inside the per-instance config scope so ctx.config resolves to this delivery's instance config
     // (mirrors WorkerHookRegistry.handleHook). Absent config => the bootstrap getter falls back to base.
+    const store: { config?: Record<string, unknown>; dispatchId?: string } | undefined =
+      message.config !== undefined || message.dispatchId !== undefined
+        ? {
+            config: message.config,
+            dispatchId: message.dispatchId,
+          }
+        : undefined;
+    const clearDispatch = (): void => {
+      if (store) store.dispatchId = undefined;
+    };
     const run = async () => {
       try {
-        const result = await handler({
+        const called = handler({
           instanceId: message.instanceId,
           method: message.method,
           headers: message.headers,
@@ -57,6 +68,9 @@ export class WebhookRegistry {
           deliveryId: message.deliveryId,
           sessionId: message.sessionId,
         });
+        // Skip `await` on synchronous returns so floated microtasks run AFTER dispatchId is cleared and webhook-result posts.
+        const result: WebhookResponse | void = isThenable<WebhookResponse | void>(called) ? await called : called;
+        clearDispatch();
         this.post({
           kind: 'webhook-result',
           id: message.id,
@@ -65,6 +79,7 @@ export class WebhookRegistry {
           body: result?.body,
         });
       } catch (err) {
+        clearDispatch();
         this.post({
           kind: 'webhook-result',
           id: message.id,
@@ -73,7 +88,14 @@ export class WebhookRegistry {
         });
       }
     };
-    if (message.config !== undefined) await hookConfigStore.run({ config: message.config }, run);
-    else await run();
+    if (store) {
+      try {
+        await hookConfigStore.run(store, run);
+      } finally {
+        clearDispatch();
+      }
+    } else {
+      await run();
+    }
   }
 }

@@ -69,7 +69,7 @@ import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.
 import { resolveJidCandidates } from '../../engine/identity/jid-candidates';
 import { chatKind, parseWaId } from '../../engine/identity/wa-id';
 import { Message, MessageDirection } from '../message/entities/message.entity';
-import { ServerShuttingDownException, SessionStoppedException } from './session-engine-controls';
+import { refuseLostDeleteClaim, ServerShuttingDownException, SessionStoppedException } from './session-engine-controls';
 import { phoneKey } from './message-mutation-guard';
 import { ownAccountIds } from '../../engine/adapters/baileys-stored-chat-previews.service';
 // Type-only: the module binds this class to PLUGIN_SESSION_PORT with a `useExisting` alias, which
@@ -78,6 +78,19 @@ import type { PluginSessionPort } from '../../core/plugins/plugin-host-ports';
 
 /** Stagger before the single transient-launch retry; short - the claim is held while it waits. */
 const SESSION_START_RETRY_DELAY_MS = 2_000;
+
+/** How often a stop writes its record again when the row changed under its writes and no peer holds it. */
+const KEEP_DOWN_PASSES = 5;
+
+/** The lifecycle requests that answer a retryable 503 when the database does not answer before they act, with what each does. */
+const LIFECYCLE_DONE = {
+  start: 'started',
+  stop: 'stopped',
+  delete: 'deleted',
+  logout: 'logged out',
+  'force-kill': 'killed',
+} as const;
+type LifecycleVerb = keyof typeof LIFECYCLE_DONE;
 
 /** `config.linkPreview` when it is a boolean; anything else left in the opaque blob means no default. */
 export function linkPreviewDefault(config: unknown): boolean | null {
@@ -828,14 +841,18 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         await this.keepDownForDelete(id, stops, ownsClaim).catch((error: unknown) => {
           this.dropStopMark(id, request);
           this.withdrawStop(request);
-          throw error;
+          throw this.unavailableIfRecordFailed(error, 'delete', id);
         });
         // Refused or failed before it began removing (its row read, either fence), the delete leaves the session as
         // it found it and withdraws its request, so a start it overlapped does not take it for a stop.
+        let readFailed = false;
         await this.engineLifecycle
           .delete(id, {
             mark: request.mark,
             ownsClaim,
+            onReadFailed: () => {
+              readFailed = true;
+            },
             onRemoving: () => {
               this.takeStop(request);
               stops.removing = true;
@@ -843,7 +860,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           })
           .catch((error: unknown) => {
             if (request.state !== 'taken') this.withdrawStop(request);
-            throw error;
+            // Its row read removed nothing yet, so a database that did not answer it is the retryable 503.
+            throw readFailed ? this.unavailableIfDatabaseDown(error, 'delete', id) : error;
           });
       } finally {
         endDelete();
@@ -892,6 +910,28 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
+   * Claim the session for this node. A claim answers false for more than a peer holding the row: one that a release
+   * ended while it was in flight does too, and a missing row matches nothing. Only the row says which, so a miss with no
+   * other node holding the row on a live lease is asked once more: the claim then writes a row nobody holds. A peer
+   * that holds the row refuses at once. Claims of this node that overlap never answer false for that reason (see
+   * SessionOwnershipService.claim), however many requests there are.
+   */
+  private async claimUnlessHeldElsewhere(
+    id: string,
+    ownership: SessionOwnershipService,
+    onClaimed?: (ownsClaim: () => boolean) => void,
+  ): Promise<boolean> {
+    const claim = (): Promise<boolean> => (onClaimed ? ownership.claim(id, onClaimed) : ownership.claim(id));
+    if (await claim()) return true;
+    if (await ownership.isHeldByOtherNode(id)) {
+      // Said only here: a claim also misses a row that is gone, and a start or delete of it answers 404.
+      this.logger.warn('Session is held by another node', { sessionId: id, nodeId: ownership.nodeId });
+      return false;
+    }
+    return claim();
+  }
+
+  /**
    * Hold the session's claim for as long as the delete runs. A row nobody held, or one whose holder's
    * lease lapsed, could otherwise be claimed by a peer's start or takeover while its rows are removed,
    * and the engine that peer launched would store messages for a session that no longer exists. The
@@ -907,7 +947,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   ): Promise<void> {
     let claimed: boolean;
     try {
-      claimed = await ownership.claim(id, onClaimed);
+      claimed = await this.claimUnlessHeldElsewhere(id, ownership, onClaimed);
     } catch (error) {
       this.dropStopMark(id, request);
       this.withdrawStop(request);
@@ -958,7 +998,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         .where({ id, nodeId: this.ownership!.nodeId })
         .execute();
       if (affected !== 1 || ownsClaim?.() === false) {
-        throw new ConflictException(`Session ${id} is no longer owned by this delete`);
+        // Nothing is removed yet: the read that tells its 404 from its 409 answers 503 when the database did not answer.
+        return this.checkedBefore('delete', id, () =>
+          refuseLostDeleteClaim(manager, id, `Session ${id} is no longer owned by this delete`),
+        );
       }
       await record(manager.getRepository(Session));
     });
@@ -1013,21 +1056,40 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
-   * A database failure while a start, stop or delete is still deciding whether it may act (the reads behind its 404 and
-   * its 409) has launched, stopped and deleted nothing, so it answers the retryable 503 a failed claim write does
-   * rather than a 500. Anything else comes back as it was: a refusal (an HttpException, whose text can quote an id
-   * that spells a driver message) and a statement the database rejected, which a retry cannot fix. Never
-   * ServerShuttingDownException: boot auto-start and the takeover sweep stop on that one.
+   * A database failure while a start, stop, delete, logout or force-kill is still deciding whether it may act (the
+   * reads behind its 404 and its 409) has launched, stopped, deleted and logged out nothing, so it answers the
+   * retryable 503 a failed claim write does rather than a 500. Anything else comes back as it was: a refusal (an
+   * HttpException, whose text can quote an id that spells a driver message) and a statement the database rejected,
+   * which a retry cannot fix. Never ServerShuttingDownException: boot auto-start and the takeover sweep stop on that
+   * one.
    */
-  private unavailableIfDatabaseDown(error: unknown, verb: 'start' | 'stop' | 'delete', id: string): unknown {
+  private unavailableIfDatabaseDown(error: unknown, verb: LifecycleVerb, id: string): unknown {
     if (error instanceof HttpException || !isTransientDbError(error)) return error;
-    const done = { start: 'started', stop: 'stopped', delete: 'deleted' }[verb];
+    const done = LIFECYCLE_DONE[verb];
     this.logger.warn(`Could not check session ${id} for the ${verb}; nothing was ${done}`, {
       sessionId: id,
-      action: `session_${verb}_check_failed`,
+      action: `session_${verb.replace('-', '_')}_check_failed`,
       error: error instanceof Error ? error.message : String(error),
     });
     return new ServiceUnavailableException(`Session ${id} could not be checked for the ${verb}; nothing was ${done}`);
+  }
+
+  /**
+   * The same for the write that records a stop or a delete: it runs before anything is taken down or removed, so a
+   * database that did not answer it stopped and deleted nothing. A connection that dropped after the statement may have
+   * applied it, which a repeat of the request settles: the record is idempotent, and a delete reads the row first.
+   */
+  private unavailableIfRecordFailed(error: unknown, verb: 'stop' | 'delete', id: string): unknown {
+    if (error instanceof HttpException || !isTransientDbError(error)) return error;
+    const done = LIFECYCLE_DONE[verb];
+    this.logger.warn(`Could not record the ${verb} of session ${id}; nothing was ${done}`, {
+      sessionId: id,
+      action: `session_${verb}_record_failed`,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return new ServiceUnavailableException(
+      `Session ${id} could not record the ${verb}; nothing was ${done}. The ${verb} may have been recorded, so repeating the request is safe`,
+    );
   }
 
   private async checkedBefore<T>(verb: 'start' | 'stop' | 'delete', id: string, read: () => Promise<T>): Promise<T> {
@@ -1151,7 +1213,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   private async claimForStart(id: string, ownership: SessionOwnershipService): Promise<void> {
     let claimed: boolean;
     try {
-      claimed = await ownership.claim(id);
+      claimed = await this.claimUnlessHeldElsewhere(id, ownership);
     } catch (error) {
       this.logger.warn(`Could not claim session ${id} for the start; nothing was started`, {
         sessionId: id,
@@ -1240,6 +1302,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // Synchronous stop-mark before the awaited fence — see delete() for why.
     const request = this.markStopping(id, 'stop');
     let session: Session;
+    let readFailed = false;
     try {
       if (this.ownership) await this.assertNotHeldElsewhere(id, request);
       // Recorded once the row read succeeds and BEFORE the teardown, so the 502
@@ -1251,13 +1314,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         mark: request.mark,
         afterRead: () => {
           this.takeStop(request);
-          return this.keepDown(id).catch((error: unknown) => {
+          return this.keepDown(id, read => this.checkedBefore('stop', id, read)).catch((error: unknown) => {
             this.dropStopMark(id, request);
             this.withdrawStop(request);
-            throw error;
+            throw this.unavailableIfRecordFailed(error, 'stop', id);
           });
         },
-        onReadFailed: () => this.withdrawStop(request),
+        onReadFailed: () => {
+          readFailed = true;
+          this.withdrawStop(request);
+        },
       });
     } catch (error) {
       // Only the local 502 (SESSION_STOP_INCOMPLETE) releases: it evicted the engine and wrote
@@ -1266,7 +1332,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // not adopted. The foreign-node 409 keeps its claim (it is the peer's), and so does a 404.
       if (error instanceof BadGatewayException) await this.releaseAfterTeardown(id);
       this.discardStopMarkForMissingSession(id, request, error);
-      throw error;
+      // Its row read stopped nothing yet, like the holder check before it.
+      throw readFailed ? this.unavailableIfDatabaseDown(error, 'stop', id) : error;
     } finally {
       this.endStop(id, request);
       this.engineLifecycle.settleStopping(id, request.mark);
@@ -1290,9 +1357,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       if (request) this.withdrawStop(request);
     };
     if (this.engines.get(id)) issue();
+    let readFailed = false;
     try {
       const session = await this.engineLifecycle.logout(id, {
-        onReadFailed: withdraw,
+        onReadFailed: () => {
+          readFailed = true;
+          withdraw();
+        },
         onEngineFound: () => {
           issue();
         },
@@ -1307,7 +1378,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // Neither did a failure before an engine was found (the row read): only a request means one was.
       if (error instanceof BadRequestException) withdraw();
       if (request && !(error instanceof BadRequestException)) await this.releaseAfterTeardown(id);
-      throw error;
+      // Its row read logged nothing out yet.
+      throw readFailed ? this.unavailableIfDatabaseDown(error, 'logout', id) : error;
     } finally {
       if (request) this.endStop(id, request);
     }
@@ -1325,10 +1397,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       if (request) this.withdrawStop(request);
     };
     if (this.engines.get(id)) issue();
+    let readFailed = false;
     try {
       // The engine kill records the stop itself, once it has an engine to kill.
       const session = await this.engineLifecycle.forceKill(id, {
-        onReadFailed: withdraw,
+        onReadFailed: () => {
+          readFailed = true;
+          withdraw();
+        },
         onEngineFound: () => this.takeStop(issue()),
         recordStop: () => this.keepDown(id),
       });
@@ -1339,7 +1415,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // evict the engine: its request stands and it releases.
       if (error instanceof BadRequestException) withdraw();
       if (request && !(error instanceof BadRequestException)) await this.releaseAfterTeardown(id);
-      throw error;
+      // Its row read killed nothing yet.
+      throw readFailed ? this.unavailableIfDatabaseDown(error, 'force-kill', id) : error;
     } finally {
       if (request) this.endStop(id, request);
     }
@@ -1349,8 +1426,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * Persist a stop only while no live peer owns the engine. The initial ownership read may predate a peer's
    * claim; deciding in this write also fences a stop delayed until after that peer's start returned. A delete's
    * record still accepts a stop, while remaining distinguishable until its delete finishes.
+   *
+   * A row no write could take is a live peer's, or one another request changed since the write that missed: the
+   * other stop cleared an abandoned claim, this node's own start took it, a delete began. Only a live lease names
+   * another node, so with none the writes run again, up to `passes` times.
    */
-  private async keepDown(id: string): Promise<void> {
+  private async keepDown(
+    id: string,
+    check: (read: () => Promise<boolean>) => Promise<boolean> = read => read(),
+    passes = KEEP_DOWN_PASSES,
+  ): Promise<void> {
     const claims: FindOptionsWhere<Session>[] = this.ownership
       ? [
           { id, nodeId: IsNull() },
@@ -1375,8 +1460,25 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // Clear an abandoned foreign claim with the record, before its heartbeat can revive it. A
       // pending delete took the branch above and keeps its claim throughout removal.
       if (this.ownership && (await this.ownership.stopExpiredForeignClaim(id))) return;
-      await this.findOne(id);
-      throw new ConflictException(`Session ${id} is running on another node`);
+      // The reads behind the 404 and the 409. Only stop() maps their failure (check): a force-kill or a start that
+      // records a stop has already acted, so it logs the failure as it came.
+      const heldElsewhere = await check(async () => {
+        await this.findOne(id);
+        return !this.ownership || (await this.ownership.isHeldByOtherNode(id));
+      });
+      if (heldElsewhere) {
+        throw new ConflictException(`Session ${id} is running on another node`);
+      }
+      if (passes > 1) return this.keepDown(id, check, passes - 1);
+      // No write took the row in any pass and no peer holds it: a row that kept changing is settled by the requests that
+      // changed it, and a row in a state the stop cannot change stays as it is.
+      this.logger.warn(
+        `Could not record the stop of session ${id}: no write took the row in ${KEEP_DOWN_PASSES} passes`,
+        {
+          sessionId: id,
+          action: 'session_stop_record_unsettled',
+        },
+      );
     }
   }
 
@@ -1990,13 +2092,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   /**
    * Get overall session statistics for multi-session monitoring
    */
-  async getStats(allowedSessions?: string[] | null): Promise<{
+  async getStats(
+    allowedSessions?: string[] | null,
+    options?: { includeMemoryUsage?: boolean },
+  ): Promise<{
     total: number;
     active: number;
     ready: number;
     disconnected: number;
     byStatus: Record<string, number>;
-    memoryUsage: { heapUsed: number; heapTotal: number; rss: number };
+    memoryUsage?: { heapUsed: number; heapTotal: number; rss: number };
   }> {
     // Scope to the caller's allowedSessions so a session-restricted key cannot enumerate the count /
     // status distribution of sessions it has no rights to (matches the scoped GET /sessions route).
@@ -2022,21 +2127,32 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       total += count;
     }
 
-    const memory = process.memoryUsage();
-
-    return {
+    const result: {
+      total: number;
+      active: number;
+      ready: number;
+      disconnected: number;
+      byStatus: Record<string, number>;
+      memoryUsage?: { heapUsed: number; heapTotal: number; rss: number };
+    } = {
       total,
       // engines is keyed by session id; a scoped key sees only its own running engines, not the global count.
       active: scope ? [...this.engines.keys()].filter(id => scope.includes(id)).length : this.engines.size,
       ready: byStatus[SessionStatus.READY] || 0,
       disconnected: byStatus[SessionStatus.DISCONNECTED] || 0,
       byStatus,
-      memoryUsage: {
+    };
+
+    if (options?.includeMemoryUsage) {
+      const memory = process.memoryUsage();
+      result.memoryUsage = {
         heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
         heapTotal: Math.round(memory.heapTotal / 1024 / 1024),
         rss: Math.round(memory.rss / 1024 / 1024),
-      },
-    };
+      };
+    }
+
+    return result;
   }
 
   /**
@@ -2050,10 +2166,23 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * The response's `engineLoaded`: an engine in this process, or a live claim by a peer node. A list
    * is answered by whichever node the request landed on, while the lifecycle routes are forwarded to
    * the owner, so a session a peer runs must not read as stopped. The local precondition checks keep
-   * using {@link isActive}.
+   * using {@link isActive}. Callers serving PostgreSQL read responses pass a DB-fetched `now` from
+   * {@link leaseClockNow} so `engineLoaded` agrees with DB-clock routing under clock skew.
    */
-  engineLoaded(session: Session): boolean {
-    return this.isActive(session.id) || !!this.ownership?.heldByOtherLiveNode(session);
+  engineLoaded(session: Session, now?: Date): boolean {
+    return this.isActive(session.id) || !!this.ownership?.heldByOtherLiveNode(session, now);
+  }
+
+  /**
+   * Reference UTC clock for evaluating `engineLoaded` over one or more loaded session rows.
+   * Queries PostgreSQL's DB clock once per response when running on Postgres; returns undefined on
+   * SQLite so `engineLoaded` uses the local clock with zero extra queries.
+   */
+  async leaseClockNow(): Promise<Date | undefined> {
+    if (this.ownership?.isPostgres && typeof this.ownership.getDbNow === 'function') {
+      return this.ownership.getDbNow();
+    }
+    return undefined;
   }
 
   /**
@@ -2074,6 +2203,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
   private startSlotsInUse(): Set<string> {
     return new Set([...this.engineLifecycle.startSlotHolders(), ...this.startReservations.keys()]);
+  }
+
+  /**
+   * Drop what this process keeps in memory for a session an infra import removed. Its claim too: left in place, the
+   * next heartbeat reads the missing row as a claim a peer took and reports a loss that never happened.
+   */
+  forgetSession(id: string): void {
+    this.ownership?.forget(id);
+    this.engineLifecycle.forgetSession(id);
   }
 
   /**
@@ -2110,8 +2248,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * narrows that case without closing it: a holder cut off from the database for longer than the
    * cutoff is marked too, and does not write its status back once it reconnects.
    */
-  async markLapsedDisconnected(sessions: Session[], goneBefore: Date): Promise<string[]> {
+  async markLapsedDisconnected(sessions: Session[], goneBefore: Date, graceMs?: number): Promise<string[]> {
     const marked: string[] = [];
+    const usePgClock = this.ownership?.isPostgres === true;
     for (const session of sessions) {
       if (!ACTIVE_STATUSES.includes(session.status)) continue;
       // A correction must never change what the takeover sweep adopts. It adopts every other active
@@ -2126,18 +2265,24 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // Both are guaranteed non-null by the lapsed-claim query that produced these rows, and both are
       // load-bearing in the predicate below. TypeORM throws on a null or undefined where value, so a
       // null here would fail this row's write instead of matching on it.
-      if (session.nodeId == null) continue;
-      if (session.leaseExpiresAt == null || session.leaseExpiresAt >= goneBefore) continue;
+      if (session.nodeId == null || session.leaseExpiresAt == null) continue;
+      // On PostgreSQL, the DB clock owns the cutoff so node-to-DB clock skew never skips or
+      // prematurely corrects a row; on SQLite, pre-filter in JS before issuing the UPDATE.
+      if (!usePgClock && session.leaseExpiresAt >= goneBefore) continue;
       // Written on the same predicate the read used, never by id alone: a peer, or this node's own
       // adopt loop, can claim and start this row at any moment, and a claim rewrites `nodeId`, so a
       // row that was taken matches nothing here and keeps the status its start gave it.
+      const leaseCutoff =
+        typeof this.ownership?.expiredBeforeOperator === 'function'
+          ? this.ownership.expiredBeforeOperator(goneBefore, graceMs)
+          : LessThan(goneBefore);
       let affected: number | undefined;
       try {
         ({ affected } = await this.sessionRepository.update(
           {
             id: session.id,
             nodeId: session.nodeId,
-            leaseExpiresAt: LessThan(goneBefore),
+            leaseExpiresAt: leaseCutoff,
             status: session.status,
             ...(unlinkedOnly && { phone: IsNull() }),
           },

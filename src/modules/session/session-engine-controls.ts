@@ -18,6 +18,7 @@ import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.ent
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 import { Template } from '../template/entities/template.entity';
+import { AutomationRule } from '../automation/entities/automation-rule.entity';
 import { BaileysStoredMessage } from '../../engine';
 import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
@@ -34,6 +35,7 @@ import { type createLogger } from '../../common/services/logger.service';
 import { HookManager } from '../../core/hooks';
 import { SessionLifecycleFences } from './session-lifecycle-fences';
 import { SessionStatusBroadcaster } from './session-status-broadcaster';
+import type { MessageProjector } from './message-projector.service';
 import { sessionNotFound } from './session-id.pipe';
 // The two pure config resolvers stay exported from the lifecycle module (its export surface is
 // unchanged — session.service re-exports them from there), so this unit imports them back. The
@@ -100,6 +102,16 @@ export const SESSION_DELETE_READ_AHEAD_POSTGRES = 20;
 export function nextSqliteDeleteBatchSize(rows: number, tookMs: number): number {
   const scaled = Math.round((rows * SESSION_DELETE_BATCH_TARGET_MS_SQLITE) / Math.max(tookMs, 1));
   return Math.max(SESSION_DELETE_BATCH_MIN_SQLITE, Math.min(SESSION_DELETE_BATCH_SIZE_SQLITE, rows * 2, scaled));
+}
+
+/**
+ * Refuse a delete that found its claim gone. When the session row is gone too, another delete of the session removed
+ * it and nothing changed owner: the answer is the 404 the same request gets a moment later, not a 409 that points at
+ * another node. A row that is still there is held by someone else or under another claim, and stays the conflict.
+ */
+export async function refuseLostDeleteClaim(manager: EntityManager, id: string, conflict: string): Promise<never> {
+  if (!(await manager.exists(Session, { where: { id } }))) throw sessionNotFound(id);
+  throw new ConflictException(conflict);
 }
 
 /** One table's pass of the batched delete: the repository to delete from and the reader of the next page of ids. */
@@ -258,12 +270,15 @@ export interface SessionEngineControlsHost {
   sessionErrors: SessionErrorStore;
   sessionRestrictions: SessionRestrictionStore;
   presence: PresenceStore;
+  projector?: Partial<Pick<MessageProjector, 'forgetSession'>>;
   hookManager: HookManager;
   configService?: ConfigService;
   nodeId?: string;
   /** Same contract as SessionEngineWiringHost.bindingEpoch. */
   bindingEpoch(id: string): number;
   forgetBindingEpoch?(id: string): void;
+  /** delete(), once the row is removed: the claim guards nothing from there on (SessionOwnershipService.forget). */
+  forgetClaim?(id: string, ownsClaim?: () => boolean): void;
   /**
    * `read`, once the phone writes this process issued (an unlink's clear, the number and push name a READY links, the
    * clear of a logout) have been answered: a row read that overlaps one can return the binding it replaces.
@@ -281,7 +296,7 @@ export interface SessionEngineControlsHost {
   isSessionRetired(id: string): Promise<boolean>;
   prepareStart(id: string, desiredState: Session['desiredState']): Promise<boolean>;
   purgeAuthDirsIfDeleted(id: string): Promise<void>;
-  updateStatus(id: string, status: SessionStatus): Promise<void>;
+  updateStatus(id: string, status: SessionStatus, options?: { allowUnowned?: boolean }): Promise<boolean | void>;
   /** Ownership gate, same contract as SessionEngineWiringHost.ownsSession. */
   ownsSession(id: string): boolean;
   /** True once shutdown() has begun; the lifecycle never reopens. */
@@ -768,7 +783,7 @@ export class SessionEngineControls {
           // settled (Map reconciled, status DISCONNECTED — mirroring logout()'s incomplete path), but
           // the stop is reported as incomplete instead of claimed clean: a retryable 502 with a stable
           // code, and no success log (the controller audits SESSION_STOPPED only after this resolves).
-          await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+          await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
           throw new BadGatewayException({
             statusCode: HttpStatus.BAD_GATEWAY,
             message:
@@ -790,7 +805,7 @@ export class SessionEngineControls {
       sessionId: id,
       action: 'stop',
     });
-    await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+    await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
     return this.requireSession(id);
   }
 
@@ -894,9 +909,17 @@ export class SessionEngineControls {
       // the session into a QR it can never pass on every restart. onReady rewrites it on the next link.
       // Issued in the step that evicts the engine: a start that finds none registered reads the row only once this
       // clear has been answered, and a READY's number still waiting on an earlier write goes in before it.
-      const clearPhone = (): Promise<unknown> => this.sessionRepository.update(id, { phone: null });
+      const nodeId = this.host.nodeId;
+      const phoneWhere =
+        nodeId === undefined
+          ? id
+          : [
+              { id, nodeId },
+              { id, nodeId: IsNull() },
+            ];
+      const clearPhone = (): Promise<unknown> => this.sessionRepository.update(phoneWhere, { phone: null });
       await (this.host.writePhone?.(id, clearPhone) ?? clearPhone());
-      await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+      await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
     } finally {
       if (!teardownLaunched) {
         releaseTeardown();
@@ -986,7 +1009,7 @@ export class SessionEngineControls {
       if (!tornDown) {
         // As in stop(): local state is settled, but a kill that may have left the process alive is
         // reported as incomplete, not claimed clean (the controller audits only after a resolve).
-        await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+        await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
         throw new BadGatewayException({
           statusCode: HttpStatus.BAD_GATEWAY,
           message:
@@ -1001,7 +1024,7 @@ export class SessionEngineControls {
         sessionId: id,
         action: 'force_kill',
       });
-      await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+      await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
     } finally {
       if (this.operatorTeardowns.get(id) === engine) {
         this.operatorTeardowns.delete(id);
@@ -1068,7 +1091,7 @@ export class SessionEngineControls {
         await this.fences.awaitPendingTeardown(session.name);
       } catch (fenceError) {
         if (engine) {
-          await this.host.updateStatus(id, SessionStatus.DISCONNECTED).catch(() => undefined);
+          await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true }).catch(() => undefined);
         }
         throw fenceError;
       }
@@ -1121,6 +1144,7 @@ export class SessionEngineControls {
         await manager.delete(StatusUpdate, { sessionId: id });
         await manager.delete(Webhook, { sessionId: id });
         await manager.delete(Template, { sessionId: id });
+        await manager.delete(AutomationRule, { sessionId: id });
         await manager.delete(BaileysStoredMessage, { sessionId: id });
         await manager.delete(WebhookOutboxEvent, { sessionId: id });
         await manager.delete(WebhookDeliveryFailure, { sessionId: id });
@@ -1129,6 +1153,9 @@ export class SessionEngineControls {
         await manager.remove(session);
       });
       parentDeleted = true;
+      // The row is gone, so the claim on it guards nothing: a heartbeat tick during the credential purge would read
+      // the missing row as a claim a peer took, and tear down a session this delete already removed.
+      this.host.forgetClaim?.(id, hooks.ownsClaim);
       this.logger.log(`Session deleted: ${session.name}`, {
         sessionId: id,
         action: 'delete',
@@ -1177,28 +1204,35 @@ export class SessionEngineControls {
         this.stoppingSessions.deleteStamped(id, ownMark);
         if (hooks.mark !== undefined) this.stoppingSessions.deleteStamped(id, hooks.mark);
       }
-      if (parentDeleted) {
-        this.broadcaster.clear(id);
-        // Drop the FAILED-reason entry too: it's keyed by a now-deleted UUID that can never be read
-        // again, so leaving it would grow the map without bound across create/fail/delete churn.
-        this.sessionErrors.clear(id);
-        // Same unbounded-growth argument for the restriction entry, and the gauge it feeds must not
-        // keep counting an account whose session no longer exists.
-        this.sessionRestrictions.clear(id);
-        // Presence is per-connection state that the deleted session can never receive again, and it
-        // is keyed by an id that will never be read.
-        this.presence.clear(id);
-        // The stuck-auth recovery budget is keyed by id; a committed delete frees it (and a recreated
-        // session under the same name gets a fresh UUID + fresh budget). Left only on a committed
-        // delete so a failed/409 delete — the session still exists — keeps the budget intact.
-        this.stuckAuthRecoveryUsed.delete(id);
-        this.host.forgetBindingEpoch?.(id);
-      }
+      if (parentDeleted) this.forgetSession(id);
       // NOTE: pendingTeardowns is intentionally NOT cleared here. It is keyed by session NAME and
       // its entries self-remove on settlement (identity-checked). A delete that refused at either
       // fence MUST leave the entry in place — the name is still reserved against the live remover —
       // and a delete that succeeded already saw both fences pass, so no live remover exists.
     }
+  }
+
+  /**
+   * Drop what this process keeps in memory for a session whose row is gone: by a committed delete, or by an infra import
+   * that replaced the table without it. Never for a session that still exists.
+   */
+  forgetSession(id: string): void {
+    this.broadcaster.clear(id);
+    // Drop the FAILED-reason entry too: it's keyed by a now-deleted UUID that can never be read
+    // again, so leaving it would grow the map without bound across create/fail/delete churn.
+    this.sessionErrors.clear(id);
+    // Same unbounded-growth argument for the restriction entry, and the gauge it feeds must not
+    // keep counting an account whose session no longer exists.
+    this.sessionRestrictions.clear(id);
+    // Presence is per-connection state that the deleted session can never receive again, and it
+    // is keyed by an id that will never be read.
+    this.presence.clear(id);
+    // The stuck-auth recovery budget is keyed by id; a committed delete frees it (and a recreated
+    // session under the same name gets a fresh UUID + fresh budget). Left only on a committed
+    // delete so a failed/409 delete (the session still exists) keeps the budget intact.
+    this.stuckAuthRecoveryUsed.delete(id);
+    this.host.forgetBindingEpoch?.(id);
+    this.host.projector?.forgetSession?.(id);
   }
 
   /**
@@ -1307,10 +1341,15 @@ export class SessionEngineControls {
           .set({ nodeId: this.host.nodeId, updatedAt: () => '"updatedAt"' })
           .where({ id: session.id, nodeId: this.host.nodeId, claimedAt: session.claimedAt ?? IsNull() })
           .execute();
-        if (affected !== 1) throw new ConflictException(`Session ${session.id} is no longer owned by this node`);
+        if (affected !== 1) {
+          return refuseLostDeleteClaim(manager, session.id, `Session ${session.id} is no longer owned by this node`);
+        }
       }
-      if (ownsClaim?.() === false)
+      // A delete holds a claim only where ownership is wired, so the update above matched the row and locked it: the
+      // row is still there, and a claim this delete lost is a conflict, never a 404.
+      if (ownsClaim?.() === false) {
         throw new ConflictException(`Session ${session.id} is no longer owned by this delete`);
+      }
       await remove(manager);
     });
   }
@@ -1428,13 +1467,10 @@ export class SessionEngineControls {
           return;
         }
         try {
-          const tornDown = await this.fences.destroyWithEscalation(id, engine);
-          // The engine leaves the Map regardless of teardown outcome so it stops holding a
-          // concurrency slot — but only a completed teardown counts as `stopped`. A throw/timeout
-          // means the Chromium/socket may still be alive and writing, so the id lands in `failed`
-          // and the caller (the infra import) can flag restartRequired instead of reporting a
-          // clean stop for a wedged engine.
+          // Evict from the live registry before teardown settles so concurrent callers stop seeing
+          // or reusing the departing engine immediately.
           this.engines.deleteIfLive(id, engine);
+          const tornDown = await this.fences.destroyWithEscalation(id, engine);
           if (tornDown) {
             stopped.push(id);
           } else {

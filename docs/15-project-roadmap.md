@@ -40,7 +40,7 @@ timeline
                  : Bundled Traefik removed
                  : Bring-your-own reverse proxy
 
-    section v0.5.0-v0.30.x - Incremental Releases (Released)
+    section v0.5.0-v0.32.x - Incremental Releases (Released)
         Jun-Oct 2026 : Integration Fabric provisioning
                      : Java & Go SDKs
                      : Live message edits
@@ -82,7 +82,7 @@ timeline
 | v0.10.x | Chat `kind` discriminator, 24-hour status store, Docker Hub dual-publish                             | ✅ Released |
 | v0.11.0 | SDK poll / profile-picture / status-media coverage, security & reliability hardening                 | ✅ Released |
 | v0.12.x | Session/engine decomposition (`EngineRegistry`), plugin lifecycle and configuration-precedence fixes | ✅ Released |
-| v0.13+  | Incremental releases through v0.30.x; see `CHANGELOG.md`                                             | ✅ Released |
+| v0.13+  | Incremental releases through v0.32.x; see `CHANGELOG.md`                                             | ✅ Released |
 | v1.0.0  | Enterprise Ready (K8s Operator, multi-tenant)                                                        | 📋 Planned  |
 
 > SDK / docs-site / observability features are delivered **incrementally** as they're additive — they no
@@ -529,10 +529,10 @@ flowchart LR
         V020[v0.2.0 - i18n, Real-time Chats,<br/>Webhook Delivery-state & Hardening]
     end
 
-    subgraph v0.x["✅ Released (v0.3-v0.30.x)"]
+    subgraph v0.x["✅ Released (v0.3-v0.32.x)"]
         V030[v0.3.0 - Engine Pluggability<br/>Baileys engine + plugin layer]
         V040[v0.4.0 - Single-Port Deployment<br/>Dashboard on API port, no bundled Traefik]
-        V011[v0.5.0-v0.30.x - Incremental releases<br/>see the CHANGELOG]
+        V011[v0.5.0-v0.32.x - Incremental releases<br/>see the CHANGELOG]
     end
 
     subgraph v1.x["v1.x Series - Enterprise"]
@@ -660,6 +660,17 @@ PR, and pushing the tag from `main` hands everything else to `.github/workflows/
 - The amd64 image's Chrome for Testing pin (`chrome@<version>` in the `Dockerfile`) is the current
   Stable in `last-known-good-versions.json`. Nothing else refreshes it and no image scan sees it, so
   bump it on `main` first, as the comment above that install describes.
+- The arm64 image has no pin: it installs the `chromium` Debian ships when the layer is built, and the
+  release workflow rebuilds that layer without cache, so its browser major can change between two releases
+  with nothing changed on `main`. Compare the major of the last release's image
+  (`docker run --rm --platform linux/arm64 --entrypoint /usr/local/bin/puppeteer-chrome ghcr.io/rmyndharis/openwa:<last> --version`)
+  with the Candidate that
+  `docker run --rm --platform linux/arm64 docker.io/node:22-slim sh -c 'apt-get update -qq >/dev/null; apt-cache policy chromium'`
+  prints, and when they differ give the release the same browser-major Upgrade note as an amd64 pin bump.
+- The Node base image pin (one digest shared by both `FROM` lines of the `Dockerfile`) equals what
+  `docker buildx imagetools inspect docker.io/node:22-slim` serves, or the newer image carries no Node
+  security release. The scheduled `base-image-drift` job tolerates a newer image for up to a week, so a
+  green run does not show that the pin is current.
 - Name the version wherever the text was written before it was known, in a docs commit on `main` ahead of
   the release commit: every `next` in the Release column of the Known Upgrade Hazards table in
   `docs/14-migration-guide.md`, one for each hazard the release added, and every clause that says
@@ -714,7 +725,7 @@ npm run check:versions && npm run openapi:check && npm run lint && npm run forma
 npx tsc --noEmit -p tsconfig.json && npm run check:dockerignore
 npm run check:sdk-routes && npm run check:sdk-coverage && npm run check:sdk-events && npm run check:sdk-docs
 npm run check:contract-shapes
-CHECK_AUDIT_REQUIRED=1 npm run check:audit && (cd dashboard && npm audit --audit-level=high)
+CHECK_AUDIT_REQUIRED=1 npm run check:audit && (cd dashboard && CHECK_AUDIT_REQUIRED=1 node ../scripts/check-audit.mjs)
 npm run test:cov && npm run test:scripts && npm run test:docs && npm run test:e2e && npm run build && npm run test:engine-real
 cd dashboard && npm run lint && npm run format:check && npm run typecheck && npm run i18n:check && npm run build && npm run test:unit
 ```
@@ -806,9 +817,8 @@ after confirming it carries no release tag.
 Two failure classes are worth anticipating because they depend on the outside world rather than on
 the change being released:
 
-- **The dependency audit** in the release gate (`npm run check:audit` for the root,
-  `npm audit --audit-level=high` for the dashboard) is time-dependent: a tree that was clean last week
-  can fail on a newly published advisory.
+- **The dependency audit** in the release gate (`scripts/check-audit.mjs`, run for the root and for the
+  dashboard) is time-dependent: a tree that was clean last week can fail on a newly published advisory.
 - **The image scan reads the base image**, including the dependency tree bundled inside its npm CLI,
   which `npm audit` never sees. Accepted findings live in `.trivyignore`, each with a written
   justification and the condition for removing it.

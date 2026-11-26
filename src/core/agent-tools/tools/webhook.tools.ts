@@ -2,9 +2,10 @@ import { z } from 'zod';
 import { ApiKeyRole } from '../../../modules/auth/entities/api-key.entity';
 import type { WebhookService } from '../../../modules/webhook/webhook.service';
 import { WebhookResponseDto } from '../../../modules/webhook/dto/webhook.dto';
-import { defineTool, type AnyToolDescriptor } from '../tool-descriptor';
+import { listLimitSchema } from '../list-limit-schema';
+import { defineTool, sessionIdSchema, type AnyToolDescriptor } from '../tool-descriptor';
 
-const sessionId = z.string().min(1).describe('Session UUID (the session id, not the name)');
+const sessionId = sessionIdSchema;
 
 export function webhookTools(webhook: WebhookService): AnyToolDescriptor[] {
   return [
@@ -15,7 +16,7 @@ export function webhookTools(webhook: WebhookService): AnyToolDescriptor[] {
       tier: 'read',
       requiredRole: ApiKeyRole.OPERATOR,
       inputSchema: z.object({
-        limit: z.number().int().min(1).max(1000).optional(),
+        limit: listLimitSchema,
         offset: z.number().int().min(0).optional(),
       }),
       handler: (input, apiKey) =>

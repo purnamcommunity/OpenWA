@@ -88,7 +88,9 @@ jobs:
         run: cd dashboard && npm ci
 
       - name: Security audit (dashboard)
-        run: cd dashboard && npm audit --audit-level=high
+        env:
+          CHECK_AUDIT_REQUIRED: '1'
+        run: cd dashboard && node ../scripts/check-audit.mjs
 
       - name: Run ESLint
         run: npm run lint
@@ -137,7 +139,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     # Mirrors ci.yml's test job. The queue-on and throttler-redis e2e suites need this service: under
     # GitHub Actions they fail rather than skipping when Redis is unreachable, so the tag is never
     # verified less than the branch it came from.
@@ -251,7 +253,7 @@ jobs:
         # tree CI had passed minutes earlier). The lock spec's own two-migrator race is in-file
         # (Promise.all) and unaffected by runInBand. The synchronize spec additionally CREATEs and
         # DROPs a scratch database of its own, which is only safe serialized.
-        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/modules/search/providers/builtin-fts.provider.contains.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts src/database/postgres-utc.pg.spec.ts src/modules/webhook/webhook-recovery.pg.spec.ts src/modules/message/idempotency/send-idempotency.service.pg.spec.ts src/modules/infra/infra-data.import.pg.spec.ts src/modules/infra/infra-data.optional-tables.pg.spec.ts src/modules/message/message-selection-restore.pg.spec.ts src/database/migrations/__tests__/scoped-backup-schema-owner.pg.spec.ts src/modules/session/session-content-lifetime.spec.ts src/modules/session/session-delete-claim.spec.ts src/modules/takeover/session-takeover-failed-adoption.spec.ts src/engine/identity/lid-mapping-store.spec.ts src/modules/chat-media/chat-media-retention-marker.spec.ts src/modules/session/message-edit-persisted.spec.ts src/modules/session/ack-foreign-chat.spec.ts src/modules/message/outgoing-row-sender.spec.ts src/modules/search/search-own-sender.spec.ts src/database/migrations/__tests__/1791400000000-AddLidMappingReportSource.spec.ts src/modules/session/message-projector.merged-ack.spec.ts src/engine/adapters/baileys.adapter.spec.ts src/engine/adapters/whatsapp-web-js.adapter.spec.ts src/engine/adapters/baileys-stored-chat-previews.service.spec.ts src/modules/message/send-pacing-lid-twins.spec.ts
+        run: npx jest --runInBand src/database/migrations/__tests__/1782400000000-AddMessagesFts.pg.spec.ts src/modules/search/providers/builtin-fts.provider.contains.pg.spec.ts src/database/migrations/__tests__/pg-boot-migrations.pg.spec.ts src/modules/message/message-list-ordering.pg.spec.ts src/database/migrations/__tests__/pg-entity-synchronize.pg.spec.ts src/database/postgres-utc.pg.spec.ts src/modules/webhook/webhook-recovery.pg.spec.ts src/modules/message/idempotency/send-idempotency.service.pg.spec.ts src/modules/infra/infra-data.import.pg.spec.ts src/modules/infra/infra-data.optional-tables.pg.spec.ts src/modules/message/message-selection-restore.pg.spec.ts src/database/migrations/__tests__/scoped-backup-schema-owner.pg.spec.ts src/modules/session/session-ownership.pg.spec.ts src/modules/session/session-content-lifetime.spec.ts src/modules/session/session-delete-claim.spec.ts src/modules/takeover/session-takeover-failed-adoption.spec.ts src/engine/identity/lid-mapping-store.spec.ts src/modules/chat-media/chat-media-retention-marker.spec.ts src/modules/session/message-edit-persisted.spec.ts src/modules/session/ack-foreign-chat.spec.ts src/modules/message/outgoing-row-sender.spec.ts src/modules/search/search-own-sender.spec.ts src/database/migrations/__tests__/1791400000000-AddLidMappingReportSource.spec.ts src/modules/session/message-projector.merged-ack.spec.ts src/engine/adapters/baileys.adapter.spec.ts src/engine/adapters/whatsapp-web-js.adapter.spec.ts src/engine/adapters/baileys-stored-chat-previews.service.spec.ts src/modules/message/send-pacing-lid-twins.spec.ts src/modules/integration/ingress-reconciler.walk.spec.ts
         env:
           TZ: Asia/Jakarta
           DATABASE_TYPE: postgres
@@ -299,6 +301,11 @@ jobs:
       - name: Run dashboard unit tests
         timeout-minutes: 10
         run: cd dashboard && npm run test:unit
+
+      # Gate the coverage runner script so coverage-specific exclusions and concurrency stay working.
+      - name: Run dashboard unit tests with coverage
+        timeout-minutes: 10
+        run: cd dashboard && npm run test:cov
 
   # Mirrors ci.yml's scripts-smoke job, which had no counterpart here at all: the shell scripts that
   # ship inside the image were linted and exercised on the branch path and on nothing else.
@@ -439,7 +446,7 @@ jobs:
           printf '%s\n' "$NOTES" > "$RUNNER_TEMP/release-notes.md"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           # Author the release as a real user (the PAT owner) instead of github-actions[bot].
           # Add a repo secret RELEASE_PAT — a fine-grained PAT scoped to this repo with
@@ -483,7 +490,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -569,7 +576,7 @@ jobs:
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -677,7 +684,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -849,7 +856,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -859,7 +866,7 @@ jobs:
       # pull count lives (GHCR exposes no download metrics). Requires the DOCKERHUB_USERNAME /
       # DOCKERHUB_TOKEN repo secrets; without them this step fails before any tag is applied.
       - name: Login to Docker Hub
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

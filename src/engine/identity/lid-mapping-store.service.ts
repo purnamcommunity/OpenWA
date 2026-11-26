@@ -25,7 +25,8 @@ const LID_QUERY_CHUNK = 500;
  * that has something to write (each inbound message that carries the lid, while its write keeps failing),
  * since a report held back would leave the table naming a number the contact no longer has; the warning is
  * what is bounded, to one in this interval for the whole store, with a count of the failures in between. A
- * dropped second-lid check and a failed second-lid read are logged the same way, each on its own.
+ * dropped second-lid check, a failed second-lid read, a failed-write mark the bound forgets and a lid it forgets again
+ * after the lid was reported are logged the same way, each on its own.
  */
 const LID_WRITE_WARN_MS = 60_000;
 
@@ -44,6 +45,29 @@ interface SecondLidCheck {
   queued: boolean;
 }
 
+/** The writes of one lid under way, one entry per lid: see {@link LidMappingStoreService.unsettledWrites}. */
+interface UnsettledWrite {
+  count: number;
+  latestReport?: object;
+  latestOperation?: { phone: string | null };
+  latestOpSeq?: number;
+  check?: SecondLidCheck;
+  /**
+   * The phone of the latest actual report begun, until every write of the lid has settled. The lid's mirror entry can
+   * leave while that write is under way (the LRU, a reload), and this is what a row of the table is held against then.
+   */
+  reportPhone?: string;
+  /**
+   * The display lookup that contradicted the stored phone, while its revocation has not settled and no report or
+   * clearing negative has taken its place: no row is answered meanwhile.
+   */
+  revoking?: object;
+  /** The latest actual call begun, a report or a negative. Unlike `latestReport`, an eviction or a reload leaves it. */
+  latestActual?: object;
+  /** A statement of these writes failed, so the table may lack what the cache holds. */
+  failed?: boolean;
+}
+
 /** An engine reported `newLid` for a phone the table already maps to the reported `previousLid`. */
 export interface SecondLidReport {
   phone: string;
@@ -52,11 +76,30 @@ export interface SecondLidReport {
   sessionId: string | null;
 }
 
-/** Set a key as the newest, dropping the oldest past `max`; whether one was dropped. */
-function setNewest<V>(map: Map<string, V>, key: string, value: V, max: number): boolean {
+/** A non-null lid->phone mapping persisted by {@link LidMappingStoreService.remember}. */
+export interface LearnedLidMapping {
+  lid: string;
+  phone: string;
+}
+
+/** Set a key as the newest, dropping the oldest past `max`; the key dropped, if any. */
+function setNewest<V>(map: Map<string, V>, key: string, value: V, max: number): string | undefined {
   map.delete(key);
   map.set(key, value);
-  return map.size > max && map.delete(map.keys().next().value as string);
+  if (map.size <= max) return undefined;
+  const oldest = map.keys().next().value as string;
+  map.delete(oldest);
+  return oldest;
+}
+
+/** Bits of the record of dropped failed-write marks: 128 KiB, however many marks the bound drops. */
+const DROPPED_MARK_BITS = 1 << 20;
+
+/** The bit a lid takes in the record of dropped marks (FNV-1a, its high bits). */
+function markBit(lid: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < lid.length; i++) hash = Math.imul(hash ^ lid.charCodeAt(i), 0x01000193);
+  return hash >>> 12;
 }
 
 function chunk<T>(items: T[], size = LID_QUERY_CHUNK): T[][] {
@@ -74,16 +117,22 @@ function chunk<T>(items: T[], size = LID_QUERY_CHUNK): T[][] {
 export interface LidMappingStore {
   /**
    * Sync read from the in-memory cache: phone digits, `null` = known-unresolved, `undefined` = never
-   * seen. A miss is warmed from the persisted table in the background, so a later read can hit.
+   * seen. A miss is warmed from the persisted table in the background, so a later read can hit. An entry
+   * is judged as a stored row is: while this process holds a failed write of the lid against another
+   * phone, the entry is not returned.
    */
   getCached(lid: string): string | null | undefined;
   /**
    * Resolve any WA JID through the mirror: the phone digits for its user part, `null` when the lid
-   * is known-unresolved, unreported or never seen. This hot-cache view may lag another process;
-   * alias authorization and rule matching await the persisted reads below.
+   * is known-unresolved, unreported, never seen or held against its entry by a failed write. This
+   * hot-cache view may lag another process; alias authorization and rule matching await the persisted
+   * reads below.
    */
   resolveLid(jid: string): string | null;
-  /** Sync reverse lookup: the lids currently mapped to this phone (used by the message from-filter). */
+  /**
+   * Sync reverse lookup: the lids currently mapped to this phone, less those a failed write holds against
+   * it. The Baileys store scopes a chat's twin keys, and so what a chat deletion removes, with it.
+   */
   lidsForPhone(phone: string): string[];
   /** The phone the table holds for a lid JID, read from the database; null when none is stored. */
   findPhoneForLid?(jid: string): Promise<string | null>;
@@ -145,16 +194,15 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
    * Lids whose row this process has indexed but not yet committed. `remember()` updates the in-memory
    * maps synchronously and writes the table afterwards, so between the two a table read answers "no
    * row" about a mapping that is about to exist. The forward map cannot stand in for this: the LRU
-   * can evict the entry inside that same window, leaving it indistinguishable from never-learned.
+   * can evict the entry inside that same window, leaving it indistinguishable from never-learned, and a reload
+   * leaves it out. What the table's row is held against meanwhile, the phone of an actual report or a revocation by
+   * a display lookup, lives on this entry ({@link UnsettledWrite}) until the last write of the lid settles.
    * Counted per lid, so the first of two overlapping writes settling does not clear the second. The
    * latest actual report's token remains until all older writes settle, isolating their late results.
    * It also holds the second-lid check the latest new pairing owes until a landed write queues it, for a report
    * overlapping it.
    */
-  private readonly unsettledWrites = new Map<
-    string,
-    { count: number; latestReport?: object; latestOperation?: { phone: string | null }; check?: SecondLidCheck }
-  >();
+  private readonly unsettledWrites = new Map<string, UnsettledWrite>();
   /**
    * Lids a write started for while their table read was in flight. That read may have run before the
    * write committed, so whatever it answers predates the mapping this process now holds.
@@ -171,10 +219,62 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
    */
   private readonly seenBy = new Map<string, Set<string>>();
   /**
-   * Cached phones whose report is pending or failed, or whose cached contradiction failed to persist.
-   * Kept only while the cache holds that phone, until a current write lands or a negative clears it.
+   * Cached phones whose report is pending or failed.
+   * Kept only while the cache holds that phone, until a current write lands or a negative clears it. A write still
+   * under way keeps its own witness on its {@link unsettledWrites} entry, which eviction and a reload leave.
    */
   private readonly failedWrites = new Set<string>();
+  /**
+   * The phone a write failed to store, by lid: that of a report that did not land, or none (an empty one, which no
+   * row has) for a display lookup that did not store, whose statement may have revoked a row this node never saw, so
+   * that no row is answered. The table still names the phone the write was to replace, so the entry that
+   * {@link failedWrites} marks going out with the mirror entry (the cap, a reload) must not make the lid answer it
+   * again. It outranks an entry warmed back from that row. Ended by a report of the lid that begins or lands, a
+   * negative that clears the row and a reload, which replaces the table, except for the marks of lids written while its
+   * read was out. Bounded like the mirror (`LID_MAPPING_CACHE_MAX`), oldest first; the lid of a mark the bound drops
+   * goes on in {@link droppedMarks}. The mark of a failed lookup is not ended by another node's later report of the lid,
+   * as a lookup that landed would be: only this node's own report, a negative that clears the row or a reload ends it,
+   * and a row that names another phone than the lookup is refused until then.
+   */
+  private readonly failedPhones = new Map<string, string>();
+  /**
+   * The lids whose mark in {@link failedPhones} the bound dropped, as a bit per hash of the lid, so that its size stays
+   * fixed however many marks go: a lid that hashes to a set bit may have lost its mark, as may another lid that shares
+   * the bit. Such a lid with no mirror entry, no mark and no report under way answers no phone, and is not warmed back
+   * from the table, which may still name the phone it replaced. A report of it that lands puts it in {@link recovered},
+   * so the lid answers its row again. Ended by a reload, except for the lids written while its read was out.
+   */
+  private droppedMarks?: Uint8Array;
+  private readonly markDropWarning = { at: -Infinity, held: 0 };
+  /**
+   * The lids whose report landed while {@link droppedMarks} held their bit: each answers, and is warmed back, as a
+   * lid no mark of which was dropped, until a mark of its own goes again. Kept apart from the failed-write marks,
+   * which it neither pushes out nor outranks. Bounded like them, oldest report first: a lid that goes is in the record
+   * again, and answers no phone once it has no mirror entry, until it is reported again or the mapping reloads. A
+   * reload leaves it, as the lid has no mark the reload could end.
+   */
+  private readonly recovered = new Set<string>();
+  private readonly recoveryDropWarning = { at: -Infinity, held: 0 };
+  /**
+   * The table statements of each lid with a write under way, as one chain. A pool hands the statements of two writes
+   * to two connections, which can apply them in either order, and on any database a write of two statements (a
+   * negative, a display lookup) lets the statement of a call made in the same turn in between them. So the table could
+   * end on what the older call said: a report behind the display lookup that contradicted it, the phone of the earlier
+   * of two reports, or a pair behind the negative that cleared it.
+   */
+  private readonly turns = new Map<string, Promise<void>>();
+  /**
+   * For each {@link reload} whose table read is out, the lids with a write under way when it began or begun since.
+   * Its snapshot may predate what those writes store.
+   */
+  private readonly reloadsOut = new Set<Set<string>>();
+  /** Monotonic reload sequence so stale warmFromTable reads cannot mutate post-reload cache/absence state. */
+  private reloadSeq = 0;
+  /** Monotonic write-operation sequence for gating failedWrites cleanup independently of seenBy. */
+  private opSeq = 0;
+  /** Per-lid mapping epoch reset on phone changes, revocations, clears, evictions, and reloads, but never on releaseSession(). */
+  private readonly mappingEpoch = new Map<string, number>();
+  private nextEpoch = 0;
   /** When a failed write was last logged, on {@link now}, and how many have failed since without a line. */
   private readonly writeWarning = { at: -Infinity, held: 0 };
   /**
@@ -195,6 +295,7 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
   private readonly secondLidReported = new Map<string, number>();
   private secondLidClosing = false;
   private secondLidListener?: (report: SecondLidReport) => unknown;
+  private readonly mappingLearnedListeners = new Set<(mapping: LearnedLidMapping) => void>();
   /** Monotonic clock in ms (a seam for tests). */
   private readonly now = (): number => performance.now();
   // 0 = unbounded (legacy behaviour). Every other long-lived map in the engine surface is bounded, so
@@ -229,9 +330,16 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
    * fail the import — resolution falls back to engine re-resolution until the table is readable.
    */
   async reload(): Promise<void> {
+    this.reloadSeq++;
     // Dropped before the read too: a restore may have replaced the table, so if the read fails, a lid
     // not cached must read through rather than trust a stale absence.
     this.absentFromTable.clear();
+    // A lid whose write is under way when the read starts, or begins while it is out, is not taken from the
+    // snapshot: the row may predate what that write stores, and the entry would go on answering it once the write
+    // has landed (the phone a negative cleared, or the one a report replaced). It stays uncached, and the next read
+    // warms it once its writes have settled (see warmFromTable).
+    const raced = new Set(this.unsettledWrites.keys());
+    this.reloadsOut.add(raced);
     try {
       // Deterministic preload: an unordered find() followed by LRU eviction keeps an ARBITRARY
       // subset once the table exceeds the cap. Order by last-write and take at most the cap, so
@@ -241,11 +349,19 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
         order: { updatedAt: 'DESC' },
         take: this.maxCachedLids > 0 ? this.maxCachedLids : undefined,
       });
+      this.reloadSeq++;
       this.lidToPhone.clear();
       this.unreported.clear();
       this.phoneToLids.clear();
       this.seenBy.clear();
+      this.mappingEpoch.clear();
       this.failedWrites.clear();
+      // The marks that predate the read go with the table they were made against. A write that failed while the read was
+      // out made its own, for a lid that is not taken from the snapshot: that mark is all that refuses the lid then.
+      for (const lid of [...this.failedPhones.keys()]) if (!raced.has(lid)) this.failedPhones.delete(lid);
+      const racedDrops = [...raced].filter(lid => this.markDropped(lid));
+      this.droppedMarks?.fill(0);
+      for (const lid of racedDrops) this.recordDropped(lid);
       for (const writing of this.unsettledWrites.values()) {
         delete writing.latestReport;
         delete writing.latestOperation;
@@ -255,13 +371,15 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
       // Oldest first, so the newest row ends at the most-recent end of the LRU rather than the first
       // one evicted.
       for (const row of rows.reverse()) {
-        this.index(row.lid, row.phone, row.sessionId, row.isReported);
+        if (!raced.has(row.lid)) this.index(row.lid, row.phone, row.sessionId, row.isReported);
       }
       this.logger.log(
         `Loaded ${rows.length} lid->phone mappings into cache${this.maxCachedLids ? ` (cap ${this.maxCachedLids})` : ''}`,
       );
     } catch (err) {
       this.logger.warn(`Could not preload lid->phone mappings: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.reloadsOut.delete(raced);
     }
   }
 
@@ -272,7 +390,7 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
       const phone = this.lidToPhone.get(lid);
       this.lidToPhone.delete(lid);
       this.lidToPhone.set(lid, phone as string | null);
-      return phone;
+      return phone && this.markedOut(lid, phone) ? null : phone;
     }
     this.warmFromTable(lid);
     return undefined;
@@ -285,7 +403,19 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
 
   lidsForPhone(phone: string): string[] {
     const set = this.phoneToLids.get(phone);
-    return set ? [...set].filter(lid => !this.unreported.has(lid)) : [];
+    return set ? [...set].filter(lid => !this.unreported.has(lid) && !this.markedOut(lid, phone)) : [];
+  }
+
+  /**
+   * A failed write of the lid names another phone than its entry holds (the empty mark names none): the entry is the
+   * row a read warmed back, which the write was to replace, or one a conflicting lookup revoked. The synchronous views
+   * leave it out, as the readers that await judge a row, so what a caller scopes with them (the Baileys store
+   * expands a chat deletion and its state over them) never reaches a lid this process knows has moved. An entry that
+   * is the phone the mark names is this process's own, and stays.
+   */
+  private markedOut(lid: string, phone: string): boolean {
+    const mark = this.failedPhones.get(lid);
+    return mark !== undefined && mark !== phone;
   }
 
   /**
@@ -300,7 +430,7 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
       return (await this.readLidsForPhones([phone]))[phone];
     } catch (err) {
       this.logger.warn(`Could not read lids for a phone: ${err instanceof Error ? err.message : String(err)}`);
-      return this.lidsForPhone(phone).filter(lid => !this.unreported.has(lid));
+      return this.lidsForPhone(phone);
     }
   }
 
@@ -314,7 +444,7 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
     if (lids.length === 0) return out;
     // The mirror is only the fallback for a failed table read, so it is read without getCached:
     // that warms every miss with a findOne of its own, one per lid ahead of the batched query below.
-    for (const lid of lids) out[lid] = this.unreported.has(lid) ? null : (this.lidToPhone.get(lid) ?? null);
+    for (const lid of lids) out[lid] = this.mirrorPhone(lid, this.lidToPhone.get(lid));
     try {
       for (const batch of chunk(lids)) {
         const rows = await this.repo.find({ where: { lid: In(batch) } });
@@ -334,10 +464,18 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
       return await this.readLidsForPhones(phones);
     } catch {
       // The table may not exist yet (migration pending); the cache is the best available answer.
-      return Object.fromEntries(
-        phones.map(phone => [phone, this.lidsForPhone(phone).filter(lid => !this.unreported.has(lid))]),
-      );
+      return Object.fromEntries(phones.map(phone => [phone, this.lidsForPhone(phone)]));
     }
+  }
+
+  /**
+   * What the mirror answers for a lid, read without touching it: its entry, judged as a row would be. The synchronous
+   * views answer the same way ({@link markedOut}), and are what the readers that await fall back to while the table
+   * cannot be read: a lid with a failed write has the table's row warmed back into the mirror beside its mark, and
+   * that row is the phone the write was to replace, which the mark refuses.
+   */
+  private mirrorPhone(lid: string, held: string | null | undefined): string | null {
+    return !held || this.unreported.has(lid) ? null : this.rowPhone(lid, held, true);
   }
 
   /** Read only current table rows on success; a resident mapping cannot restore a deleted row. */
@@ -354,17 +492,33 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
 
   /** This process has a phone write for the lid that the table does not have: in flight, or failed. */
   private unstored(lid: string): boolean {
-    return this.unsettledWrites.has(lid) || this.failedWrites.has(lid);
+    return this.unsettledWrites.has(lid) || this.failedWrites.has(lid) || this.failedPhones.has(lid);
   }
 
   /**
    * The phone a lid's row answers. The table is the truth across nodes, but while a phone this process holds
    * for the lid is not stored yet, a row that differs may be the number it replaces: the lid then answers
-   * none, so no fence lookup admits either one until the write lands.
+   * none, so no fence lookup admits either one until the write lands. The mirror entry is not the only witness
+   * of that phone: the LRU or a reload can drop it while the write is under way, so with none resident the
+   * write's own entry stands in for it, and keeps a revocation not stored yet in the same way.
    */
   private rowPhone(lid: string, phone: string | null, isReported = false): string | null {
     if (!isReported || (this.unreported.has(lid) && this.unstored(lid))) return null;
-    const cached = this.lidToPhone.get(lid);
+    const writing = this.unsettledWrites.get(lid);
+    if (writing?.revoking) return null;
+    // The mark of this lid may be gone with the bound: the phone this node holds for it is then not known, and nothing
+    // but a mirror entry, a mark, a report under way or one that landed since ({@link recovered}) says it again. The
+    // entry of a write that failed says nothing: its report may have landed, and its failure left a mark that the bound
+    // has since dropped.
+    if (
+      this.markDropped(lid) &&
+      !this.lidToPhone.has(lid) &&
+      !this.failedPhones.has(lid) &&
+      !(writing?.reportPhone && !writing.failed)
+    )
+      return null;
+    const cached =
+      this.failedPhones.get(lid) ?? (this.lidToPhone.has(lid) ? this.lidToPhone.get(lid) : writing?.reportPhone);
     return this.unstored(lid) && cached !== undefined && cached !== phone ? null : phone;
   }
 
@@ -387,7 +541,7 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
     } catch (err) {
       this.logger.warn(`Could not read the phone for a lid: ${err instanceof Error ? err.message : String(err)}`);
     }
-    return this.unreported.has(lid) ? null : (this.getCached(lid) ?? null);
+    return this.resolveLid(lid);
   }
 
   /**
@@ -401,20 +555,24 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
     if (cached && cached !== phone) {
       this.unreported.add(lid);
       this.seenBy.set(lid, new Set());
+      this.mappingEpoch.set(lid, ++this.nextEpoch);
     }
     const reporters = this.seenBy.get(lid);
     const writing = this.beginWrite(lid, lookup);
+    if (cached && cached !== phone) writing.revoking = lookup;
     try {
-      await this.repo
-        .createQueryBuilder()
-        .insert()
-        .values({ lid, phone, sessionId: sessionId ?? null, updatedAt: new Date() })
-        .orIgnore()
-        .execute();
-      const { affected } = await this.repo.update(
-        { lid, phone: Raw(column => `${column} <> :lookupPhone`, { lookupPhone: phone }), isReported: true },
-        { isReported: false, updatedAt: () => '"updatedAt"' },
-      );
+      const { affected } = await this.inTurn(lid, async () => {
+        await this.repo
+          .createQueryBuilder()
+          .insert()
+          .values({ lid, phone, sessionId: sessionId ?? null, updatedAt: new Date() })
+          .orIgnore()
+          .execute();
+        return this.repo.update(
+          { lid, phone: Raw(column => `${column} <> :lookupPhone`, { lookupPhone: phone }), isReported: true },
+          { isReported: false, updatedAt: () => '"updatedAt"' },
+        );
+      });
       if (
         affected &&
         writing.latestOperation === lookup &&
@@ -426,8 +584,17 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
       this.absentFromTable.delete(lid);
       return true;
     } catch (err) {
-      if (writing.latestOperation === lookup && this.seenBy.get(lid) === reporters && this.unreported.has(lid))
-        this.failedWrites.add(lid);
+      writing.failed = true;
+      // The update revokes any reported row that names another phone than the lookup's, whatever the mirror holds: a row
+      // another node reported is revoked by the statement that landed, so a failed one marks the lid however it compared
+      // with the mirror. The row the lookup names is the one the statement leaves, so the mark names that phone and
+      // answers that row only: a lookup that merely repeats the stored phone must not hide the lid. The mark names no
+      // phone where one would hide a witness: another mark (a failed report's mark must not come to admit a row), a
+      // report of another phone on the entry (a mark outranks it), or a lid whose marks the bound dropped (a mark would
+      // exempt it from {@link droppedMarks}).
+      const held = this.failedPhones.get(lid);
+      const named = held === phone || (held === undefined && !this.markDropped(lid));
+      this.keepMark(lid, named && (!writing.reportPhone || writing.reportPhone === phone) ? phone : '');
       this.warnWriteFailed(`Could not store lid mapping: ${err instanceof Error ? err.message : String(err)}`);
       return false;
     } finally {
@@ -454,52 +621,81 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
     const owed = gaining ? { phone, sessionId: sessionId ?? null, queued: false } : earlier;
     // A negative is not cached until the table has taken it: see clear().
     if (!seen && phone !== null) this.index(lid, phone, null);
-    if (phone !== null) this.failedWrites.add(lid);
+    if (phone !== null) {
+      this.failedWrites.add(lid);
+      this.failedPhones.delete(lid); // this report takes the place of the one that failed
+    }
     const reporters = this.seenBy.get(lid);
     const report = { phone };
     const writing = this.beginWrite(lid, report, true);
+    let epoch = this.mappingEpoch.get(lid);
+    if (phone !== null && epoch === undefined) {
+      epoch = ++this.nextEpoch;
+      this.mappingEpoch.set(lid, epoch);
+    }
+    if (phone !== null) {
+      writing.reportPhone = phone;
+      if (!seen) writing.revoking = undefined; // index() above took the lid off `unreported`
+    }
     if (gaining) {
       writing.check = owed; // outside the cap of owed checks while the lid's writes are unsettled
       this.secondLidOwed.delete(lid);
     }
     try {
-      if (seen && phone !== null) {
-        // A peer may have changed or revoked this row since this node counted the report. Keep the
-        // owner and timestamp for the same phone, but let the latest actual report replace another one.
-        const changed = '"lid_mappings"."phone" IS NULL OR "lid_mappings"."phone" <> EXCLUDED."phone"';
-        const [insert, parameters] = this.repo
-          .createQueryBuilder('lid_mappings')
-          .insert()
-          .values({ lid, phone, sessionId: sessionId ?? null, isReported: true, updatedAt: new Date() })
-          .getQueryAndParameters();
-        await this.repo.query(
-          insert +
-            ` ON CONFLICT ("lid") DO UPDATE SET "phone" = EXCLUDED."phone", "isReported" = true, ` +
-            `"sessionId" = CASE WHEN ${changed} THEN EXCLUDED."sessionId" ELSE "lid_mappings"."sessionId" END, ` +
-            `"updatedAt" = CASE WHEN ${changed} THEN EXCLUDED."updatedAt" ELSE "lid_mappings"."updatedAt" END ` +
-            `WHERE ${changed} OR "lid_mappings"."isReported" = false`,
-          parameters,
-        );
-      } else if (phone === null) await this.clear(lid, sessionId ?? null, seen, report);
-      else {
-        await this.repo.upsert({ lid, phone, sessionId: sessionId ?? null, isReported: true, updatedAt: new Date() }, [
-          'lid',
-        ]);
+      await this.inTurn(lid, async () => {
+        if (seen && phone !== null) {
+          // A peer may have changed or revoked this row since this node counted the report. Keep the
+          // owner and timestamp for the same phone, but let the latest actual report replace another one.
+          const changed = '"lid_mappings"."phone" IS NULL OR "lid_mappings"."phone" <> EXCLUDED."phone"';
+          const [insert, parameters] = this.repo
+            .createQueryBuilder('lid_mappings')
+            .insert()
+            .values({ lid, phone, sessionId: sessionId ?? null, isReported: true, updatedAt: new Date() })
+            .getQueryAndParameters();
+          await this.repo.query(
+            insert +
+              ` ON CONFLICT ("lid") DO UPDATE SET "phone" = EXCLUDED."phone", "isReported" = true, ` +
+              `"sessionId" = CASE WHEN ${changed} THEN EXCLUDED."sessionId" ELSE "lid_mappings"."sessionId" END, ` +
+              `"updatedAt" = CASE WHEN ${changed} THEN EXCLUDED."updatedAt" ELSE "lid_mappings"."updatedAt" END ` +
+              `WHERE ${changed} OR "lid_mappings"."isReported" = false`,
+            parameters,
+          );
+        } else if (phone === null) await this.clear(lid, sessionId ?? null, seen, report);
+        else {
+          await this.repo.upsert(
+            { lid, phone, sessionId: sessionId ?? null, isReported: true, updatedAt: new Date() },
+            ['lid'],
+          );
+        }
+      });
+      if (phone !== null) {
+        this.failedPhones.delete(lid);
+        // The table names this phone now: a lid whose mark the bound dropped answers it, as one whose mark never went.
+        if (writing.latestActual === report) this.recover(lid);
       }
-      // Count only a stored report in this phone's current cache epoch. A late completion after
-      // P -> Q -> P must not count the first P as a report of the replacement P.
-      if (phone !== null && reporters && this.seenBy.get(lid) === reporters) {
+      // Count only a stored report in this phone's current mapping epoch and operation order. A late
+      // completion after P -> Q -> P (different epoch) or an intervening write during findOne() must
+      // not clear marks for a replacement report. Do not require seenBy identity so releaseSession()
+      // cannot strand lid in failedWrites.
+      if (phone !== null) {
         const operation = writing.latestOperation;
+        const opSeq = writing.latestOpSeq;
         let reported = !this.unreported.has(lid);
         // A consistent lookup may have revoked the old stored phone while this actual write was
         // in flight. Only the current reported row can establish which SQL statement landed last.
-        if (!reported && writing.latestReport === report && operation?.phone === phone) {
+        if (
+          !reported &&
+          this.mappingEpoch.get(lid) === epoch &&
+          writing.latestReport === report &&
+          operation?.phone === phone
+        ) {
           const row = await this.repo.findOne({ where: { lid } }).catch(() => null);
           reported = row?.isReported === true && row.phone === phone;
         }
         if (
           reported &&
-          this.seenBy.get(lid) === reporters &&
+          this.mappingEpoch.get(lid) === epoch &&
+          writing.latestOpSeq === opSeq &&
           writing.latestReport === report &&
           writing.latestOperation === operation &&
           operation?.phone === phone
@@ -507,7 +703,7 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
           this.failedWrites.delete(lid);
           this.unreported.delete(lid);
         }
-        if (sessionId && this.seenBy.get(lid) === reporters) reporters.add(sessionId);
+        if (sessionId && reporters && this.seenBy.get(lid) === reporters) reporters.add(sessionId);
       }
       // A check owed again after its read failed, or found the row not holding its phone, is a copy no write already in
       // flight carries. The lid's latest report takes it when it lands with that phone; an older one could run it
@@ -515,8 +711,18 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
       const again = writing.latestReport === report ? this.secondLidOwed.get(lid) : undefined;
       if (owed && owed.phone === phone) this.queueSecondLid(lid, owed);
       if (again?.phone === phone) this.queueSecondLid(lid, again);
+      if (phone !== null) this.notifyMappingLearned(lid, phone);
       return true;
     } catch (err) {
+      writing.failed = true;
+      // The latest report of the lid, still marked or already without a mirror entry (a report that landed clears its mark).
+      if (
+        phone !== null &&
+        writing.reportPhone === phone &&
+        (this.failedWrites.has(lid) || !this.lidToPhone.has(lid))
+      ) {
+        this.keepMark(lid, phone);
+      }
       this.warnWriteFailed(
         `Failed to persist lid->phone mapping for ${lid}: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -527,13 +733,37 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
     }
   }
 
+  /**
+   * Run the table statements of a write once those of every write of the lid that began before it have ended, in
+   * success or failure. Called in the turn the write begins, before any await, so the order is the order of the calls.
+   */
+  private inTurn<T>(lid: string, statements: () => Promise<T>): Promise<T> {
+    const previous = this.turns.get(lid);
+    // With no write of the lid under way the statements start at once, as they always did.
+    const run = previous ? previous.then(statements) : statements();
+    const ended = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.turns.set(lid, ended);
+    void ended.then(() => {
+      if (this.turns.get(lid) === ended) this.turns.delete(lid);
+    });
+    return run;
+  }
+
   /** Keep report and lookup ordering until all older writes settle, without counting a lookup as a report. */
-  private beginWrite(lid: string, operation: { phone: string | null }, actual = false) {
+  private beginWrite(lid: string, operation: { phone: string | null }, actual = false): UnsettledWrite {
     const writing = this.unsettledWrites.get(lid) ?? { count: 0 };
     writing.count++;
     writing.latestOperation = operation;
-    if (actual) writing.latestReport = operation;
+    writing.latestOpSeq = ++this.opSeq;
+    if (actual) {
+      writing.latestReport = operation;
+      writing.latestActual = operation;
+    }
     this.unsettledWrites.set(lid, writing);
+    for (const raced of this.reloadsOut) raced.add(lid);
     if (this.pendingLookups.has(lid)) this.racedLookups.add(lid);
     return writing;
   }
@@ -542,11 +772,17 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
    * Once the last write of the lid settles, the latest new pairing's check, if no landed write queued it, is owed
    * until a write of its phone lands, unless a newer report of the lid took its place. Not before: an overlapping
    * report or negative can fail while the pairing's own write is still in flight, and that write queues the check if
-   * it lands.
+   * it lands. It also ends the failed-write mark of a report that landed, when a write that came after the report kept
+   * it from clearing the mark itself.
    */
-  private endWrite(lid: string, writing: { count: number; check?: SecondLidCheck }): void {
+  private endWrite(lid: string, writing: UnsettledWrite): void {
     if (this.unsettledWrites.get(lid) !== writing || --writing.count > 0) return;
     this.unsettledWrites.delete(lid);
+    // A report clears the failed-write mark only while it is the lid's latest, yet a later write can displace it and
+    // leave the table holding its phone: a negative the owner rule refused, a lookup that only revoked it. With no
+    // failed statement and the cache still holding the last report's phone, nothing is pending or failed any more.
+    if (!writing.failed && writing.reportPhone !== undefined && this.lidToPhone.get(lid) === writing.reportPhone)
+      this.failedWrites.delete(lid);
     if (writing.check && !writing.check.queued) this.oweSecondLid(lid, writing.check);
   }
 
@@ -593,12 +829,28 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
       ? replaceable.slice(1).map(where => ({ ...where, phone: Not(IsNull()) }))
       : replaceable;
     const { affected } = await this.repo.update(eligible, { phone: null, sessionId, isReported: true, updatedAt });
-    if (!affected || this.unsettledWrites.get(lid)?.latestReport !== report) return;
+    if (!affected) return;
+    const writing = this.unsettledWrites.get(lid);
+    // The witnesses a resident entry would have had go with it, also after an eviction or a reload dropped the entry.
+    // Only when this negative is the lid's latest call: a report begun after it has its own, and its statement is not
+    // run yet.
+    if (writing?.latestActual === report) {
+      writing.reportPhone = undefined;
+      writing.revoking = undefined;
+    }
+    // A newer report of a phone owns the cached entry. A newer negative says what this one did, so the entry goes
+    // now: left to that negative, it would stay if its statement failed, answering a phone the table has cleared.
+    // Read through latestActual: an eviction or a reload erases latestReport while this statement is under way, and
+    // the marks that guarded the row it cleared must still end with it.
+    const latest = writing?.latestActual as { phone: string | null } | undefined;
+    if (latest !== report && latest?.phone !== null) return;
     const cached = this.lidToPhone.get(lid);
     this.lidToPhone.delete(lid);
     this.unreported.delete(lid);
     this.seenBy.delete(lid);
+    this.mappingEpoch.delete(lid);
     this.failedWrites.delete(lid);
+    this.failedPhones.delete(lid);
     if (cached) this.unindex(lid, cached);
     this.absentFromTable.delete(lid);
   }
@@ -606,6 +858,29 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
   /** Set the one listener told of each second-lid report; the session module audits it. */
   onSecondLid(listener: (report: SecondLidReport) => unknown): void {
     this.secondLidListener = listener;
+  }
+
+  /**
+   * Register a listener notified whenever remember() persists a non-null lid->phone mapping.
+   * Returns an unsubscribe callback so callers can detach on module teardown.
+   */
+  onMappingLearned(listener: (mapping: LearnedLidMapping) => void): () => void {
+    this.mappingLearnedListeners.add(listener);
+    return () => {
+      this.mappingLearnedListeners.delete(listener);
+    };
+  }
+
+  private notifyMappingLearned(lid: string, phone: string): void {
+    if (this.mappingLearnedListeners.size === 0) return;
+    const mapping: LearnedLidMapping = { lid, phone };
+    for (const listener of this.mappingLearnedListeners) {
+      try {
+        listener(mapping);
+      } catch (err) {
+        this.logger.warn(`Mapping-learned listener failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   /**
@@ -679,8 +954,8 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
       queued.forEach((newLid, i) => {
         if (!held.includes(newLid)) {
           // Its row holds another phone by now, or a conflicting display lookup marked it unreported. If this node
-          // still holds this phone for it, the row is another node's, an older write that committed last (a pool can
-          // reorder commits) or that lookup's: the next write of this phone to land checks it again.
+          // still holds this phone for it, the row is another node's or that lookup's: the next write of this phone to
+          // land checks it again.
           const check = lids.get(newLid);
           if (check && this.lidToPhone.get(newLid) === phone && !this.secondLidOwed.has(newLid))
             this.oweSecondLid(newLid, { ...check, queued: false });
@@ -765,23 +1040,26 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
    * next one hits. A table miss IS remembered, so an unmapped lid stops re-querying on every
    * lookup ({@link absentFromTable}), but only when nothing learned that lid in the meantime;
    * a read error is swallowed (the table may not exist yet), the same posture as reload().
+   * A lid with a failed-write mark is warmed too, with the row the write was to replace. The mark outranks that
+   * entry in every reader: the synchronous views leave it out ({@link markedOut}), and the readers that authorize
+   * judge it through {@link rowPhone}, also when they fall back to the mirror.
    */
   private warmFromTable(lid: string): void {
-    if (!lid || this.pendingLookups.has(lid) || this.absentFromTable.has(lid)) return;
+    if (!lid || this.pendingLookups.has(lid) || this.absentFromTable.has(lid) || this.markDropped(lid)) return;
     this.pendingLookups.add(lid);
     // Captured BEFORE the query: a write for this lid that has not reached the table yet means the
     // answer is already stale, whatever it says. The forward-map check below cannot see that case,
     // because `remember()` indexes synchronously and the LRU can evict the entry again before the
     // query answers, at which point the map looks exactly like "never learned".
     const writeInFlight = this.unsettledWrites.has(lid);
+    const seq = this.reloadSeq;
     void this.repo
       .findOne({ where: { lid } })
       .then(row => {
-        // A write that was unsettled when the query ran, or started while it was in flight, is newer
-        // than either answer: a row would be the phone it replaces, served as a hit after the write
-        // commits, and an absence would block the warm-back once the LRU evicts the forward entry.
-        // Neither is recorded, so the next miss reads the table again.
-        if (writeInFlight || this.racedLookups.has(lid)) return;
+        // A write that was unsettled when the query ran, or started while it was in flight, or any
+        // reload() that completed or started since, makes this read stale: neither the row nor an
+        // absence may be recorded.
+        if (seq !== this.reloadSeq || writeInFlight || this.racedLookups.has(lid) || this.markDropped(lid)) return;
         // Last-write-wins: a mapping indexed while the lookup was in flight is newer.
         if (row && !this.lidToPhone.has(row.lid)) {
           this.index(row.lid, row.phone, row.sessionId, row.isReported);
@@ -805,10 +1083,15 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
     if (prev && prev !== phone) {
       this.unindex(lid, prev);
     }
-    const seen = (isReported && previouslyReported && prev === phone && this.seenBy.get(lid)) || new Set<string>();
+    const keepSeen = isReported && previouslyReported && prev === phone;
+    if (!keepSeen) this.mappingEpoch.set(lid, ++this.nextEpoch);
+    const seen = (keepSeen && this.seenBy.get(lid)) || new Set<string>();
     if (isReported && sessionId) seen.add(sessionId);
     if (phone) this.seenBy.set(lid, seen);
-    else this.seenBy.delete(lid);
+    else {
+      this.seenBy.delete(lid);
+      this.mappingEpoch.delete(lid);
+    }
     // Re-insert (delete + set) so the entry moves to the most-recent end of the LRU order even on update.
     this.lidToPhone.delete(lid);
     this.lidToPhone.set(lid, phone);
@@ -844,18 +1127,74 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit, On
     while (this.lidToPhone.size > this.maxCachedLids) {
       const oldest = this.lidToPhone.keys().next().value;
       if (oldest === undefined) break;
-      const phone = this.lidToPhone.get(oldest);
-      this.lidToPhone.delete(oldest);
-      this.unreported.delete(oldest);
-      this.seenBy.delete(oldest);
-      this.failedWrites.delete(oldest);
-      const writing = this.unsettledWrites.get(oldest);
-      if (writing) {
-        delete writing.latestReport;
-        delete writing.latestOperation;
-      }
-      if (phone) this.unindex(oldest, phone);
+      this.evict(oldest);
     }
+  }
+
+  /** Drop a lid's forward entry and what only the entry carried. */
+  private evict(lid: string): void {
+    const phone = this.lidToPhone.get(lid);
+    this.lidToPhone.delete(lid);
+    this.unreported.delete(lid);
+    this.seenBy.delete(lid);
+    this.mappingEpoch.delete(lid);
+    this.failedWrites.delete(lid);
+    const writing = this.unsettledWrites.get(lid);
+    if (writing) {
+      delete writing.latestReport;
+      delete writing.latestOperation;
+    }
+    if (phone) this.unindex(lid, phone);
+  }
+
+  /**
+   * Keep the phone a write of the lid failed to store ('' for a lookup) past its mirror entry. The oldest mark goes
+   * past the bound, and nothing may then make its lid answer the row the write was to replace: the lid is recorded in
+   * {@link droppedMarks}, and its mirror entry, which could be that row warmed back, goes too.
+   */
+  private keepMark(lid: string, phone: string): void {
+    const dropped = setNewest(this.failedPhones, lid, phone, this.maxCachedLids || Infinity);
+    if (dropped === undefined) return;
+    this.recordDropped(dropped);
+    if (this.lidToPhone.has(dropped)) this.evict(dropped);
+    this.warnAtMost(
+      this.markDropWarning,
+      `Failed lid writes are remembered for ${this.maxCachedLids} lids at most (LID_MAPPING_CACHE_MAX): the oldest is ` +
+        'forgotten, and its lid answers no phone until it is reported again or the mapping reloads',
+      'dropped',
+    );
+  }
+
+  /**
+   * A report of the lid landed: one the record holds, or one already recovered (which moves to the newest end), answers
+   * as a lid whose mark never went ({@link recovered}). The oldest goes past the bound, and the record holds it again.
+   */
+  private recover(lid: string): void {
+    if (!this.recovered.delete(lid) && !this.markDropped(lid)) return;
+    this.recovered.add(lid);
+    if (this.recovered.size <= (this.maxCachedLids || Infinity)) return;
+    this.recovered.delete(this.recovered.values().next().value as string);
+    this.warnAtMost(
+      this.recoveryDropWarning,
+      `Lids reported again after their failed write was forgotten are remembered for ${this.maxCachedLids} ` +
+        'lids at most (LID_MAPPING_CACHE_MAX): the oldest is forgotten again, and once it has no cache entry its lid ' +
+        'answers no phone until it is reported again or the mapping reloads',
+      'dropped',
+    );
+  }
+
+  private recordDropped(lid: string): void {
+    this.recovered.delete(lid); // a mark of its own went again
+    const bit = markBit(lid);
+    this.droppedMarks ??= new Uint8Array(DROPPED_MARK_BITS >> 3);
+    this.droppedMarks[bit >> 3] |= 1 << (bit & 7);
+  }
+
+  /** Whether the bound may have dropped the failed-write mark of this lid since a report of it last landed. */
+  private markDropped(lid: string): boolean {
+    if (!this.droppedMarks || this.recovered.has(lid)) return false;
+    const bit = markBit(lid);
+    return (this.droppedMarks[bit >> 3] & (1 << (bit & 7))) !== 0;
   }
 
   /** Drop a lid from its phone's reverse entry, and the entry itself once no lid is left under it. */

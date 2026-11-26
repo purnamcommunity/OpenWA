@@ -8,6 +8,7 @@ import { BadRequestException, ExecutionContext, NotFoundException, PayloadTooLar
 import { from, lastValueFrom } from 'rxjs';
 import { MessageSendService } from './message-send.service';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
+import { Session, SessionStatus } from '../session/entities/session.entity';
 import { SessionService } from '../session/session.service';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
@@ -22,7 +23,11 @@ import type { MessageProjector } from '../session/message-projector.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { SendIdempotencyKey } from './entities/send-idempotency-key.entity';
 import { SendIdempotencyService } from './idempotency/send-idempotency.service';
-import { SendIdempotencyInterceptor } from './idempotency/send-idempotency.interceptor';
+import { SendIdempotencyInterceptor, sendFailureProvesNothingSent } from './idempotency/send-idempotency.interceptor';
+import { BaileysMessaging, type BaileysMessagingHost } from '../../engine/adapters/baileys-messaging';
+import { WhatsAppWebJsAdapter } from '../../engine/adapters/whatsapp-web-js.adapter';
+import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
+import { createLogger } from '../../common/services/logger.service';
 import * as sessionWriteScope from '../../common/utils/session-write-scope';
 import type { SendTextMessageDto } from './dto';
 
@@ -1108,19 +1113,19 @@ describe('MessageSendService', () => {
       expect(mockEngine.sendImageMessage).not.toHaveBeenCalled();
     });
 
-    it('threads a plugin-modified media input through to the engine', async () => {
+    it('threads plugin-modified media content through to the engine while keeping chatId pinned', async () => {
       (hookManager.execute as jest.Mock).mockResolvedValueOnce({
         continue: true,
         data: {
           sessionId: 'sess-1',
           type: 'image',
-          input: { chatId: '999@c.us', url: 'https://e.com/mod.jpg', caption: 'edited' },
+          input: { chatId: '999@c.us', url: 'https://e.com/mod.jpg', caption: 'edited', quotedMessageId: 'injected' },
         },
       });
       await service.sendImage('sess-1', { chatId: '628@c.us', url: 'https://e.com/i.jpg', caption: 'orig' });
       expect(mockEngine.sendImageMessage).toHaveBeenCalledWith(
-        '999@c.us',
-        expect.objectContaining({ data: 'https://e.com/mod.jpg', caption: 'edited' }),
+        '628@c.us',
+        expect.objectContaining({ data: 'https://e.com/mod.jpg', caption: 'edited', quotedMessageId: undefined }),
       );
     });
 
@@ -1892,6 +1897,134 @@ describe('MessageSendService', () => {
         expect.anything(),
       );
     });
+
+    it('releases Idempotency-Key on Baileys not-ready 409, unknown/non-clickable 400, and wwebjs 501 clickButton refusals', async () => {
+      const makeBaileysHost = (opts: { ready?: boolean; stored?: unknown } = {}): BaileysMessagingHost => {
+        const sock = { sendMessage: jest.fn() };
+        return {
+          ensureReady: () => {
+            if (opts.ready === false) throw new EngineNotReadyError();
+          },
+          sessionProxyUrl: () => undefined,
+          getSocket: () => sock as never,
+          getSocketOrNull: () => sock as never,
+          logger: createLogger('click-button-idempotency-test'),
+          toNeutralJid: (j: string) => j.replace('@s.whatsapp.net', '@c.us'),
+          toEngineJid: (j: string) => j.replace('@c.us', '@s.whatsapp.net'),
+          normalizedSelfJid: () => '628177@s.whatsapp.net',
+          getEphemeralExpiration: () => undefined,
+          toUnixSeconds: (ts: number) => ts,
+          loadLib: () =>
+            Promise.resolve({
+              normalizeMessageContent: (c: unknown) => c,
+              getContentType: (c: Record<string, unknown> | undefined) =>
+                Object.keys(c ?? {}).find(k => k === 'conversation' || k.includes('Message')),
+            } as never),
+          getStoredMessage: jest.fn().mockResolvedValue(opts.stored),
+          wasDeletedForEveryone: () => false,
+          pendingEditOf: () => undefined,
+          markDeletedForEveryone: () => undefined,
+          putStoredMessage: jest.fn(),
+          recordMessage: () => undefined,
+          rememberOwnSend: () => undefined,
+          recordLidMapping: () => undefined,
+          getOnMessageCreate: () => undefined,
+          mapMessage: () => Promise.resolve({} as never),
+        } as unknown as BaileysMessagingHost;
+      };
+
+      const buttonsPrompt = {
+        key: { id: 'PROMPT-1', remoteJid: 'test@s.whatsapp.net', fromMe: false },
+        message: {
+          buttonsMessage: {
+            contentText: 'Choose one',
+            buttons: [{ buttonId: 'yes', buttonText: { displayText: 'Yes' } }],
+          },
+        },
+      };
+      const plainTextPrompt = {
+        key: { id: 'PROMPT-PLAIN', remoteJid: 'test@s.whatsapp.net', fromMe: false },
+        message: { conversation: 'Not a button prompt' },
+      };
+
+      const cases: Array<{
+        label: string;
+        runEngine: () => Promise<unknown>;
+        expectedError: new (...args: never[]) => Error;
+      }> = [
+        {
+          label: 'Baileys not-ready 409',
+          runEngine: () =>
+            new BaileysMessaging(makeBaileysHost({ ready: false })).clickButton('test@c.us', 'PROMPT-1', 'yes'),
+          expectedError: EngineNotReadyError,
+        },
+        {
+          label: 'Baileys unknown buttonId 400',
+          runEngine: () =>
+            new BaileysMessaging(makeBaileysHost({ stored: buttonsPrompt })).clickButton(
+              'test@c.us',
+              'PROMPT-1',
+              'unknown-btn',
+            ),
+          expectedError: BadRequestException,
+        },
+        {
+          label: 'Baileys non-clickable prompt 400',
+          runEngine: () =>
+            new BaileysMessaging(makeBaileysHost({ stored: plainTextPrompt })).clickButton(
+              'test@c.us',
+              'PROMPT-PLAIN',
+              'yes',
+            ),
+          expectedError: BadRequestException,
+        },
+        {
+          label: 'whatsapp-web.js unsupported 501',
+          runEngine: () => WhatsAppWebJsAdapter.prototype.clickButton.call({}),
+          expectedError: EngineNotSupportedError,
+        },
+      ];
+
+      for (const tc of cases) {
+        const claim = jest.fn().mockResolvedValue({ kind: 'claimed', id: `claim-${tc.label}` });
+        const complete = jest.fn().mockResolvedValue(undefined);
+        const release = jest.fn().mockResolvedValue(undefined);
+        const markFailed = jest.fn().mockResolvedValue(undefined);
+        const store = { claim, complete, release, markFailed } as unknown as SendIdempotencyService;
+        const interceptor = new SendIdempotencyInterceptor(store);
+
+        mockEngine.clickButton.mockImplementationOnce(() => tc.runEngine());
+
+        const ctx = {
+          getType: () => 'http',
+          getHandler: () => ({ name: 'clickButton' }),
+          switchToHttp: () => ({
+            getRequest: () => ({
+              headers: { 'idempotency-key': `key-${tc.label.replace(/\s+/g, '-')}` },
+              params: { sessionId: 'sess-1' },
+              body: { chatId: 'test@c.us', messageId: 'PROMPT-1', buttonId: 'yes' },
+            }),
+            getResponse: () => ({ setHeader: jest.fn() }),
+          }),
+        } as unknown as ExecutionContext;
+
+        let caught: unknown;
+        try {
+          const obs = await interceptor.intercept(ctx, {
+            handle: () =>
+              from(service.clickButton('sess-1', { chatId: 'test@c.us', messageId: 'PROMPT-1', buttonId: 'yes' })),
+          });
+          await lastValueFrom(obs);
+        } catch (err) {
+          caught = err;
+        }
+
+        expect(caught).toBeInstanceOf(tc.expectedError);
+        expect(sendFailureProvesNothingSent(caught)).toBe(true);
+        expect(release).toHaveBeenCalledWith(`claim-${tc.label}`);
+        expect(markFailed).not.toHaveBeenCalled();
+      }
+    });
   });
 
   describe('forward', () => {
@@ -2611,5 +2744,111 @@ describe('MessageSendService', () => {
 
       expect(archive.archive).not.toHaveBeenCalled();
     });
+
+    it('never archives a FAILED row', async () => {
+      const archive = { archive: jest.fn() };
+      const svc = withFlag(true, archive);
+
+      await svc.saveOutgoingMessage('sess-1', {
+        waMessageId: 'wa-failed',
+        chatId: '621@c.us',
+        type: 'image',
+        status: MessageStatus.FAILED,
+        metadata: { media: { mimetype: 'image/png' } },
+      });
+
+      expect(archive.archive).not.toHaveBeenCalled();
+    });
+
+    it.each([MessageStatus.DELIVERED, MessageStatus.READ])(
+      'archives an outbound row whose merged echo status already reached %s',
+      async status => {
+        const archive = { archive: jest.fn().mockResolvedValue('chat-media/k') };
+        const svc = withFlag(true, archive);
+
+        await svc.saveOutgoingMessage('sess-1', {
+          waMessageId: `wa-${status}`,
+          chatId: '621@c.us',
+          type: 'image',
+          status,
+          metadata: { media: { mimetype: 'image/png', data: 'QUJD' } },
+        });
+
+        expect(archive.archive).toHaveBeenCalledWith(expect.objectContaining({ waMessageId: `wa-${status}`, status }));
+      },
+    );
+  });
+});
+
+describe('MessageSendService fallback media save beside concurrent writes on SQLite', () => {
+  it('does not wrap the line-1007 id-less fallback save in an implicit SQLite transaction that rolls back sibling writes', async () => {
+    const ds = await new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [Session, Message],
+      synchronize: true,
+    }).initialize();
+    try {
+      await ds.getRepository(Session).save({ id: 'sess-1', name: 'sess-1', status: SessionStatus.READY, config: {} });
+      await ds.getRepository(Session).save({ id: 'sessB', name: 'sessB', status: SessionStatus.READY, config: {} });
+      const repo = ds.getRepository(Message);
+      // Pre-seed echo row so saveOutgoingMessage hits UNIQUE(sessionId, waMessageId).
+      await repo.save({
+        sessionId: 'sess-1',
+        waMessageId: 'wa-dup-1',
+        chatId: '621@c.us',
+        from: 'me@c.us',
+        to: '621@c.us',
+        body: '',
+        type: 'image',
+        direction: MessageDirection.OUTGOING,
+        status: MessageStatus.SENT,
+      });
+
+      const svc = new MessageSendService(
+        repo,
+        { findOne: jest.fn().mockResolvedValue({ phone: '621' }) } as never,
+        new EngineRegistry(),
+        { execute: jest.fn((_e: unknown, d: unknown) => Promise.resolve({ continue: true, data: d })) } as never,
+        {} as never,
+        inertPacing(),
+        { get: (_k: string, d?: unknown) => d } as never,
+      );
+
+      // Force mergeSentMetadata path to throw so line 1006-1008 fallback save executes.
+      jest.spyOn(repo, 'findOne').mockRejectedValueOnce(new Error('echo read busy'));
+
+      let triggerSibling = false;
+      let beside = Promise.resolve();
+      const origInsert = ds.getRepository(Message).insert.bind(repo);
+      void origInsert;
+      ds.subscribers.push({
+        listenTo: () => Message,
+        beforeInsert: event => {
+          if (event.entity && (event.entity as Message).waMessageId === undefined) {
+            triggerSibling = true;
+            beside = (async () => {
+              await ds.getRepository(Session).update('sessB', { status: SessionStatus.FAILED });
+            })();
+            throw new Error('abort fallback save');
+          }
+        },
+      });
+
+      await expect(
+        svc.saveOutgoingMessage('sess-1', {
+          waMessageId: 'wa-dup-1',
+          chatId: '621@c.us',
+          type: 'image',
+          status: MessageStatus.SENT,
+          metadata: { media: { mimetype: 'image/png', data: 'QUJD' } },
+        }),
+      ).rejects.toThrow('abort fallback save');
+      await beside;
+      expect(triggerSibling).toBe(true);
+      expect((await ds.getRepository(Session).findOneByOrFail({ id: 'sessB' })).status).toBe(SessionStatus.FAILED);
+    } finally {
+      await ds.destroy();
+    }
   });
 });

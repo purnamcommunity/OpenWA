@@ -26,6 +26,7 @@ import {
   BAILEYS_NON_CONTENT_TYPES,
   baileysChatJid,
   buildIncomingMessageFromBaileys,
+  contentTypeOf,
   extractBaileysBody,
   extractBaileysButtonReply,
   extractBaileysButtons,
@@ -35,10 +36,13 @@ import {
   extractBaileysContext,
   extractBaileysLocation,
   isBaileysCatalogShare,
+  isNoiseOnly,
+  isNonContent,
   keyParticipant,
   mapBaileysEventResponseType,
   mapBaileysStatus,
   setBaileysText,
+  withoutFastRatchetDistribution,
 } from './baileys-message-mapper';
 import { boundPollOptions, boundPollText, buildEditedMessage } from './message-mapper';
 import { toUnixSeconds } from './baileys-history';
@@ -58,6 +62,7 @@ import {
   coerceDeclaredSize,
   inboundMediaMaxBytes,
   inboundMediaTimeoutMs,
+  isDroppedEphemeral,
   isMediaDownloadEnabled,
   runUnderGlobalMediaGate,
   withInboundDownloadTimeout,
@@ -113,18 +118,6 @@ const PRESENCE_STATES: ReadonlySet<PresenceState> = new Set<PresenceState>([
  * only ones message.receipt is documented for. A 1:1 chat reports through messages.update instead.
  */
 const RECEIPT_CHAT_KINDS: ReadonlySet<ChatKind> = new Set<ChatKind>(['group', 'status']);
-
-/**
- * Top-level Message keys that carry no user content. A live message made only of these is dropped;
- * messageContextInfo rides along on real content too, so on its own it is not enough to drop.
- */
-const PROTOCOL_NOISE_KEYS: ReadonlySet<string> = new Set([
-  'senderKeyDistributionMessage',
-  'fastRatchetKeySenderKeyDistributionMessage',
-  'messageContextInfo',
-  'messageHistoryNotice',
-  'messageHistoryBundle',
-]);
 
 /** Wire value of `proto.WebMessageInfo.StubType.CIPHERTEXT`, set when part of a stanza failed to decrypt. */
 const CIPHERTEXT_STUB_TYPE = 2 as BaileysLib.proto.WebMessageInfo.StubType;
@@ -260,8 +253,11 @@ export interface BaileysEventsHost {
   recordKeyLidMappings(
     key: Pick<WAMessageKey, 'remoteJid' | 'remoteJidAlt' | 'participant' | 'participantAlt' | 'fromMe'>,
   ): void;
-  /** Seed the chat's last-message preview + sort time from an inbound message. */
-  recordMessage(msg: WAMessage, type?: MessageType, order?: number): void;
+  /**
+   * Seed the chat's last-message preview + sort time from an inbound message. `withhold` keeps its text out of the
+   * preview, for a message the session drops (see isDroppedEphemeral): its key, time and place in the order still count.
+   */
+  recordMessage(msg: WAMessage, type?: MessageType, order?: number, withhold?: boolean): void;
   /** Reserve a message's place in the observed order on arrival, ahead of any limiter, store or media wait. */
   nextMessageOrder?(): number;
   /** Apply a message edit to the chat preview, when `accept` (if given) accepts the key the preview holds. */
@@ -413,7 +409,7 @@ export class BaileysEvents {
    */
   private readonly inboundInFlight = new Map<
     string,
-    { key: WAMessageKey; message: WAMessage['message']; done: Promise<void> }
+    { key: WAMessageKey; message: WAMessage['message']; done: Promise<void>; timestamp: number; order: number }
   >();
 
   /**
@@ -447,7 +443,10 @@ export class BaileysEvents {
    * handed on. A change that arrives while the delivery is still being processed (limiter wait, repeat
    * check, media download) waits for that processing to end first.
    */
-  private readonly outcomesPending = new Map<string, { count: number; ended: Promise<void>; free: () => void }>();
+  private readonly outcomesPending = new Map<
+    string,
+    { count: number; ended: Promise<void>; free: () => void; timers: Set<ReturnType<typeof setTimeout>> }
+  >();
 
   /**
    * Reactions, edits and deletes that reached a message still being processed where nothing is admitted before
@@ -458,7 +457,7 @@ export class BaileysEvents {
    */
   private readonly changesAwaitingEmit = new Map<
     string,
-    { announce: Array<() => void>; timer: ReturnType<typeof setTimeout> }
+    { announce: Array<() => void>; timer: ReturnType<typeof setTimeout>; generation: number }
   >();
 
   /** How many changes wait for a delivery or its outcome (see parkUntil); the rest are judged at once. */
@@ -474,10 +473,12 @@ export class BaileysEvents {
   private readonly messageChanges = new KeyedMutationQueue();
   private changesPreparing = 0;
   private preparationRoom?: { ready: Promise<void>; release: () => void };
-  private retirePreparations!: () => void;
-  private preparationsRetired = new Promise<void>(resolve => {
-    this.retirePreparations = resolve;
-  });
+  /**
+   * What fenceStoredWrites runs to end the preparations still under way, one entry per preparation until it has
+   * ended. Each settles the promises that preparation waits on itself: racing them against a promise the adapter
+   * keeps for good would leave a reaction on it for every change, for as long as the account stays linked.
+   */
+  private readonly preparationRetirements = new Set<() => void>();
 
   private static readonly CHANGES_PARKED_LIMIT = 64;
 
@@ -536,11 +537,20 @@ export class BaileysEvents {
   /** Drop the store writes of every message that arrived before now; call before wiping the store. */
   fenceStoredWrites(): void {
     this.storeGeneration++;
-    const retire = this.retirePreparations;
-    this.preparationsRetired = new Promise<void>(resolve => {
-      this.retirePreparations = resolve;
-    });
-    retire();
+    for (const waiting of this.changesAwaitingEmit.values()) clearTimeout(waiting.timer);
+    this.changesAwaitingEmit.clear();
+    this.changesAwaiting = 0;
+    const pendingOutcomes = [...this.outcomesPending.values()];
+    this.outcomesPending.clear();
+    for (const entry of pendingOutcomes) {
+      for (const timer of entry.timers) clearTimeout(timer);
+      entry.timers.clear();
+      entry.free();
+    }
+    const retirements = [...this.preparationRetirements];
+    this.preparationRetirements.clear();
+    for (const retire of retirements) retire();
+    this.wakePreparationWaiters();
   }
 
   /** Whether a delete for everyone of this message was accepted (see deletedForEveryone). */
@@ -680,6 +690,7 @@ export class BaileysEvents {
       const processed = this.host.inboundLimiter
         .run(yieldSlot => this.processInboundMessage(msg, { generation, order, ticket, yieldSlot }))
         .catch((error: unknown) => {
+          if (generation !== this.storeGeneration) return;
           // Names the failure rather than calling it "saturated", which used to send operators to look
           // at concurrency settings for a problem that was never there. The retry below skips the
           // limiter and processInboundMessage handles its own errors, so it cannot reject.
@@ -706,6 +717,8 @@ export class BaileysEvents {
           key: msg.key,
           message: msg.message,
           done: Promise.all([this.inboundInFlight.get(id)?.done, processed]).then(() => undefined),
+          timestamp: toUnixSeconds(msg.messageTimestamp),
+          order: order ?? 0,
         };
         this.inboundInFlight.set(id, tracked);
         void tracked.done.finally(() => {
@@ -718,6 +731,27 @@ export class BaileysEvents {
         });
       }
     }
+  }
+
+  /**
+   * The messages the account received that this session is still processing (a download, the queue for a slot) and
+   * Baileys has counted as unread already, which it does when the message arrives and not once it is recorded: where
+   * each belongs, and its place in the order observed. What Baileys takes for no message (a reaction, an edit sent as
+   * a protocol message) is not listed, nor what this session drops as no message of its own (see
+   * isNonContent), which would otherwise keep a chat unread until the next read.
+   */
+  receivedInFlight(): Array<{ chatJid: string; id: string; timestamp: number; order: number }> {
+    const b = this.host.getLoadedLib?.();
+    const received = [];
+    for (const [id, { key, message, timestamp, order }] of this.inboundInFlight) {
+      if (key.fromMe === true || !key.remoteJid) continue;
+      if (b) {
+        const content = b.normalizeMessageContent(message ?? undefined) ?? message ?? undefined;
+        if (!b.isRealMessage({ key, message }) || isNonContent(content, b.getContentType)) continue;
+      }
+      received.push({ chatJid: baileysChatJid(key.remoteJid, key.participant, false), id, timestamp, order });
+    }
+    return received;
   }
 
   /** The ack Baileys' event buffer merged into the upsert of a message the account sent, as an update. */
@@ -775,6 +809,15 @@ export class BaileysEvents {
     );
   }
 
+  /** Whether the session drops `msg` under STORE_EPHEMERAL_MESSAGES=false, by the timer its content carries. */
+  private dropsAsEphemeral(msg: WAMessage, ephemeralDuration: number | undefined): boolean {
+    return isDroppedEphemeral({
+      ephemeralDuration,
+      fromMe: msg.key.fromMe === true,
+      isStatusBroadcast: msg.key.remoteJid === 'status@broadcast',
+    });
+  }
+
   /**
    * Whether processing `msg` downloads its media: the gates of {@link resolveInboundMedia}, read before
    * the processing starts. True when the module is not loaded yet, which cannot happen once a socket
@@ -785,8 +828,9 @@ export class BaileysEvents {
     const ownStatusPost = msg.key.fromMe === true && msg.key.remoteJid === 'status@broadcast';
     const normalized = b.normalizeMessageContent(msg.message ?? undefined) ?? msg.message ?? undefined;
     return (
-      isBaileysMediaType(b.getContentType(normalized)) &&
+      isBaileysMediaType(contentTypeOf(normalized, b.getContentType)) &&
       !ownStatusPost &&
+      !this.dropsAsEphemeral(msg, extractBaileysContext(normalized ?? {}).ephemeralDuration) &&
       isMediaDownloadEnabled() &&
       coerceDeclaredSize(mediaSubMessage(normalized ?? {})?.fileLength) <= inboundMediaMaxBytes()
     );
@@ -924,23 +968,50 @@ export class BaileysEvents {
       // type drives routing here AND mapMessage. The protocol and reaction branches below read the
       // normalized content too: a client wraps an edit in `editedMessage`, and `ephemeralMessage` can hold
       // a revoke or a reaction just as well, so the raw root does not always carry them.
-      let normalizedRoot = b.normalizeMessageContent(msg.message ?? undefined) ?? msg.message ?? undefined;
-      let contentType = b.getContentType(normalizedRoot);
+      const normalizedRoot = b.normalizeMessageContent(msg.message ?? undefined) ?? msg.message ?? undefined;
+      const contentType = contentTypeOf(normalizedRoot, b.getContentType);
       // A contact's edit, and a reaction in some chats, arrive encrypted under the secret of the message
-      // they change. Read with the stored original's secret, they are handled below as the plain
-      // protocol or reaction message they stand for; one that cannot be read stays dropped as non-content.
+      // they change. Read with the stored original's secret, they are handled as the plain protocol or
+      // reaction message they stand for; one that cannot be read stays dropped as non-content. The read of
+      // the original is made in the queue of the message it changes, as every other change reads, so changes
+      // of one message are applied in the order they arrived in, whatever order the store answers the reads in.
       if (contentType === 'secretEncryptedMessage' || contentType === 'encReactionMessage') {
-        const revealed = await this.revealEncryptedModification(b, msg, normalizedRoot, contentType);
-        if (revealed) {
-          normalizedRoot = revealed.content;
-          contentType = revealed.contentType;
-        }
+        const encrypted =
+          contentType === 'secretEncryptedMessage'
+            ? normalizedRoot?.secretEncryptedMessage
+            : normalizedRoot?.encReactionMessage;
+        let handled = false;
+        await this.prepareMessageChange(
+          encrypted?.targetMessageKey?.id,
+          opts,
+          async (releasePreparation, yieldSlot) => {
+            const revealed = await this.revealEncryptedModification(
+              b,
+              msg,
+              normalizedRoot,
+              contentType,
+              opts.generation,
+            );
+            if (!revealed || opts.generation !== this.storeGeneration) return;
+            handled = true;
+            await this.processMessageChange(b, msg, revealed.content, revealed.contentType, {
+              ...opts,
+              yieldSlot,
+              releasePreparation,
+            });
+          },
+        );
+        if (handled) return;
       }
 
       if (contentType === 'protocolMessage' || contentType === 'reactionMessage') {
         const targetId = normalizedRoot?.protocolMessage?.key?.id ?? normalizedRoot?.reactionMessage?.key?.id;
-        await this.prepareMessageChange(targetId, opts, releasePreparation =>
-          this.processMessageChange(b, msg, normalizedRoot, contentType, { ...opts, releasePreparation }),
+        await this.prepareMessageChange(targetId, opts, (releasePreparation, yieldSlot) =>
+          this.processMessageChange(b, msg, normalizedRoot, contentType, {
+            ...opts,
+            yieldSlot,
+            releasePreparation,
+          }),
         );
         return;
       }
@@ -980,23 +1051,23 @@ export class BaileysEvents {
       // A stanza with a CIPHERTEXT stub lost part of its payload to a decryption failure; if what
       // survived holds only protocol noise (even a lone messageContextInfo), drop it before storing
       // so a redelivery carrying the real body is not skipped as a duplicate.
-      const keys = Object.keys(normalizedRoot ?? {});
       const ciphertextStub = msg.messageStubType === CIPHERTEXT_STUB_TYPE;
-      if (
-        keys.every(k => PROTOCOL_NOISE_KEYS.has(k)) &&
-        (ciphertextStub || keys.some(k => k !== 'messageContextInfo'))
-      ) {
+      if (isNoiseOnly(normalizedRoot, ciphertextStub)) {
         this.host.logger.debug('Dropping contentless protocol message', {
           action: 'baileys_drop_protocol_noise',
           msgId: msg.key.id,
           remoteJid,
-          keys,
+          keys: Object.keys(normalizedRoot ?? {}),
           ...(ciphertextStub ? { ciphertextStub: true } : {}),
         });
         return;
       }
 
       // --- Normal message: enrich + emit ---
+      // Baileys' own readers of the message (the media download, a quote of it) type it by the first key that
+      // contains `Message`, which a fast-ratchet distribution merged in before the content is. contentType above
+      // passed over it, so the download, the click and the quote get the message without it too.
+      msg = withoutFastRatchetDistribution(msg);
       // A message the store already holds was delivered or sent before: WhatsApp re-delivers a node
       // whose ack was lost on a drop, so the second copy has to stop here. Downstream would not catch
       // it: the own-send path dispatches message.sent whatever its insert did, and the inbound path
@@ -1011,6 +1082,7 @@ export class BaileysEvents {
         });
         return;
       }
+      if (opts.generation !== this.storeGeneration) return;
       // The account's own status post reaches the projector and is dropped there: a story is not a
       // conversation, so no `message.sent` is emitted for it. Downloading its media first is work
       // nothing consumes, and a story is a full-size photo or video. Everything else about the path
@@ -1021,6 +1093,7 @@ export class BaileysEvents {
         ticket: opts.ticket,
         yieldSlot: opts.yieldSlot,
       });
+      if (opts.generation !== this.storeGeneration) return;
       // Stored before it is announced: whoever hears about this message may act on it at once (a quoted
       // reply, a reaction, a read receipt), and the store holds a read of an id until its write lands.
       // A message deleted for everyone or edited while it was being processed is stored as the change
@@ -1041,7 +1114,11 @@ export class BaileysEvents {
         if (editedBody !== incoming.body || edit?.afterOtherText) incoming.originalBody = incoming.body;
         incoming.body = editedBody;
       }
-      if (opts.generation === this.storeGeneration) {
+      // A message the session drops under STORE_EPHEMERAL_MESSAGES=false is never announced, so no copy of its content is
+      // kept here either, nor its text in the chat preview. What the account sent or typed on its phone is announced
+      // and can be changed, and a status is the status store's: they keep theirs.
+      const dropped = isDroppedEphemeral(incoming);
+      if (opts.generation === this.storeGeneration && !dropped) {
         void this.host.putStoredMessage(toStore)?.catch(err =>
           this.host.logger.warn('Failed to persist message to store', {
             error: err instanceof Error ? err.message : String(err),
@@ -1058,9 +1135,9 @@ export class BaileysEvents {
         const emit = msg.key.fromMe === true ? this.host.getOnMessageCreate() : this.host.getOnMessage();
         // The ticket goes along only where one was issued, so elsewhere the call is unchanged.
         const receipt = opts.ticket ? emit?.(incoming, opts.ticket) : emit?.(incoming);
-        this.watchOutcome(msg.key, receipt);
+        this.watchOutcome(msg.key, receipt, opts.generation);
       }
-      this.host.recordMessage(msg, deleted ? 'revoked' : incoming.type, opts.order);
+      this.host.recordMessage(msg, deleted ? 'revoked' : incoming.type, opts.order, dropped);
       if (deleted) {
         this.host.recordMessageEdit(chatJid, storedId, '', 'revoked');
       } else if (editedBody !== undefined && storedId !== null) {
@@ -1082,52 +1159,81 @@ export class BaileysEvents {
   private async prepareMessageChange(
     messageId: string | null | undefined,
     opts: { generation: number; ticket?: InboundTicket; yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R> },
-    work: (releasePreparation: () => void) => Promise<void>,
+    work: (releasePreparation: () => void, yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>) => Promise<void>,
   ): Promise<void> {
     if (opts.generation !== this.storeGeneration) return;
-    const retired = this.preparationsRetired;
     if (!messageId) {
-      if (opts.generation === this.storeGeneration) await work(() => undefined);
+      if (opts.generation === this.storeGeneration) await work(() => undefined, opts.yieldSlot);
       return;
     }
     opts.ticket?.drop();
-    while (this.changesPreparing >= BaileysEvents.CHANGES_PARKED_LIMIT) {
-      if (!this.preparationRoom) {
-        let release!: () => void;
-        const ready = new Promise<void>(resolve => {
-          release = resolve;
-        });
-        this.preparationRoom = { ready, release };
-      }
-      await Promise.race([this.preparationRoom.ready, retired]);
+    const run = async (): Promise<void> => {
       if (opts.generation !== this.storeGeneration) return;
-    }
-    this.changesPreparing++;
-    let finish!: () => void;
-    let fail!: (error: unknown) => void;
-    const done = new Promise<void>((resolve, reject) => {
-      finish = resolve;
-      fail = reject;
-    });
-    let releasePreparation!: () => void;
-    const released = new Promise<void>(resolve => {
-      releasePreparation = resolve;
-    });
-    this.messageChanges.enqueue(messageId, async () => {
-      const preparing = (async () => {
-        if (opts.generation === this.storeGeneration) await work(releasePreparation);
-      })().then(finish, fail);
-      try {
-        await Promise.race([preparing, released, retired]);
-      } finally {
-        this.changesPreparing--;
-        const room = this.preparationRoom;
-        this.preparationRoom = undefined;
-        room?.release();
+      while (this.changesPreparing >= BaileysEvents.CHANGES_PARKED_LIMIT) {
+        if (!this.preparationRoom) {
+          let release!: () => void;
+          const ready = new Promise<void>(resolve => {
+            release = resolve;
+          });
+          this.preparationRoom = { ready, release };
+        }
+        await this.preparationRoom.ready;
+        if (opts.generation !== this.storeGeneration) return;
       }
-    });
-    const settled = Promise.race([done, retired]);
-    await (opts.yieldSlot ? opts.yieldSlot(() => settled) : settled);
+      this.changesPreparing++;
+      let retired = false;
+      let finish!: () => void;
+      let fail!: (error: unknown) => void;
+      const done = new Promise<void>((resolve, reject) => {
+        finish = resolve;
+        fail = reject;
+      });
+      let releasePreparation!: () => void;
+      const released = new Promise<void>(resolve => {
+        releasePreparation = resolve;
+      });
+      // Once retired (or fenced), detached work must never invoke opts.yieldSlot after the
+      // surrounding inboundLimiter.run() has already exited, or it would double-release the slot.
+      const gatedYieldSlot = opts.yieldSlot
+        ? <R>(fn: () => Promise<R>): Promise<R> => {
+            if (retired || opts.generation !== this.storeGeneration) return fn();
+            return opts.yieldSlot!(fn);
+          }
+        : undefined;
+      this.messageChanges.enqueue(messageId, async () => {
+        const preparing = (async () => {
+          if (!retired && opts.generation === this.storeGeneration) {
+            await work(releasePreparation, gatedYieldSlot);
+          }
+        })().then(finish, fail);
+        try {
+          await Promise.race([preparing, released]);
+        } finally {
+          this.changesPreparing--;
+          this.wakePreparationWaiters();
+        }
+      });
+      const retire = (): void => {
+        retired = true;
+        releasePreparation();
+        finish();
+      };
+      this.preparationRetirements.add(retire);
+      try {
+        await done;
+      } finally {
+        retired = true;
+        this.preparationRetirements.delete(retire);
+      }
+    };
+    await (opts.yieldSlot ? opts.yieldSlot(run) : run());
+  }
+
+  /** Wake the arrivals waiting for room; each looks again for room, and whether its store was fenced meanwhile. */
+  private wakePreparationWaiters(): void {
+    const room = this.preparationRoom;
+    this.preparationRoom = undefined;
+    room?.release();
   }
 
   private async processMessageChange(
@@ -1344,9 +1450,11 @@ export class BaileysEvents {
         const storedKey = (await this.readTarget(edited.messageId, 'reading an edit target'))?.key ?? target?.key;
         const resolveStored = await this.reportedPhones(storedKey, target?.key, msg.key);
         if (opts.generation !== this.storeGeneration) return;
-        const currentTarget = this.inboundInFlight.get(edited.messageId) ?? target;
+        const currentTarget = this.inboundInFlight.get(edited.messageId);
         if (currentTarget && this.mayChange(currentTarget.key, msg.key, false, resolveStored)) {
           recordInFlightEdit(resolveStored);
+        } else if (this.editedWhileInFlight.get(edited.messageId)?.envelope === msg.key) {
+          this.editedWhileInFlight.delete(edited.messageId);
         }
         const storedChatJid =
           storedKey?.remoteJid && this.mayChange(storedKey, msg.key, false, resolveStored)
@@ -1426,7 +1534,7 @@ export class BaileysEvents {
     }
     const timer = setTimeout(() => this.handOverChanges(messageId), 3 * inboundMediaTimeoutMs());
     timer.unref();
-    this.changesAwaitingEmit.set(messageId, { announce: [announce], timer });
+    this.changesAwaitingEmit.set(messageId, { announce: [announce], timer, generation: this.storeGeneration });
   }
 
   /** Announce, in order, what waited for message `id` to be handed on (see announceWhenHandedOn). */
@@ -1436,6 +1544,7 @@ export class BaileysEvents {
     this.changesAwaitingEmit.delete(messageId);
     clearTimeout(waiting.timer);
     this.changesAwaiting -= waiting.announce.length;
+    if (waiting.generation !== this.storeGeneration) return;
     for (const announce of waiting.announce) {
       try {
         announce();
@@ -1455,14 +1564,19 @@ export class BaileysEvents {
    * later edit, delete or reaction of it is judged. Detached: it never delays inbound handling, and
    * nothing it does can fail it, whatever the callback returns or rejects with.
    */
-  private watchOutcome(key: WAMessageKey, receipt: void | InboundReceipt): void {
+  private watchOutcome(key: WAMessageKey, receipt: void | InboundReceipt, generation = this.storeGeneration): void {
     const id = key.id;
     if (!id || !receipt?.settled) return;
     // The session holds no entry for a status post, so it judges no change aimed at one: only a message
     // it holds can stand in for the stored copy there.
-    const release = key.remoteJid === 'status@broadcast' ? undefined : this.holdOutcome(id);
+    const release =
+      key.remoteJid === 'status@broadcast' || generation !== this.storeGeneration ? undefined : this.holdOutcome(id);
     void Promise.resolve(receipt.settled)
-      .then(result => (result?.conflict === true ? this.dropConflictingCopy(key, id) : undefined))
+      .then(result =>
+        result?.conflict === true && generation === this.storeGeneration
+          ? this.dropConflictingCopy(key, id)
+          : undefined,
+      )
       .catch((err: unknown) =>
         this.host.logger.warn('Could not act on what the session made of a message', {
           msgId: id,
@@ -1483,7 +1597,7 @@ export class BaileysEvents {
     if (!hold) {
       let free!: () => void;
       const ended = new Promise<void>(resolve => (free = resolve));
-      hold = { count: 0, ended, free };
+      hold = { count: 0, ended, free, timers: new Set() };
       this.outcomesPending.set(id, hold);
     }
     const entry = hold;
@@ -1493,12 +1607,14 @@ export class BaileysEvents {
       if (ended) return;
       ended = true;
       clearTimeout(timer);
+      entry.timers.delete(timer);
       if (--entry.count > 0) return;
-      this.outcomesPending.delete(id);
+      if (this.outcomesPending.get(id) === entry) this.outcomesPending.delete(id);
       entry.free();
     };
     const timer = setTimeout(end, BaileysEvents.OUTCOME_HOLD_MS);
     timer.unref();
+    entry.timers.add(timer);
     return end;
   }
 
@@ -1597,6 +1713,7 @@ export class BaileysEvents {
     msg: WAMessage,
     content: WAMessage['message'],
     contentType: string,
+    generation?: number,
   ): Promise<
     { content: NonNullable<WAMessage['message']>; contentType: 'protocolMessage' | 'reactionMessage' } | undefined
   > {
@@ -1616,6 +1733,7 @@ export class BaileysEvents {
         if (type !== editType && type !== 'MESSAGE_EDIT') return undefined;
       }
       const original = await this.readTarget(targetId, 'reading the message an encrypted edit or reaction targets');
+      if (generation !== undefined && generation !== this.storeGeneration) return undefined;
       const secret = messageSecretOf(original?.message);
       if (!original || !secret) {
         this.host.logger.debug('Cannot read an encrypted edit or reaction: the message it targets is not stored', {
@@ -1700,6 +1818,7 @@ export class BaileysEvents {
     checkAuthor: boolean,
     kind?: 'reaction',
     inbound?: {
+      generation?: number;
       ticket?: InboundTicket;
       yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>;
       releasePreparation?: () => void;
@@ -1713,10 +1832,12 @@ export class BaileysEvents {
     let heldUntil: number | undefined;
     let reread = false;
     for (;;) {
+      if (inbound?.generation !== undefined && inbound.generation !== this.storeGeneration) return true;
       const removals = this.removalsOf(targetId);
       // A message still being processed has no stored copy yet, but the projector may already hold it
       // (PostgreSQL), so its own key is checked instead.
       const found = await this.readTarget(targetId, 'checking what an edit, revoke or reaction targets');
+      if (inbound?.generation !== undefined && inbound.generation !== this.storeGeneration) return true;
       // Without a stored copy the key the wait was for stands (a delivery that may never have been stored: no
       // store, a failed write; or a copy gone since), unless a conflicting copy went since the wait for it
       // began: then that delivery was not the message the id names, and nothing says which one is.
@@ -1745,6 +1866,7 @@ export class BaileysEvents {
         waitedFor = { key: original, removals };
         if (await this.parkUntil(processing, 3 * inboundMediaTimeoutMs(), inbound)) continue;
       }
+      if (inbound?.generation !== undefined && inbound.generation !== this.storeGeneration) return true;
       // A conflicting copy went while the store was read, and the read may have returned it: it ends the
       // hold only once removed, so the read is the one that can no longer be told from the real copy. Read
       // again, with the copy gone, rather than drop the real author's change against it.
@@ -1775,11 +1897,13 @@ export class BaileysEvents {
     until: Promise<void>,
     limitMs: number,
     inbound?: {
+      generation?: number;
       ticket?: InboundTicket;
       yieldSlot?: <R>(fn: () => Promise<R>) => Promise<R>;
       releasePreparation?: () => void;
     },
   ): Promise<boolean> {
+    if (inbound?.generation !== undefined && inbound.generation !== this.storeGeneration) return false;
     if (this.changesParked >= BaileysEvents.CHANGES_PARKED_LIMIT) return false;
     this.changesParked++;
     try {
@@ -2290,7 +2414,7 @@ export class BaileysEvents {
    * on). Only action 'created' maps to the neutral join_request kind — the wwebjs event has no
    * revoke/reject counterpart, so only the shared signal is surfaced. Upstream scope caveat: rc14
    * emits this event only from the NON_ADMIN_ADD stub (172); the direct self-request stub (144) is
-   * unhandled with an upstream TODO (Utils/process-message.js:569), so an invite-link self-request
+   * unhandled with an upstream TODO (Utils/process-message.js), so an invite-link self-request
    * may produce no event on this engine — the REST list endpoint still sees it. The pn twins are
    * preferred over lids for the same reason as everywhere else. The event carries no timestamp, so
    * it is stamped at receipt.
@@ -2332,7 +2456,7 @@ export class BaileysEvents {
    * the wwebjs adapter, which emits uninterpretable updates the same way rather than dropping them.
    *
    * The same event also carries FULL metadata snapshots: groupFetchAllParticipating() emits its
-   * entire result set through it (Socket/groups.js:56 `sock.ev.emit('groups.update', ...)`), and
+   * entire result set through it (Socket/groups.js `sock.ev.emit('groups.update', ...)`), and
    * this adapter calls that on every connect (hydrateNames) and every REST getGroups(). Real deltas
    * (Utils/process-message.js emitGroupUpdate) carry only `{id, ...oneChangedField, author?}`;
    * snapshots are recognized by their full-metadata markers (participants/creation/subjectTime/
@@ -2404,7 +2528,7 @@ export class BaileysEvents {
         continue;
       }
       // Baileys replays offers for calls missed while disconnected with offline: true
-      // (Socket/messages-recv.js:1458 `offline: !!attrs.offline`; WACallEvent.offline is
+      // (Socket/messages-recv.js `offline: !!attrs.offline`; WACallEvent.offline is
       // non-optional). Those calls are long dead — emitting call.received (and, with
       // autoRejectCalls, rejecting a stale call) would be wrong, so drop them before caching.
       if (call.offline) {
@@ -2692,6 +2816,11 @@ export class BaileysEvents {
     // Hold the stream handle in the outer scope so the timeout can destroy it. A genuine
     // download/read error still rejects (propagating to the caller's catch as before).
     let stream: (AsyncIterable<Buffer> & { destroy?: () => void }) | undefined;
+    // AbortController cancels the underlying HTTP fetch (via patch-baileys-media-signal) and any
+    // pending reuploadRequest when the deadline fires, the byte cap trips, or reading stops early.
+    const abort = new AbortController();
+    const abortReason = (): Error =>
+      abort.signal.reason instanceof Error ? abort.signal.reason : new Error('inbound media download aborted');
     // The timeout can fire before the stream exists (an expired-media re-upload wait, a slow response):
     // the abandoned download must then stop on its own instead of buffering outside the limiter.
     let timedOut = false;
@@ -2705,7 +2834,7 @@ export class BaileysEvents {
       releaseSlot = () => resolve(Buffer.alloc(0));
     });
     const body = async (): Promise<Buffer | { overflowBytes: number }> => {
-      if (timedOut) {
+      if (timedOut || abort.signal.aborted) {
         return Buffer.alloc(0);
       }
       const b = await this.host.loadLib();
@@ -2723,34 +2852,60 @@ export class BaileysEvents {
       // from the nested `options`; a top-level one is ignored. Read after the socket: once the session
       // is torn down getSocket() throws, and a dispatcher built then would never be closed.
       const dispatcher = this.host.getFetchDispatcher();
-      stream = (await b.downloadMediaMessage(
-        msg,
-        'stream',
-        dispatcher ? { options: { dispatcher } as RequestInit } : {},
-        {
-          logger: createSilentLogger(),
-          reuploadRequest: async m => assertWhatsAppSource(await sock.updateMediaMessage(m)),
-        },
-      )) as AsyncIterable<Buffer> & { destroy?: () => void };
-      if (timedOut) {
-        stream.destroy?.();
-        return Buffer.alloc(0);
-      }
-
-      const chunks: Buffer[] = [];
-      let total = 0;
-      for await (const chunk of stream) {
-        if (timedOut) {
-          break;
-        }
-        total += chunk.length;
-        if (total > maxBytes) {
+      try {
+        stream = (await b.downloadMediaMessage(
+          msg,
+          'stream',
+          { options: { ...(dispatcher ? { dispatcher } : {}), signal: abort.signal } },
+          {
+            logger: createSilentLogger(),
+            reuploadRequest: async m => {
+              if (abort.signal.aborted) {
+                throw abortReason();
+              }
+              let onAbort: (() => void) | undefined;
+              const reupload = Promise.resolve(sock.updateMediaMessage(m));
+              // Attach a no-op rejection handler so a late rejection after abort never goes unhandled.
+              reupload.catch(() => undefined);
+              const updated = await new Promise<WAMessage>((resolve, reject) => {
+                onAbort = () => reject(abortReason());
+                abort.signal.addEventListener('abort', onAbort, { once: true });
+                reupload.then(resolve, reject);
+              }).finally(() => {
+                if (onAbort) abort.signal.removeEventListener('abort', onAbort);
+              });
+              if (abort.signal.aborted) {
+                throw abortReason();
+              }
+              return assertWhatsAppSource(updated);
+            },
+          },
+        )) as AsyncIterable<Buffer> & { destroy?: () => void };
+        if (timedOut || abort.signal.aborted) {
           stream.destroy?.();
-          return { overflowBytes: total };
+          return Buffer.alloc(0);
         }
-        chunks.push(chunk);
+
+        const chunks: Buffer[] = [];
+        let total = 0;
+        for await (const chunk of stream) {
+          if (timedOut || abort.signal.aborted) {
+            break;
+          }
+          total += chunk.length;
+          if (total > maxBytes) {
+            abort.abort(new Error('inbound media download exceeded size cap'));
+            stream.destroy?.();
+            return { overflowBytes: total };
+          }
+          chunks.push(chunk);
+        }
+        return Buffer.concat(chunks);
+      } finally {
+        if (!abort.signal.aborted) {
+          abort.abort();
+        }
       }
-      return Buffer.concat(chunks);
     };
     // The wait for the process-wide gate sits inside the deadline below, so a contended gate cannot
     // hold this session's inbound handler longer than MEDIA_DOWNLOAD_TIMEOUT_MS.
@@ -2762,10 +2917,11 @@ export class BaileysEvents {
     });
 
     // A slow/trickling sender never trips the byte cap, so without a deadline it pins a concurrency
-    // slot (and, on Baileys, the whole inbound handler) indefinitely. On timeout, destroy the stream
-    // and treat it as no usable media.
+    // slot (and, on Baileys, the whole inbound handler) indefinitely. On timeout, abort the signal
+    // before destroying the stream so pre-header fetches and pending re-uploads cancel immediately.
     return withInboundDownloadTimeout(download, inboundMediaTimeoutMs(), () => {
       timedOut = true;
+      abort.abort(new Error('inbound media download timed out'));
       stream?.destroy?.();
       releaseSlot();
     });
@@ -2906,10 +3062,13 @@ export class BaileysEvents {
     // Body: text first, then media caption, then WhatsApp Business interactive shapes (#562).
     const body = extractBaileysBody(normalized);
     const location = extractBaileysLocation(normalized, contentType);
-    const media = await this.resolveInboundMedia(msg, contentType, content, b, opts?.skipMediaDownload === true, opts);
     // The quote, the disappearing-messages timer, the mentions and the status styling all come from
     // one region of the content — see BaileysMessageContext.
     const context = extractBaileysContext(normalized);
+    // A message the session drops under STORE_EPHEMERAL_MESSAGES=false is neither stored nor announced, so its media
+    // is not fetched: the marker stands in, as for any download that is skipped.
+    const skipMedia = opts?.skipMediaDownload === true || this.dropsAsEphemeral(msg, context.ephemeralDuration);
+    const media = await this.resolveInboundMedia(msg, contentType, content, b, skipMedia, opts);
     // Commerce ids (order token, product id): the generic path sees an empty body and drops them,
     // and they are the only handle a caller has on the order or the product.
     const commerce = extractBaileysCommerce(normalized, contentType);
@@ -3019,7 +3178,13 @@ export class BaileysEvents {
         return;
       }
 
-      if (this.readsAsForeign(original.key, msg.key, false, 'reaction')) {
+      // A poll the account sent to a broadcast list is filed under the list, which no chat can match, so
+      // readsAsForeign lets every vote through. Each recipient votes from its 1:1 chat, and only that is exempt.
+      const ownListPoll = original.key.fromMe === true && !!original.key.remoteJid?.endsWith('@broadcast');
+      if (
+        this.readsAsForeign(original.key, msg.key, false, 'reaction') ||
+        (ownListPoll && chatKind(remoteJid) !== 'individual')
+      ) {
         this.host.logger.warn('Dropping a poll vote sent in a chat other than its poll', {
           action: 'baileys_poll_vote_cross_chat',
           msgId: msg.key.id ?? 'unknown',

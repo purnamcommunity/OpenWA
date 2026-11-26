@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, type RefObject } from 'react';
+import { useState, useEffect, useMemo, useRef, useContext, type RefObject } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import {
   useTable,
@@ -35,6 +35,8 @@ import { PageHeader } from '../components/PageHeader';
 import { Modal } from '../components/Modal';
 import { SessionScopePicker } from '../components/SessionScopePicker';
 import { useToast } from '../hooks/useToast';
+import { RoleContext } from '../hooks/useRole';
+import { getActiveApiKeyId } from '../utils/authLifecycle';
 import { copyToClipboard } from '../utils/clipboard';
 import { captionLength } from '../utils/bulkMedia';
 import {
@@ -60,16 +62,6 @@ const emptyKeyForm = { name: '', role: 'operator', allowedSessions: [] as string
 
 // What the gateway lists for the key seeded from API_MASTER_KEY: its first characters are secret, so none is shown.
 const MASTER_KEY_PREFIX = '(master key)';
-
-// The key this dashboard signed in with: the list only carries each key's prefix, which is the first
-// 12 characters of the raw key. The key seeded from API_MASTER_KEY lists a fixed marker instead, so it is the
-// one that no other key's prefix matches.
-function isSignedInKey(apiKey: ApiKey, keys: ApiKey[]): boolean {
-  const signedIn = sessionStorage.getItem('openwa_api_key');
-  if (!signedIn || !apiKey.keyPrefix) return false;
-  if (apiKey.keyPrefix !== MASTER_KEY_PREFIX) return signedIn.startsWith(apiKey.keyPrefix);
-  return !keys.some(other => other.id !== apiKey.id && !!other.keyPrefix && signedIn.startsWith(other.keyPrefix));
-}
 
 // The first IP or chat line the gateway would refuse, so the form can name it instead of the bare
 // "Bad Request" a production gateway answers with. On an edit, a list left as stored is not sent (see
@@ -258,6 +250,11 @@ export function ApiKeys() {
     null,
   );
 
+  const confirmKey = confirmAction ? apiKeys.find(key => key.id === confirmAction.id) : undefined;
+  const roleContext = useContext(RoleContext);
+  const signedInApiKeyId = roleContext?.apiKeyId !== undefined ? roleContext.apiKeyId : getActiveApiKeyId();
+  const isSignedInKey = (apiKey: ApiKey): boolean => Boolean(signedInApiKeyId && apiKey.id === signedInApiKeyId);
+
   const windowWidth = useWindowSize();
   const isMobile = windowWidth <= 768;
   const isSmall = windowWidth < 640;
@@ -393,7 +390,7 @@ export function ApiKeys() {
     if (await copyToClipboard(text)) {
       setCopied(id);
       setTimeout(() => setCopied(null), 2000);
-    }
+    } else toast.error(t('common.copyFailed'));
   };
 
   const columns = useMemo(
@@ -409,7 +406,8 @@ export function ApiKeys() {
           // The list carries only the prefix: the full key exists once, in the post-creation modal.
           cell: info => (
             <span className="key-cell">
-              <code>{info.getValue()}****</code>
+              {/* The bootstrap key seeded from API_MASTER_KEY carries a marker, not a prefix: nothing to mask. */}
+              <code>{info.getValue() === MASTER_KEY_PREFIX ? info.getValue() : `${info.getValue()}****`}</code>
             </span>
           ),
         }),
@@ -606,7 +604,7 @@ export function ApiKeys() {
                   style={{
                     flex: 1,
                     padding: '0.75rem',
-                    background: 'var(--bg-secondary)',
+                    background: 'var(--bg-light)',
                     borderRadius: '6px',
                     wordBreak: 'break-all',
                   }}
@@ -703,7 +701,7 @@ export function ApiKeys() {
           <p className="session-scope-edit-name">
             <strong>{editingKey.name}</strong>
           </p>
-          {isSignedInKey(editingKey, apiKeys) && (
+          {isSignedInKey(editingKey) && (
             <p className="key-signed-in-warning" role="note">
               <AlertTriangle size={16} />
               {t('apiKeys.edit.signedIn')}
@@ -835,15 +833,20 @@ export function ApiKeys() {
               i18nKey={
                 confirmAction.type === 'delete' ? 'apiKeys.confirm.deleteMessage' : 'apiKeys.confirm.revokeMessage'
               }
-              values={{ name: confirmAction.name }}
-              components={{ strong: <strong /> }}
-              // The key's name is free text. Without escaping, a name carrying markup became elements of the
-              // message: a styled tag handed React a string for `style`, which throws and took the whole page
-              // down. Escaped on interpolation and unescaped for display, it stays the text it was typed as.
-              tOptions={{ interpolation: { escapeValue: true } }}
-              shouldUnescape
+              // The key's name is free text, so it is a child of the message and not a value interpolated into it:
+              // as a value it was interpolated a second time (a name that held braces came back inside itself) and,
+              // unescaped, markup in it became elements of the message. As a child it is always the text it was
+              // typed as.
+              components={{ name: <strong>{confirmAction.name}</strong> }}
             />
           </p>
+          {/* Revoking or deleting the key this dashboard is signed in with ends the session at its next request. */}
+          {confirmKey && isSignedInKey(confirmKey) && (
+            <p className="key-signed-in-warning" role="note">
+              <AlertTriangle size={16} />
+              {t('apiKeys.confirm.signedIn')}
+            </p>
+          )}
         </Modal>
       )}
     </div>

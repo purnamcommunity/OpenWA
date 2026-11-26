@@ -1,4 +1,4 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import type { Socket } from 'net';
@@ -15,7 +15,9 @@ import {
   CreateBucketCommand,
 } from '@aws-sdk/client-s3';
 import { createLogger } from '../services/logger.service';
+import { STORAGE_FALLBACK_SHUTDOWN_WAIT_MS } from '../services/shutdown-budget';
 import { positiveIntFromEnv } from '../utils/env-int';
+import { ensurePrivateDir } from '../utils/private-dir.util';
 import { isSafeStorageKey } from '../utils/path-safety';
 import { DEFAULT_S3_KEY_PREFIX, normalizeS3KeyPrefix } from './s3-key-prefix';
 import {
@@ -25,7 +27,14 @@ import {
   importFromStream,
   isMissingObjectError,
 } from './storage-transfer';
-import { iterateLocalFiles, getLocalFile, openLocalFile, putLocalFile, deleteLocalFile } from './storage-local-files';
+import {
+  iterateLocalFiles,
+  getLocalFile,
+  openLocalFile,
+  putLocalFile,
+  putLocalStream,
+  deleteLocalFile,
+} from './storage-local-files';
 
 // Re-exported so feature modules keep importing it next to StorageService.
 export { isMissingObjectError } from './storage-transfer';
@@ -130,7 +139,7 @@ function withIdleBound(body: Readable, idleMs: number, readerIdleMs: number): Re
 }
 
 @Injectable()
-export class StorageService implements OnModuleDestroy {
+export class StorageService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = createLogger('StorageService');
   private readonly storageType: string;
   private readonly localPath: string;
@@ -146,6 +155,7 @@ export class StorageService implements OnModuleDestroy {
   private s3Bucket = 'openwa';
   private s3KeyRoot = DEFAULT_S3_KEY_PREFIX;
   private s3Available = false;
+  private s3InitPromise: Promise<void> | null = null;
   private s3ReprobeTimer: NodeJS.Timeout | null = null;
   private readonly s3ReprobeIntervalMs = positiveIntFromEnv('S3_REPROBE_INTERVAL_MS', DEFAULT_S3_REPROBE_INTERVAL_MS);
 
@@ -186,7 +196,7 @@ export class StorageService implements OnModuleDestroy {
         const keyRoot = normalizeS3KeyPrefix(process.env.S3_KEY_PREFIX || s3Config.keyPrefix);
         if (!keyRoot) throw new Error('S3_KEY_PREFIX is not a safe relative key prefix');
         this.s3KeyRoot = keyRoot;
-        void this.initializeS3Bucket();
+        this.s3InitPromise = this.initializeS3Bucket();
         this.startS3Reprobe();
       } else {
         // Every other degradation in this service announces itself, but this one could not: the
@@ -209,14 +219,72 @@ export class StorageService implements OnModuleDestroy {
       }
     }
 
-    // Ensure local directory exists
+    // Ensure the local directory exists and is owner-only: it holds message content as plain files, like the
+    // databases and the engine auth directories, which are already 0600 and 0700. Files written earlier keep
+    // their mode but sit under the 0700 root.
     if (!fs.existsSync(this.localPath)) {
-      fs.mkdirSync(this.localPath, { recursive: true });
+      fs.mkdirSync(this.localPath, { recursive: true, mode: 0o700 });
     }
+    ensurePrivateDir(this.localPath);
+    this.warnWhenLocalRootIsOpen();
   }
 
-  onModuleDestroy(): void {
+  /**
+   * ensurePrivateDir is best effort, so a root the gateway does not own (a volume or bind mount owned by another
+   * user) keeps its mode without a word, and files written earlier with a loose mode stay reachable through it. Say
+   * so once at boot, with what to do. Windows reports no POSIX modes, so there is nothing to read there.
+   */
+  private warnWhenLocalRootIsOpen(): void {
+    if (process.platform === 'win32') return;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(this.localPath);
+    } catch {
+      // A diagnostic never stops the boot: what is wrong with the directory shows at its first use.
+      return;
+    }
+    const { mode, uid } = stat;
+    if ((mode & 0o077) === 0) return;
+    this.logger.warn(
+      `The local media directory '${path.resolve(this.localPath)}' has mode ` +
+        `${(mode & 0o7777).toString(8).padStart(4, '0')} and could not be made owner-only (0700): other users can ` +
+        `list it and read any file in it written with a loose mode. It is owned by uid ${uid} and the gateway runs ` +
+        `as uid ${process.getuid?.()}. Own the directory as the gateway's user (chown it, then restart), or restrict ` +
+        `it from outside: a stricter mode or ACL on the mount, or a parent directory only that user can enter.`,
+    );
+  }
+
+  async onModuleInit(): Promise<void> {
+    await this.s3InitPromise;
+  }
+
+  private stopped = false;
+  private mayHaveLocalFallback = false;
+  private inFlightLocalFallbackWrites = 0;
+  private localFallbackWriteEpoch = 0;
+  private localFallbackSyncPending = false;
+  private fallbackSyncInFlight: Promise<void> | null = null;
+  private fallbackSyncRetryTimer: NodeJS.Timeout | null = null;
+  private readonly fallbackKeyLocks = new Map<string, Promise<void>>();
+
+  async onModuleDestroy(): Promise<void> {
+    this.stopped = true;
+    this.localFallbackSyncPending = false;
     this.clearS3Reprobe();
+    this.clearFallbackSyncRetry();
+    if (!this.fallbackSyncInFlight) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.fallbackSyncInFlight,
+        new Promise<void>(resolve => {
+          timer = setTimeout(resolve, STORAGE_FALLBACK_SHUTDOWN_WAIT_MS);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async initializeS3Bucket(): Promise<void> {
@@ -227,6 +295,7 @@ export class StorageService implements OnModuleDestroy {
       this.s3Available = true;
       this.logger.log(`S3 bucket '${this.s3Bucket}' is available`);
     } catch (error: unknown) {
+      this.mayHaveLocalFallback = true;
       this.logger.error('S3 bucket check failed', String(error));
       this.lastS3Error = String(error);
       this.warnLocalFallback();
@@ -329,13 +398,12 @@ export class StorageService implements OnModuleDestroy {
       try {
         await this.ensureS3Bucket();
         this.s3Available = true;
-        // WARN (not log): the degraded window matters — media written to the local fallback dir while
-        // S3 was down stays local-only; reads for those keys keep working via the NoSuchKey
-        // read-through in getS3File, but the operator should reconcile/acknowledge the gap.
+        this.mayHaveLocalFallback = true;
         this.logger.warn(
-          `S3 bucket '${this.s3Bucket}' recovered — media storage back on S3. Files written to the local ` +
-            `fallback dir '${this.localPath}' during the outage remain there (still readable via read-through).`,
+          `S3 bucket '${this.s3Bucket}' recovered: media storage is back on S3; syncing any files ` +
+            `written to local fallback dir '${this.localPath}' during the outage.`,
         );
+        this.scheduleLocalFallbackSync();
       } catch (error: unknown) {
         // still unavailable: leave s3Available false; a later poll retries after the throttle window
         this.lastS3Error = String(error);
@@ -367,6 +435,7 @@ export class StorageService implements OnModuleDestroy {
    * sweep): the directory is named in a warning and left alone.
    */
   async *iterateFiles(prefix = '', options: { skipUnreadable?: boolean } = {}): AsyncGenerator<string> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     if (this.storageType === 's3' && this.s3Client && this.s3Available) {
       const local = new Set<string>();
       for await (const file of this.iterateLocalFiles(prefix, options.skipUnreadable)) {
@@ -382,6 +451,7 @@ export class StorageService implements OnModuleDestroy {
   }
 
   async getFile(filePath: string): Promise<Buffer> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     // Mirror putFile: getLocalFile has its own isPathWithin guard, but getS3File builds
     // `${s3KeyRoot}${filePath}` with none, so contain both read backends at this boundary.
     if (!isSafeStorageKey(filePath)) {
@@ -399,6 +469,7 @@ export class StorageService implements OnModuleDestroy {
    * On S3 a download past S3_MAX_OPEN_DOWNLOADS is refused at once with a 503.
    */
   async openFile(filePath: string): Promise<ExportFileSource> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     return this.openStoredFile(filePath, this.s3StreamClient);
   }
 
@@ -413,15 +484,50 @@ export class StorageService implements OnModuleDestroy {
   }
 
   async putFile(filePath: string, data: Buffer): Promise<void> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     // Centralized containment so BOTH backends inherit it: putLocalFile has its own isPathWithin
     // guard, but putS3File builds `${s3KeyRoot}${filePath}` with none, so reject a traversing key here.
     if (!isSafeStorageKey(filePath)) {
       throw new Error(`Refusing to store an unsafe storage key: ${filePath}`);
     }
-    if (this.storageType === 's3' && this.s3Client && this.s3Available) {
-      return this.putS3File(filePath, data);
+    if (this.storageType === 's3' && this.s3Client) {
+      return this.runWithFallbackKeyLock(filePath, async () => {
+        if (this.s3Available) {
+          await this.putS3File(filePath, data);
+          if (this.mayHaveLocalFallback) {
+            await this.deleteLocalFile(filePath);
+          }
+          return;
+        }
+        return this.writeLocalFallback(() => this.putLocalFile(filePath, data));
+      });
     }
     return this.putLocalFile(filePath, data);
+  }
+
+  async putStream(filePath: string, stream: Readable, sizeBytes: number): Promise<void> {
+    try {
+      if (this.s3InitPromise) await this.s3InitPromise;
+      if (!isSafeStorageKey(filePath)) {
+        throw new Error(`Refusing to store an unsafe storage key: ${filePath}`);
+      }
+      if (this.storageType === 's3' && this.s3Client) {
+        return await this.runWithFallbackKeyLock(filePath, async () => {
+          if (this.s3Available) {
+            await this.putS3Stream(filePath, stream, sizeBytes);
+            if (this.mayHaveLocalFallback) {
+              await this.deleteLocalFile(filePath);
+            }
+            return;
+          }
+          return this.writeLocalFallback(() => this.putLocalStream(filePath, stream));
+        });
+      }
+      return await this.putLocalStream(filePath, stream);
+    } catch (error) {
+      stream.destroy();
+      throw error;
+    }
   }
 
   /**
@@ -434,16 +540,24 @@ export class StorageService implements OnModuleDestroy {
    * S3 DeleteObject is idempotent by design) so a caller doesn't have to special-case "already gone".
    */
   async deleteFile(filePath: string): Promise<void> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     if (!isSafeStorageKey(filePath)) {
       throw new Error(`Refusing to delete an unsafe storage key: ${filePath}`);
     }
-    if (this.storageType === 's3' && this.s3Client && this.s3Available) {
-      await this.deleteS3File(filePath);
+    if (this.storageType === 's3' && this.s3Client) {
+      return this.runWithFallbackKeyLock(filePath, async () => {
+        if (!this.s3Available) {
+          throw new Error(`S3 storage is currently unavailable; refusing local-only delete for ${filePath}`);
+        }
+        await this.deleteS3File(filePath);
+        return this.deleteLocalFile(filePath);
+      });
     }
     return this.deleteLocalFile(filePath);
   }
 
   async getFileCount(): Promise<{ count: number; sizeBytes: number }> {
+    if (this.s3InitPromise) await this.s3InitPromise;
     if (this.storageType === 's3' && this.s3Client && this.s3Available) {
       // Union with the local fallback dir (media written locally while S3 was down is not in the
       // bucket listing): a local-only file counts with its real on-disk size; for a key present in
@@ -562,7 +676,9 @@ export class StorageService implements OnModuleDestroy {
 
   // Best-effort, NOT atomic: see the implementation in storage-transfer.ts for the full contract.
   importFromStream(inputStream: Readable): Promise<{ imported: number; failed: number }> {
-    return importFromStream(inputStream, (filePath, data) => this.putFile(filePath, data), this.logger);
+    return importFromStream(inputStream, (filePath, data) => this.putFile(filePath, data), this.logger, {
+      putStream: (filePath, stream, sizeBytes) => this.putStream(filePath, stream, sizeBytes),
+    });
   }
 
   // ============================================================================
@@ -584,6 +700,159 @@ export class StorageService implements OnModuleDestroy {
 
   private putLocalFile(filePath: string, data: Buffer): Promise<void> {
     return putLocalFile(this.localPath, filePath, data);
+  }
+
+  private putLocalStream(filePath: string, stream: Readable): Promise<void> {
+    return putLocalStream(this.localPath, filePath, stream);
+  }
+
+  private async runWithFallbackKeyLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    if (!this.mayHaveLocalFallback && this.s3Available && !this.fallbackKeyLocks.has(key)) {
+      return fn();
+    }
+    const prev = this.fallbackKeyLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const tail = prev.then(() => gate);
+    this.fallbackKeyLocks.set(key, tail);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.fallbackKeyLocks.get(key) === tail) {
+        this.fallbackKeyLocks.delete(key);
+      }
+    }
+  }
+
+  private async writeLocalFallback(write: () => Promise<void>): Promise<void> {
+    this.mayHaveLocalFallback = true;
+    this.localFallbackWriteEpoch++;
+    this.inFlightLocalFallbackWrites++;
+    try {
+      await write();
+    } finally {
+      this.inFlightLocalFallbackWrites--;
+      if (this.s3Available && !this.stopped) {
+        this.localFallbackSyncPending = true;
+        this.scheduleLocalFallbackSync();
+      }
+    }
+  }
+
+  private clearFallbackSyncRetry(): void {
+    if (this.fallbackSyncRetryTimer) {
+      clearTimeout(this.fallbackSyncRetryTimer);
+      this.fallbackSyncRetryTimer = null;
+    }
+  }
+
+  private scheduleFallbackSyncRetry(): void {
+    if (this.stopped || !this.s3Available || this.fallbackSyncRetryTimer) return;
+    this.fallbackSyncRetryTimer = setTimeout(() => {
+      this.fallbackSyncRetryTimer = null;
+      this.scheduleLocalFallbackSync();
+    }, this.s3ReprobeIntervalMs);
+    this.fallbackSyncRetryTimer.unref();
+  }
+
+  private scheduleLocalFallbackSync(): void {
+    if (this.stopped || !this.s3Available) return;
+    if (this.fallbackSyncInFlight) {
+      this.localFallbackSyncPending = true;
+      return;
+    }
+    this.localFallbackSyncPending = false;
+    this.clearFallbackSyncRetry();
+    this.fallbackSyncInFlight = this.syncLocalFallbackToS3().finally(() => {
+      this.fallbackSyncInFlight = null;
+      if (this.localFallbackSyncPending && !this.stopped && this.s3Available) {
+        this.localFallbackSyncPending = false;
+        this.scheduleLocalFallbackSync();
+      }
+    });
+  }
+
+  private async syncLocalFallbackToS3(): Promise<void> {
+    if (!this.s3Client || !this.s3Available || this.stopped) return;
+    const startEpoch = this.localFallbackWriteEpoch;
+    let synced = 0;
+    let failed = 0;
+    let stoppedEarly = false;
+    let enumerationFailed = false;
+    try {
+      for await (const file of this.iterateLocalFiles('', true)) {
+        if (this.stopped || !this.s3Available) {
+          stoppedEarly = true;
+          break;
+        }
+        if (!isSafeStorageKey(file)) continue;
+        try {
+          await this.runWithFallbackKeyLock(file, async () => {
+            if (this.stopped || !this.s3Available) {
+              stoppedEarly = true;
+              return;
+            }
+            let source: ExportFileSource;
+            try {
+              source = await openLocalFile(this.localPath, file);
+            } catch (error: unknown) {
+              if (isMissingObjectError(error)) return;
+              throw error;
+            }
+            try {
+              if (source.size !== undefined) {
+                await this.putS3Stream(file, source.stream, source.size);
+              } else {
+                source.stream.destroy();
+                const buf = await this.getLocalFile(file);
+                await this.putS3File(file, buf);
+              }
+            } finally {
+              source.stream.destroy();
+            }
+            await this.deleteLocalFile(file);
+            synced++;
+          });
+        } catch (error: unknown) {
+          failed++;
+          this.logger.warn(`Failed to sync local fallback file '${file}' to S3`, { error: String(error) });
+        }
+      }
+    } catch (error: unknown) {
+      enumerationFailed = true;
+      this.logger.warn('Failed to enumerate local fallback dir after S3 recovery', { error: String(error) });
+    }
+    if (synced > 0) {
+      this.logger.log(`Synced ${synced} local fallback file(s) to S3 after recovery`);
+    }
+    if (this.stopped || !this.s3Available) return;
+    if (failed === 0 && !stoppedEarly && !enumerationFailed) {
+      let anyRemaining = false;
+      try {
+        for await (const file of this.iterateLocalFiles('', true)) {
+          if (isSafeStorageKey(file)) {
+            anyRemaining = true;
+            break;
+          }
+        }
+      } catch {
+        anyRemaining = true;
+      }
+      if (
+        !anyRemaining &&
+        this.inFlightLocalFallbackWrites === 0 &&
+        !this.localFallbackSyncPending &&
+        this.localFallbackWriteEpoch === startEpoch
+      ) {
+        this.mayHaveLocalFallback = false;
+        return;
+      }
+    }
+    this.scheduleFallbackSyncRetry();
   }
 
   private deleteLocalFile(filePath: string): Promise<void> {
@@ -697,6 +966,22 @@ export class StorageService implements OnModuleDestroy {
         Bucket: this.s3Bucket,
         Key: `${this.s3KeyRoot}${filePath}`,
         Body: data,
+      }),
+    );
+  }
+
+  private async putS3Stream(filePath: string, stream: Readable, sizeBytes: number): Promise<void> {
+    if (!this.s3Client) {
+      stream.destroy();
+      throw new Error('S3 client not initialized');
+    }
+
+    await this.s3Client.send(
+      new PutObjectCommand({
+        Bucket: this.s3Bucket,
+        Key: `${this.s3KeyRoot}${filePath}`,
+        Body: stream,
+        ContentLength: sizeBytes,
       }),
     );
   }

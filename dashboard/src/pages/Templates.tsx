@@ -16,6 +16,7 @@ import { PageHeader } from '../components/PageHeader';
 import { Modal } from '../components/Modal';
 import { copyToClipboard } from '../utils/clipboard';
 import { captionLength } from '../utils/bulkMedia';
+import { extractPlaceholders, PLACEHOLDER_PATTERN } from '../utils/templatePlaceholders';
 import './Templates.css';
 
 type TemplateForm = {
@@ -31,22 +32,6 @@ const emptyForm: TemplateForm = {
   body: '',
   footer: '',
 };
-
-// The gateway's renderer pattern (PLACEHOLDER_PATTERN in src/common/utils/template-render.ts), kept verbatim: a send
-// fills the legacy single-brace `{key}` form as well as `{{key}}`, so the list and the preview read both. Only the
-// double-brace form is advertised.
-export const PLACEHOLDER_PATTERN = /\{\{\s*([\w.-]+)\s*\}\}|\{(\w+)\}/g;
-
-/** The variables a send fills, each once, with the form it is written in: `{{key}}`, or `{key}` for the legacy form. */
-function extractPlaceholders(template: TemplateForm | MessageTemplate): Array<{ key: string; token: string }> {
-  const source = [template.header, template.body, template.footer].filter(Boolean).join('\n');
-  const tokens = new Map<string, string>();
-  for (const [, doubleKey, singleKey] of source.matchAll(PLACEHOLDER_PATTERN)) {
-    const key = doubleKey ?? singleKey;
-    if (!tokens.has(key)) tokens.set(key, doubleKey !== undefined ? `{{${key}}}` : `{${key}}`);
-  }
-  return [...tokens.keys()].sort().map(key => ({ key, token: tokens.get(key)! }));
-}
 
 function toPayload(form: TemplateForm): TemplatePayload {
   return {
@@ -244,7 +229,7 @@ export function Templates() {
   const copyName = async (name: string) => {
     if (await copyToClipboard(name)) {
       toast.success(t('templates.toasts.copied'));
-    }
+    } else toast.error(t('common.copyFailed'));
   };
 
   if (loadingSessions) {
@@ -311,6 +296,7 @@ export function Templates() {
             <div className="templates-search">
               <Search size={16} />
               <input
+                type="text"
                 value={searchTerm}
                 onChange={event => setSearchTerm(event.target.value)}
                 placeholder={t('common.search')}
@@ -364,6 +350,7 @@ export function Templates() {
                     >
                       <button
                         className={`template-list-item ${isSelected ? 'selected' : ''}`}
+                        aria-current={isSelected ? 'true' : undefined}
                         onClick={() => openEdit(template)}
                         disabled={template.id === updatingId}
                         type="button"
@@ -428,6 +415,7 @@ export function Templates() {
               <div className="form-group">
                 <label htmlFor="tpl-1">{t('common.name')}</label>
                 <input
+                  type="text"
                   id="tpl-1"
                   value={form.name}
                   onChange={event => setForm({ ...form, name: event.target.value })}
@@ -441,6 +429,7 @@ export function Templates() {
                 <div className="form-group">
                   <label htmlFor="tpl-2">{t('templates.header')}</label>
                   <input
+                    type="text"
                     id="tpl-2"
                     value={form.header}
                     onChange={event => setForm({ ...form, header: event.target.value })}
@@ -466,6 +455,7 @@ export function Templates() {
                 <div className="form-group">
                   <label htmlFor="tpl-4">{t('templates.footer')}</label>
                   <input
+                    type="text"
                     id="tpl-4"
                     value={form.footer}
                     onChange={event => setForm({ ...form, footer: event.target.value })}
@@ -512,6 +502,7 @@ export function Templates() {
                     <label key={key}>
                       <span>{token}</span>
                       <input
+                        type="text"
                         value={ownValue(previewValues, key) || ''}
                         onChange={event => setPreviewValues({ ...previewValues, [key]: event.target.value })}
                         placeholder={t('templates.previewValuePlaceholder')}

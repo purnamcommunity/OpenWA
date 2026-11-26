@@ -273,7 +273,8 @@ export interface SessionStatsOverview {
   ready: number;
   disconnected: number;
   byStatus: Record<string, number>;
-  memoryUsage: { heapUsed: number; heapTotal: number; rss: number };
+  /** Process memory snapshot; only returned for unscoped ADMIN keys. */
+  memoryUsage?: { heapUsed: number; heapTotal: number; rss: number };
 }
 
 // ── Message ───────────────────────────────────────────────────────
@@ -1146,10 +1147,13 @@ export interface CreateWebhookRequest {
 }
 
 /**
- * Every field is a partial update. `secret: ''` and `headers: {}` are the documented "clear it"
+ * Every field is a partial update. `secret: ''` (or `null`) and `headers: {}` are the documented "clear it"
  * values; any other secret is still held to the 16-character minimum.
  */
-export type UpdateWebhookRequest = Partial<CreateWebhookRequest> & { active?: boolean };
+export type UpdateWebhookRequest = Omit<Partial<CreateWebhookRequest>, 'secret'> & {
+  secret?: string | null;
+  active?: boolean;
+};
 
 export interface WebhookResponse {
   id: string;
@@ -1250,7 +1254,16 @@ export interface ChatActivityPreview {
 
 export interface ChatSummary {
   id: Jid;
+  /**
+   * `''` for a Baileys chat held under a privacy id (`@lid`) that has no name of its own: title it by `phone`,
+   * when present.
+   */
   name: string;
+  /**
+   * Baileys only; whatsapp-web.js sends none. Phone digits of a 1:1 chat WhatsApp holds under a privacy id
+   * (`@lid`), when the session can map it. Absent for a phone-keyed chat and when the mapping is unknown.
+   */
+  phone?: string;
   isGroup: boolean;
   unreadCount: number;
   /** Preview text of the last message (the server returns a plain string, not an object). */
@@ -1283,7 +1296,7 @@ export type CallLinkType = 'audio' | 'video';
 /** Body for {@link CallsResource.createLink}. */
 export interface CreateCallLinkRequest {
   type: CallLinkType;
-  /** Absolute epoch MILLISECONDS the call is scheduled to start at. */
+  /** Absolute epoch MILLISECONDS the call is scheduled to start at, a whole number: a fraction answers `400`. */
   startTime: number;
 }
 

@@ -52,6 +52,7 @@ import { Message, MessageDirection, MessageStatus } from '../message/entities/me
 import { MessageBatch } from '../message/entities/message-batch.entity';
 import { Webhook } from '../webhook/entities/webhook.entity';
 import { Template } from '../template/entities/template.entity';
+import { AutomationRule } from '../automation/entities/automation-rule.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
 import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
@@ -1571,6 +1572,7 @@ describe('SessionService', () => {
       expect(managerDelete).toHaveBeenCalledWith(MessageBatch, { sessionId: 'sess-uuid-1' });
       expect(managerDelete).toHaveBeenCalledWith(Webhook, { sessionId: 'sess-uuid-1' });
       expect(managerDelete).toHaveBeenCalledWith(Template, { sessionId: 'sess-uuid-1' });
+      expect(managerDelete).toHaveBeenCalledWith(AutomationRule, { sessionId: 'sess-uuid-1' });
       expect(managerDelete).toHaveBeenCalledWith(BaileysStoredMessage, { sessionId: 'sess-uuid-1' });
       // chat_states and status_updates carry a plain sessionId with no FK at all.
       expect(managerDelete).toHaveBeenCalledWith(ChatState, { sessionId: 'sess-uuid-1' });
@@ -2295,6 +2297,8 @@ describe('SessionService', () => {
       });
       let finishFirstClaim: () => void = () => undefined;
       let finishSecondClaim: () => void = () => undefined;
+      // The first start is refused because a peer holds the session (the stop's own check found none before it).
+      ownership.isHeldByOtherNode.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
       ownership.claim
         .mockImplementationOnce(() => new Promise<boolean>(resolve => (finishFirstClaim = () => resolve(false))))
         .mockImplementationOnce(() => new Promise<boolean>(resolve => (finishSecondClaim = () => resolve(true))));
@@ -2498,6 +2502,8 @@ describe('SessionService', () => {
     // then fails must not read as a used slot while that claim is awaited.
     it('hasStartCapacity() does not count a start whose claim is still awaited', async () => {
       const ownership = withOwnership();
+      // The claim is refused because a peer holds the session.
+      ownership.isHeldByOtherNode.mockResolvedValue(true);
       (configService.get as jest.Mock).mockImplementation(<T>(key: string, def?: T): T | number =>
         key === 'sessions.maxConcurrent' ? 2 : (def as T),
       );
@@ -2607,10 +2613,71 @@ describe('SessionService', () => {
     });
 
     it('start() answers 409 when a live peer really holds the session', async () => {
-      withOwnership(false);
+      const ownership = withOwnership(false);
+      ownership.isHeldByOtherNode.mockResolvedValue(true);
       (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
 
+      await expect(service.start('sess-uuid-1')).rejects.toThrow('running on another node');
+      // The row says a peer holds it, so the claim is not asked again.
+      expect(ownership.claim).toHaveBeenCalledTimes(1);
+    });
+
+    // A claim answers false for a miss of this node's own too (one a later claim of this node superseded), so the answer
+    // is not read as a peer without the row saying so: with no other node holding it the claim is asked again.
+    it('start() asks the claim again when no other node holds the session, and goes on once it is granted', async () => {
+      const ownership = withOwnership();
+      ownership.claim.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      jest.spyOn(lifecycle, 'start').mockResolvedValue(createMockSession());
+      jest.spyOn(lifecycle, 'isEngineActive').mockReturnValue(true);
+
+      await expect(service.start('sess-uuid-1')).resolves.toBeDefined();
+
+      expect(ownership.claim).toHaveBeenCalledTimes(2);
+      expect(ownership.isHeldByOtherNode).toHaveBeenCalledTimes(1);
+    });
+
+    it('start() answers 409 when the claim asked again is refused too', async () => {
+      const ownership = withOwnership(false);
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      const launch = jest.spyOn(lifecycle, 'start');
+
       await expect(service.start('sess-uuid-1')).rejects.toThrow(ConflictException);
+
+      expect(ownership.claim).toHaveBeenCalledTimes(2);
+      expect(launch).not.toHaveBeenCalled();
+    });
+
+    it('start() answers the retryable 503 when the check for a peer cannot be made', async () => {
+      const ownership = withOwnership(false);
+      ownership.isHeldByOtherNode.mockRejectedValue(new Error('Connection terminated unexpectedly'));
+      const launch = jest.spyOn(lifecycle, 'start');
+
+      await expect(service.start('sess-uuid-1')).rejects.toBeInstanceOf(ServiceUnavailableException);
+
+      expect(launch).not.toHaveBeenCalled();
+    });
+
+    it('delete() answers 409 without asking the claim again when a live peer took the session after its check', async () => {
+      const ownership = withOwnership(false);
+      ownership.isHeldByOtherNode.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      const removal = jest.spyOn(lifecycle, 'delete');
+
+      await expect(service.delete('sess-uuid-1')).rejects.toThrow('running on another node');
+
+      expect(ownership.claim).toHaveBeenCalledTimes(1);
+      expect(removal).not.toHaveBeenCalled();
+    });
+
+    it('delete() answers 409 when the claim asked again is refused too, and removes nothing', async () => {
+      const ownership = withOwnership(false);
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      const removal = jest.spyOn(lifecycle, 'delete');
+
+      await expect(service.delete('sess-uuid-1')).rejects.toThrow(ConflictException);
+
+      expect(ownership.claim).toHaveBeenCalledTimes(2);
+      expect(removal).not.toHaveBeenCalled();
     });
 
     it('logout() hands the claim back once the engine is torn down', async () => {
@@ -2843,7 +2910,7 @@ describe('SessionService', () => {
       };
 
       (repository.findOne as jest.Mock).mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
-      await expect(call(service)).rejects.toThrow('Connection terminated unexpectedly');
+      await expect(call(service)).rejects.toBeInstanceOf(ServiceUnavailableException);
       expect(internals.stoppingSessions.has('sess-uuid-1')).toBe(false);
       // Nothing was taken down, so no stop is recorded for the next boot and no request stays counted.
       expect((repository.update as jest.Mock).mock.calls).not.toContainEqual([
@@ -2888,6 +2955,10 @@ describe('SessionService', () => {
       const until = async (condition: () => boolean): Promise<void> => {
         for (let i = 0; i < 200 && !condition(); i++) await new Promise(resolve => setImmediate(resolve));
         expect(condition()).toBe(true);
+      };
+      /** The next stop's fence reads the session free; a live peer holds it when the stop then asks again. */
+      const peerClaimsBeforeTheRecordWrite = (): void => {
+        jest.spyOn(ownership, 'isHeldByOtherNode').mockResolvedValueOnce(false).mockResolvedValueOnce(true);
       };
 
       beforeAll(async () => {
@@ -3233,10 +3304,12 @@ describe('SessionService', () => {
         ],
         [
           'refused when its record is written',
-          () =>
+          () => {
+            peerClaimsBeforeTheRecordWrite();
             (repository.update as jest.Mock).mockImplementation((_where: unknown, patch: Partial<Session>) =>
               Promise.resolve({ affected: patch.desiredState ? 0 : 1 }),
-            ),
+            );
+          },
           ConflictException,
         ],
       ])(
@@ -3274,10 +3347,12 @@ describe('SessionService', () => {
           await until(() => mockEngine.initialize.mock.calls.length === 1 && !lifecycle.isEngineActive(row.id));
           await service.stop(row.id);
           if (refusal === 'ownership read') jest.spyOn(ownership, 'isHeldByOtherNode').mockResolvedValueOnce(true);
-          else
+          else {
+            peerClaimsBeforeTheRecordWrite();
             (repository.update as jest.Mock).mockImplementation((_where: unknown, patch: Partial<Session>) =>
               Promise.resolve({ affected: patch.desiredState ? 0 : 1 }),
             );
+          }
           await expect(service.stop(row.id)).rejects.toThrow(ConflictException);
 
           expect(await outcome).toBeInstanceOf(SessionStoppedException);
@@ -3308,7 +3383,7 @@ describe('SessionService', () => {
         const row = await seed({ nodeId: 'dead-node', leaseExpiresAt: new Date(Date.now() - 60_000) });
         (repository.findOne as jest.Mock).mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
 
-        await expect(call(service, row.id)).rejects.toThrow('Connection terminated unexpectedly');
+        await expect(call(service, row.id)).rejects.toBeInstanceOf(ServiceUnavailableException);
 
         expect(await nodeIdOf(row.id)).toBe('dead-node');
       });
@@ -8937,7 +9012,7 @@ describe('SessionService', () => {
       getRawMany: jest.fn().mockResolvedValue(rows),
     });
 
-    it('should return correct session statistics', async () => {
+    it('should return correct session statistics and omit memoryUsage unless explicitly opted in', async () => {
       (repository.createQueryBuilder as jest.Mock) = jest.fn().mockReturnValue(
         makeStatsQb([
           { status: SessionStatus.READY, count: '2' },
@@ -8945,13 +9020,21 @@ describe('SessionService', () => {
         ]),
       );
 
-      const stats = await service.getStats();
+      const defaultStats = await service.getStats();
 
-      expect(stats.total).toBe(3);
-      expect(stats.ready).toBe(2);
-      expect(stats.disconnected).toBe(1);
-      expect(stats.byStatus[SessionStatus.READY]).toBe(2);
-      expect(stats.memoryUsage).toBeDefined();
+      expect(defaultStats.total).toBe(3);
+      expect(defaultStats.ready).toBe(2);
+      expect(defaultStats.disconnected).toBe(1);
+      expect(defaultStats.byStatus[SessionStatus.READY]).toBe(2);
+      expect(defaultStats.memoryUsage).toBeUndefined();
+      expect('memoryUsage' in defaultStats).toBe(false);
+
+      const adminStats = await service.getStats(null, { includeMemoryUsage: true });
+      expect(adminStats.memoryUsage).toEqual({
+        heapUsed: expect.any(Number) as number,
+        heapTotal: expect.any(Number) as number,
+        rss: expect.any(Number) as number,
+      });
     });
 
     it('counts every session via a grouped COUNT, not the bounded findAll (no undercount past the cap)', async () => {

@@ -49,15 +49,13 @@
     "refresh": "刷新",
     "errorGeneric": "发生错误",
     "unknownError": "未知错误",
-    "retry": "重试"
+    "retry": "重试",
+    "copyFailed": "无法复制到剪贴板"
   },
   "theme": {
     "light": "浅色",
     "dark": "深色",
     "system": "跟随系统",
-    "label": "主题：{{value}}",
-    "appearance": "外观",
-    "mode": "模式",
     "toggleTo": "切换到{{value}}"
   },
   "nav": {
@@ -77,6 +75,7 @@
     "edited": "已编辑",
     "media": {
       "location": "位置",
+      "contact": "联系人",
       "call": "通话",
       "callMissed": "未接来电",
       "callVideo": "视频通话",
@@ -84,7 +83,6 @@
       "omitted": "媒体",
       "image": "图片"
     },
-    "subtitle": "实时发送和回复 WhatsApp 消息",
     "noSessionsTitle": "没有已连接的会话",
     "noSessionsDesc": "请先从 <1>会话</1> 菜单连接一个 WhatsApp 会话，才能使用聊天功能。",
     "sessionLabel": "WhatsApp 会话",
@@ -93,6 +91,7 @@
     "loadingChats": "正在加载聊天...",
     "empty": "没有聊天",
     "noMessageYet": "暂无消息",
+    "draftLabel": "草稿：",
     "unreadBadge": "{{count}} 条未读消息",
     "unreadBadge_other": "{{count}} 条未读消息",
     "markedUnread": "已标记为未读",
@@ -100,6 +99,8 @@
     "loadingOlderMessages": "正在加载更早的消息...",
     "loadOlderMessagesError": "无法加载更早的消息。向上滚动重试。",
     "loadOlderMessagesRetryHint": "向上滚动重试。",
+    "refreshMessagesError": "无法刷新消息。点按重试。",
+    "refreshMessagesRetryHint": "点按重试。",
     "noMessagesInChat": "暂无消息。发送第一条消息即可开始！",
     "downloadDocument": "下载文档",
     "actions": {
@@ -233,7 +234,6 @@
     "moreActions": "更多操作",
     "copyChatId": "复制聊天 ID",
     "chatIdCopied": "已复制聊天 ID",
-    "copyFailed": "无法复制到剪贴板",
     "closeChat": "关闭聊天",
     "phone": "电话号码",
     "chatId": "聊天 ID",
@@ -353,6 +353,26 @@
         "always": "始终"
       },
       "saveContactUnavailable": "需要已知的电话号码：此聊天只有隐私 ID（@lid）。"
+    },
+    "slash": {
+      "title": "快捷回复",
+      "hint": "Enter 插入高亮的模板。准备好后再发送。",
+      "placeholder": "消息或 /模板…",
+      "empty": "没有匹配的模板",
+      "needsVars": "发送前请填写模板中的占位符。",
+      "loading": "正在加载模板… 加载完成前，Enter 暂不生效。",
+      "loadError": "无法加载模板",
+      "close": "关闭模板列表",
+      "more": "还有更多匹配的模板。继续输入以缩小范围。"
+    },
+    "roomSearch": {
+      "title": "搜索消息",
+      "placeholder": "搜索",
+      "date": "跳到日期",
+      "clearDate": "清除日期",
+      "noDateHits": "当天没有已加载的消息",
+      "notLoaded": "早于此聊天中已加载的消息。在聊天中向上滚动可加载更早的消息。",
+      "open": "在聊天中搜索"
     }
   },
   "errorBoundary": {
@@ -418,9 +438,7 @@
   },
   "sessionStatus": {
     "created": "新建",
-    "idle": "空闲",
     "initializing": "正在启动...",
-    "connecting": "正在连接...",
     "qr_ready": "扫描 QR",
     "ready": "已连接",
     "disconnected": "已断开",
@@ -442,7 +460,8 @@
     },
     "empty": {
       "title": "未找到会话",
-      "description": "创建新会话即可开始"
+      "description": "创建新会话即可开始",
+      "filtered": "没有符合搜索或状态筛选条件的会话。"
     },
     "create": {
       "title": "创建新会话",
@@ -610,7 +629,7 @@
     "filters": {
       "title": "筛选条件（可选）",
       "hint": "仅当所有条件都匹配时才触发。适用于消息事件。",
-      "incomplete": "请为每个筛选条件填写值，且条件最多 20 个、每个条件最多 100 个值、文本最多 1000 个字符。",
+      "incomplete": "请为每个筛选条件填写值，且条件最多 20 个、每个条件最多 100 个值、每个 ID 最多 128 个字符、文本最多 1000 个字符。",
       "badge": "{{count}} 个筛选条件",
       "badge_other": "{{count}} 个筛选条件",
       "addCondition": "添加条件",
@@ -689,16 +708,16 @@
       "session.reconnect_loop": "会话反复重连失败时",
       "session.restriction": "WhatsApp 限制账号或解除限制时",
       "presence.update": "已订阅的聊天上线、正在输入或下线时",
-      "event.response": "嘉宾回复 WhatsApp 活动邀请时（参加、不参加、可能参加）",
+      "event.response": "嘉宾回复 WhatsApp 活动邀请时（参加、不参加、可能参加）（仅 Baileys）",
       "poll.vote": "有人在投票中选择或取消选项时",
       "group.join": "有成员加入或被添加到群组时",
       "group.leave": "有成员退出或被移出群组时",
       "group.update": "群组名称、描述或设置变化时",
       "group.join_request": "有人申请加入此会话管理的群组时",
       "call.received": "来电开始响铃时",
-      "call.accepted": "来电被接听时",
-      "call.rejected": "来电被拒接时",
-      "call.missed": "来电未接听时",
+      "call.accepted": "来电被接听时（仅 Baileys）",
+      "call.rejected": "来电被拒接时（仅 Baileys）",
+      "call.missed": "来电未接听时（仅 Baileys）",
       "status.received": "联系人发布状态时",
       "all": "除 message.receipt 外的所有事件（message.receipt 须明确指定）"
     },
@@ -826,8 +845,9 @@
     "confirm": {
       "deleteTitle": "删除 API 密钥",
       "revokeTitle": "撤销 API 密钥",
-      "deleteMessage": "确定要永久删除 <strong>{{name}}</strong> 吗？此操作无法撤销。",
-      "revokeMessage": "确定要撤销 <strong>{{name}}</strong> 吗？它将不再可用。",
+      "deleteMessage": "确定要永久删除 <name/> 吗？此操作无法撤销。",
+      "revokeMessage": "确定要撤销 <name/> 吗？它将不再可用。",
+      "signedIn": "此仪表板正使用该密钥登录。撤销或删除该密钥会使你退出登录。",
       "delete": "删除",
       "revoke": "撤销"
     },
@@ -1128,6 +1148,7 @@
       "reason409": "会话未连接",
       "reason429": "已达到网关的速率限制",
       "reason503": "WhatsApp 未响应查询",
+      "reasonReloading": "WhatsApp Web 正在重新加载页面",
       "reasonOther": "网关拒绝了一次查询",
       "partial": "{{reason}}（HTTP {{status}}）。已在第 {{attempted}} 个号码处停止（共 {{total}} 个），其余 {{count}} 个号码未查询。请稍后重试。",
       "partial_other": "{{reason}}（HTTP {{status}}）。已在第 {{attempted}} 个号码处停止（共 {{total}} 个），其余 {{count}} 个号码未查询。请稍后重试。",
@@ -1261,7 +1282,9 @@
       "storageWarning": "现有的媒体文件不会自动迁移到新的存储后端；它们将保留在原位置。",
       "downloadBackup": "请先下载备份",
       "backupTitle": "数据备份与恢复",
-      "backupHint": "在切换数据库之前，将所有数据导出为 JSON，然后在切换后导入。备份不包含 webhook 签名密钥、webhook 自定义请求头和代理凭据，恢复后请重新填写。集成实例的密钥和设置以明文形式包含在内，请妥善保管文件，并在恢复完成后将其删除。",
+      "backupHint": "在切换数据库之前，将所有数据导出为 JSON，然后在切换后导入。备份不包含 webhook 签名密钥、webhook 自定义请求头和代理凭据，恢复后请重新填写。集成实例密钥默认会被省略，仅在勾选下方选项时才会包含。",
+      "includePluginSecrets": "包含插件实例密钥",
+      "includePluginSecretsHint": "以明文形式包含集成入口密钥和插件机密配置字段。请妥善保管文件，并在恢复后将其删除。",
       "export": "导出数据",
       "import": "导入数据",
       "exportFailed": "无法导出数据",

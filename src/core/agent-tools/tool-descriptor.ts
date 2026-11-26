@@ -1,7 +1,20 @@
 import { z } from 'zod';
+import { MAX_SESSION_ID_LENGTH } from '../../modules/session/session-id.pipe';
 import type { ApiKey } from '../../modules/auth/entities/api-key.entity';
 import type { ApiKeyRole } from '../../modules/auth/entities/api-key.entity';
 import type { ChatScopeService } from '../../modules/auth/chat-scope.service';
+
+/**
+ * A session id taken by a tool, bounded as the REST routes bound it (SessionIdPipe): letters, digits and hyphens, at
+ * most MAX_SESSION_ID_LENGTH characters. The tools call the services directly, so the pipe never runs, and any other
+ * id would reach the lookup, which has to cut what it quotes in its not-found answer.
+ */
+export const sessionIdSchema = z
+  .string()
+  .min(1)
+  .max(MAX_SESSION_ID_LENGTH)
+  .regex(/^[A-Za-z0-9-]+$/, 'a session id holds only letters, digits and hyphens')
+  .describe('Session UUID (the session id, not the name)');
 
 /** A single agent-invocable capability. Protocol-neutral: no MCP types here. */
 export interface ToolDescriptor<I = unknown> {
@@ -11,6 +24,8 @@ export interface ToolDescriptor<I = unknown> {
   description: string;
   /** Input contract: validates the call AND is advertised to the agent. */
   inputSchema: z.ZodType<I>;
+  /** Human-readable name shown to the user (MCP `title`). Defaults to the name split into words: 'Message send text'. */
+  title?: string;
   tier: 'read' | 'write';
   /** True for irreversible or state-overwriting ops; surfaced to MCP clients as destructiveHint. */
   destructive?: boolean;
@@ -24,6 +39,12 @@ export interface ToolDescriptor<I = unknown> {
   chatScope?: readonly string[] | 'filtered' | 'agnostic';
   /** The quote resolves within the authorized chat, as it does on the REST reply route. */
   chatQuotedAllowed?: boolean;
+  /**
+   * True when the tool returns text authored by external WhatsApp users (messages, captions,
+   * contact/chat names, group subjects/descriptions). MCP frames such results in a randomized
+   * data-boundary envelope so clients treat the payload strictly as untrusted data.
+   */
+  returnsUntrustedContent?: boolean;
   /** Calls the service. Receives validated input + the resolved, scoped key. */
   handler: (input: I, apiKey: ApiKey, chatScope?: ChatScopeService, signal?: AbortSignal) => Promise<unknown>;
 }

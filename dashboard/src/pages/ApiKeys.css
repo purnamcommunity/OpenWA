@@ -40,12 +40,12 @@
   text-transform: uppercase;
   letter-spacing: 0.05em;
   border-bottom: 1px solid var(--border);
-  padding: 1.125rem 1.5rem;
+  padding: 1.125rem 1rem;
   text-align: start;
 }
 
 .api-keys-page .keys-table tbody tr.table-row td {
-  padding: 1.125rem 1.5rem;
+  padding: 1.125rem 1rem;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
@@ -66,10 +66,43 @@
   background: rgba(37, 211, 102, 0.05);
 }
 
+/* The table needs more window than a laptop has (every cell keeps its text on one line), and its row actions are the
+   last cell, the one that ran out of the scroll container. That cell is pinned to the inline end of the container, so
+   the actions stay in reach at any width and in either direction. It hides what slides under it, so it is opaque in
+   every state of its row: the tint of the row over white. The phone cards start where this ends (768px) and pin nothing.
+   The divider on its inline start is a shadow: the table collapses its borders, which stay on the grid line the cell
+   was pinned away from. */
+@media (min-width: 768.02px) {
+  .api-keys-page .keys-table thead tr.table-row.header th:last-child,
+  .api-keys-page .keys-table tbody tr.table-row td:last-child {
+    position: sticky;
+    inset-inline-end: 0;
+    box-shadow: inset 1px 0 0 var(--border);
+  }
+
+  [dir='rtl'] .api-keys-page .keys-table thead tr.table-row.header th:last-child,
+  [dir='rtl'] .api-keys-page .keys-table tbody tr.table-row td:last-child {
+    box-shadow: inset -1px 0 0 var(--border);
+  }
+
+  .api-keys-page .keys-table tbody tr.table-row td:last-child {
+    background: var(--bg-white);
+  }
+
+  .api-keys-page .keys-table tbody tr.table-row:nth-child(even) td:last-child {
+    background: linear-gradient(rgba(148, 163, 184, 0.08), rgba(148, 163, 184, 0.08)), var(--bg-white);
+  }
+
+  .api-keys-page .keys-table tbody tr.table-row:hover td:last-child {
+    background: linear-gradient(rgba(37, 211, 102, 0.05), rgba(37, 211, 102, 0.05)), var(--bg-white);
+  }
+}
+
 .api-keys-page .name-cell {
   font-weight: 500;
   color: var(--text-primary);
   white-space: nowrap;
+  unicode-bidi: plaintext;
 }
 
 .api-keys-page .key-cell {
@@ -125,6 +158,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: plaintext;
 }
 
 .api-keys-page .sessions-cell.all {
@@ -363,13 +397,23 @@
 .api-keys-page .modal-body > textarea {
   width: 100%;
   padding: 0.625rem 1rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
   font-size: 0.875rem;
   font-family: 'JetBrains Mono Variable', 'JetBrains Mono', monospace;
   background: var(--bg-light);
   box-sizing: border-box;
   resize: vertical;
+}
+
+/* The dialog's input rule does not reach a textarea, so it states the focus the inputs beside it show. */
+.api-keys-page .modal-body > textarea:focus {
+  outline: none;
+  border-color: var(--focus-ring);
+  background: var(--bg-white);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px rgba(37, 211, 102, 0.1);
 }
 
 .api-keys-page .modal-body > select,
@@ -417,10 +461,15 @@
   font-size: 0.8125rem;
 }
 
+/* Under the confirmation sentence, which sets no margin below it. */
+.api-keys-page .confirm-message + .key-signed-in-warning {
+  margin-top: 1rem;
+}
+
 .api-keys-page .key-signed-in-warning svg {
   flex: none;
   margin-top: 0.125rem;
-  color: var(--warning, #f59e0b);
+  color: var(--warning-text);
 }
 
 .api-keys-page .restrictions-cell {
@@ -537,6 +586,9 @@
     color: var(--text-primary);
     white-space: normal;
     overflow-wrap: anywhere;
+    /* A block in the card, so it is as wide as the name: the name keeps the edge the page puts it, as in the table. */
+    width: fit-content;
+    max-width: 100%;
   }
 
   /* Key cell */

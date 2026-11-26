@@ -2,7 +2,14 @@
 // Centralized API client with TypeScript types
 
 import { warnIfInsecureHttpUrl } from '../utils/urlSecurity';
-import { isKeyUnusable } from '../utils/authLifecycle';
+import {
+  broadcastAuthEvent,
+  clearSessionMetadata,
+  DASHBOARD_CSRF_HEADER,
+  DASHBOARD_CSRF_HEADER_VALUE,
+  getActiveApiKeyId,
+  isKeyUnusable,
+} from '../utils/authLifecycle';
 import { fetchAllPages } from '../utils/fetchAllPages';
 
 // Resolve the API base URL. By default this is the same-origin relative path '/api',
@@ -88,6 +95,16 @@ export interface Session {
    * dashboard can be served by a gateway that predates the field.
    */
   restriction?: AccountRestriction | null;
+  /**
+   * Whether WhatsApp is still delivering chats or history to the line. Optional only because a
+   * dashboard can be served by a gateway that predates the field; this client does not show it yet.
+   */
+  sync?: {
+    state: 'syncing' | 'synced' | 'unknown';
+    phase: 'offline' | 'history' | null;
+    progress: number | null;
+    paused: boolean;
+  } | null;
 }
 
 /** One participant's presence within a chat. */
@@ -131,7 +148,7 @@ export interface SessionStats {
   ready: number;
   disconnected: number;
   byStatus: Record<string, number>;
-  memoryUsage: { heapUsed: number; heapTotal: number; rss: number };
+  memoryUsage?: { heapUsed: number; heapTotal: number; rss: number };
 }
 
 export type WebhookFilterOperator = 'is' | 'isNot' | 'contains' | 'equals';
@@ -266,6 +283,8 @@ export interface ChatActivityPreview {
 export interface Chat {
   id: string;
   name: string;
+  /** Baileys only: phone digits when the chat is held under a privacy id and the session can map it. */
+  phone?: string;
   isGroup: boolean;
   kind: ChatKind;
   unreadCount: number;
@@ -836,25 +855,27 @@ export interface SearchResults {
 // stored it stays silent too rather than reloading the login form under the user. With another key
 // stored, the answer speaks for a key no longer in use and must not sign out the current one, so it
 // fails like any other error.
-async function handleErrorResponse<T>(response: Response, sentKey: string | null): Promise<T> {
+async function handleErrorResponse<T>(response: Response, sentActorId: string | null): Promise<T> {
   // On a non-JSON body (e.g. a reverse-proxy 502/503/504 HTML page) fall through to `HTTP <status>`
   // rather than statusText: the toast folds an exact `HTTP 502`/`HTTP 503` into its connection-lost
   // toast (a 504 keeps its own), and statusText is empty over HTTP/2 anyway.
   const error = await response.json().catch(() => ({}));
-  const storedKey = sessionStorage.getItem('openwa_api_key');
-  if (isKeyUnusable(response.status, error.message) && (storedKey === sentKey || storedKey === null)) {
-    sessionStorage.removeItem('openwa_api_key');
+  const storedActorId = getActiveApiKeyId();
+  if (isKeyUnusable(response.status, error.message) && (storedActorId === sentActorId || storedActorId === null)) {
+    clearSessionMetadata();
+    if (sentActorId !== null && storedActorId === sentActorId) {
+      broadcastAuthEvent({ type: 'logout' });
+    }
     if (typeof window !== 'undefined') {
-      if (sentKey !== null && storedKey === sentKey) window.location.assign('/');
+      if (sentActorId !== null && storedActorId === sentActorId) window.location.assign('/');
       return new Promise<T>(() => {});
     }
   }
   // Carry the HTTP status on the Error (message unchanged, so the toast de-dup still matches) so
   // callers can tell apart a permission 403 from a real server 5xx instead of guessing from text.
   // Carry the machine `code` too: the gateway's stable codes (SESSION_LOGOUT_INCOMPLETE,
-  // SESSION_NAME_TEARDOWN_PENDING, …) drive specific recovery UI, and a reverse-proxy 502 that
-  // never reached the gateway carries no code at all — that distinction is exactly what the unlink
-  // classifier keys on instead of fragile message heuristics.
+  // SESSION_NAME_TEARDOWN_PENDING, ...) drive specific recovery UI, and a reverse-proxy 502 that
+  // never reached the gateway carries no code at all.
   const err = new Error(error.message || `HTTP ${response.status}`) as Error & {
     status?: number;
     code?: string;
@@ -870,22 +891,20 @@ async function handleErrorResponse<T>(response: Response, sentKey: string | null
 
 async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
   const url = `${API_BASE_URL}${endpoint}`;
-
-  // Get API key from sessionStorage for authentication
-  const apiKey = sessionStorage.getItem('openwa_api_key');
+  const sentActorId = getActiveApiKeyId();
 
   // For FormData (file uploads) let the browser set multipart/form-data + boundary itself.
   const isFormData = options.body instanceof FormData;
   const headers: HeadersInit = {
     ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
-    ...(apiKey ? { 'X-API-Key': apiKey } : {}),
+    [DASHBOARD_CSRF_HEADER]: DASHBOARD_CSRF_HEADER_VALUE,
     ...options.headers,
   };
 
-  const response = await fetch(url, { ...options, headers });
+  const response = await fetch(url, { ...options, credentials: 'include', headers });
 
   if (!response.ok) {
-    return handleErrorResponse<T>(response, apiKey);
+    return handleErrorResponse<T>(response, sentActorId);
   }
 
   if (response.status === 204) {
@@ -895,47 +914,93 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   return response.json();
 }
 
-/** Like {@link request} but returns the raw response text — e.g. a plugin's HTML config-UI bundle. */
+/** Like {@link request} but returns the raw response text, e.g. a plugin's HTML config-UI bundle. */
 async function requestText(endpoint: string): Promise<string> {
-  const apiKey = sessionStorage.getItem('openwa_api_key');
+  const sentActorId = getActiveApiKeyId();
   const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-    headers: { ...(apiKey ? { 'X-API-Key': apiKey } : {}) },
+    credentials: 'include',
+    headers: { [DASHBOARD_CSRF_HEADER]: DASHBOARD_CSRF_HEADER_VALUE },
   });
 
   if (!response.ok) {
-    return handleErrorResponse<string>(response, apiKey);
+    return handleErrorResponse<string>(response, sentActorId);
   }
 
   return response.text();
 }
 
-/** Like {@link request} but returns a Blob — e.g. for status media downloads. */
+/** Like {@link request} but returns a Blob, e.g. for status media downloads. */
 async function requestBlob(endpoint: string, signal?: AbortSignal): Promise<Blob> {
   const url = `${API_BASE_URL}${endpoint}`;
-
-  // Get API key from sessionStorage for authentication
-  const apiKey = sessionStorage.getItem('openwa_api_key');
+  const sentActorId = getActiveApiKeyId();
 
   const headers: HeadersInit = {
-    ...(apiKey ? { 'X-API-Key': apiKey } : {}),
+    [DASHBOARD_CSRF_HEADER]: DASHBOARD_CSRF_HEADER_VALUE,
   };
 
-  const response = await fetch(url, { headers, signal });
+  const response = await fetch(url, { credentials: 'include', headers, signal });
 
   if (!response.ok) {
-    return handleErrorResponse<Blob>(response, apiKey);
+    return handleErrorResponse<Blob>(response, sentActorId);
   }
 
   return response.blob();
 }
 
+let pendingLogout: Promise<void> = Promise.resolve();
+
+export const authApi = {
+  createSession: async (apiKey: string) => {
+    // Wait for any in-flight logout DELETE so a slow Set-Cookie Max-Age=0 response cannot clear
+    // the freshly created session cookie on rapid logout-then-relogin.
+    await pendingLogout;
+    return fetch(`${API_BASE_URL}/auth/session`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': apiKey,
+        [DASHBOARD_CSRF_HEADER]: DASHBOARD_CSRF_HEADER_VALUE,
+      },
+    });
+  },
+  getSession: () =>
+    fetch(`${API_BASE_URL}/auth/session`, {
+      method: 'GET',
+      credentials: 'include',
+      headers: {
+        [DASHBOARD_CSRF_HEADER]: DASHBOARD_CSRF_HEADER_VALUE,
+      },
+    }),
+  deleteSession: () => {
+    const req = fetch(`${API_BASE_URL}/auth/session`, {
+      method: 'DELETE',
+      credentials: 'include',
+      keepalive: true,
+      headers: {
+        [DASHBOARD_CSRF_HEADER]: DASHBOARD_CSRF_HEADER_VALUE,
+      },
+    });
+    pendingLogout = req.then(
+      () => undefined,
+      () => undefined,
+    );
+    return req;
+  },
+};
+
 // =============================================================================
 // Session API
 // =============================================================================
 
+const enc = encodeURIComponent;
+
+/** Safety cap on paginated chat and contact list walks so a non-terminating server cannot loop forever. */
+export const MAX_PAGINATED_LIST_ITEMS = 50_000;
+
 export const sessionApi = {
   list: () => request<Session[]>('/sessions'),
-  get: (id: string) => request<Session>(`/sessions/${id}`),
+  get: (id: string) => request<Session>(`/sessions/${enc(id)}`),
   create: (name: string, options?: CreateSessionOptions) =>
     request<Session>('/sessions', {
       method: 'POST',
@@ -944,82 +1009,81 @@ export const sessionApi = {
         ...(options?.proxyUrl ? { proxyUrl: options.proxyUrl } : {}),
       }),
     }),
-  delete: (id: string) => request<void>(`/sessions/${id}`, { method: 'DELETE' }),
-  getConfig: (id: string) => request<SessionConfig>(`/sessions/${id}/config`),
+  delete: (id: string) => request<void>(`/sessions/${enc(id)}`, { method: 'DELETE' }),
+  getConfig: (id: string) => request<SessionConfig>(`/sessions/${enc(id)}/config`),
   // PATCH merges: only the keys sent are touched. Send null to clear one back to its default.
   updateConfig: (id: string, patch: Partial<Record<keyof SessionConfig, boolean | number | null>>) =>
-    request<SessionConfig>(`/sessions/${id}/config`, {
+    request<SessionConfig>(`/sessions/${enc(id)}/config`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
     }),
-  getProxy: (id: string) => request<SessionProxy>(`/sessions/${id}/proxy`),
+  getProxy: (id: string) => request<SessionProxy>(`/sessions/${enc(id)}/proxy`),
   updateProxy: (id: string, patch: { proxyUrl?: string | null }) =>
-    request<SessionProxy>(`/sessions/${id}/proxy`, {
+    request<SessionProxy>(`/sessions/${enc(id)}/proxy`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
     }),
-  start: (id: string) => request<Session>(`/sessions/${id}/start`, { method: 'POST' }),
-  stop: (id: string) => request<Session>(`/sessions/${id}/stop`, { method: 'POST' }),
-  logout: (id: string) => request<Session>(`/sessions/${id}/logout`, { method: 'POST' }),
-  forceKill: (id: string) => request<Session>(`/sessions/${id}/force-kill`, { method: 'POST' }),
-  getQR: (id: string) => request<{ qrCode: string; status: string }>(`/sessions/${id}/qr`),
+  start: (id: string) => request<Session>(`/sessions/${enc(id)}/start`, { method: 'POST' }),
+  stop: (id: string) => request<Session>(`/sessions/${enc(id)}/stop`, { method: 'POST' }),
+  logout: (id: string) => request<Session>(`/sessions/${enc(id)}/logout`, { method: 'POST' }),
+  forceKill: (id: string) => request<Session>(`/sessions/${enc(id)}/force-kill`, { method: 'POST' }),
+  getQR: (id: string) => request<{ qrCode: string; status: string }>(`/sessions/${enc(id)}/qr`),
   requestPairingCode: (id: string, phoneNumber: string) =>
-    request<{ pairingCode: string; status: string }>(`/sessions/${id}/pairing-code`, {
+    request<{ pairingCode: string; status: string }>(`/sessions/${enc(id)}/pairing-code`, {
       method: 'POST',
       body: JSON.stringify({ phoneNumber }),
     }),
   getStats: () => request<SessionStats>('/sessions/stats/overview'),
   getGroups: (id: string) =>
-    request<{ id: string; name?: string; linkedParentJID?: string | null }[]>(`/sessions/${id}/groups`),
+    request<{ id: string; name?: string; linkedParentJID?: string | null }[]>(`/sessions/${enc(id)}/groups`),
   // Operator route, Baileys only: whatsapp-web.js answers 501. Participants are WhatsApp ids (`…@c.us`).
   createGroup: (id: string, name: string, participants: string[]) =>
-    request<{ id: string; name: string }>(`/sessions/${id}/groups`, {
+    request<{ id: string; name: string }>(`/sessions/${enc(id)}/groups`, {
       method: 'POST',
       body: JSON.stringify({ name, participants }),
     }),
-  getGroup: (id: string, groupId: string) =>
-    request<GroupInfo>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}`),
+  getGroup: (id: string, groupId: string) => request<GroupInfo>(`/sessions/${enc(id)}/groups/${enc(groupId)}`),
   // The group writes below are operator routes. Whether WhatsApp lets this account make them (an admin,
   // or any member while the group's info is unlocked) is decided by WhatsApp; a refusal answers 403.
   setGroupSubject: (id: string, groupId: string, subject: string) =>
-    request<GroupAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/subject`, {
+    request<GroupAck>(`/sessions/${enc(id)}/groups/${enc(groupId)}/subject`, {
       method: 'PUT',
       body: JSON.stringify({ subject }),
     }),
   setGroupDescription: (id: string, groupId: string, description: string) =>
-    request<GroupAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/description`, {
+    request<GroupAck>(`/sessions/${enc(id)}/groups/${enc(groupId)}/description`, {
       method: 'PUT',
       body: JSON.stringify({ description }),
     }),
   setGroupPicture: (id: string, groupId: string, base64: string, mimetype: string) =>
-    request<GroupAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/picture`, {
+    request<GroupAck>(`/sessions/${enc(id)}/groups/${enc(groupId)}/picture`, {
       method: 'PUT',
       body: JSON.stringify({ base64, mimetype }),
     }),
   addGroupParticipants: (id: string, groupId: string, participants: string[]) =>
-    request<GroupParticipantsAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/participants`, {
+    request<GroupParticipantsAck>(`/sessions/${enc(id)}/groups/${enc(groupId)}/participants`, {
       method: 'POST',
       body: JSON.stringify({ participants }),
     }),
   removeGroupParticipants: (id: string, groupId: string, participants: string[]) =>
-    request<GroupParticipantsAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/participants`, {
+    request<GroupParticipantsAck>(`/sessions/${enc(id)}/groups/${enc(groupId)}/participants`, {
       method: 'DELETE',
       body: JSON.stringify({ participants }),
     }),
   setGroupAdmins: (id: string, groupId: string, participants: string[], admin: boolean) =>
     request<GroupParticipantsAck>(
-      `/sessions/${id}/groups/${encodeURIComponent(groupId)}/participants/${admin ? 'promote' : 'demote'}`,
+      `/sessions/${enc(id)}/groups/${enc(groupId)}/participants/${admin ? 'promote' : 'demote'}`,
       { method: 'POST', body: JSON.stringify({ participants }) },
     ),
   leaveGroup: (id: string, groupId: string) =>
-    request<GroupAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/leave`, { method: 'POST' }),
+    request<GroupAck>(`/sessions/${enc(id)}/groups/${enc(groupId)}/leave`, { method: 'POST' }),
   getChats: async (id: string, signal?: AbortSignal) => {
     let lastError: unknown;
     const { items, throttled } = await fetchAllPages<Chat>(
       async (limit, offset) => {
         signal?.throwIfAborted();
         try {
-          const data = await request<Chat[]>(`/sessions/${id}/chats?limit=${limit}&offset=${offset}`, { signal });
+          const data = await request<Chat[]>(`/sessions/${enc(id)}/chats?limit=${limit}&offset=${offset}`, { signal });
           return { data, total: data.length < limit ? offset + data.length : Infinity };
         } catch (err) {
           lastError = err;
@@ -1028,7 +1092,7 @@ export const sessionApi = {
           signal?.throwIfAborted();
         }
       },
-      { pageSize: 1000, maxItems: Infinity },
+      { pageSize: 1000, maxItems: MAX_PAGINATED_LIST_ITEMS },
     );
     // A later throttled page must fail the load rather than present an incomplete sidebar.
     if (throttled) throw lastError;
@@ -1042,83 +1106,78 @@ export const sessionApi = {
   // `messageIds` are the messages to acknowledge. Baileys acknowledges them one by one and, without any, only the
   // newest it holds; whatsapp-web.js reads the whole chat and ignores them.
   markChatRead: (id: string, chatId: string, messageIds?: string[]) =>
-    request<{ success: boolean }>(`/sessions/${id}/chats/read`, {
+    request<{ success: boolean }>(`/sessions/${enc(id)}/chats/read`, {
       method: 'POST',
       body: JSON.stringify({ chatId, ...(messageIds?.length ? { messageIds } : {}) }),
     }),
   // Both also delete the gateway's stored copy of the chat's messages (rows, media, search entries).
   clearChatMessages: (id: string, chatId: string) =>
-    request<{ success: boolean }>(`/sessions/${id}/chats/${encodeURIComponent(chatId)}/messages`, {
+    request<{ success: boolean }>(`/sessions/${enc(id)}/chats/${enc(chatId)}/messages`, {
       method: 'DELETE',
     }),
   deleteChat: (id: string, chatId: string) =>
-    request<{ success: boolean }>(`/sessions/${id}/chats/delete`, {
+    request<{ success: boolean }>(`/sessions/${enc(id)}/chats/delete`, {
       method: 'POST',
       body: JSON.stringify({ chatId }),
     }),
   // Archive and pin answer `{ success: false }` when the engine declined to act (WhatsApp keeps at most three
   // chats pinned), which the callers treat as a failure. Mute has no declined outcome and always answers success.
   archiveChat: (id: string, chatId: string, archive: boolean) =>
-    request<{ success: boolean }>(`/sessions/${id}/chats/archive`, {
+    request<{ success: boolean }>(`/sessions/${enc(id)}/chats/archive`, {
       method: 'POST',
       body: JSON.stringify({ chatId, archive }),
     }),
   pinChat: (id: string, chatId: string, pin: boolean) =>
-    request<{ success: boolean }>(`/sessions/${id}/chats/pin`, {
+    request<{ success: boolean }>(`/sessions/${enc(id)}/chats/pin`, {
       method: 'POST',
       body: JSON.stringify({ chatId, pin }),
     }),
   /** `muteUntil` is epoch MILLISECONDS; null unmutes. */
   muteChat: (id: string, chatId: string, muteUntil: number | null) =>
-    request<{ success: boolean }>(`/sessions/${id}/chats/mute`, {
+    request<{ success: boolean }>(`/sessions/${enc(id)}/chats/mute`, {
       method: 'POST',
       body: JSON.stringify({ chatId, muteUntil }),
     }),
   markChatUnread: (id: string, chatId: string) =>
-    request<{ success: boolean }>(`/sessions/${id}/chats/unread`, {
+    request<{ success: boolean }>(`/sessions/${enc(id)}/chats/unread`, {
       method: 'POST',
       body: JSON.stringify({ chatId }),
     }),
   // `offset` counts DB rows already fetched for this chat, never rendered rows: the thread merges
   // these with engine history, so paging by the merged length would skip DB rows. `total` is not
-  // read to decide whether an older page exists — a page short of `limit` is; a chat with live
+  // read to decide whether an older page exists: a page short of `limit` is; a chat with live
   // traffic keeps growing `total` after the fact, so comparing rows-held against it stops early.
   getChatMessages: (id: string, chatId: string, limit = 100, offset = 0) =>
     request<{ messages: ChatMessage[]; total: number }>(
-      `/sessions/${id}/messages?chatId=${encodeURIComponent(chatId)}&limit=${limit}&offset=${offset}`,
+      `/sessions/${enc(id)}/messages?chatId=${enc(chatId)}&limit=${limit}&offset=${offset}`,
     ),
-  // Live history straight from WhatsApp (bypasses the DB) — backfills a thread the gateway never
+  // Live history straight from WhatsApp (bypasses the DB): backfills a thread the gateway never
   // captured, e.g. a freshly paired session whose persisted store is still empty.
   // includeMedia downloads the media payload (base64) for history messages so stickers/images/
   // video/voice render instead of collapsing to an empty timestamp-only bubble.
   getChatHistory: (id: string, chatId: string, limit = 100, includeMedia = false) =>
     request<EngineHistoryMessage[]>(
-      `/sessions/${id}/messages/${encodeURIComponent(chatId)}/history?limit=${limit}${
-        includeMedia ? '&includeMedia=true' : ''
-      }`,
+      `/sessions/${enc(id)}/messages/${enc(chatId)}/history?limit=${limit}${includeMedia ? '&includeMedia=true' : ''}`,
     ),
   // A message's stored media, fetched on demand. The message list carries its media inline only up to
   // MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES; past that budget the payload arrives as the
   // `{ omitted: true, sizeBytes }` marker and the bytes are only reachable here. Served as an
   // attachment (Content-Disposition), so callers download it rather than rendering it inline.
   getMessageMediaBlob: (id: string, chatId: string, messageId: string, signal?: AbortSignal) =>
-    requestBlob(
-      `/sessions/${id}/messages/${encodeURIComponent(chatId)}/${encodeURIComponent(messageId)}/media`,
-      signal,
-    ),
-  getSubscribedChannels: (id: string) => request<Channel[]>(`/sessions/${id}/channels`),
+    requestBlob(`/sessions/${enc(id)}/messages/${enc(chatId)}/${enc(messageId)}/media`, signal),
+  getSubscribedChannels: (id: string) => request<Channel[]>(`/sessions/${enc(id)}/channels`),
   getChannelMessages: (id: string, channelId: string, limit = 50) =>
-    request<ChannelMessage[]>(`/sessions/${id}/channels/${encodeURIComponent(channelId)}/messages?limit=${limit}`),
-  getContactStatuses: (id: string) => request<{ statuses: StatusUpdate[] }>(`/sessions/${id}/status`),
+    request<ChannelMessage[]>(`/sessions/${enc(id)}/channels/${enc(channelId)}/messages?limit=${limit}`),
+  getContactStatuses: (id: string) => request<{ statuses: StatusUpdate[] }>(`/sessions/${enc(id)}/status`),
   getStatusMediaBlob: (id: string, statusId: string, signal?: AbortSignal) =>
-    requestBlob(`/sessions/${id}/status/${encodeURIComponent(statusId)}/media`, signal),
+    requestBlob(`/sessions/${enc(id)}/status/${enc(statusId)}/media`, signal),
   postTextStatus: (
     id: string,
     text: string,
     recipients?: string[],
     extra?: { backgroundColor?: string; font?: number },
   ) =>
-    request(`/sessions/${id}/status/send-text`, {
+    request(`/sessions/${enc(id)}/status/send-text`, {
       method: 'POST',
       body: JSON.stringify({ text, recipients, ...extra }),
     }),
@@ -1128,7 +1187,7 @@ export const sessionApi = {
     recipients?: string[],
     caption?: string,
   ) =>
-    request(`/sessions/${id}/status/send-image`, {
+    request(`/sessions/${enc(id)}/status/send-image`, {
       method: 'POST',
       body: JSON.stringify({ image, recipients, caption }),
     }),
@@ -1139,24 +1198,27 @@ export const sessionApi = {
 // =============================================================================
 
 export const webhookApi = {
-  listBySession: (sessionId: string) => request<Webhook[]>(`/sessions/${sessionId}/webhooks`),
+  listBySession: (sessionId: string) => request<Webhook[]>(`/sessions/${enc(sessionId)}/webhooks`),
   listAll: () => request<Webhook[]>('/webhooks'),
   create: (sessionId: string, data: CreateWebhookRequest) =>
-    request<Webhook>(`/sessions/${sessionId}/webhooks`, {
+    request<Webhook>(`/sessions/${enc(sessionId)}/webhooks`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   update: (sessionId: string, id: string, data: UpdateWebhookRequest) =>
-    request<Webhook>(`/sessions/${sessionId}/webhooks/${id}`, {
+    request<Webhook>(`/sessions/${enc(sessionId)}/webhooks/${enc(id)}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     }),
   delete: (sessionId: string, id: string) =>
-    request<void>(`/sessions/${sessionId}/webhooks/${id}`, { method: 'DELETE' }),
+    request<void>(`/sessions/${enc(sessionId)}/webhooks/${enc(id)}`, { method: 'DELETE' }),
   test: (sessionId: string, id: string) =>
-    request<{ success: boolean; statusCode?: number; error?: string }>(`/sessions/${sessionId}/webhooks/${id}/test`, {
-      method: 'POST',
-    }),
+    request<{ success: boolean; statusCode?: number; error?: string }>(
+      `/sessions/${enc(sessionId)}/webhooks/${enc(id)}/test`,
+      {
+        method: 'POST',
+      },
+    ),
 };
 
 // =============================================================================
@@ -1164,19 +1226,19 @@ export const webhookApi = {
 // =============================================================================
 
 export const templateApi = {
-  list: (sessionId: string) => request<MessageTemplate[]>(`/sessions/${sessionId}/templates`),
+  list: (sessionId: string) => request<MessageTemplate[]>(`/sessions/${enc(sessionId)}/templates`),
   create: (sessionId: string, data: TemplatePayload) =>
-    request<MessageTemplate>(`/sessions/${sessionId}/templates`, {
+    request<MessageTemplate>(`/sessions/${enc(sessionId)}/templates`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   update: (sessionId: string, id: string, data: Partial<TemplatePayload>) =>
-    request<MessageTemplate>(`/sessions/${sessionId}/templates/${id}`, {
+    request<MessageTemplate>(`/sessions/${enc(sessionId)}/templates/${enc(id)}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     }),
   delete: (sessionId: string, id: string) =>
-    request<void>(`/sessions/${sessionId}/templates/${id}`, { method: 'DELETE' }),
+    request<void>(`/sessions/${enc(sessionId)}/templates/${enc(id)}`, { method: 'DELETE' }),
 };
 
 // =============================================================================
@@ -1196,14 +1258,14 @@ export interface ProfilePictureResponse {
 }
 
 export const contactApi = {
-  // The route caps a response at 1000 contacts; walk the pages so an address book past that is complete.
-  // No item cap: the status recipient picker needs every contact, and the server's short page ends the walk.
+  // The route caps a response at 1000 contacts; walk the pages so an address book past that is complete,
+  // stopping at MAX_PAGINATED_LIST_ITEMS if the server never returns a short page.
   list: async (sessionId: string) => {
     let lastError: unknown;
     const { items, throttled } = await fetchAllPages(
       async (limit, offset) => {
         try {
-          const data = await request<Contact[]>(`/sessions/${sessionId}/contacts?limit=${limit}&offset=${offset}`);
+          const data = await request<Contact[]>(`/sessions/${enc(sessionId)}/contacts?limit=${limit}&offset=${offset}`);
           // The route answers a bare array with no total: a short page is the last one.
           return { data, total: data.length < limit ? offset + data.length : Infinity };
         } catch (err) {
@@ -1211,7 +1273,7 @@ export const contactApi = {
           throw err;
         }
       },
-      { pageSize: 1000, maxItems: Infinity },
+      { pageSize: 1000, maxItems: MAX_PAGINATED_LIST_ITEMS },
     );
     // A page still throttled after the retries would leave the picker silently short; fail the whole
     // load with that page's 429, as a throttled first page already does.
@@ -1219,43 +1281,40 @@ export const contactApi = {
     return items;
   },
   /** The ids of the contacts this account has blocked. */
-  listBlocked: (sessionId: string) => request<string[]>(`/sessions/${sessionId}/contacts/blocked`),
+  listBlocked: (sessionId: string) => request<string[]>(`/sessions/${enc(sessionId)}/contacts/blocked`),
   block: (sessionId: string, contactId: string) =>
-    request<{ success: boolean }>(`/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/block`, {
+    request<{ success: boolean }>(`/sessions/${enc(sessionId)}/contacts/${enc(contactId)}/block`, {
       method: 'POST',
     }),
   unblock: (sessionId: string, contactId: string) =>
-    request<{ success: boolean }>(`/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/block`, {
+    request<{ success: boolean }>(`/sessions/${enc(sessionId)}/contacts/${enc(contactId)}/block`, {
       method: 'DELETE',
     }),
   /** Save the contact to the account's address book, or rename the entry it has. */
   upsert: (sessionId: string, contactId: string, firstName: string, lastName?: string) =>
-    request<{ success: boolean }>(`/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}`, {
+    request<{ success: boolean }>(`/sessions/${enc(sessionId)}/contacts/${enc(contactId)}`, {
       method: 'PUT',
       body: JSON.stringify({ firstName, ...(lastName ? { lastName } : {}) }),
     }),
   checkNumber: (sessionId: string, number: string) =>
-    request<CheckNumberResponse>(`/sessions/${sessionId}/contacts/check/${encodeURIComponent(number)}`),
+    request<CheckNumberResponse>(`/sessions/${enc(sessionId)}/contacts/check/${enc(number)}`),
   // Returns the contact/group profile picture URL. Both engines return null when the user hid their
   // picture or has none. The URL is a signed WhatsApp CDN link that expires in a few hours, so the
   // dashboard caches it for an hour (see useProfilePicture) and re-fetches on expiry.
   profilePicture: (sessionId: string, contactId: string) =>
-    request<ProfilePictureResponse>(`/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/profile-picture`),
+    request<ProfilePictureResponse>(`/sessions/${enc(sessionId)}/contacts/${enc(contactId)}/profile-picture`),
   // Best-effort resolution of a contact id (e.g. an @lid privacy id) to its phone number (MSISDN
   // digits), or null when the engine can't map it. Cached a day by useResolvedPhone.
   resolvePhone: (sessionId: string, contactId: string) =>
     request<{ contactId: string; phone: string | null }>(
-      `/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/phone`,
+      `/sessions/${enc(sessionId)}/contacts/${enc(contactId)}/phone`,
     ),
-  // Batch-resolve profile picture URLs for a whole sidebar in ONE request — the per-chat burst of
+  // Batch-resolve profile picture URLs for a whole sidebar in ONE request: the per-chat burst of
   // parallel single fetches exhausts the per-IP throttle (429s). Engine lookups run 5 at a time
   // server-side; ids beyond the backend's 50-id cap are dropped client-side too.
   profilePictures: (sessionId: string, contactIds: string[]) =>
     request<{ pictures: Record<string, string | null> }>(
-      `/sessions/${sessionId}/contacts/profile-pictures?ids=${contactIds
-        .slice(0, 50)
-        .map(encodeURIComponent)
-        .join(',')}`,
+      `/sessions/${enc(sessionId)}/contacts/profile-pictures?ids=${contactIds.slice(0, 50).map(enc).join(',')}`,
     ),
 };
 
@@ -1289,12 +1348,12 @@ export const apiKeyApi = {
       allowedChats?: string[];
     },
   ) =>
-    request<ApiKey>(`/auth/api-keys/${id}`, {
+    request<ApiKey>(`/auth/api-keys/${enc(id)}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     }),
-  delete: (id: string) => request<void>(`/auth/api-keys/${id}`, { method: 'DELETE' }),
-  revoke: (id: string) => request<ApiKey>(`/auth/api-keys/${id}/revoke`, { method: 'POST' }),
+  delete: (id: string) => request<void>(`/auth/api-keys/${enc(id)}`, { method: 'DELETE' }),
+  revoke: (id: string) => request<ApiKey>(`/auth/api-keys/${enc(id)}/revoke`, { method: 'POST' }),
 };
 
 // =============================================================================
@@ -1319,7 +1378,7 @@ export const auditApi = {
 
 export const messageApi = {
   sendText: (sessionId: string, chatId: string, text: string) =>
-    request<MessageResponse>(`/sessions/${sessionId}/messages/send-text`, {
+    request<MessageResponse>(`/sessions/${enc(sessionId)}/messages/send-text`, {
       method: 'POST',
       body: JSON.stringify({ chatId, text }),
     }),
@@ -1329,50 +1388,50 @@ export const messageApi = {
     mediaType: 'image' | 'video' | 'audio' | 'document',
     payload: SendMediaPayload,
   ) =>
-    request<MessageResponse>(`/sessions/${sessionId}/messages/send-${mediaType}`, {
+    request<MessageResponse>(`/sessions/${enc(sessionId)}/messages/send-${enc(mediaType)}`, {
       method: 'POST',
       body: JSON.stringify({ chatId, ...payload }),
     }),
   sendLocation: (sessionId: string, data: SendLocationPayload) =>
-    request<MessageResponse>(`/sessions/${sessionId}/messages/send-location`, {
+    request<MessageResponse>(`/sessions/${enc(sessionId)}/messages/send-location`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   sendContact: (sessionId: string, data: SendContactPayload) =>
-    request<MessageResponse>(`/sessions/${sessionId}/messages/send-contact`, {
+    request<MessageResponse>(`/sessions/${enc(sessionId)}/messages/send-contact`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   // Stickers take the same media body as the other send-* endpoints (base64 XOR url + mimetype).
   sendSticker: (sessionId: string, chatId: string, payload: SendMediaPayload) =>
-    request<MessageResponse>(`/sessions/${sessionId}/messages/send-sticker`, {
+    request<MessageResponse>(`/sessions/${enc(sessionId)}/messages/send-sticker`, {
       method: 'POST',
       body: JSON.stringify({ chatId, ...payload }),
     }),
   sendPoll: (sessionId: string, data: SendPollPayload) =>
-    request<MessageResponse>(`/sessions/${sessionId}/messages/send-poll`, {
+    request<MessageResponse>(`/sessions/${enc(sessionId)}/messages/send-poll`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   forward: (sessionId: string, data: ForwardMessagePayload) =>
-    request<MessageResponse>(`/sessions/${sessionId}/messages/forward`, {
+    request<MessageResponse>(`/sessions/${enc(sessionId)}/messages/forward`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   // Async batch: returns 202 immediately; poll getBatchStatus until a terminal status.
   sendBulk: (sessionId: string, data: SendBulkPayload) =>
-    request<BulkBatchResponse>(`/sessions/${sessionId}/messages/send-bulk`, {
+    request<BulkBatchResponse>(`/sessions/${enc(sessionId)}/messages/send-bulk`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   getBatchStatus: (sessionId: string, batchId: string) =>
-    request<BatchStatusResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}`),
+    request<BatchStatusResponse>(`/sessions/${enc(sessionId)}/messages/batch/${enc(batchId)}`),
   cancelBatch: (sessionId: string, batchId: string) =>
-    request<BatchCancelResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}/cancel`, {
+    request<BatchCancelResponse>(`/sessions/${enc(sessionId)}/messages/batch/${enc(batchId)}/cancel`, {
       method: 'POST',
     }),
   reply: (sessionId: string, data: { chatId: string; quotedMessageId: string; text: string }) =>
-    request<MessageResponse>(`/sessions/${sessionId}/messages/reply`, {
+    request<MessageResponse>(`/sessions/${enc(sessionId)}/messages/reply`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -1381,17 +1440,17 @@ export const messageApi = {
    * `messageId` is the prompt's WhatsApp id; `buttonId` is `buttons[].id`.
    */
   clickButton: (sessionId: string, data: { chatId: string; messageId: string; buttonId: string; text?: string }) =>
-    request<MessageResponse>(`/sessions/${sessionId}/messages/click-button`, {
+    request<MessageResponse>(`/sessions/${enc(sessionId)}/messages/click-button`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   react: (sessionId: string, data: { chatId: string; messageId: string; emoji: string }) =>
-    request<void>(`/sessions/${sessionId}/messages/react`, {
+    request<void>(`/sessions/${enc(sessionId)}/messages/react`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   delete: (sessionId: string, data: { chatId: string; messageId: string; forEveryone?: boolean }) =>
-    request<void>(`/sessions/${sessionId}/messages/delete`, {
+    request<void>(`/sessions/${enc(sessionId)}/messages/delete`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -1451,7 +1510,7 @@ export const infraApi = {
     request<{ status: 'ok' | 'error'; details: Record<string, { status: string }> }>('/health/ready', { signal }),
   // Data migration: export all Data-DB tables (call while still on the OLD database, before switching),
   // then import after the switch + restart. Used by the DB-switch migration guard so data isn't lost.
-  exportData: () =>
+  exportData: (includePluginSecrets = false) =>
     request<{
       exportedAt: string;
       dataDbType: string;
@@ -1464,7 +1523,7 @@ export const infraApi = {
       // all there but some of their media is not — a state a restored archive cannot express, since
       // the omitted marker is the same one media skipped on the way in gets.
       omittedInlineMedia: { messages: number; messageBatches: number };
-    }>('/infra/export-data'),
+    }>(includePluginSecrets ? '/infra/export-data?includePluginSecrets=true' : '/infra/export-data'),
   // 200 contract includes the orphan-engine reconciliation result (restartRequired / notices /
   // stopped+failed ids). 409 has several causes and the error's `code` distinguishes them:
   // IMPORT_WOULD_ORPHAN_ENGINES (live engines exist for sessions the backup would remove; the
@@ -1592,30 +1651,30 @@ export interface CatalogPlugin {
 
 export const pluginsApi = {
   list: () => request<Plugin[]>('/plugins'),
-  get: (id: string) => request<Plugin>(`/plugins/${id}`),
+  get: (id: string) => request<Plugin>(`/plugins/${enc(id)}`),
   enable: (id: string) =>
-    request<{ success: boolean; message: string }>(`/plugins/${id}/enable`, {
+    request<{ success: boolean; message: string }>(`/plugins/${enc(id)}/enable`, {
       method: 'POST',
     }),
   disable: (id: string) =>
-    request<{ success: boolean; message: string }>(`/plugins/${id}/disable`, {
+    request<{ success: boolean; message: string }>(`/plugins/${enc(id)}/disable`, {
       method: 'POST',
     }),
   updateConfig: (id: string, config: Record<string, unknown>) =>
-    request<{ success: boolean; message: string }>(`/plugins/${id}/config`, {
+    request<{ success: boolean; message: string }>(`/plugins/${enc(id)}/config`, {
       method: 'PUT',
       body: JSON.stringify({ config }),
     }),
   /** Set which sessions a session-scoped plugin is activated for (['*'] = all). */
   setSessions: (id: string, sessions: string[]) =>
-    request<Plugin>(`/plugins/${id}/sessions`, { method: 'PUT', body: JSON.stringify({ sessions }) }),
+    request<Plugin>(`/plugins/${enc(id)}/sessions`, { method: 'PUT', body: JSON.stringify({ sessions }) }),
   /** Set (or clear, with an empty object) a plugin's config override for one session. */
   updateSessionConfig: (id: string, sessionId: string, config: Record<string, unknown>) =>
-    request<{ success: boolean; message: string }>(`/plugins/${id}/config/${encodeURIComponent(sessionId)}`, {
+    request<{ success: boolean; message: string }>(`/plugins/${enc(id)}/config/${enc(sessionId)}`, {
       method: 'PUT',
       body: JSON.stringify({ config }),
     }),
-  healthCheck: (id: string) => request<{ healthy: boolean; message?: string }>(`/plugins/${id}/health`),
+  healthCheck: (id: string) => request<{ healthy: boolean; message?: string }>(`/plugins/${enc(id)}/health`),
   install: (file: File) => {
     const form = new FormData();
     form.append('file', file);
@@ -1624,11 +1683,12 @@ export const pluginsApi = {
   installFromUrl: (url: string) =>
     request<Plugin>('/plugins/install-url', { method: 'POST', body: JSON.stringify({ url }) }),
   updateFromUrl: (id: string, url: string) =>
-    request<Plugin>(`/plugins/${id}/update`, { method: 'POST', body: JSON.stringify({ url }) }),
+    request<Plugin>(`/plugins/${enc(id)}/update`, { method: 'POST', body: JSON.stringify({ url }) }),
   catalog: () => request<CatalogPlugin[]>('/plugins/catalog'),
   /** Fetch a plugin's sandboxed config-UI entry HTML (the API key stays here, in the parent). */
-  getConfigUi: (id: string) => requestText(`/plugins/${id}/config-ui`),
-  uninstall: (id: string) => request<{ success: boolean; message: string }>(`/plugins/${id}`, { method: 'DELETE' }),
+  getConfigUi: (id: string) => requestText(`/plugins/${enc(id)}/config-ui`),
+  uninstall: (id: string) =>
+    request<{ success: boolean; message: string }>(`/plugins/${enc(id)}`, { method: 'DELETE' }),
   getEngines: () => request<Engine[]>('/infra/engines'),
   getCurrentEngine: () => request<{ engineType: string }>('/infra/engines/current'),
 };
@@ -1675,23 +1735,23 @@ export interface UpdateInstanceInput {
 }
 
 export const pluginInstancesApi = {
-  list: (pluginId: string) => request<InstanceView[]>(`/integration/plugins/${pluginId}/instances`),
+  list: (pluginId: string) => request<InstanceView[]>(`/integration/plugins/${enc(pluginId)}/instances`),
   create: (pluginId: string, body: CreateInstanceInput) =>
-    request<MintedInstance>(`/integration/plugins/${pluginId}/instances`, {
+    request<MintedInstance>(`/integration/plugins/${enc(pluginId)}/instances`, {
       method: 'POST',
       body: JSON.stringify(body),
     }),
   regenerateSecret: (pluginId: string, instanceId: string) =>
-    request<MintedInstance>(`/integration/plugins/${pluginId}/instances/${instanceId}/regenerate-secret`, {
+    request<MintedInstance>(`/integration/plugins/${enc(pluginId)}/instances/${enc(instanceId)}/regenerate-secret`, {
       method: 'POST',
     }),
   update: (pluginId: string, instanceId: string, body: UpdateInstanceInput) =>
-    request<InstanceView>(`/integration/plugins/${pluginId}/instances/${instanceId}`, {
+    request<InstanceView>(`/integration/plugins/${enc(pluginId)}/instances/${enc(instanceId)}`, {
       method: 'PATCH',
       body: JSON.stringify(body),
     }),
   remove: (pluginId: string, instanceId: string) =>
-    request<void>(`/integration/plugins/${pluginId}/instances/${instanceId}`, { method: 'DELETE' }),
+    request<void>(`/integration/plugins/${enc(pluginId)}/instances/${enc(instanceId)}`, { method: 'DELETE' }),
 };
 
 // =============================================================================
@@ -1720,5 +1780,5 @@ export interface MessageStats {
 
 export const statsApi = {
   getOverview: () => request<OverviewStats>('/stats/overview'),
-  getMessages: (period: StatsPeriod) => request<MessageStats>(`/stats/messages?period=${period}`),
+  getMessages: (period: StatsPeriod) => request<MessageStats>(`/stats/messages?period=${enc(period)}`),
 };

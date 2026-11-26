@@ -325,8 +325,8 @@ describe('BuiltInFtsProvider trigram index build (sqlite)', () => {
       provider = new BuiltInFtsProvider(ds, containsOn);
       Object.assign(provider, { containsBuildRetryMs: 20 });
     });
-    afterEach(() => {
-      provider.onModuleDestroy();
+    afterEach(async () => {
+      await provider.onModuleDestroy();
       jest.restoreAllMocks();
     });
 
@@ -409,5 +409,108 @@ describe('trigram schema helpers', () => {
       `SELECT "public".unaccent('"public".unaccent'::regdictionary, $1)`,
     );
     expect(postgresUnaccentFunctionDdl(`we"ird's`)).toContain(`SELECT "we""ird's".unaccent('"we""ird''s".unaccent'`);
+  });
+});
+
+describe('BuiltInFtsProvider match=contains PostgreSQL ctype catalog probe', () => {
+  it.each(['C', 'POSIX'])(
+    'rejects non-ASCII contains queries when probePostgresTrigram discovers %s ctype without buildContainsIndex',
+    async ctype => {
+      const query = jest.fn().mockResolvedValue([]);
+      const managerQuery = jest
+        .fn()
+        .mockResolvedValue([{ trgm: 'public', unaccent: 'public', fn: true, idx: true, ctype }]);
+      const ds = {
+        options: { type: 'postgres' },
+        query,
+        manager: { query: managerQuery },
+      } as unknown as DataSource;
+      const provider = new BuiltInFtsProvider(ds, containsOn);
+
+      const attempt = provider.search({ q: '서울역', match: 'contains' });
+      await expect(attempt).rejects.toBeInstanceOf(BadRequestException);
+      await expect(attempt).rejects.toBeInstanceOf(ContainsTermsRefusedError);
+      await expect(attempt).rejects.toThrow(/3 or more ASCII letters or digits in a row/);
+      expect(query).not.toHaveBeenCalled();
+
+      // An ASCII-foldable term is still allowed and reaches the database.
+      await expect(provider.search({ q: 'café', match: 'contains' })).resolves.toMatchObject({ total: 0 });
+      expect(query).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('skips redundant DROP+CREATE TRIGGER on a healthy trigram index and uses awaitNoOpenTransaction + IMMEDIATE when rebuilding triggers', async () => {
+    const ds = await new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [Session, Message],
+      synchronize: true,
+    }).initialize();
+    try {
+      await ds.getRepository(Message).insert({
+        sessionId: 's1',
+        chatId: 'c1',
+        from: 'a@c.us',
+        to: 'b@c.us',
+        body: 'alpha beta',
+        type: 'text',
+        direction: MessageDirection.INCOMING,
+        timestamp: 1000,
+      });
+      const provider = new BuiltInFtsProvider(ds, containsOn);
+      await provider.buildContainsIndex();
+
+      const spy = jest.spyOn(ds, 'query');
+      await provider.buildContainsIndex();
+      const sqls = spy.mock.calls.map(([sql]) => String(sql));
+      expect(sqls.some(sql => /DROP TRIGGER/i.test(sql) || /CREATE TRIGGER/i.test(sql))).toBe(false);
+      spy.mockRestore();
+
+      // When a trigger is missing or stale, trigger recreation waits for open tx and executes inside BEGIN IMMEDIATE.
+      await ds.query('DROP TRIGGER IF EXISTS messages_trgm_ad');
+      const runnerSqls: string[] = [];
+      const order: string[] = [];
+      const awaitSpy = jest.spyOn(sharedConnection, 'awaitNoOpenTransaction').mockImplementation(() => {
+        order.push('awaitNoOpenTransaction');
+        return Promise.resolve(true);
+      });
+      const runnerQuerySpies: Array<jest.SpyInstance> = [];
+      const spiedRunners = new WeakSet<object>();
+      const origCreateRunner = ds.createQueryRunner.bind(ds);
+      const runnerSpy = jest.spyOn(ds, 'createQueryRunner').mockImplementation((...args) => {
+        const runner = origCreateRunner(...args);
+        if (!spiedRunners.has(runner)) {
+          spiedRunners.add(runner);
+          const origQuery = runner.query.bind(runner) as (...args: unknown[]) => Promise<never>;
+          runnerQuerySpies.push(
+            jest.spyOn(runner, 'query').mockImplementation((sql: string, ...rest: unknown[]) => {
+              runnerSqls.push(sql);
+              if (/BEGIN IMMEDIATE/i.test(sql)) order.push('BEGIN IMMEDIATE');
+              return origQuery(sql, ...rest);
+            }),
+          );
+        }
+        return runner;
+      });
+
+      try {
+        await provider.buildContainsIndex();
+      } finally {
+        for (const spy of runnerQuerySpies) spy.mockRestore();
+        awaitSpy.mockRestore();
+        runnerSpy.mockRestore();
+      }
+      const beginOrderIdx = order.indexOf('BEGIN IMMEDIATE');
+      expect(beginOrderIdx).toBeGreaterThan(0);
+      expect(order[beginOrderIdx - 1]).toBe('awaitNoOpenTransaction');
+      const beginIdx = runnerSqls.findIndex(sql => /BEGIN IMMEDIATE/i.test(sql));
+      const commitIdx = runnerSqls.findIndex(sql => /COMMIT/i.test(sql));
+      expect(beginIdx).toBeGreaterThanOrEqual(0);
+      expect(commitIdx).toBeGreaterThan(beginIdx);
+      const txWindow = runnerSqls.slice(beginIdx + 1, commitIdx);
+      expect(txWindow.some(sql => /CREATE TRIGGER messages_trgm_ad/i.test(sql))).toBe(true);
+    } finally {
+      await ds.destroy();
+    }
   });
 });

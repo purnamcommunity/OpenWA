@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { ConsoleLogger, Logger } from '@nestjs/common';
 import { LoggerService, LogLevel, LogFormat, createLogger, redactSecrets } from './logger.service';
 import { runWithRequestId } from './request-context';
+import { leastCpuMs } from '../../../test/helpers/cpu-time';
 
 interface LogEntry {
   timestamp: string;
@@ -396,18 +397,18 @@ describe('LoggerService', () => {
     const parsed = (): Record<string, unknown> => getLogOutput(consoleSpy) as unknown as Record<string, unknown>;
 
     it('is written as [Truncated] at once in the first levels, with the rest of the line kept', () => {
-      const started = Date.now();
-      logger.log('saved', { sessionId: 's1', list: sparse() });
+      const cpuMs = leastCpuMs(() => logger.log('saved', { sessionId: 's1', list: sparse() }));
 
-      expect(Date.now() - started).toBeLessThan(1000);
+      expect(cpuMs).toBeLessThan(1000);
       expect(parsed()).toMatchObject({ message: 'saved', sessionId: 's1', list: '[Truncated]' });
     });
 
     it('is written as [Truncated] at once below the fifth level, with the rest of the line kept', () => {
-      const started = Date.now();
-      logger.log('saved', { sessionId: 's1', a: { b: { c: { d: { e: { list: sparse() } } } } } });
+      const cpuMs = leastCpuMs(() =>
+        logger.log('saved', { sessionId: 's1', a: { b: { c: { d: { e: { list: sparse() } } } } } }),
+      );
 
-      expect(Date.now() - started).toBeLessThan(1000);
+      expect(cpuMs).toBeLessThan(1000);
       expect(parsed()).toMatchObject({
         message: 'saved',
         sessionId: 's1',
@@ -424,20 +425,18 @@ describe('LoggerService', () => {
     it('is written as its type and length at once in the first levels, with the rest of the line kept', () => {
       const file = Buffer.alloc(5_000_000);
 
-      const started = Date.now();
-      logger.log('saved', { sessionId: 's1', file });
+      const cpuMs = leastCpuMs(() => logger.log('saved', { sessionId: 's1', file }));
 
-      expect(Date.now() - started).toBeLessThan(1000);
+      expect(cpuMs).toBeLessThan(1000);
       expect(parsed()).toMatchObject({ message: 'saved', sessionId: 's1', file: written });
     });
 
     it('is written as its type and length at once below the fifth level, with the rest of the line kept', () => {
       const file = Buffer.alloc(5_000_000);
 
-      const started = Date.now();
-      logger.log('saved', { sessionId: 's1', a: { b: { c: { d: { e: { file } } } } } });
+      const cpuMs = leastCpuMs(() => logger.log('saved', { sessionId: 's1', a: { b: { c: { d: { e: { file } } } } } }));
 
-      expect(Date.now() - started).toBeLessThan(1000);
+      expect(cpuMs).toBeLessThan(1000);
       expect(parsed()).toMatchObject({ sessionId: 's1', a: { b: { c: { d: { e: { file: written } } } } } });
     });
   });
@@ -1512,11 +1511,10 @@ describe('redactSecrets', () => {
 
       it('finishes a record of 900 references to one wide object in a bounded time', () => {
         const shared = wide(20_000);
-        const started = Date.now();
 
-        redactSecrets(deep(Array.from({ length: 900 }, () => shared)));
+        const cpuMs = leastCpuMs(() => redactSecrets(deep(Array.from({ length: 900 }, () => shared))));
 
-        expect(Date.now() - started).toBeLessThan(500);
+        expect(cpuMs).toBeLessThan(500);
       });
 
       it('spends the node budget on the keys of a too wide object, so what follows it is [Truncated]', () => {
@@ -1882,6 +1880,24 @@ describe('redactSecrets', () => {
       ).toEqual({
         kept: { id: 1, toJSON: 'not a function' },
         dropped: { id: 2 },
+      });
+    });
+
+    it('redacts cookie, set-cookie, proxyUrl, and x-openwa-forwarded-sig fields', () => {
+      expect(
+        redactSecrets({
+          cookie: 'openwa_session=secret',
+          'set-cookie': ['openwa_session=secret; HttpOnly'],
+          proxyUrl: 'http://user:pass@proxy.internal:8080',
+          'x-openwa-forwarded-sig': 'hmac-sha256-deadbeef',
+          nested: { headers: { Cookie: 'abc', 'X-OpenWA-Forwarded-Sig': 'sig' } },
+        }),
+      ).toEqual({
+        cookie: '[REDACTED]',
+        'set-cookie': '[REDACTED]',
+        proxyUrl: '[REDACTED]',
+        'x-openwa-forwarded-sig': '[REDACTED]',
+        nested: { headers: { Cookie: '[REDACTED]', 'X-OpenWA-Forwarded-Sig': '[REDACTED]' } },
       });
     });
   });

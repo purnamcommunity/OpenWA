@@ -6,6 +6,7 @@ import { ConfigService } from '@nestjs/config';
 import { DataSource, DataSourceOptions } from 'typeorm';
 import { join } from 'path';
 import { BuiltInFtsProvider, TRIGRAM_BUILD_LOCK, TRIGRAM_BUILD_LOCK_KEY } from './builtin-fts.provider';
+import { waitUntil } from '../../../../test/helpers/wait-until';
 
 /**
  * Postgres runtime coverage for match=contains: the pg_trgm/unaccent schema buildContainsIndex creates
@@ -144,7 +145,7 @@ const containsOn = new ConfigService({ search: { containsEnabled: true } });
 
         expect((await waiting.search({ q: 'voic', match: 'contains' })).total).toBe(2);
       } finally {
-        waiting.onModuleDestroy();
+        await waiting.onModuleDestroy();
         await other.release();
       }
     });
@@ -161,15 +162,15 @@ const containsOn = new ConfigService({ search: { containsEnabled: true } });
 
         // The holder dies or fails: the lock goes, and no index is left behind.
         await other.query(`SELECT pg_advisory_unlock(${LOCK})`, [TRIGRAM_BUILD_LOCK_KEY]);
-        for (let i = 0; i < 200 && (await trigramState()).idx !== true; i++) await new Promise(r => setTimeout(r, 50));
+        await waitUntil(async () => (await trigramState()).idx === true);
 
         expect(await trigramState()).toEqual({ extensions: 2, fn: true, idx: true });
         expect((await waiting.search({ q: 'voic', match: 'contains' })).total).toBe(2);
       } finally {
-        waiting.onModuleDestroy();
+        await waiting.onModuleDestroy();
         await other.release();
       }
-    });
+    }, 60_000);
 
     it('is not held up by the build lock of a deployment in another schema of the database', async () => {
       const other = ds.createQueryRunner();
@@ -360,6 +361,40 @@ const containsOn = new ConfigService({ search: { containsEnabled: true } });
       await expect(search).rejects.toThrow(/3 or more ASCII letters or digits in a row/);
       expect((await provider.search({ q: 'café', match: 'contains' })).total).toBe(1);
       expect((await provider.search({ q: '서울역 lunch', match: 'contains' })).total).toBe(1);
+    });
+
+    it('enforces the ASCII-only rule on a second replica that probes the existing index without running buildContainsIndex', async () => {
+      const builder = new BuiltInFtsProvider(cds, containsOn);
+      await builder.buildContainsIndex();
+
+      const follower = new BuiltInFtsProvider(cds, containsOn);
+      const search = follower.search({ q: '서울역', match: 'contains' });
+      await expect(search).rejects.toBeInstanceOf(BadRequestException);
+      await expect(search).rejects.toThrow(/3 or more ASCII letters or digits in a row/);
+      expect((await follower.search({ q: 'café', match: 'contains' })).total).toBe(1);
+    });
+
+    it('runs word search ts_headline outside the LIMIT/OFFSET CTE and preserves order', async () => {
+      await cds.query('DELETE FROM messages');
+      for (let i = 1; i <= 5; i++) {
+        await cds.query(
+          `INSERT INTO messages ("sessionId", "chatId", "from", "to", "body", "type", "direction", "timestamp")
+           VALUES ('s-cte', 'c1', 'a@c.us', 'b@c.us', $1, 'text', 'in', $2)`,
+          [`outer headline target word row ${i}`, 1000 + i],
+        );
+      }
+
+      const provider = new BuiltInFtsProvider(cds, containsOn);
+      const querySpy = jest.spyOn(cds, 'query');
+      const res = await provider.search({ q: 'headline', sessionId: 's-cte', limit: 2, offset: 1 });
+
+      expect(res.total).toBe(5);
+      expect(res.hits).toHaveLength(2);
+      expect(res.hits[0].snippet).toContain('<mark>');
+      const searchSql = String(querySpy.mock.calls.find(([sql]) => /ts_headline/i.test(String(sql)))?.[0] ?? '');
+      expect(searchSql).toMatch(/\bWITH\b/i);
+      expect(searchSql.search(/\bts_headline\s*\(/i)).toBeGreaterThan(searchSql.search(/\bLIMIT\b/i));
+      querySpy.mockRestore();
     });
   });
 });

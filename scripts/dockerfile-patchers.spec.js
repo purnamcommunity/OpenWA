@@ -133,6 +133,13 @@ test('every patcher is also wired into postinstall', () => {
   assert.deepEqual(missing, [], `not wired into postinstall: ${missing.join(', ')}`);
 });
 
+test('production stage does not install the GNU patch package', () => {
+  const aptRuns = production.filter(line => /\bapt-get\s+install\b/.test(line));
+  assert.ok(aptRuns.length > 0, 'no apt-get install RUN found in the production stage');
+  const installsPatch = aptRuns.some(line => /(?:^|\s)patch(?:\s|$)/.test(line));
+  assert.equal(installsPatch, false, 'production stage still installs the unused GNU patch package');
+});
+
 test('docs install the same Chrome for Testing build as the image', () => {
   // The amd64 pin is bumped by hand, and the docs repeat the install command. A bump that misses
   // them leaves a copy-paste recipe for an older, unpatched browser.

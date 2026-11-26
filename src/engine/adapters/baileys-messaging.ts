@@ -3,6 +3,7 @@ import type * as BaileysLib from '@whiskeysockets/baileys';
 import type {
   AnyMessageContent,
   MiscMessageGenerationOptions,
+  WAMediaUploadFunction,
   WAMessage,
   WAMessageKey,
   WASocket,
@@ -33,16 +34,23 @@ import {
   resolveBaileysButtonClick,
   setBaileysText,
   storedKeyInChatPersisted,
+  withoutFastRatchetDistribution,
 } from './baileys-message-mapper';
 import { LINK_PREVIEW_THUMBNAIL_MAX_BYTES, loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import { BadRequestException, InternalServerErrorException } from '@nestjs/common';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
+import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
 import { type createLogger } from '../../common/services/logger.service';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
-import { EngineNotSentError, markNothingSent, markOutcomeUnknown } from '../../common/errors/engine-not-sent.error';
+import {
+  EngineNotSentError,
+  markNothingSent,
+  markOutcomeUnknown,
+  provesNothingSent,
+} from '../../common/errors/engine-not-sent.error';
 import { parseWaId, userPart } from '../identity/wa-id';
 import { BAILEYS_QUERY_BUDGET_MS, confirmedWrite, guardLookup, withQueryDeadline } from './baileys-query-deadline';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
@@ -116,7 +124,7 @@ function isWebpBuffer(data: Buffer): boolean {
  *
  * Baileys stamps the label unconditionally — `prepareWAMessageMedia` applies
  * `if (!uploadData.mimetype) uploadData.mimetype = MIMETYPE_MAP[mediaType]` with
- * `MIMETYPE_MAP.sticker = 'image/webp'` (Utils/messages.js:18, 86-88) — and transcodes nothing. So
+ * `MIMETYPE_MAP.sticker = 'image/webp'` (Utils/messages.js) — and transcodes nothing. So
  * a PNG handed over here is published as a stickerMessage whose declared type contradicts its bytes,
  * and the send still reports success. whatsapp-web.js has no such gap: `sendMediaAsSticker: true`
  * routes through `Util.formatToWebpSticker`, which converts `image/*` and throws for anything else.
@@ -320,6 +328,29 @@ export async function resolveMediaBuffer(
 const CONNECTION_CLOSED = 428;
 
 /**
+ * What a send answers 409 when its socket was replaced or stopped while the message was being written. The frame may
+ * already be on the wire, so unlike the refusal of a send that sent nothing, it does not say to send it again.
+ */
+export const CONNECTION_LOST_DURING_SEND_MESSAGE =
+  'The WhatsApp connection was replaced or stopped while the message was being sent, and it may or may not have ' +
+  'been sent. Check the chat before sending it again.';
+
+/** The same window for a status post, which is written to status@broadcast and takes no idempotency key. */
+export const CONNECTION_LOST_DURING_STATUS_POST =
+  'The WhatsApp connection was replaced or stopped while the status was being posted, and it may or may not have ' +
+  'been published. Check your status before posting it again.';
+
+/** The same window for the revoke of a status. */
+export const CONNECTION_LOST_DURING_STATUS_REVOKE =
+  'The WhatsApp connection was replaced or stopped while the status was being revoked, and it may or may not have ' +
+  'been removed. Check your status before deleting it again.';
+
+/** The same window for a reaction to a message, an edit, a delete or a pin, which is a change to a message. */
+export const CONNECTION_LOST_DURING_MESSAGE_CHANGE =
+  'The WhatsApp connection was replaced or stopped while the change was being written, and it may or may not have ' +
+  'been applied. Check the chat before repeating it.';
+
+/**
  * Give a WhatsApp throttle or timeout answer (WA code 429 or 408) its retryable 503 instead of letting
  * the raw Boom surface as a 500. `sendMessage` awaits several IQs before it relays the message (group
  * roster, devices, sessions) and nothing after the relay awaits a result, so a numeric code here is a
@@ -343,11 +374,106 @@ export function mapSendRefusal(error: unknown): unknown {
   return error;
 }
 
+/**
+ * The `upload` option of a send. Baileys awaits the upload while it builds the message, before `relayMessage` hands
+ * anything to WhatsApp, and it spreads the caller's options last, so this stands in for its own. A failure of it (the
+ * media host refusing every attempt) therefore sent nothing, and the error carries markNothingSent: a keyed send frees
+ * its Idempotency-Key, a paced one gives its admission back, and the send breaker does not count it. The send's refusal
+ * mapping still runs on the error, so a throttle or a closed connection answers as it does anywhere else and a timeout
+ * of the media query stays unproven, as one of any other query does.
+ */
+export function uploadBeforeRelay(sock: WASocket): WAMediaUploadFunction {
+  return async (filePath, options) => {
+    try {
+      return await sock.waUploadToServer(filePath, options);
+    } catch (error) {
+      throw markNothingSent(error);
+    }
+  };
+}
+
+/** Max cached positive onWhatsApp recipient resolutions per session (LRU evicted at cap). */
+const NUMBER_ID_CACHE_MAX_ENTRIES = 5000;
+/** Positive TTL for cached onWhatsApp recipient resolutions used on outbound sends. */
+const NUMBER_ID_CACHE_TTL_MS = 15 * 60_000;
+
+function isInvalidRecipientSendError(error: unknown): boolean {
+  if (error instanceof RecipientUnreachableError) return true;
+  const code = refusedStatusCode(error);
+  if (code === 400 || code === 404) return true;
+  const err = error as { status?: unknown; statusCode?: unknown; output?: { statusCode?: unknown } } | null | undefined;
+  const status = err?.output?.statusCode ?? err?.statusCode ?? err?.status;
+  return status === 400 || status === 404;
+}
+
 export class BaileysMessaging {
+  // Positive-only LRU + TTL cache of canonical phone digits -> neutral JID for outbound sends.
+  private readonly numberIdCache = new Map<string, { numberId: string; storedAt: number }>();
+  // Coalesces concurrent send-path onWhatsApp lookups for the same canonical phone digits.
+  private readonly numberIdInFlight = new Map<string, Promise<string | null>>();
+  // Generation fence bumped on clearNumberIdCache() so stale in-flight lookups cannot repopulate.
+  private numberIdCacheGeneration = 0;
+
   constructor(
     private readonly host: BaileysMessagingHost,
     private readonly queryBudgetMs: number = BAILEYS_QUERY_BUDGET_MS,
   ) {}
+
+  /** Drop cached send-path recipient number-id resolutions and fence any in-flight lookups. */
+  clearNumberIdCache(): void {
+    this.numberIdCacheGeneration++;
+    this.numberIdCache.clear();
+    this.numberIdInFlight.clear();
+  }
+
+  private resolveNumberIdCached(jid: string, sock: WASocket): Promise<string | null> {
+    const key = userPart(this.host.toEngineJid(jid));
+    if (!key) return this.getNumberId(jid);
+    const cached = this.numberIdCache.get(key);
+    if (cached) {
+      const elapsed = Date.now() - cached.storedAt;
+      if (elapsed >= 0 && elapsed < NUMBER_ID_CACHE_TTL_MS) {
+        // LRU touch: move to most-recently-used position.
+        this.numberIdCache.delete(key);
+        this.numberIdCache.set(key, cached);
+        return Promise.resolve(cached.numberId);
+      }
+      this.numberIdCache.delete(key);
+    }
+    const joined = this.numberIdInFlight.get(key);
+    if (joined) return joined;
+    const generation = this.numberIdCacheGeneration;
+    const pending = this.getNumberId(jid).then(
+      numberId => {
+        if (this.numberIdInFlight.get(key) === pending) {
+          this.numberIdInFlight.delete(key);
+        }
+        // Cache only positive resolutions when neither the cache generation nor the socket changed.
+        if (numberId !== null && generation === this.numberIdCacheGeneration && this.host.getSocketOrNull() === sock) {
+          this.storeNumberIdCache(key, numberId);
+        }
+        return numberId;
+      },
+      (error: unknown) => {
+        if (this.numberIdInFlight.get(key) === pending) {
+          this.numberIdInFlight.delete(key);
+        }
+        throw error;
+      },
+    );
+    this.numberIdInFlight.set(key, pending);
+    return pending;
+  }
+
+  private storeNumberIdCache(key: string, numberId: string): void {
+    this.numberIdCache.delete(key);
+    this.numberIdCache.set(key, { numberId, storedAt: Date.now() });
+    while (this.numberIdCache.size > NUMBER_ID_CACHE_MAX_ENTRIES) {
+      const oldest = this.numberIdCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.numberIdCache.delete(oldest);
+    }
+  }
 
   /** Bound a write whose confirmation the library discards; see baileys-query-deadline.ts. */
   private confirmed<T>(work: Promise<T>, operation: string): Promise<T> {
@@ -448,7 +574,7 @@ export class BaileysMessaging {
   ): Promise<MessageResult> {
     const socket = this.ensureReadyToSend();
     const jid = await this.toDeliverableJid(chatId, socket);
-    // Baileys spreads the caller's options LAST (messages-send.js:1086), so `getUrlInfo` here
+    // Baileys spreads the caller's options LAST (messages-send.js), so `getUrlInfo` here
     // replaces its hardcoded one — which delegates to a package carrying an unfixed SSRF advisory
     // (see safe-link-preview.ts). Passed on every text send so that generator is never reachable,
     // not only when a preview was asked for.
@@ -460,7 +586,7 @@ export class BaileysMessaging {
       ...((await this.quoteOption(sendOptions?.quotedMessageId, socket)) ?? {}),
     };
     // `linkPreview: null` is Baileys' explicit "no preview": with the key absent it instead calls the
-    // configured generator (Utils/messages.js:279-281), which for us means a blocking outbound fetch
+    // configured generator (Utils/messages.js), which for us means a blocking outbound fetch
     // of every URL in the text (up to 3s each, no cache) before the message can go out.
     //
     // Previews are therefore OPT-IN on this engine: only `linkPreview: true` leaves the key absent.
@@ -490,7 +616,7 @@ export class BaileysMessaging {
           }
         : {}),
     });
-    const sent = await this.send(jid, content, options, socket);
+    const sent = await this.send(jid, content, options, socket, true);
     if (sent) {
       void this.host.putStoredMessage(sent)?.catch(err =>
         this.host.logger.warn('Failed to persist sent message to store', {
@@ -601,6 +727,12 @@ export class BaileysMessaging {
         new BadRequestException(`Product ${product.id} has no image — a product card requires one`),
       );
     }
+    if (!/^https?:\/\//i.test(product.imageUrl)) {
+      throw markNothingSent(new BadRequestException(`Product ${product.id} imageUrl must be an http(s) URL`));
+    }
+    // Pre-fetch via loadRemoteMediaBuffer so session proxy, SSRF guard, timeout, and size cap apply
+    // consistently (including on @newsletter recipients) instead of passing a raw URL to Baileys.
+    const { data: productImage } = await loadRemoteMediaBuffer(product.imageUrl, this.host.sessionProxyUrl());
     const content: AnyMessageContent = {
       product: {
         productId: product.id,
@@ -610,7 +742,7 @@ export class BaileysMessaging {
         priceAmount1000: product.price === undefined ? undefined : Math.round(product.price * 1000),
         retailerId: product.retailerId,
         url: product.url || undefined,
-        productImage: { url: product.imageUrl },
+        productImage,
       },
       businessOwnerJid: this.host.toEngineJid(this.host.normalizedSelfJid()),
       body,
@@ -812,7 +944,7 @@ export class BaileysMessaging {
    * native-flow prompt.
    */
   async clickButton(chatId: string, messageId: string, buttonId: string, text?: string): Promise<MessageResult> {
-    this.host.ensureReady();
+    this.ensureReadyToSend();
     const socket = this.sock();
     const quoted = await this.requireStored(messageId);
     await this.assertStoredInChat(quoted, chatId, messageId, socket);
@@ -823,12 +955,14 @@ export class BaileysMessaging {
     const resolved = resolveBaileysButtonClick(normalized, contentType, buttonId, text);
     if (!resolved.ok) {
       if (resolved.error === 'unknown_button') {
-        throw new BadRequestException(
-          `buttonId "${buttonId}" is not among the clickable choices on message ${messageId}`,
+        throw markNothingSent(
+          new BadRequestException(`buttonId "${buttonId}" is not among the clickable choices on message ${messageId}`),
         );
       }
-      throw new BadRequestException(
-        `message ${messageId} is not a WhatsApp Business button/list prompt that can be clicked`,
+      throw markNothingSent(
+        new BadRequestException(
+          `message ${messageId} is not a WhatsApp Business button/list prompt that can be clicked`,
+        ),
       );
     }
 
@@ -1027,9 +1161,8 @@ export class BaileysMessaging {
    * Fold the chat's known disappearing-messages timer into Baileys' send options so outbound messages
    * honor the chat's ephemeral setting (#473). Returns `options` unchanged when no positive timer is
    * cached: omitting `ephemeralExpiration` reproduces today's behavior (Baileys' send guard is truthy),
-   * so an unknown / boot-window / stale-empty cache never forces a message to disappear. Returning
-   * `undefined` keeps the send a 2-arg call, identical to before. React/delete/status do not route
-   * through here, so they are excluded by construction (reactions are NOT excluded by Baileys' guard).
+   * so an unknown / boot-window / stale-empty cache never forces a message to disappear. React/delete/status do
+   * not route through here, so they are excluded by construction (reactions are NOT excluded by Baileys' guard).
    */
   private withEphemeral(
     chatId: string,
@@ -1062,8 +1195,7 @@ export class BaileysMessaging {
 
   /**
    * Options carrying the vetted generator, so the library's own is never selected. Added only for
-   * text-bearing content: media sends never reach the generator, and leaving their options untouched
-   * keeps the two-argument sendMessage call they already make.
+   * text-bearing content: media sends never reach the generator.
    */
   private previewSafeOptions(content: AnyMessageContent, options?: MiscMessageGenerationOptions) {
     if (!('text' in content)) return options;
@@ -1090,7 +1222,7 @@ export class BaileysMessaging {
       typeof content === 'function' ? async () => this.previewSafe(await content()) : this.previewSafe(content);
     const ephemeral = this.withEphemeral(jid, options);
     const merged = typeof safe === 'function' ? ephemeral : this.previewSafeOptions(safe, ephemeral);
-    const sent = await this.send(jid, safe, merged, expected);
+    const sent = await this.send(jid, safe, merged, expected, true);
     if (sent) {
       void this.host.putStoredMessage(sent)?.catch(err =>
         this.host.logger.warn('Failed to persist sent message to store', {
@@ -1145,6 +1277,7 @@ export class BaileysMessaging {
     content: Parameters<WASocket['sendMessage']>[1] | (() => Promise<Parameters<WASocket['sendMessage']>[1]>),
     options?: Parameters<WASocket['sendMessage']>[2],
     expected?: WASocket,
+    applyEphemeral = false,
   ): Promise<WAMessage | undefined> {
     const sock = this.sock(expected);
     const recipient = parseWaId(jid);
@@ -1153,30 +1286,64 @@ export class BaileysMessaging {
     if (recipient.kind === 'unknown' && !recipient.userPart && jid.includes('@')) {
       throw markNothingSent(new BadRequestException(`Recipient ${jid} is not a valid WhatsApp id`));
     }
+    let numberIdCacheKey: string | undefined;
+    let resolvedCacheKey: string | undefined;
     if (recipient.kind === 'user') {
+      numberIdCacheKey = userPart(this.host.toEngineJid(jid));
       let numberId: string | null;
       try {
-        numberId = await this.getNumberId(jid);
+        numberId = await this.resolveNumberIdCached(jid, sock);
       } catch (error) {
         this.sock(sock);
         if (error instanceof EngineNotReadyError) throw markNothingSent(error);
         throw new EngineNotSentError(`WhatsApp could not check the recipient before send: ${String(error)}`);
       }
       this.sock(sock);
-      if (!numberId)
-        throw markNothingSent(new BadRequestException(`WhatsApp reports recipient ${jid} is not registered`));
+      if (!numberId) {
+        throw markNothingSent(
+          new RecipientUnreachableError(jid, `WhatsApp reports recipient ${jid} is not registered`),
+        );
+      }
       const canonical = this.host.toEngineJid(numberId);
-      if (canonical !== jid) jid = await this.toDeliverableJid(numberId, sock);
+      resolvedCacheKey = userPart(canonical);
+      if (canonical !== jid) {
+        jid = await this.toDeliverableJid(numberId, sock);
+        if (applyEphemeral) options = this.withEphemeral(jid, options);
+      }
     }
     const message = typeof content === 'function' ? await content() : content;
     this.sock(sock);
     const mediaUploadTimeoutMs = this.uploadTimeoutMs();
-    const sendOptions = mediaUploadTimeoutMs ? { ...options, mediaUploadTimeoutMs } : options;
+    const sendOptions = {
+      ...options,
+      upload: uploadBeforeRelay(sock),
+      ...(mediaUploadTimeoutMs ? { mediaUploadTimeoutMs } : {}),
+    };
     let sent: WAMessage | undefined;
     try {
-      sent = sendOptions ? await sock.sendMessage(jid, message, sendOptions) : await sock.sendMessage(jid, message);
+      sent = await sock.sendMessage(jid, message, sendOptions);
     } catch (error) {
-      if (this.host.getSocketOrNull() !== sock) throw markOutcomeUnknown(new EngineNotReadyError());
+      if (isInvalidRecipientSendError(error)) {
+        if (numberIdCacheKey) {
+          this.numberIdCache.delete(numberIdCacheKey);
+          this.numberIdInFlight.delete(numberIdCacheKey);
+        }
+        if (resolvedCacheKey && resolvedCacheKey !== numberIdCacheKey) {
+          this.numberIdCache.delete(resolvedCacheKey);
+          this.numberIdInFlight.delete(resolvedCacheKey);
+        }
+      }
+      // An upload that failed on a socket since replaced or stopped still sent nothing: the write was never reached.
+      if (this.host.getSocketOrNull() !== sock)
+        throw provesNothingSent(error)
+          ? markNothingSent(new EngineNotReadyError())
+          : markOutcomeUnknown(
+              new EngineNotReadyError(
+                'react' in message || 'delete' in message || 'edit' in message || 'pin' in message
+                  ? CONNECTION_LOST_DURING_MESSAGE_CHANGE
+                  : CONNECTION_LOST_DURING_SEND_MESSAGE,
+              ),
+            );
       throw mapSendRefusal(error);
     }
     // Mutations are announced by their library echo; no local callback replaces it.
@@ -1237,7 +1404,8 @@ export class BaileysMessaging {
    * that overtook it the same way is applied to a copy, so a quote or forward carries the edited text.
    */
   private async requireStored(messageId: string, allowDeleted = false): Promise<WAMessage> {
-    const found = await this.host.getStoredMessage(messageId);
+    // A row an earlier version wrote may still hold a fast-ratchet distribution, which Baileys would quote and click by.
+    const found = withoutFastRatchetDistribution(await this.host.getStoredMessage(messageId));
     const deleted = !found?.message || this.host.wasDeletedForEveryone(messageId);
     if (!found?.key || (deleted && !allowDeleted)) {
       // Every caller looks the message up before it writes anything, so nothing was sent.

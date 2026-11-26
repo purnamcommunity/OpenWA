@@ -96,6 +96,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'SESSION_PROXY_TIMEOUT_MS',
   // Liveness watchdog warm-up after a session reports ready, blank-forwarded like the knobs above.
   'SESSION_WATCHDOG_WARMUP_MS',
+  'SESSION_PROXY_SECRET',
   // Autoreply rule cap, blank-forwarded like the knobs above so an operator who sets nothing does
   // not have an empty string shadow a value in .env / data/.env.generated.
   'AUTOMATION_MAX_PER_SESSION',
@@ -148,10 +149,15 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'API_MASTER_KEY',
   'TRUSTED_PROXIES',
   'CSP_UPGRADE_INSECURE_REQUESTS',
-  // whatsapp-web.js launch knobs: the WhatsApp Web version pin, its remote HTML template, and the
-  // first-boot init wait raised for slow hosts.
+  'DASHBOARD_SESSION_TTL_MS',
+  'DASHBOARD_SESSION_COOKIE_SECURE',
+  'HOOK_PRE_EGRESS_FAIL_CLOSED',
+  // whatsapp-web.js launch knobs: the WhatsApp Web version pin, its remote HTML template,
+  // integrity verification controls, and the first-boot init wait raised for slow hosts.
   'WWEBJS_WEB_VERSION',
   'WWEBJS_WEB_VERSION_REMOTE_PATH',
+  'WWEBJS_WEB_VERSION_SHA256',
+  'WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED',
   'WWEBJS_AUTH_TIMEOUT_MS',
   // The remainder of the documented knob set, forwarded blank once the compose forwarding list was
   // completed (compose-parity.spec.ts now derives the required forwards from .env.example, so every
@@ -163,6 +169,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'VALIDATION_ERROR_DETAIL',
   'MCP_READONLY',
   'MCP_RATE_LIMIT_MAX',
+  'MCP_MAX_RESULT_BYTES',
   'MCP_RATE_LIMIT_WINDOW_MS',
   'MCP_IP_RATE_LIMIT_MAX',
   'MCP_IP_RATE_LIMIT_WINDOW_MS',
@@ -212,6 +219,7 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'DATABASE_IDLE_TIMEOUT_MS',
   'DATABASE_CONNECTION_TIMEOUT_MS',
   'MAIN_DATABASE_NAME',
+  'SQLITE_JOURNAL_MODE',
   'REDIS_USERNAME',
   'REDIS_PASSWORD',
   'REDIS_CONNECT_TIMEOUT_MS',
@@ -260,6 +268,8 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'LOG_FORMAT',
   'BASE_URL',
   'DASHBOARD_URL',
+  'DOCKER_HOST',
+  'DOCKER_ALLOW_LOCAL_SOCKET',
 ];
 
 export function clearBlankEnv(env: NodeJS.ProcessEnv, keys: string[]): void {

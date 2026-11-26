@@ -712,8 +712,10 @@ curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 ```
 
 > Restoring `sessions/` is required, not optional, when the rollback crosses a browser major upgrade (on
-> amd64, 0.23.5 moved Chrome for Testing from 146 to 153, 0.26.0 moves it to 156 and 0.29.0 moves it to 157; arm64
-> runs the chromium Debian shipped when each image was built), and the backup must predate the first start
+> amd64, 0.23.5 moved Chrome for Testing from 146 to 153, 0.26.0 moves it to 156, 0.29.0 moves it to 157 and 0.31.0 moves it to 158; arm64
+> runs the chromium Debian shipped when each image was built; a source install without
+> `PUPPETEER_EXECUTABLE_PATH` runs the Chrome Puppeteer downloads, which moved from 156 to 157 with Puppeteer
+> 25.17.0), and the backup must predate the first start
 > on the newer image; a daily backup taken after the upgrade does not qualify. An older Chrome silently
 > deletes the IndexedDB of a profile a newer Chrome has opened, which is where whatsapp-web.js keeps the
 > WhatsApp login. The symptom: every previously linked whatsapp-web.js session starts at a QR code instead
@@ -747,19 +749,22 @@ curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 
 **Trigger:** Daily schedule, before maintenance, before upgrade
 
-**Impact:** The databases are snapshotted consistently online (`sqlite3 .backup`, `pg_dump`). Each
-SQLite file (`main.sqlite` on every deployment, plus the data database with `DATABASE_TYPE=sqlite`)
-is copied under a read lock, and an app write that meets it waits for the copy to end, failing if the
-copy outlasts the 30 s busy timeout. The SQLite driver waits synchronously, so while a write waits the
-whole gateway stalls with it (API, WebSocket, engine events, health probes), not only that write; run
-the backup in a quiet window, or stop the container for a large database. Engine authentication
-state (`sessions/`, `baileys/`) is copied while the engines write it, so a restored session can need
-re-pairing; for a copy that is consistent by construction, stop the sessions first
-(`POST /api/sessions/:id/stop`), or stop the container and archive the volume. A stopped session
-stays down across restarts, even with `AUTO_START_SESSIONS=true`, so start each one again with
-`POST /api/sessions/:id/start` once the backup is copied. From 0.24.0 the stop is recorded in the
-backed-up database, so a restore of that archive keeps the session stopped too; an archive taken on
-0.23.7 or earlier records no stop.
+**Impact:** The databases are snapshotted consistently online (`sqlite3 .backup`, `pg_dump`). With
+the default `SQLITE_JOURNAL_MODE=WAL`, `sqlite3 .backup` captures both the base `.sqlite` file and
+any uncheckpointed `-wal` transactions consistently without blocking concurrent writers; under
+`SQLITE_JOURNAL_MODE=DELETE` (rollback-journal mode), each SQLite file (`main.sqlite` on every
+deployment, plus the data database with `DATABASE_TYPE=sqlite`) is copied under a read lock, so an
+app write waits up to the 30 s busy timeout (blocking the synchronous SQLite driver on the event
+loop). If the `sqlite3` CLI is unavailable on the backup host and a non-empty `-wal` sidecar exists,
+`scripts/backup.sh` refuses to run rather than silently dropping uncheckpointed WAL transactions:
+install `sqlite3` or stop OpenWA cleanly first (clean shutdown runs `PRAGMA wal_checkpoint(TRUNCATE)`).
+Engine authentication state (`sessions/`, `baileys/`) is copied while the engines write it, so a
+restored session can need re-pairing; for a copy that is consistent by construction, stop the
+sessions first (`POST /api/sessions/:id/stop`), or stop the container and archive the volume. A
+stopped session stays down across restarts, even with `AUTO_START_SESSIONS=true`, so start each one
+again with `POST /api/sessions/:id/start` once the backup is copied. From 0.24.0 the stop is recorded
+in the backed-up database, so a restore of that archive keeps the session stopped too; an archive
+taken on 0.23.7 or earlier records no stop.
 
 **Prerequisites:**
 
@@ -964,10 +969,12 @@ tar -tzf "$(ls -t ./backups/openwa-backup-*.tar.gz | head -n 1)"
 **Steps:**
 
 Use the repo's `scripts/restore.sh`. It restores `main.sqlite` (auth/audit) and a SQLite data store;
-for PostgreSQL it stages `database.sql` for the explicit import below. It also restores
-whatsapp-web.js/Baileys auth state, local media, plugins, and generated secret/config files, all as the
-archive holds them, so restore only archives you made. It snapshots the current data dir first so a
-bad restore can be undone:
+for PostgreSQL it stages `database.sql` for the explicit import below. An archive that holds the SQLite
+data store is refused, before anything is written, while `DATABASE_TYPE` is `postgres`: restore it into a
+SQLite install, then move that install as [14.3](./14-migration-guide.md#143-database-migration-sqlite--postgresql)
+shows. It also restores whatsapp-web.js/Baileys auth state, local media, plugins, and generated
+secret/config files, all as the archive holds them, so restore only archives you made. It snapshots the
+current data dir first so a bad restore can be undone:
 
 ```bash
 # 1. Stop the app (so files are quiescent)

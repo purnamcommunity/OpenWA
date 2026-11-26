@@ -23,6 +23,9 @@
 
 .message-tester .compose-panel,
 .message-tester .response-panel {
+  /* A grid item will not shrink below its content: a long group name or an unbroken token in an error would widen
+     the whole form past a phone screen, where the page clips what falls outside. */
+  min-width: 0;
   background: var(--bg-white);
   border-radius: 12px;
   padding: 1.5rem;
@@ -57,7 +60,7 @@
   width: 100%;
   padding: 0.75rem 1rem;
   font-size: 0.9375rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius);
   background-color: var(--bg-white);
   transition: border-color 0.2s;
@@ -68,11 +71,20 @@
 .message-tester .form-group textarea:focus {
   outline: none;
   border-color: var(--focus-ring);
+  box-shadow: 0 0 0 1px var(--focus-ring);
+}
+
+/* A select keeps the glow of the global select:focus, which the box-shadow above replaces. */
+.message-tester .form-group select:focus {
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px rgba(37, 211, 102, 0.1);
 }
 
 .message-tester .form-group textarea {
   resize: vertical;
   min-height: 100px;
+  unicode-bidi: plaintext;
 }
 
 .message-tester .form-group .hint {
@@ -164,6 +176,8 @@
 .message-tester .detail-row {
   display: flex;
   justify-content: space-between;
+  /* A value that wraps (a long error text) must not run into its label. */
+  gap: 1rem;
   padding: 0.625rem 0;
   border-bottom: 1px solid var(--border);
 }
@@ -178,6 +192,8 @@
 }
 
 .message-tester .detail-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-size: 0.875rem;
   color: var(--text-primary);
   font-weight: 500;
@@ -389,6 +405,12 @@
   margin: 0;
 }
 
+/* A native checkbox shows no border and draws its outline ring on keyboard focus, so the ring the text fields take
+   is not drawn around it. */
+.message-tester .form-group input[type='checkbox']:focus {
+  box-shadow: none;
+}
+
 .message-tester .group-picker {
   display: flex;
   flex-direction: column;
@@ -445,6 +467,7 @@
 }
 
 .message-tester .group-picker-option span {
+  unicode-bidi: plaintext;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -469,10 +492,6 @@
   margin-top: 0.5rem;
   font-size: 0.8125rem;
   color: var(--text-secondary);
-}
-
-.message-tester .detail-row.group-failures {
-  gap: 1rem;
 }
 
 .message-tester .detail-row.group-failures ul {
@@ -628,4 +647,16 @@
   padding: 0;
   margin: 0;
   min-width: 0;
+}
+
+/* Forced colours drop fills: a toggle that is on draws a heavy frame and the send button a frame. */
+@media (forced-colors: active) {
+  .message-tester .toggle-group button.active,
+  .message-tester .toggle-group.toggle-group-wrap button.active {
+    border: 3px solid CanvasText;
+  }
+
+  .message-tester .send-btn {
+    border: 1px solid ButtonText;
+  }
 }

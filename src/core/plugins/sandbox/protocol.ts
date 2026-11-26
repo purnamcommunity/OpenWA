@@ -11,6 +11,7 @@
  */
 
 import type { SearchQuery, SearchResults } from '../../../modules/search/search.types';
+import type { HookEvent } from '../../hooks/hook.interfaces';
 
 export type PluginLifecycleMethod = 'onLoad' | 'onEnable' | 'onDisable' | 'onUnload';
 
@@ -20,7 +21,53 @@ export interface SandboxStaticContext {
   config: Record<string, unknown>;
 }
 
+/** Host-authoritative dispatch context (firing hook session or ingress instance) for a worker request. */
+export interface SandboxDispatchContext {
+  sessionId?: string;
+  instanceId?: string;
+}
+
 export type PluginLogLevel = 'log' | 'debug' | 'warn' | 'error';
+
+/**
+ * Bound on the `ctx.logger.*` lines one plugin gets across to the host: the worker sends at most this many per
+ * window and drops the rest on its own thread, so a loop that logs without yielding costs the host no more than
+ * the lines it writes. The host's log relay keeps the same bound as a backstop.
+ */
+export const SANDBOX_LOG_MAX_PER_WINDOW = 200;
+export const SANDBOX_LOG_WINDOW_MS = 10000;
+
+/**
+ * Max worker-initiated capability calls the host runs concurrently per sandboxed plugin. A burst beyond this is
+ * rejected (the plugin sees a thrown Error) rather than amplified into unbounded host-side sends/fetches/writes.
+ */
+export const SANDBOX_MAX_INFLIGHT_CAPS = 32;
+
+/**
+ * Capability calls a worker leaves unanswered before it holds the next one back. Twice the host's bound, so the host's
+ * own bound is still the one a slow verb meets first. A loop that does not await its calls stops posting here: each
+ * message past the host's bound is still read and answered on the host's one thread, so a call past this waits in the
+ * worker until a reply frees a slot, in the order the plugin made the calls.
+ */
+export const SANDBOX_MAX_PENDING_CAPS = SANDBOX_MAX_INFLIGHT_CAPS * 2;
+
+/**
+ * Capability calls a worker holds back at once, past SANDBOX_MAX_PENDING_CAPS. A loop that never yields fills this
+ * queue in the worker's own heap, and the call past it is refused, so the host is handed no more than
+ * SANDBOX_MAX_PENDING_CAPS messages while the loop runs.
+ */
+export const SANDBOX_MAX_HELD_CAPS = 10000;
+
+/**
+ * Capability verbs whose host-side work is an outbound message send. A send fires the hooks of the send (message:sending
+ * and the rest), so a hook handler that issues one can cause a dispatch of its own event again, and the host gives these
+ * verbs a wider timeout budget than a lookup.
+ */
+export const SEND_CAP_VERBS: ReadonlySet<string> = new Set([
+  'messages.sendText',
+  'messages.reply',
+  'conversation.send',
+]);
 
 export type HostToWorkerMessage =
   | { kind: 'load'; mainPath: string; context?: SandboxStaticContext }
@@ -34,6 +81,9 @@ export type HostToWorkerMessage =
   | {
       kind: 'hook';
       id: number;
+      dispatchId?: string;
+      /** Host-generated opaque token bound to the concrete sessionId of this hook dispatch for floated net.fetch calls. */
+      netScopeId?: string;
       event: string;
       data: unknown;
       sessionId?: string;
@@ -43,6 +93,8 @@ export type HostToWorkerMessage =
       // handler led to it). The worker echoes it on every capability call the handler makes, so the
       // host re-establishes the re-entrancy guard for that causal chain only.
       inFlight?: string[];
+      /** True when the host chain is executing in fail-closed mode for this dispatch. */
+      failClosed?: boolean;
     }
   // The plugin's config was updated: refresh ctx.config and invoke onConfigChange (fire-and-forget).
   | { kind: 'config-change'; config: Record<string, unknown> }
@@ -58,6 +110,7 @@ export type HostToWorkerMessage =
   | {
       kind: 'webhook';
       id: number;
+      dispatchId?: string;
       instanceId: string;
       route: string;
       method: string;
@@ -89,7 +142,21 @@ export type WorkerToHostMessage =
   // validates it (permission + session scope) before running the real verb and replying.
   // `inFlight` is the chain of the hook dispatch whose handler issued the call (absent outside a hook,
   // e.g. an ingress handler or a timer); the host trusts only events it actually dispatched.
-  | { kind: 'cap'; id: number; verb: string; args: unknown[]; inFlight?: string[] }
+  // `dispatchId` echoes the host-generated id of the active hook or webhook dispatch so the host can
+  // look up its authoritative session/instance context without trusting worker-supplied identifiers.
+  // `originHook` names the hook event whose handler initiated the call; the host verifies it against
+  // the active dispatch tracked in inFlightDispatches before re-establishing hook context.
+  | {
+      kind: 'cap';
+      id: number;
+      verb: string;
+      args: unknown[];
+      inFlight?: string[];
+      dispatchId?: string;
+      /** Sent for `net.fetch` after a concrete-session hook dispatch has already returned, keeping floated fetches session-scoped. */
+      netScopeId?: string;
+      originHook?: HookEvent;
+    }
   // The worker asks the host to dispatch `event` to it (registered a handler for it).
   | { kind: 'hook-subscribe'; event: string; priority?: number }
   // The worker's handler result for a dispatched hook (continue/modify/error).

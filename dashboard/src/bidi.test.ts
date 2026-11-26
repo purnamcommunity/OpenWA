@@ -77,6 +77,7 @@ test('text cut with an ellipsis takes its direction from its own characters', ()
     '.chats-page .replying-to-body',
     '.chats-page .group-info-member .name',
     '.chats-page .session-name',
+    '.chats-page .slash-template-preview',
   ];
   for (const selector of cut) {
     const rule = body('pages/Chats.css', selector);
@@ -116,6 +117,26 @@ test('cut text that a flex column stretches hugs the start edge, where its sibli
   assert.match(quote, /max-width:\s*min\(\d+px,\s*100%\)/);
 });
 
+test('a template in the picker is named and previewed in the direction of its own characters', () => {
+  // Under the page direction an Arabic page drew the name "/aviso" as "aviso/", and a Latin preview with its full
+  // stop first. The row puts both at its start edge, so text read the other way round stays under its neighbours.
+  assert.match(body('pages/Chats.css', '.chats-page .slash-template-name'), /unicode-bidi:\s*plaintext/);
+  assert.match(body('pages/Chats.css', '.chats-page .slash-template-preview'), /max-width:\s*100%/);
+  const row = body('pages/Chats.css', '.chats-page .slash-template-item');
+  assert.match(row, /flex-direction:\s*column/);
+  assert.match(row, /align-items:\s*flex-start/);
+});
+
+test('a draft in the chat list stays next to its label, and only the draft is cut', () => {
+  // The label is a box before the snippet, so the draft alone sets the snippet's direction. The row spreads its
+  // children apart: without the margin a short draft would sit at the far edge of the row, away from its label.
+  const snippet = body('pages/Chats.css', '.chats-page .chat-item-draft-label + .chat-item-snippet');
+  assert.match(snippet, /margin-inline-end:\s*auto/);
+  const label = body('pages/Chats.css', '.chats-page .chat-item-draft-label');
+  assert.match(label, /flex-shrink:\s*0/);
+  assert.match(label, /white-space:\s*nowrap/);
+});
+
 test("a group member's number hugs the start edge, where the name above it is", () => {
   // Isolated left to right, the number takes start as left: stretched across the column it sat at the left edge of an
   // Arabic page.
@@ -138,6 +159,24 @@ test('the session number is cut by its own isolate, so an RTL page keeps its fir
   assert.match(cut, /text-overflow:\s*ellipsis/);
   assert.match(cut, /min-width:\s*0/);
   assert.match(body('pages/Chats.css', '.chats-page .session-phone-line'), /max-width:\s*100%/);
+});
+
+test('a chat id printed as text is isolated left to right in the save-contact dialog and the filter list', () => {
+  // "15550001111@c.us" is laid out right to left in an RTL page and reads "c.us@15550001111". A chip is a name, or the
+  // id of a chat the list does not hold, so it takes its direction from its own first strong letter.
+  const dialogs = readFileSync(join(SRC, 'components/chats/ChatDialogs.tsx'), 'utf8');
+  assert.match(
+    dialogs,
+    /<p className="text-muted">\s*<bdi dir="ltr">\{chat\.id\}<\/bdi>\s*<\/p>/,
+    'the id in the save-contact dialog is not isolated',
+  );
+  const filter = readFileSync(join(SRC, 'components/FilterBuilder.tsx'), 'utf8');
+  assert.match(
+    filter,
+    /<span className="chips-suggestion-id">\s*<bdi dir="ltr">\{c\.id\}<\/bdi>\s*<\/span>/,
+    'a suggested id is not isolated',
+  );
+  assert.match(filter, /<bdi>\{labelFor\(jid\)\}<\/bdi>/, 'a chip is not isolated');
 });
 
 test('chart plots stay left to right on a right to left page', () => {

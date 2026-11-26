@@ -130,20 +130,23 @@ select {
   background-repeat: no-repeat;
   background-position: right 0.75rem center;
   background-size: 16px;
-  border: 1px solid var(--border, #e2e8f0);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
   cursor: pointer;
   transition: all 0.2s;
 }
 
+/* The brand fill is 1.98:1 on white, fainter than the border at rest; the focus colour is stronger on every surface. */
 select:hover {
-  border-color: var(--primary, #25d366);
+  border-color: var(--focus-ring);
 }
 
 select:focus {
   outline: none;
   border-color: var(--focus-ring);
-  box-shadow: 0 0 0 3px rgba(37, 211, 102, 0.1);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px rgba(37, 211, 102, 0.1);
 }
 
 select:disabled {
@@ -247,7 +250,7 @@ select:disabled {
 .modal-body input {
   width: 100%;
   padding: 0.875rem 1rem;
-  border: 1px solid var(--border, #e2e8f0);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
   font-size: 0.9375rem;
   background: var(--bg-light, #f8fafc);
@@ -259,7 +262,9 @@ select:disabled {
   outline: none;
   border-color: var(--focus-ring);
   background: var(--bg-white, #fff);
-  box-shadow: 0 0 0 3px rgba(37, 211, 102, 0.1);
+  box-shadow:
+    0 0 0 1px var(--focus-ring),
+    0 0 0 3px rgba(37, 211, 102, 0.1);
 }
 
 /* The rule above is meant for TEXT inputs. Radios/checkboxes would otherwise stretch to width:100%
@@ -444,6 +449,18 @@ code {
   color: var(--text-primary, #1e293b);
 }
 
+/* Typed text takes its direction from its own characters: under the page direction an Arabic page put the full stop
+   of an English sentence on the wrong end of it. One rule covers every field a person types into (a textarea, and
+   an input with no type or of type text or search), so a new field cannot miss it. url, email, tel, number and
+   password fields hold addresses, digits and secrets and are left as they are (url, email and tel are forced left
+   to right below). */
+textarea,
+input:not([type]),
+input[type='text'],
+input[type='search'] {
+  unicode-bidi: plaintext;
+}
+
 /* RTL / Hebrew direction support */
 
 /* Keep code, technical identifiers, and numbers LTR even inside RTL containers */
@@ -484,7 +501,9 @@ code {
 /* Inputs in modals: text aligns naturally */
 [dir='rtl'] .modal-body input,
 [dir='rtl'] .modal-body textarea,
+[dir='rtl'] input:not([type]),
 [dir='rtl'] input[type='text'],
+[dir='rtl'] input[type='search'],
 [dir='rtl'] input[type='url'],
 [dir='rtl'] input[type='password'],
 [dir='rtl'] input[type='number'],
@@ -556,5 +575,13 @@ code {
     border-radius: 16px 16px 0 0;
     /* max-height + body scroll already come from the base .modal rule; the bottom-sheet only
        changes width/anchoring. (Scrolling lives on .modal-body to avoid a double scrollbar.) */
+  }
+}
+
+/* Forced colours drop fills, so the filled buttons draw a frame as the secondary one does. */
+@media (forced-colors: active) {
+  .btn-primary,
+  .btn-danger {
+    border: 1px solid ButtonText;
   }
 }

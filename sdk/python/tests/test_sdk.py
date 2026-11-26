@@ -29,6 +29,7 @@ from openwa.resources.messages import MessagesResource
 from openwa.types import (
     AuthValidateResponse,
     BatchCancelResponse,
+    ClickButtonRequest,
     HealthReadyResponse,
     ForwardMessageRequest,
     ReplyMessageRequest,
@@ -622,6 +623,7 @@ class TestMessages:
         template: SendTemplateRequest = {"chatId": "a@c.us", "templateId": "t", "vars": {}}
         poll: SendPollRequest = {"chatId": "a@c.us", "name": "Q", "options": ["A", "B"]}
         reply: ReplyMessageRequest = {"chatId": "a@c.us", "quotedMessageId": "q", "text": "reply"}
+        click: ClickButtonRequest = {"chatId": "a@c.us", "messageId": "p", "buttonId": "yes", "text": "Yes"}
         forward: ForwardMessageRequest = {"fromChatId": "a@c.us", "toChatId": "b@c.us", "messageId": "m"}
 
         client.messages.send_text("s", text, idempotency_key=key)
@@ -635,13 +637,14 @@ class TestMessages:
         client.messages.send_template("s", template, idempotency_key=key)
         client.messages.send_poll("s", poll, idempotency_key=key)
         client.messages.reply("s", reply, idempotency_key=key)
+        client.messages.click_button("s", click, idempotency_key=key)
         client.messages.forward("s", forward, idempotency_key=key)
 
         expected = [
             ("send-text", text), ("send-image", media), ("send-video", media), ("send-audio", audio),
             ("send-document", media), ("send-sticker", media), ("send-location", location),
             ("send-contact", contact), ("send-template", template), ("send-poll", poll),
-            ("reply", reply), ("forward", forward),
+            ("reply", reply), ("click-button", click), ("forward", forward),
         ]
         assert len(backend.calls) == len(expected)
         for call, (segment, body) in zip(backend.calls, expected):
@@ -1278,6 +1281,16 @@ class TestChatsAndHealth:
         assert chats[0]["lastMessageType"] == "image"
         assert "lastMessageType" not in chats[1]
 
+    def test_chats_preserve_optional_phone_of_a_privacy_id_chat(self):
+        backend = MockBackend().on("GET", "/chats", body=[
+            {"id": "262813461250072@lid", "name": "", "phone": "15550006666"},
+            {"id": "15550001111@c.us", "name": "Alice"},
+        ])
+        chats = make_client(backend).chats.list("s")
+        assert chats[0]["phone"] == "15550006666"
+        assert chats[0]["name"] == ""
+        assert "phone" not in chats[1]
+
     def test_chats(self):
         backend = MockBackend()
         backend.on("GET", "/chats", body=[])
@@ -1589,6 +1602,17 @@ class TestCallLink:
         assert backend.calls[-1].url.endswith("/sessions/s/calls/link")
         assert backend.calls[-1].body == {"type": "video", "startTime": 1800000000000}
         assert "call.whatsapp.com" in res["link"]
+
+    def test_a_fractional_start_time_is_a_type_error(self):
+        # The gateway refuses a fraction with 400, so startTime is typed int. mypy reports the float on the
+        # call below and the ignore silences it; warn_unused_ignores fails the run if the type goes back to float.
+        backend = MockBackend()
+        backend.on("POST", "/calls/link", body={"link": "https://call.whatsapp.com/video/AbC"})
+        client = make_client(backend)
+        client.calls.create_link("s", {"type": "video", "startTime": 1800000000000.5})  # type: ignore[typeddict-item]
+        assert backend.calls[-1].body == {"type": "video", "startTime": 1800000000000.5}
+
+
 class TestChannelAdminOwnership:
     def test_demote_and_transfer(self):
         backend = MockBackend()

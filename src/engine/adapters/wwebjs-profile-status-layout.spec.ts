@@ -1,0 +1,112 @@
+import * as wwebjs from 'whatsapp-web.js';
+import { WhatsAppWebJsAdapter } from './whatsapp-web-js.adapter';
+import { EngineStatus } from '../interfaces/whatsapp-engine.interface';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
+
+/**
+ * Stock `Client.setStatus` of whatsapp-web.js sets the About text through `setMyStatus` of WhatsApp Web's
+ * `WAWebContactStatusBridge`, which current builds no longer export: the About text became a text status. The fork's
+ * scripts/patch-wwebjs-text-status.js moves the call to `setTextStatus` of `WAWebContactTextStatusBridge`, and the
+ * installed (patched) library runs here against fake pages. The adapter asks the page whether that setter is there
+ * first, and a build without it answers 501 instead of a bare 500 from the page.
+ *
+ * From a page.evaluate Meta's `require` answers `undefined` for a module the page has not defined, and throws only
+ * inside a guard or before the page's error setup has run; the registry here does either, and throws unless told to
+ * answer `undefined`.
+ */
+describe('setting the About text on each WhatsApp Web layout', () => {
+  const g = globalThis as unknown as { window?: unknown };
+  const { Client } = wwebjs as unknown as {
+    Client: { prototype: { setStatus(this: unknown, status: string): Promise<void> } };
+  };
+
+  afterEach(() => {
+    delete g.window;
+  });
+
+  const pageWith = (modules: Record<string, unknown>, unknownModule: 'throws' | 'undefined' = 'throws') => {
+    g.window = {
+      require: (name: string) => {
+        if (!(name in modules)) {
+          if (unknownModule === 'undefined') return undefined;
+          throw new Error(`Requiring unknown module "${name}"`);
+        }
+        return modules[name];
+      },
+    };
+  };
+
+  /** The text-status modules of a current build, as the patched `setStatus` uses them. */
+  const textStatusPage = (setTextStatus: jest.Mock) => ({
+    WAWebContactTextStatusBridge: { setTextStatus, getTextStatus: jest.fn() },
+    WAWebTextStatusUtils: { TEXT_STATUS_DURATION_INFINITE: 0 },
+    WAWebContactCollection: { ContactCollection: { getMeContact: () => undefined } },
+  });
+
+  /** The library's own `setStatus` runs against the fake page, so a call that reaches the page is the library's. */
+  const adapterOnThatPage = () => {
+    const evaluate = jest.fn((fn: (...args: unknown[]) => unknown, ...args: unknown[]) =>
+      Promise.resolve().then(() => fn(...args)),
+    );
+    const client: Record<string, unknown> = {
+      info: { wid: { _serialized: '628000000001@c.us', user: '628000000001' } },
+      pupPage: { evaluate },
+    };
+    client.setStatus = (status: string) => Client.prototype.setStatus.call(client, status);
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    (adapter as unknown as { status: EngineStatus }).status = EngineStatus.READY;
+    (adapter as unknown as { client: unknown }).client = client;
+    return { adapter, evaluate };
+  };
+
+  it('sets the text through the text status bridge on a build that has it', async () => {
+    const setTextStatus = jest.fn().mockResolvedValue({ result: 'SUCCESS' });
+    pageWith(textStatusPage(setTextStatus));
+
+    await expect(adapterOnThatPage().adapter.setProfileStatus('Busy')).resolves.toBeUndefined();
+    expect(setTextStatus).toHaveBeenCalledWith('Busy', null, 0);
+  });
+
+  it.each([
+    [
+      'the page has only the setMyStatus of the old layout',
+      { WAWebContactStatusBridge: { queryStatusAll: jest.fn(), sendReadStatus: jest.fn(), setMyStatus: jest.fn() } },
+    ],
+    ['the text status bridge has no setTextStatus', { WAWebContactTextStatusBridge: { getTextStatus: jest.fn() } }],
+    ['the module is not defined', {}],
+  ])('answers 501 and writes nothing when %s', async (_case, modules) => {
+    pageWith(modules);
+    const { adapter, evaluate } = adapterOnThatPage();
+
+    const attempt = adapter.setProfileStatus('Busy');
+    await expect(attempt).rejects.toBeInstanceOf(EngineNotSupportedError);
+    await expect(attempt).rejects.toThrow(/setProfileStatus\(no status setter on this build\)/);
+    // One page call: the check for the setter. The library's setStatus was never run.
+    expect(evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  // The shape of a booted page: a module it has not defined answers `undefined`.
+  it('answers 501 and writes nothing when require answers undefined for the module', async () => {
+    pageWith({}, 'undefined');
+    const { adapter, evaluate } = adapterOnThatPage();
+
+    await expect(adapter.setProfileStatus('Busy')).rejects.toBeInstanceOf(EngineNotSupportedError);
+    expect(evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the failure of setTextStatus as it was', async () => {
+    const failure = new Error('Evaluation failed: not allowed');
+    pageWith(textStatusPage(jest.fn().mockRejectedValue(failure)));
+
+    await expect(adapterOnThatPage().adapter.setProfileStatus('Busy')).rejects.toBe(failure);
+  });
+
+  // A document that has not defined `require` yet is a page that is reloading: the retryable 409, which it must not
+  // trade for a 501 that says this build cannot set the text.
+  it('lets a document without require through as the reload it is, not as a build without the setter', async () => {
+    g.window = {};
+
+    await expect(adapterOnThatPage().adapter.setProfileStatus('Busy')).rejects.toBeInstanceOf(EngineNotReadyError);
+  });
+});

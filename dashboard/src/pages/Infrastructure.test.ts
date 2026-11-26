@@ -207,7 +207,10 @@ function installFetchStub(): void {
       if (overrides.readyFails) return Promise.resolve(jsonResponse({ status: 'error', details: {} }, 503));
       return Promise.resolve(jsonResponse({ status: 'ok', details: {} }));
     }
-    if (method === 'GET' && path === '/api/infra/export-data') {
+    if (
+      method === 'GET' &&
+      (path === '/api/infra/export-data' || path === '/api/infra/export-data?includePluginSecrets=true')
+    ) {
       const answer = () =>
         jsonResponse({ exportedAt: new Date(0).toISOString(), dataDbType: 'postgres', tables: {}, counts: {} });
       return overrides.exportGate ? overrides.exportGate.then(answer) : Promise.resolve(answer());
@@ -446,14 +449,20 @@ test('the storage badge names local storage in the active language', async () =>
  * covers the rest of them, and every other page, structurally.
  */
 test('every rendered toggle exposes an accessible name from its visible caption', async () => {
-  const { screen } = rtl;
+  const { screen, waitFor } = rtl;
   resetFetchCalls();
   const { container } = renderInfrastructure();
   await screen.findByText('Database Configuration');
 
-  const toggles = Array.from(container.querySelectorAll('label.toggle-switch input[type="checkbox"]'));
-  // Guards against a vacuous pass if the page ever stops rendering toggles under this fixture.
-  assert.ok(toggles.length >= 4, `expected the open sections to render toggles, found ${toggles.length}`);
+  const renderedToggles = () => Array.from(container.querySelectorAll('label.toggle-switch input[type="checkbox"]'));
+  // The toggles render once the page's reads have answered, which can be after its heading: counting them at once
+  // found none on a slow run. Waiting for the count is also the guard against a vacuous pass if the page ever stops
+  // rendering toggles under this fixture.
+  await waitFor(() => {
+    const found = renderedToggles().length;
+    assert.ok(found >= 4, `expected the open sections to render toggles, found ${found}`);
+  });
+  const toggles = renderedToggles();
 
   const unnamed = toggles
     .map(input => {
@@ -3329,3 +3338,28 @@ for (const cacheUsesRedis of [false, true]) {
     });
   });
 }
+
+test('data backup export omits plugin secrets by default and sends includePluginSecrets=true only when opted in', async () => {
+  const { screen, waitFor, fireEvent } = rtl;
+  resetFetchCalls();
+  renderInfrastructure();
+
+  await screen.findByText('Database Configuration');
+  const checkbox = screen.getByRole('checkbox', { name: 'Include plugin instance secrets' }) as HTMLInputElement;
+  assert.equal(checkbox.checked, false, 'plugin secrets opt-in must be unchecked by default');
+
+  fireEvent.click(screen.getByRole('button', { name: 'Export data' }));
+  await waitFor(() => assert.ok(findFetchCall('GET', '/api/infra/export-data')));
+  assert.equal(findFetchCall('GET', '/api/infra/export-data?includePluginSecrets=true'), undefined);
+
+  resetFetchCalls();
+  fireEvent.click(checkbox);
+  assert.equal(checkbox.checked, true);
+  fireEvent.click(screen.getByRole('button', { name: 'Export data' }));
+  await waitFor(() =>
+    assert.ok(
+      findFetchCall('GET', '/api/infra/export-data?includePluginSecrets=true'),
+      'expected export-data?includePluginSecrets=true when opted in',
+    ),
+  );
+});

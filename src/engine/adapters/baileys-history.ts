@@ -5,6 +5,7 @@ import { EngineEventCallbacks, IncomingMessage, MessageType } from '../interface
 import {
   BAILEYS_NON_CONTENT_TYPES,
   buildIncomingMessageFromBaileys,
+  contentTypeOf,
   extractBaileysBody,
   extractBaileysButtonReply,
   extractBaileysButtons,
@@ -15,6 +16,7 @@ import {
   keyParticipant,
 } from './baileys-message-mapper';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
+import { isDroppedEphemeral } from './inbound-media-cap';
 import { type createLogger } from '../../common/services/logger.service';
 
 /**
@@ -33,8 +35,11 @@ export interface BaileysHistoryHost {
   normalizedSelfJid(): string;
   /** Lazily loaded @whiskeysockets/baileys module (ESM-only; loaded on first connect, not at boot). */
   loadLib(): Promise<typeof BaileysLib>;
-  /** Seed the chat's last-message preview + sort time from a history/live message. */
-  recordMessage(msg: WAMessage, type?: MessageType, order?: number): void;
+  /**
+   * Seed the chat's last-message preview + sort time from a history/live message. `withhold` keeps its text out of the
+   * preview, for a message the session drops (see isDroppedEphemeral).
+   */
+  recordMessage(msg: WAMessage, type?: MessageType, order?: number, withhold?: boolean): void;
   recordMessageEdit(
     chatId: string,
     messageId: string,
@@ -247,7 +252,7 @@ export class BaileysHistory {
           this.rememberLidMessage(incoming.id, incoming.chatId, incoming.fromMe);
         }
         // History has no observed order: equal-time messages keep the first one met, and give way to a live one.
-        this.host.recordMessage(original, deleted ? 'revoked' : incoming.type, 0);
+        this.host.recordMessage(original, deleted ? 'revoked' : incoming.type, 0, isDroppedEphemeral(incoming));
       }
       for (const m of revoked) {
         const kind = parseWaId(m.chatId).kind;
@@ -403,8 +408,8 @@ export class BaileysHistory {
   /**
    * Media-free WAMessage -> IncomingMessage map for bulk history (downloading media for thousands of
    * messages would be ruinous; the type is kept, the payload dropped). Returns null for protocol /
-   * reaction / key / empty messages and for BAILEYS_NON_CONTENT_TYPES, which carry nothing for the
-   * chat view.
+   * reaction / empty messages, for a message of protocol noise alone (sender-key distributions) and for
+   * BAILEYS_NON_CONTENT_TYPES, which carry nothing for the chat view.
    */
   private mapHistoryMessage(b: typeof BaileysLib, msg: WAMessage): IncomingMessage | null {
     const raw = msg.message;
@@ -416,12 +421,11 @@ export class BaileysHistory {
     // already unwrapped. Derive ONE contentType from the normalized content for both the skip-filter and
     // the type mapping, and reuse extractBaileysBody (the same body extraction the live path uses).
     const content = b.normalizeMessageContent(raw) ?? raw;
-    const contentType = b.getContentType(content);
+    const contentType = contentTypeOf(content, b.getContentType);
     if (
       !contentType ||
       contentType === 'protocolMessage' ||
       contentType === 'reactionMessage' ||
-      contentType === 'senderKeyDistributionMessage' ||
       BAILEYS_NON_CONTENT_TYPES.has(contentType)
     ) {
       return null;

@@ -49,15 +49,13 @@
     "refresh": "Muat ulang",
     "errorGeneric": "Terjadi kesalahan",
     "unknownError": "Kesalahan tidak diketahui",
-    "retry": "Coba lagi"
+    "retry": "Coba lagi",
+    "copyFailed": "Tidak dapat menyalin ke papan klip"
   },
   "theme": {
     "light": "Terang",
     "dark": "Gelap",
     "system": "Sistem",
-    "label": "Tema: {{value}}",
-    "appearance": "Tampilan",
-    "mode": "Mode",
     "toggleTo": "Ganti ke {{value}}"
   },
   "nav": {
@@ -77,6 +75,7 @@
     "edited": "Diedit",
     "media": {
       "location": "Lokasi",
+      "contact": "Kontak",
       "call": "Panggilan",
       "callMissed": "Panggilan tak terjawab",
       "callVideo": "Panggilan video",
@@ -84,7 +83,6 @@
       "omitted": "Media",
       "image": "Gambar"
     },
-    "subtitle": "Kirim dan balas pesan WhatsApp secara real-time",
     "noSessionsTitle": "Tidak ada sesi terhubung",
     "noSessionsDesc": "Hubungkan sesi WhatsApp dari menu <1>Sesi</1> terlebih dahulu untuk menggunakan fitur obrolan.",
     "sessionLabel": "Sesi WhatsApp",
@@ -93,6 +91,7 @@
     "loadingChats": "Memuat obrolan...",
     "empty": "Tidak ada obrolan",
     "noMessageYet": "Belum ada pesan",
+    "draftLabel": "Draf:",
     "unreadBadge": "{{count}} pesan belum dibaca",
     "unreadBadge_other": "{{count}} pesan belum dibaca",
     "markedUnread": "Ditandai belum dibaca",
@@ -100,6 +99,8 @@
     "loadingOlderMessages": "Memuat pesan lama...",
     "loadOlderMessagesError": "Gagal memuat pesan lama. Gulir ke atas untuk mencoba lagi.",
     "loadOlderMessagesRetryHint": "Gulir ke atas untuk mencoba lagi.",
+    "refreshMessagesError": "Gagal menyegarkan pesan. Ketuk untuk mencoba lagi.",
+    "refreshMessagesRetryHint": "Ketuk untuk mencoba lagi.",
     "noMessagesInChat": "Belum ada pesan. Kirim pesan pertama untuk memulai!",
     "downloadDocument": "Unduh dokumen",
     "actions": {
@@ -233,7 +234,6 @@
     "moreActions": "Tindakan lainnya",
     "copyChatId": "Salin ID obrolan",
     "chatIdCopied": "ID obrolan disalin",
-    "copyFailed": "Tidak dapat menyalin ke papan klip",
     "closeChat": "Tutup obrolan",
     "phone": "Nomor telepon",
     "chatId": "ID obrolan",
@@ -353,6 +353,26 @@
         "always": "Selalu"
       },
       "saveContactUnavailable": "Memerlukan nomor telepon yang diketahui: obrolan ini hanya memiliki ID privasi (@lid)."
+    },
+    "slash": {
+      "title": "Balasan cepat",
+      "hint": "Enter menyisipkan templat yang disorot. Kirim saat sudah siap.",
+      "placeholder": "Pesan atau /templat…",
+      "empty": "Tidak ada templat yang cocok",
+      "needsVars": "Isi variabel templat sebelum mengirim.",
+      "loading": "Memuat templat… Enter menunggu sampai selesai dimuat.",
+      "loadError": "Templat tidak dapat dimuat",
+      "close": "Tutup daftar templat",
+      "more": "Masih ada templat lain yang cocok. Ketik lagi untuk mempersempit daftar."
+    },
+    "roomSearch": {
+      "title": "Cari pesan",
+      "placeholder": "Cari",
+      "date": "Lompat ke tanggal",
+      "clearDate": "Hapus tanggal",
+      "noDateHits": "Tidak ada pesan termuat pada hari itu",
+      "notLoaded": "Lebih lama dari pesan yang termuat di chat ini. Gulir ke atas di chat untuk memuat pesan lama.",
+      "open": "Cari di chat"
     }
   },
   "errorBoundary": {
@@ -418,9 +438,7 @@
   },
   "sessionStatus": {
     "created": "Baru",
-    "idle": "Idle",
     "initializing": "Memulai...",
-    "connecting": "Menghubungkan...",
     "qr_ready": "Pindai QR",
     "ready": "Terhubung",
     "disconnected": "Terputus",
@@ -442,7 +460,8 @@
     },
     "empty": {
       "title": "Tidak ada sesi ditemukan",
-      "description": "Buat sesi baru untuk memulai"
+      "description": "Buat sesi baru untuk memulai",
+      "filtered": "Tidak ada sesi yang cocok dengan pencarian atau filter status."
     },
     "create": {
       "title": "Buat Sesi Baru",
@@ -610,7 +629,7 @@
     "filters": {
       "title": "Filter (opsional)",
       "hint": "Hanya terpicu jika semua kondisi cocok. Berlaku untuk kejadian pesan.",
-      "incomplete": "Beri nilai pada setiap kondisi filter, dan gunakan paling banyak 20 kondisi, 100 nilai per kondisi, dan 1000 karakter teks.",
+      "incomplete": "Beri nilai pada setiap kondisi filter, dan gunakan paling banyak 20 kondisi, 100 nilai per kondisi, 128 karakter per ID, dan 1000 karakter teks.",
       "badge": "{{count}} filter",
       "badge_other": "{{count}} filter",
       "addCondition": "Tambah kondisi",
@@ -689,16 +708,16 @@
       "session.reconnect_loop": "Saat sesi terus gagal terhubung kembali",
       "session.restriction": "Saat WhatsApp membatasi akun atau mencabut pembatasan",
       "presence.update": "Saat obrolan yang dilanggani online, mengetik atau offline",
-      "event.response": "Saat tamu menjawab undangan acara WhatsApp (hadir, tidak hadir, mungkin)",
+      "event.response": "Saat tamu menjawab undangan acara WhatsApp (hadir, tidak hadir, mungkin) (hanya Baileys)",
       "poll.vote": "Saat seseorang memilih atau membatalkan opsi pada polling",
       "group.join": "Saat peserta bergabung atau ditambahkan ke grup",
       "group.leave": "Saat peserta keluar atau dikeluarkan dari grup",
       "group.update": "Saat nama, deskripsi atau pengaturan grup berubah",
       "group.join_request": "Saat seseorang meminta bergabung ke grup yang dikelola sesi ini",
       "call.received": "Saat panggilan masuk mulai berdering",
-      "call.accepted": "Saat panggilan dijawab",
-      "call.rejected": "Saat panggilan ditolak",
-      "call.missed": "Saat panggilan tidak terjawab",
+      "call.accepted": "Saat panggilan dijawab (hanya Baileys)",
+      "call.rejected": "Saat panggilan ditolak (hanya Baileys)",
+      "call.missed": "Saat panggilan tidak terjawab (hanya Baileys)",
       "status.received": "Saat kontak memposting status",
       "all": "Semua kejadian kecuali message.receipt, yang harus disebutkan secara eksplisit"
     },
@@ -826,8 +845,9 @@
     "confirm": {
       "deleteTitle": "Hapus Kunci API",
       "revokeTitle": "Cabut Kunci API",
-      "deleteMessage": "Yakin ingin menghapus permanen <strong>{{name}}</strong>? Tindakan ini tidak dapat dibatalkan.",
-      "revokeMessage": "Yakin ingin mencabut <strong>{{name}}</strong>? Kunci ini tidak akan berfungsi lagi.",
+      "deleteMessage": "Yakin ingin menghapus permanen <name/>? Tindakan ini tidak dapat dibatalkan.",
+      "revokeMessage": "Yakin ingin mencabut <name/>? Kunci ini tidak akan berfungsi lagi.",
+      "signedIn": "Anda masuk ke dasbor ini menggunakan kunci ini. Mencabut atau menghapusnya akan membuat Anda keluar.",
       "delete": "Hapus",
       "revoke": "Cabut"
     },
@@ -1128,6 +1148,7 @@
       "reason409": "Sesi tidak terhubung",
       "reason429": "Batas permintaan gateway tercapai",
       "reason503": "WhatsApp tidak merespons pemeriksaan",
+      "reasonReloading": "WhatsApp Web sedang memuat ulang halamannya",
       "reasonOther": "Gateway menolak pemeriksaan",
       "partial": "{{reason}} (HTTP {{status}}). Berhenti di nomor {{attempted}} dari {{total}}; {{count}} nomor belum diperiksa. Coba lagi nanti.",
       "partial_other": "{{reason}} (HTTP {{status}}). Berhenti di nomor {{attempted}} dari {{total}}; {{count}} nomor belum diperiksa. Coba lagi nanti.",
@@ -1240,7 +1261,9 @@
       "storageWarning": "Berkas media yang ada tidak dipindahkan ke backend penyimpanan baru secara otomatis; berkas akan tetap di lokasi lama.",
       "downloadBackup": "Unduh cadangan terlebih dahulu",
       "backupTitle": "Cadangan & pemulihan data",
-      "backupHint": "Ekspor semua data sebagai JSON sebelum mengganti database, lalu impor setelah pergantian. Secret penandatanganan webhook, header webhook kustom, dan kredensial proxy tidak disertakan; masukkan kembali setelah pemulihan. Secret dan pengaturan instance integrasi disertakan dalam plaintext, jadi simpan berkas dengan aman dan hapus setelah dipulihkan.",
+      "backupHint": "Ekspor semua data sebagai JSON sebelum mengganti database, lalu impor setelah pergantian. Secret penandatanganan webhook, header webhook kustom, dan kredensial proxy tidak disertakan; masukkan kembali setelah pemulihan. Secret instance integrasi dikecualikan secara default dan hanya disertakan jika Anda mengaktifkan opsi di bawah.",
+      "includePluginSecrets": "Sertakan secret instance plugin",
+      "includePluginSecretsHint": "Menyertakan secret ingress integrasi dan bidang konfigurasi plugin rahasia dalam plaintext. Simpan berkas dengan aman dan hapus setelah dipulihkan.",
       "export": "Ekspor data",
       "import": "Impor data",
       "exportFailed": "Gagal mengekspor data",

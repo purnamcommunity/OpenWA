@@ -1,5 +1,5 @@
 import type { Client } from 'whatsapp-web.js';
-import { WwebjsGroups, changeAdminStatusInPage } from './wwebjs-groups';
+import { WwebjsGroups, changeAdminStatusInPage, readInviteCodeInPage, readInviteSenderInPage } from './wwebjs-groups';
 import { createLogger } from '../../common/services/logger.service';
 import { type WwebjsEngineHost } from './wwebjs-host';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
@@ -87,6 +87,13 @@ describe('group writes classify a dead page', () => {
       info: {},
       getChatById:
         chat instanceof Promise ? jest.fn(() => chat) : jest.fn().mockResolvedValue({ isGroup: true, ...chat }),
+      // The page still has the library's invitation sender and no job for the invite code, so that read is the
+      // library's own call through the chat. A row about the page call overrides it.
+      pupPage: {
+        evaluate: jest.fn((fn: unknown) =>
+          Promise.resolve(fn === readInviteSenderInPage ? true : fn === readInviteCodeInPage ? 'missing' : undefined),
+        ),
+      },
       ...clientMethods,
     };
     const reportIfPageTransportError = jest.fn();
@@ -101,16 +108,10 @@ describe('group writes classify a dead page', () => {
     return { groups: new WwebjsGroups(host), reportIfPageTransportError };
   }
 
-  // [public op, chat method it calls, invocation]
+  // [public op, chat method it calls, invocation]: what still runs the library's own call, which only the invite code
+  // read falls back to where the page has no job for it. The group writes are sent in-page (below).
   const CONVERGING: [string, string, (g: WwebjsGroups) => Promise<unknown>][] = [
     ['getGroupInviteCode', 'getInviteCode', g => g.getGroupInviteCode(GROUP)],
-    ['setGroupSubject', 'setSubject', g => g.setGroupSubject(GROUP, 's')],
-    ['setGroupDescription', 'setDescription', g => g.setGroupDescription(GROUP, 'd')],
-    ['setGroupMessagesAdminsOnly', 'setMessagesAdminsOnly', g => g.setGroupMessagesAdminsOnly(GROUP, true)],
-    ['setGroupInfoAdminsOnly', 'setInfoAdminsOnly', g => g.setGroupInfoAdminsOnly(GROUP, true)],
-    ['setGroupMemberAddMode', 'setAddMembersAdminsOnly', g => g.setGroupMemberAddMode(GROUP, 'admins')],
-    ['deleteGroupPicture', 'deletePicture', g => g.deleteGroupPicture(GROUP)],
-    ['setGroupPicture', 'setPicture', g => g.setGroupPicture(GROUP, IMAGE)],
   ];
   const NON_CONVERGING_CHAT: [string, string, (g: WwebjsGroups) => Promise<unknown>][] = [
     ['leaveGroup', 'leave', g => g.leaveGroup(GROUP)],
@@ -127,6 +128,21 @@ describe('group writes classify a dead page', () => {
     ['rejectGroupMembershipRequests', g => g.rejectGroupMembershipRequests(GROUP, ['628111@c.us'])],
   ];
 
+  // The group writes are sent in-page, where the page has the job, and converge when repeated.
+  const GROUP_WRITES: [string, (g: WwebjsGroups) => Promise<unknown>][] = [
+    ['setGroupSubject', g => g.setGroupSubject(GROUP, 's')],
+    ['setGroupDescription', g => g.setGroupDescription(GROUP, 'd')],
+    ['setGroupMessagesAdminsOnly', g => g.setGroupMessagesAdminsOnly(GROUP, true)],
+    ['setGroupInfoAdminsOnly', g => g.setGroupInfoAdminsOnly(GROUP, true)],
+    ['setGroupMemberAddMode', g => g.setGroupMemberAddMode(GROUP, 'admins')],
+    ['setGroupPicture', g => g.setGroupPicture(GROUP, IMAGE)],
+  ];
+  // The invite code is read in-page too.
+  const PAGE_WRITES: [string, (g: WwebjsGroups) => Promise<unknown>][] = [
+    ...GROUP_WRITES,
+    ['getGroupInviteCode', g => g.getGroupInviteCode(GROUP)],
+  ];
+
   // revokeGroupInviteCode runs its write in-page through pupPage.evaluate, not a chat method.
   const REVOKE: [string, string, (g: WwebjsGroups) => Promise<unknown>] = [
     'revokeGroupInviteCode',
@@ -134,7 +150,18 @@ describe('group writes classify a dead page', () => {
     g => g.revokeGroupInviteCode(GROUP),
   ];
 
-  it.each([...CONVERGING, ...NON_CONVERGING_CHAT, ...ADMIN_CHANGE, REVOKE])(
+  // deleteGroupPicture sends its request in-page as well, and converges when repeated.
+  const DELETE_PICTURE: [string, string, (g: WwebjsGroups) => Promise<unknown>] = [
+    'deleteGroupPicture',
+    'pupPage.evaluate',
+    g => g.deleteGroupPicture(GROUP),
+  ];
+
+  const GROUP_WRITES_IN_PAGE = GROUP_WRITES.map(
+    ([op, run]): [string, string, (g: WwebjsGroups) => Promise<unknown>] => [op, 'pupPage.evaluate', run],
+  );
+
+  it.each([...CONVERGING, ...GROUP_WRITES_IN_PAGE, ...NON_CONVERGING_CHAT, ...ADMIN_CHANGE, REVOKE, DELETE_PICTURE])(
     '%s answers a dead page during the group lookup with 503 before calling %s',
     async (op, _method, run) => {
       const lookup = Promise.reject(transportError);
@@ -173,6 +200,24 @@ describe('group writes classify a dead page', () => {
     expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, op);
   });
 
+  it.each(PAGE_WRITES)('%s answers a dead page in the page call with 503 and reports it', async (op, run) => {
+    const { groups, reportIfPageTransportError } = makeGroups(
+      {},
+      { pupPage: { evaluate: jest.fn().mockRejectedValue(transportError) } },
+    );
+
+    await expect(run(groups)).rejects.toThrow(EngineTransportError);
+    expect(reportIfPageTransportError).toHaveBeenCalledTimes(1);
+    expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, op);
+  });
+
+  it.each(PAGE_WRITES)('%s leaves an ordinary failure in the page call untouched', async (_op, run) => {
+    const failure = new Error('Evaluation failed: x');
+    const { groups } = makeGroups({}, { pupPage: { evaluate: jest.fn().mockRejectedValue(failure) } });
+
+    await expect(run(groups)).rejects.toBe(failure);
+  });
+
   it.each(NON_CONVERGING_CHAT)('%s reports a dead page in %s but keeps the raw error', async (op, method, run) => {
     const { groups, reportIfPageTransportError } = makeGroups({
       [method]: jest.fn().mockRejectedValue(transportError),
@@ -183,6 +228,30 @@ describe('group writes classify a dead page', () => {
     expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, op);
   });
 
+  // The page is asked whether the library's invitation sender exists before the add. That is a read made before
+  // anything is sent, like the group lookup in front of it, so a dead page there answers 503 with the death signal and
+  // the add is never attempted. A dead page in the add itself keeps its raw error (above).
+  it('addParticipants answers 503 and reports a dead page in the question about the invitation sender', async () => {
+    const addParticipants = jest.fn();
+    const { groups, reportIfPageTransportError } = makeGroups(
+      { addParticipants },
+      { pupPage: { evaluate: jest.fn().mockRejectedValue(transportError) } },
+    );
+
+    await expect(groups.addParticipants(GROUP, ['628111@c.us'])).rejects.toBeInstanceOf(EngineTransportError);
+    expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, 'addParticipants');
+    expect(addParticipants).not.toHaveBeenCalled();
+  });
+
+  it('addParticipants leaves an ordinary failure of the question about the invitation sender untouched', async () => {
+    const failure = new Error('Evaluation failed: x');
+    const addParticipants = jest.fn();
+    const { groups } = makeGroups({ addParticipants }, { pupPage: { evaluate: jest.fn().mockRejectedValue(failure) } });
+
+    await expect(groups.addParticipants(GROUP, ['628111@c.us'])).rejects.toBe(failure);
+    expect(addParticipants).not.toHaveBeenCalled();
+  });
+
   it('revokeGroupInviteCode reports a dead page in its write but keeps the raw error', async () => {
     const { groups, reportIfPageTransportError } = makeGroups(
       {},
@@ -191,6 +260,28 @@ describe('group writes classify a dead page', () => {
 
     await expect(groups.revokeGroupInviteCode(GROUP)).rejects.toBe(transportError);
     expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, 'revokeGroupInviteCode');
+  });
+
+  it('deleteGroupPicture answers a dead page in its request with 503 and reports it', async () => {
+    const { groups, reportIfPageTransportError } = makeGroups(
+      {},
+      { pupPage: { evaluate: jest.fn().mockRejectedValue(transportError) } },
+    );
+
+    await expect(groups.deleteGroupPicture(GROUP)).rejects.toThrow(EngineTransportError);
+    expect(reportIfPageTransportError).toHaveBeenCalledTimes(1);
+    expect(reportIfPageTransportError).toHaveBeenCalledWith(transportError, 'deleteGroupPicture');
+  });
+
+  it('deleteGroupPicture leaves an ordinary failure of its request untouched and unreported', async () => {
+    const failure = new Error('Evaluation failed: x');
+    const { groups, reportIfPageTransportError } = makeGroups(
+      {},
+      { pupPage: { evaluate: jest.fn().mockRejectedValue(failure) } },
+    );
+
+    await expect(groups.deleteGroupPicture(GROUP)).rejects.toBe(failure);
+    expect(reportIfPageTransportError).not.toHaveBeenCalled();
   });
 
   it('revokeGroupInviteCode leaves an ordinary failure untouched', async () => {

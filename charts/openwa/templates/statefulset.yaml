@@ -1,3 +1,6 @@
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail "replicaCount > 1 is not supported while main.sqlite is pod-local (see docs/13-horizontal-scaling.md)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -20,7 +23,9 @@ spec:
       # alters the ConfigMap without altering the values it was built from.
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if and (not .Values.existingSecret) (or (not (hasKey .Values "secretChecksumAnnotation")) .Values.secretChecksumAnnotation) }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
       labels:
         {{- include "openwa.selectorLabels" . | nindent 8 }}
     spec:
@@ -116,7 +121,8 @@ spec:
               mountPath: /tmp
       volumes:
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: {{ .Values.tmpVolumeSizeLimit | default "512Mi" }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

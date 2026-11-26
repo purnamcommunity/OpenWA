@@ -1,10 +1,11 @@
 import { z } from 'zod';
 import { ApiKeyRole } from '../../../modules/auth/entities/api-key.entity';
 import type { ContactService } from '../../../modules/contact/contact.service';
-import { defineTool, type AnyToolDescriptor } from '../tool-descriptor';
+import { listLimitSchema } from '../list-limit-schema';
+import { defineTool, sessionIdSchema, type AnyToolDescriptor } from '../tool-descriptor';
 import { paginate } from '../../../common/utils/paginate';
 
-const sessionId = z.string().min(1).describe('Session UUID (the session id, not the name)');
+const sessionId = sessionIdSchema;
 
 export function contactTools(contact: ContactService): AnyToolDescriptor[] {
   return [
@@ -14,9 +15,10 @@ export function contactTools(contact: ContactService): AnyToolDescriptor[] {
       description: 'List all contacts for a session. Use limit/offset to page through large contact lists.',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
-        limit: z.number().int().min(1).max(1000).optional(),
+        limit: listLimitSchema,
         offset: z.number().int().min(0).optional(),
       }),
       handler: async (input, apiKey, chatScope) => {
@@ -37,6 +39,7 @@ export function contactTools(contact: ContactService): AnyToolDescriptor[] {
       description: 'Get details for a specific contact by JID (e.g. 628xxx@c.us).',
       tier: 'read',
       sessionScoped: true,
+      returnsUntrustedContent: true,
       inputSchema: z.object({
         sessionId,
         contactId: z.string().min(1).describe('Contact JID (e.g. 628123456789@c.us)'),

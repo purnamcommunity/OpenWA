@@ -30,6 +30,9 @@ describe('isNavigationError', () => {
   it.each([
     NAVIGATION,
     'Evaluation failed: TypeError: window.require is not a function',
+    // The page functions this adapter ships read `require` through a local alias of the window, so V8 names that.
+    'Evaluation failed: TypeError: w.require is not a function',
+    'w.require is not a function',
     'execution context was destroyed',
   ])('reads %p as a navigation', message => {
     expect(isNavigationError(new Error(message))).toBe(true);
@@ -45,6 +48,10 @@ describe('isNavigationError', () => {
     'Protocol error (Runtime.callFunctionOn): Target closed',
     "Runtime.callFunctionOn timed out. Increase the 'protocolTimeout' setting in launch/connect calls",
     'Evaluation failed: TypeError: Cannot read properties of null',
+    // A build that moved a function is not a reload: reading it as one would answer a retryable 409 that never succeeds.
+    'Evaluation failed: TypeError: w.require(...).resetGroupInviteCode is not a function',
+    'Evaluation failed: TypeError: window.require(...).setMyStatus is not a function',
+    'Evaluation failed: TypeError: follow.require is not a function',
     '',
   ])('does not read %p as a navigation', message => {
     expect(isNavigationError(new Error(message))).toBe(false);
@@ -77,7 +84,11 @@ describe('a call the page navigation cut short', () => {
     return { host, reportIfPageTransportError };
   }
 
-  const reload = (): unknown => expect.objectContaining({ message: PAGE_RELOADING_MESSAGE });
+  const reload = (): unknown =>
+    expect.objectContaining({
+      message: PAGE_RELOADING_MESSAGE,
+      response: expect.objectContaining({ code: 'ENGINE_PAGE_RELOADING', retryAfterSeconds: 5 }) as unknown,
+    });
 
   it('withPage answers the 409 and schedules a health check', async () => {
     const { host, reportIfPageTransportError } = makeHost({});
@@ -127,15 +138,15 @@ describe('a call the page navigation cut short', () => {
   });
 
   it('an invite preview is not "no such invite"', async () => {
-    const getInviteInfo = jest.fn().mockRejectedValue(navigation);
-    const { host } = makeHost({ getInviteInfo });
+    const evaluate = jest.fn().mockRejectedValue(navigation);
+    const { host } = makeHost({ pupPage: { evaluate } });
 
     await expect(new WwebjsGroups(host).getGroupJoinInfo('code')).rejects.toBeInstanceOf(EngineNotReadyError);
   });
 
   it('an invite acceptance answers the unknown-outcome 503, not an invalid invite', async () => {
-    const acceptInvite = jest.fn().mockRejectedValue(navigation);
-    const { host } = makeHost({ acceptInvite });
+    const evaluate = jest.fn().mockRejectedValue(navigation);
+    const { host } = makeHost({ pupPage: { evaluate } });
 
     await expect(new WwebjsGroups(host).joinGroupViaInviteCode('code')).rejects.toBeInstanceOf(EngineTransportError);
   });
